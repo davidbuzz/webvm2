@@ -1,0 +1,2765 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ *   AP_Landing_Slope.cpp - Landing logic handler for ArduPlane for STANDARD_GLIDE_SLOPE
+ */
+
+#include "AP_Landing.h"
+#include <GCS_MAVLink/GCS.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_LandingGear/AP_LandingGear.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_GPS/AP_GPS.h>
+#include <AP_Logger/AP_Logger.h>
+
+#if defined(APM_BUILD_TYPE)
+//  - this is just here to encourage the build system to supply the "legacy build defines".  The actual dependecy is in the AP_LandingGear.h and AP_LandingGear_config.h headers
+#endif
+
+void AP_Landing::type_slope_do_land(const AP_Mission::Mission_Command& cmd, const float relative_altitude)
+{
+    initial_slope = 0;
+    slope = 0;
+
+    // once landed, post some landing statistics to the GCS
+    type_slope_flags.post_stats = false;
+
+    type_slope_stage = SlopeStage::NORMAL;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Landing approach start at %.1fm", (double)relative_altitude);
+}
+
+void AP_Landing::type_slope_verify_abort_landing(const Location &prev_WP_loc, Location &next_WP_loc, bool &throttle_suppressed)
+{
+    // when aborting a landing, mimic the verify_takeoff with steering hold. Once
+    // the altitude has been reached, restart the landing sequence
+    throttle_suppressed = false;
+    nav_controller->update_heading_hold(prev_WP_loc.get_bearing_to(next_WP_loc));
+}
+
+/*
+  update navigation for landing. Called when on landing approach or
+  final flare
+ */
+bool AP_Landing::type_slope_verify_land(const Location &prev_WP_loc, Location &next_WP_loc, const Location &current_loc,
+        const float height, const float sink_rate, const float wp_proportion, const uint32_t last_flying_ms, const bool is_armed, const bool is_flying, const bool rangefinder_state_in_range)
+{
+    // we don't 'verify' landing in the sense that it never completes,
+    // so we don't verify command completion. Instead we use this to
+    // adjust final landing parameters
+
+    // determine stage
+    if (type_slope_stage == SlopeStage::NORMAL) {
+        const bool heading_lined_up = abs(nav_controller->bearing_error_cd()) < 1000 && !nav_controller->data_is_stale();
+        const bool on_flight_line = fabsf(nav_controller->crosstrack_error()) < 5.0f && !nav_controller->data_is_stale();
+        const bool below_prev_WP = current_loc.alt < prev_WP_loc.alt;
+        if ((mission.get_prev_nav_cmd_id() == MAV_CMD_NAV_LOITER_TO_ALT) ||
+            (wp_proportion >= 0 && heading_lined_up && on_flight_line) ||
+            (wp_proportion > 0.15f && heading_lined_up && below_prev_WP) ||
+            (wp_proportion > 0.5f)) {
+            type_slope_stage = SlopeStage::APPROACH;
+        }
+    }
+
+    /* Set land_complete (which starts the flare) under 3 conditions:
+       1) we are within LAND_FLARE_ALT meters of the landing altitude
+       2) we are within LAND_FLARE_SEC of the landing point vertically
+          by the calculated sink rate (if LAND_FLARE_SEC != 0)
+       3) we have gone past the landing point and don't have
+          rangefinder data (to prevent us keeping throttle on
+          after landing if we've had positive baro drift)
+    */
+
+    // flare check:
+    // 1) below flare alt/sec requires approach stage check because if sec/alt are set too
+    //    large, and we're on a hard turn to line up for approach, we'll prematurely flare by
+    //    skipping approach phase and the extreme roll limits will make it hard to line up with runway
+    // 2) passed land point and don't have an accurate AGL
+    // 3) probably crashed (ensures motor gets turned off)
+
+    const bool on_approach_stage = type_slope_is_on_approach();
+    const bool below_flare_alt = (height <= flare_alt);
+    const bool below_flare_sec = (flare_sec > 0 && height <= sink_rate * flare_sec);
+    const bool probably_crashed = (aparm.crash_detection_enable && fabsf(sink_rate) < 0.2f && !is_flying);
+
+    height_flare_log = height;
+
+    const AP_GPS &gps = AP::gps();
+
+    if ((on_approach_stage && below_flare_alt) ||
+        (on_approach_stage && below_flare_sec && (wp_proportion > 0.5)) ||
+        (!rangefinder_state_in_range && wp_proportion >= 1) ||
+        probably_crashed) {
+
+        if (type_slope_stage != SlopeStage::FINAL) {
+            type_slope_flags.post_stats = true;
+            if (is_flying && (AP_HAL::millis()-last_flying_ms) > 3000) {
+                GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "Flare crash detected: speed=%.1f", (double)gps.ground_speed());
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Flare %.1fm sink=%.2f speed=%.1f dist=%.1f",
+                                  (double)height, (double)sink_rate,
+                                  (double)gps.ground_speed(),
+                                  (double)current_loc.get_distance(next_WP_loc));
+            }
+            
+            type_slope_stage = SlopeStage::FINAL;
+
+#if AP_LANDINGGEAR_ENABLED
+            // Check if the landing gear was deployed before landing
+            // If not - go around
+            AP_LandingGear *LG_inst = AP_LandingGear::get_singleton();
+            if (LG_inst != nullptr && !LG_inst->check_before_land()) {
+                type_slope_request_go_around();
+                GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "Landing gear was not deployed");
+            }
+#endif
+        }
+
+        if (gps.ground_speed() < 3) {
+            // reload any airspeed or groundspeed parameters that may have
+            // been set for landing. We don't do this till ground
+            // speed drops below 3.0 m/s as otherwise we will change
+            // target speeds too early.
+            aparm.airspeed_cruise.load();
+            aparm.min_groundspeed.load();
+            aparm.throttle_cruise.load();
+        }
+    } else if (type_slope_stage == SlopeStage::APPROACH && pre_flare_airspeed > 0) {
+        bool reached_pre_flare_alt = pre_flare_alt > 0 && (height <= pre_flare_alt);
+        bool reached_pre_flare_sec = pre_flare_sec > 0 && (height <= sink_rate * pre_flare_sec);
+        if (reached_pre_flare_alt || reached_pre_flare_sec) {
+            type_slope_stage = SlopeStage::PREFLARE;
+        }
+    }
+
+    /*
+      when landing we keep the L1 navigation waypoint 200m ahead. This
+      prevents sudden turns if we overshoot the landing point
+     */
+    Location land_WP_loc = next_WP_loc;
+
+    int32_t land_bearing_cd = prev_WP_loc.get_bearing_to(next_WP_loc);
+    land_WP_loc.offset_bearing(land_bearing_cd * 0.01f, prev_WP_loc.get_distance(current_loc) + 200);
+    nav_controller->update_waypoint(prev_WP_loc, land_WP_loc);
+
+    // once landed and stationary, post some statistics
+    // this is done before disarm_if_autoland_complete() so that it happens on the next loop after the disarm
+    if (type_slope_flags.post_stats && !is_armed) {
+        type_slope_flags.post_stats = false;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Distance from LAND point=%.2fm", (double)current_loc.get_distance(next_WP_loc));
+    }
+
+    // check if we should auto-disarm after a confirmed landing
+    if (type_slope_stage == SlopeStage::FINAL) {
+        disarm_if_autoland_complete_fn();
+    }
+
+    if (mission.continue_after_land() &&
+        type_slope_stage == SlopeStage::FINAL &&
+        gps.status() >= AP_GPS::GPS_OK_FIX_3D &&
+        gps.ground_speed() < 1) {
+        /*
+          user has requested to continue with mission after a
+          landing. Return true to allow for continue
+         */
+        return true;
+    }
+
+    /*
+      we return false as a landing mission item never completes
+
+      we stay on this waypoint unless the GCS commands us to change
+      mission item, reset the mission, command a go-around or finish
+      a land_abort procedure.
+     */
+    return false;
+}
+
+void AP_Landing::type_slope_adjust_landing_slope_for_rangefinder_bump(AP_FixedWing::Rangefinder_State &rangefinder_state, Location &prev_WP_loc, Location &next_WP_loc, const Location &current_loc, const float wp_distance, int32_t &target_altitude_offset_cm)
+{
+    // check the rangefinder correction for a large change. When found, recalculate the glide slope. This is done by
+    // determining the slope from your current location to the land point then following that back up to the approach
+    // altitude and moving the prev_wp to that location. From there
+    float correction_delta = fabsf(rangefinder_state.last_stable_correction) - fabsf(rangefinder_state.correction);
+
+    if (slope_recalc_shallow_threshold <= 0 ||
+            fabsf(correction_delta) < slope_recalc_shallow_threshold) {
+        return;
+    }
+
+    rangefinder_state.last_stable_correction = rangefinder_state.correction;
+
+    float corrected_alt_m = (adjusted_altitude_cm_fn() - next_WP_loc.alt)*0.01f - rangefinder_state.correction;
+    float total_distance_m = prev_WP_loc.get_distance(next_WP_loc);
+    float top_of_glide_slope_alt_m = total_distance_m * corrected_alt_m / wp_distance;
+    prev_WP_loc.alt = top_of_glide_slope_alt_m*100 + next_WP_loc.alt;
+
+    // re-calculate auto_state.land_slope with updated prev_WP_loc
+    setup_landing_glide_slope(prev_WP_loc, next_WP_loc, current_loc, target_altitude_offset_cm);
+
+    if (rangefinder_state.correction >= 0) { // we're too low or object is below us
+        // correction positive means we're too low so we should continue on with
+        // the newly computed shallower slope instead of pitching/throttling up
+
+    } else if (slope_recalc_steep_threshold_to_abort > 0 && !type_slope_flags.has_aborted_due_to_slope_recalc) {
+        // correction negative means we're too high and need to point down (and speed up) to re-align
+        // to land on target. A large negative correction means we would have to dive down a lot and will
+        // generating way too much speed that we can not bleed off in time. It is better to remember
+        // the large baro altitude offset and abort the landing to come around again with the correct altitude
+        // offset and "perfect" slope.
+
+        // calculate projected slope with projected alt
+        float new_slope_deg = degrees(atanf(slope));
+        float initial_slope_deg = degrees(atanf(initial_slope));
+
+        // is projected slope too steep?
+        if (new_slope_deg - initial_slope_deg > slope_recalc_steep_threshold_to_abort) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Landing slope too steep, aborting (%.0fm %.1fdeg)",
+                                             (double)rangefinder_state.correction, (double)(new_slope_deg - initial_slope_deg));
+            alt_offset = rangefinder_state.correction;
+            flags.commanded_go_around = true;
+            type_slope_flags.has_aborted_due_to_slope_recalc = true; // only allow this once.
+            Log();
+        }
+    }
+}
+
+bool AP_Landing::type_slope_request_go_around(void)
+{
+    flags.commanded_go_around = true;
+    return true;
+}
+
+/*
+  a special glide slope calculation for the landing approach
+
+  During the land approach use a linear glide slope to a point
+  projected through the landing point. We don't use the landing point
+  itself as that leads to discontinuities close to the landing point,
+  which can lead to erratic pitch control
+ */
+void AP_Landing::type_slope_setup_landing_glide_slope(const Location &prev_WP_loc, const Location &next_WP_loc, const Location &current_loc, int32_t &target_altitude_offset_cm)
+{
+    float total_distance = prev_WP_loc.get_distance(next_WP_loc);
+
+    // If someone mistakenly puts all 0's in their LAND command then total_distance
+    // will be calculated as 0 and cause a divide by 0 error below.  Lets avoid that.
+    if (total_distance < 1) {
+        total_distance = 1;
+    }
+
+    // height we need to sink for this WP
+    float sink_height = (prev_WP_loc.alt - next_WP_loc.alt)*0.01f;
+
+    // current ground speed
+    float groundspeed = ahrs.groundspeed();
+    if (groundspeed < 0.5f) {
+        groundspeed = 0.5f;
+    }
+
+    // calculate time to lose the needed altitude
+    float sink_time = total_distance / groundspeed;
+    if (sink_time < 0.5f) {
+        sink_time = 0.5f;
+    }
+
+    // find the sink rate needed for the target location
+    float sink_rate = sink_height / sink_time;
+
+    // the height we aim for is the one to give us the right flare point
+    float aim_height = flare_sec * sink_rate;
+    if (aim_height <= 0) {
+        aim_height = flare_alt;
+    }
+
+    // don't allow the aim height to be too far above LAND_FLARE_ALT
+    if (flare_alt > 0 && aim_height > flare_alt*2) {
+        aim_height = flare_alt*2;
+    }
+
+    // calculate time spent in flare assuming the sink rate reduces over time from sink_rate at aim_height
+    // to tecs_controller->get_land_sinkrate() at touchdown
+    const float weight = constrain_float(0.01f*(float)flare_effectivness_pct, 0.0f, 1.0f);
+    const float flare_sink_rate_avg = MAX(weight * tecs_Controller->get_land_sinkrate() + (1.0f - weight) * sink_rate, 0.1f);
+    const float flare_time = aim_height / flare_sink_rate_avg;
+
+    // distance to flare is based on ground speed, adjusted as we
+    // get closer. This takes into account the wind
+    float flare_distance = groundspeed * flare_time;
+
+    // don't allow the flare before half way along the final leg
+    if (flare_distance > total_distance*0.5f) {
+        flare_distance = total_distance*0.5f;
+    }
+
+    // project a point 500 meters past the landing point, passing
+    // through the landing point
+    const float land_projection = 500;
+    int32_t land_bearing_cd = prev_WP_loc.get_bearing_to(next_WP_loc);
+
+    // now calculate our aim point, which is before the landing
+    // point and above it
+    Location loc = next_WP_loc;
+    loc.offset_bearing(land_bearing_cd * 0.01f, -flare_distance);
+    loc.alt += aim_height*100;
+
+    // calculate slope to landing point
+    bool is_first_calc = is_zero(slope);
+    slope = (sink_height - aim_height) / (total_distance - flare_distance);
+    if (is_first_calc) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Landing glide slope %.1f degrees", (double)degrees(atanf(slope)));
+    }
+
+    // calculate point along that slope 500m ahead
+    loc.offset_bearing(land_bearing_cd * 0.01f, land_projection);
+    loc.alt -= slope * land_projection * 100;
+
+    // setup the offset_cm for set_target_altitude_proportion()
+    target_altitude_offset_cm = loc.alt - prev_WP_loc.alt;
+
+    // calculate the proportion we are to the target
+    float land_proportion = current_loc.line_path_proportion(prev_WP_loc, loc);
+
+    // now setup the glide slope for landing
+    set_target_altitude_proportion_fn(loc, 1.0f - land_proportion);
+
+    // stay within the range of the start and end locations in altitude
+    constrain_target_altitude_location_fn(loc, prev_WP_loc);
+}
+
+int32_t AP_Landing::type_slope_get_target_airspeed_cm(void)
+{
+    // we're landing, check for custom approach and
+    // pre-flare airspeeds. Also increase for head-winds
+
+    const float land_airspeed = tecs_Controller->get_land_airspeed();
+    int32_t target_airspeed_cm = aparm.airspeed_cruise*100;
+    if (land_airspeed >= 0) {
+        target_airspeed_cm = land_airspeed * 100;
+    } else {
+        target_airspeed_cm = 100 * 0.5 * (aparm.airspeed_cruise + aparm.airspeed_min);
+    }
+    switch (type_slope_stage) {
+    case SlopeStage::NORMAL:
+        target_airspeed_cm = aparm.airspeed_cruise*100;
+        break;
+    case SlopeStage::APPROACH:
+        break;
+    case SlopeStage::PREFLARE:
+    case SlopeStage::FINAL:
+        if (pre_flare_airspeed > 0) {
+            // if we just preflared then continue using the pre-flare airspeed during final flare
+            target_airspeed_cm = pre_flare_airspeed * 100;
+        }
+        break;
+    }
+
+    // when landing, add half of head-wind.
+    const float head_wind_comp = constrain_float(wind_comp, 0.0f, 100.0f)*0.01;
+    const int32_t head_wind_compensation_cm = ahrs.head_wind() * head_wind_comp * 100;
+
+    const uint32_t max_airspeed_cm = AP_Landing::allow_max_airspeed_on_land() ? aparm.airspeed_max*100 : aparm.airspeed_cruise*100;
+    
+    return constrain_int32(target_airspeed_cm + head_wind_compensation_cm, target_airspeed_cm, max_airspeed_cm);
+    
+}
+
+int32_t AP_Landing::type_slope_constrain_roll(const int32_t desired_roll_cd, const int32_t level_roll_limit_cd)
+{
+    if (type_slope_stage == SlopeStage::FINAL) {
+        return constrain_int32(desired_roll_cd, level_roll_limit_cd * -1, level_roll_limit_cd);
+    } else {
+        return desired_roll_cd;
+    }
+}
+
+bool AP_Landing::type_slope_is_flaring(void) const
+{
+    return (type_slope_stage == SlopeStage::FINAL);
+}
+
+bool AP_Landing::type_slope_is_on_approach(void) const
+{
+    return (type_slope_stage == SlopeStage::APPROACH ||
+            type_slope_stage == SlopeStage::PREFLARE);
+}
+
+bool AP_Landing::type_slope_is_expecting_impact(void) const
+{
+    return (type_slope_stage == SlopeStage::PREFLARE ||
+            type_slope_stage == SlopeStage::FINAL);
+}
+
+bool AP_Landing::type_slope_is_complete(void) const
+{
+    return (type_slope_stage == SlopeStage::FINAL);
+}
+
+#if HAL_LOGGING_ENABLED
+void AP_Landing::type_slope_log(void) const
+{
+// @LoggerMessage: LAND
+// @Description: Slope Landing data
+// @Field: TimeUS: Time since system startup
+// @Field: stage: progress through landing sequence
+// @Field: f1: Landing flags
+// @Field: f2: Slope-specific landing flags
+// @Field: slope: Slope to landing point
+// @Field: slopeInit: Initial slope to landing point
+// @Field: altO: Rangefinder correction
+// @Field: fh: Height for flare timing.
+    AP::logger().WriteStreaming("LAND", "TimeUS,stage,f1,f2,slope,slopeInit,altO,fh", "QBBBffff",
+                                            AP_HAL::micros64(),
+                                            type_slope_stage,
+                                            flags,
+                                            type_slope_flags,
+                                            (double)slope,
+                                            (double)initial_slope,
+                                            (double)alt_offset,
+                                            (double)height_flare_log);
+}
+#endif
+
+bool AP_Landing::type_slope_is_throttle_suppressed(void) const
+{
+    return type_slope_stage == SlopeStage::FINAL;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+#ifndef HAL_LANDING_DEEPSTALL_ENABLED
+#define HAL_LANDING_DEEPSTALL_ENABLED (BOARD_FLASH_SIZE > 1024)
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #pragma once
+
+#include <AP_Logger/LogStructure.h>
+#include "AP_Landing_config.h"
+
+#define LOG_IDS_FROM_LANDING \
+    LOG_DSTL_MSG
+
+#if HAL_LANDING_DEEPSTALL_ENABLED
+
+// @LoggerMessage: DSTL
+// @Description: Deepstall Landing data
+// @Field: TimeUS: Time since system startup
+// @Field: Stg: Deepstall landing stage
+// @Field: THdg: Target heading
+// @Field: Lat: Landing point latitude
+// @Field: Lng: Landing point longitude
+// @Field: Alt: Landing point altitude
+// @Field: XT: Crosstrack error
+// @Field: Travel: Expected travel distance vehicle will travel from this point
+// @Field: L1I: L1 controller crosstrack integrator value
+// @Field: Loiter: wind estimate loiter angle flown
+// @Field: Des: Deepstall steering PID desired value
+// @Field: P: Deepstall steering PID Proportional response component
+// @Field: I: Deepstall steering PID Integral response component
+// @Field: D: Deepstall steering PID Derivative response component
+
+struct PACKED log_DSTL {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t stage;
+    float target_heading;
+    int32_t target_lat;
+    int32_t target_lng;
+    int32_t target_alt;
+    int16_t crosstrack_error;
+    int16_t travel_distance;
+    float l1_i;
+    int32_t loiter_sum_cd;
+    float desired;
+    float P;
+    float I;
+    float D;
+};
+
+#define LOG_STRUCTURE_FROM_LANDING        \
+    { LOG_DSTL_MSG, sizeof(log_DSTL), \
+        "DSTL", "QBfLLeccfeffff", "TimeUS,Stg,THdg,Lat,Lng,Alt,XT,Travel,L1I,Loiter,Des,P,I,D", "s-hDUm--------", "F-0000--------" , true },
+#else
+#define LOG_STRUCTURE_FROM_LANDING
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ation(void) const
+{
+    // if we are using the WMM tables then use the table declination
+    // to ensure consistency with the table mag field. Otherwise use
+    // the declination from the compass library
+    if (have_table_earth_field && frontend->_mag_ef_limit > 0) {
+        return table_declination;
+    }
+    if (!use_compass()) {
+        return 0;
+    }
+    return dal.compass().get_declination();
+}
+
+/*
+  Update the on ground and not moving check.
+  Should be called once per IMU update.
+  Only updates when on ground and when operating without a magnetometer
+*/
+void NavEKF3_core::updateMovementCheck(void)
+{
+    const bool runCheck = onGround && (yaw_source_last == AP_NavEKF_Source::SourceYaw::GPS || yaw_source_last == AP_NavEKF_Source::SourceYaw::GPS_COMPASS_FALLBACK ||
+                                       yaw_source_last == AP_NavEKF_Source::SourceYaw::EXTNAV || yaw_source_last == AP_NavEKF_Source::SourceYaw::GSF || !use_compass());
+    if (!runCheck)
+    {
+        onGroundNotMoving = false;
+        return;
+    }
+
+    const ftype gyro_limit = radians(3.0f);
+    const ftype gyro_diff_limit = 0.2f;
+    const ftype accel_limit = 1.0f;
+    const ftype accel_diff_limit = 5.0f;
+    const ftype hysteresis_ratio = 0.7f;
+    const ftype dtEkfAvgInv = 1.0f / dtEkfAvg;
+
+    // get latest bias corrected gyro and accelerometer data
+    const auto &ins = dal.ins();
+    Vector3F gyro = ins.get_gyro(gyro_index_active).toftype() - stateStruct.gyro_bias * dtEkfAvgInv;
+    Vector3F accel = ins.get_accel(accel_index_active).toftype() - stateStruct.accel_bias * dtEkfAvgInv;
+
+    if (!prevOnGround) {
+        gyro_prev = gyro;
+        accel_prev = accel;
+        onGroundNotMoving = false;
+        gyro_diff = gyro_diff_limit;
+        accel_diff = accel_diff_limit;
+        return;
+    }
+
+    // calculate a gyro rate of change metric
+    Vector3F temp = (gyro - gyro_prev) * dtEkfAvgInv;
+    gyro_prev = gyro;
+    gyro_diff = 0.99f * gyro_diff + 0.01f * temp.length();
+
+    // calculate a acceleration rate of change metric
+    temp = (accel - accel_prev) * dtEkfAvgInv;
+    accel_prev = accel;
+    accel_diff = 0.99f * accel_diff + 0.01f * temp.length();
+
+    const ftype gyro_length_ratio = gyro.length() / gyro_limit;
+    const ftype accel_length_ratio = (accel.length() - GRAVITY_MSS) / accel_limit;
+    const ftype gyro_diff_ratio = gyro_diff / gyro_diff_limit;
+    const ftype accel_diff_ratio = accel_diff / accel_diff_limit;
+    bool logStatusChange = false;
+    if (onGroundNotMoving) {
+        if (gyro_length_ratio > frontend->_ognmTestScaleFactor ||
+            fabsF(accel_length_ratio) > frontend->_ognmTestScaleFactor ||
+            gyro_diff_ratio > frontend->_ognmTestScaleFactor ||
+            accel_diff_ratio > frontend->_ognmTestScaleFactor)
+        {
+            onGroundNotMoving = false;
+            logStatusChange = true;
+        }
+    } else if (gyro_length_ratio < frontend->_ognmTestScaleFactor * hysteresis_ratio &&
+            fabsF(accel_length_ratio) < frontend->_ognmTestScaleFactor * hysteresis_ratio &&
+            gyro_diff_ratio < frontend->_ognmTestScaleFactor * hysteresis_ratio &&
+            accel_diff_ratio < frontend->_ognmTestScaleFactor * hysteresis_ratio)
+    {
+        onGroundNotMoving = true;
+        logStatusChange = true;
+    }
+
+    if (logStatusChange || imuSampleTime_ms - lastMoveCheckLogTime_ms > 200) {
+        lastMoveCheckLogTime_ms = imuSampleTime_ms;
+#if HAL_LOGGING_ENABLED
+        const struct log_XKFM pkt{
+            LOG_PACKET_HEADER_INIT(LOG_XKFM_MSG),
+            time_us            : dal.micros64(),
+            core               : core_index,
+            ongroundnotmoving  : onGroundNotMoving,
+            gyro_length_ratio  : float(gyro_length_ratio),
+            accel_length_ratio : float(accel_length_ratio),
+            gyro_diff_ratio    : float(gyro_diff_ratio),
+            accel_diff_ratio   : float(accel_diff_ratio),
+        };
+        AP::logger().WriteBlock(&pkt, sizeof(pkt));
+#endif
+    }
+}
+
+void NavEKF3_core::SampleDragData(const imu_elements &imu)
+{
+#if EK3_FEATURE_DRAG_FUSION
+    // Average and down sample to 5Hz
+    const ftype bcoef_x = frontend->_ballisticCoef_x;
+    const ftype bcoef_y = frontend->_ballisticCoef_y;
+    const ftype mcoef = frontend->_momentumDragCoef.get();
+    const bool using_bcoef_x = bcoef_x > 1.0f;
+    const bool using_bcoef_y = bcoef_y > 1.0f;
+    const bool using_mcoef = mcoef > 0.001f;
+    if (!using_bcoef_x && !using_bcoef_y && !using_mcoef) {
+        // nothing to do
+        dragFusionEnabled = false;
+        return;
+    }
+
+    dragFusionEnabled = true;
+
+    // down-sample the drag specific force data by accumulating and calculating the mean when
+    // sufficient samples have been collected
+
+    dragSampleCount ++;
+
+    // note acceleration is accumulated as a delta velocity
+    dragDownSampled.accelXY.x += imu.delVel.x;
+    dragDownSampled.accelXY.y += imu.delVel.y;
+    dragDownSampled.time_ms += imu.time_ms;
+    dragSampleTimeDelta += imu.delVelDT;
+
+    // calculate and store means from accumulated values
+    if (dragSampleTimeDelta > 0.2f - 0.5f * EKF_TARGET_DT) {
+        // note conversion from accumulated delta velocity to acceleration
+        dragDownSampled.accelXY.x /= dragSampleTimeDelta;
+        dragDownSampled.accelXY.y /= dragSampleTimeDelta;
+        dragDownSampled.time_ms /= dragSampleCount;
+
+        // write to buffer
+        storedDrag.push(dragDownSampled);
+
+        // reset accumulators
+        dragSampleCount = 0;
+        dragDownSampled.accelXY.zero();
+        dragDownSampled.time_ms = 0;
+        dragSampleTimeDelta = 0.0f;
+    }
+#endif // EK3_FEATURE_DRAG_FUSION
+}
+
+/*
+  get the earth mag field
+ */
+void NavEKF3_core::getEarthFieldTable(const Location &loc)
+{
+    table_earth_field_ga = AP_Declination::get_earth_field_ga(loc).toftype();
+    table_declination = radians(AP_Declination::get_declination(loc.lat*1.0e-7,
+                                                                loc.lng*1.0e-7));
+    have_table_earth_field = true;
+}
+
+/*
+  update earth field, called at 1Hz
+ */
+void NavEKF3_core::checkUpdateEarthField(void)
+{
+    if (have_table_earth_field && filterStatus.flags.using_gps) {
+        Location loc = EKF_origin;
+        loc.offset(stateStruct.position.x, stateStruct.position.y);
+        getEarthFieldTable(loc);
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #include <AP_HAL/AP_HAL.h>
+
+#include "AP_NavEKF3.h"
+#include "AP_NavEKF3_core.h"
+#include <GCS_MAVLink/GCS.h>
+
+/********************************************************
+*                   RESET FUNCTIONS                     *
+********************************************************/
+
+/********************************************************
+*                   FUSE MEASURED_DATA                  *
+********************************************************/
+
+// select fusion of optical flow measurements
+void NavEKF3_core::SelectFlowFusion()
+{
+    // Check if the magnetometer has been fused on that time step and the filter is running at faster than 200 Hz
+    // If so, don't fuse measurements on this time step to reduce frame over-runs
+    // Only allow one time slip to prevent high rate magnetometer data preventing fusion of other measurements
+    if (magFusePerformed && dtIMUavg < 0.005f && !optFlowFusionDelayed) {
+        optFlowFusionDelayed = true;
+        return;
+    } else {
+        optFlowFusionDelayed = false;
+    }
+
+    of_elements ofDataDelayed;      // OF data at the fusion time horizon
+
+    // Check for data at the fusion time horizon
+    const bool flowDataToFuse = storedOF.recall(ofDataDelayed, imuDataDelayed.time_ms);
+
+    // Perform Data Checks
+    // Check if the optical flow data is still valid
+    flowDataValid = ((imuSampleTime_ms - flowValidMeaTime_ms) < 1000);
+    // check is the terrain offset estimate is still valid - if we are using range finder as the main height reference, the ground is assumed to be at 0
+    gndOffsetValid = ((imuSampleTime_ms - gndHgtValidTime_ms) < 5000) || (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER);
+    // Perform tilt check
+    bool tiltOK = (prevTnb.c.z > frontend->DCM33FlowMin);
+    // Constrain measurements to zero if takeoff is not detected and the height above ground
+    // is insufficient to achieve acceptable focus. This allows the vehicle to be picked up
+    // and carried to test optical flow operation
+    if (!takeOffDetected && ((terrainState - stateStruct.position.z) < 0.5f)) {
+        ofDataDelayed.flowRadXYcomp.zero();
+        ofDataDelayed.flowRadXY.zero();
+        flowDataValid = true;
+    }
+
+    // if have valid flow or range measurements, fuse data into a 1-state EKF to estimate terrain height
+    if (((flowDataToFuse && (frontend->_flowUse == FLOW_USE_TERRAIN)) || rangeDataToFuse) && tiltOK) {
+        // Estimate the terrain offset (runs a one state EKF)
+        EstimateTerrainOffset(ofDataDelayed);
+    }
+
+    // Fuse optical flow data into the main filter
+    if (flowDataToFuse && tiltOK) {
+        const bool fuse_optflow = (frontend->_flowUse == FLOW_USE_NAV) && frontend->sources.useVelXYSource(AP_NavEKF_Source::SourceXY::OPTFLOW);
+        // Set the flow noise used by the fusion processes
+        R_LOS = sq(MAX(frontend->_flowNoise, 0.05f));
+        // Fuse the optical flow X and Y axis data into the main filter sequentially
+        FuseOptFlow(ofDataDelayed, fuse_optflow);
+    }
+}
+
+/*
+Estimation of terrain offset using a single state EKF
+The filter can fuse motion compensated optical flow rates and range finder measurements
+Equations generated using https://github.com/PX4/ecl/tree/master/EKF/matlab/scripts/Terrain%20Estimator
+*/
+void NavEKF3_core::EstimateTerrainOffset(const of_elements &ofDataDelayed)
+{
+    // horizontal velocity squared
+    ftype velHorizSq = sq(stateStruct.velocity.x) + sq(stateStruct.velocity.y);
+
+    // don't fuse flow data if LOS rate is misaligned, without GPS, or insufficient velocity, as it is poorly observable
+    // don't fuse flow data if it exceeds validity limits
+    // don't update terrain offset if ground is being used as the zero height datum in the main filter
+    bool cantFuseFlowData = ((frontend->_flowUse != FLOW_USE_TERRAIN)
+    || !gpsIsInUse
+    || PV_AidingMode == AID_RELATIVE 
+    || velHorizSq < 25.0f 
+    || (MAX(ofDataDelayed.flowRadXY[0],ofDataDelayed.flowRadXY[1]) > frontend->_maxFlowRate));
+
+    if ((!rangeDataToFuse && cantFuseFlowData) || (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER)) {
+        // skip update
+        inhibitGndState = true;
+    } else {
+        inhibitGndState = false;
+
+        // propagate ground position state noise each time this is called using the difference in position since the last observations and an RMS gradient assumption
+        // limit distance to prevent intialisation after bad gps causing bad numerical conditioning
+        ftype distanceTravelledSq = sq(stateStruct.position[0] - prevPosN) + sq(stateStruct.position[1] - prevPosE);
+        distanceTravelledSq = MIN(distanceTravelledSq, 100.0f);
+        prevPosN = stateStruct.position[0];
+        prevPosE = stateStruct.position[1];
+
+        // in addition to a terrain gradient error model, we also have the growth in uncertainty due to the copter's vertical velocity
+        ftype timeLapsed = MIN(0.001f * (imuSampleTime_ms - timeAtLastAuxEKF_ms), 1.0f);
+        ftype Pincrement = (distanceTravelledSq * sq(frontend->_terrGradMax)) + sq(timeLapsed)*P[6][6];
+        Popt += Pincrement;
+        timeAtLastAuxEKF_ms = imuSampleTime_ms;
+
+        // fuse range finder data
+        if (rangeDataToFuse) {
+            // reset terrain state if rangefinder data not fused for 5 seconds
+            if (imuSampleTime_ms - gndHgtValidTime_ms > 5000) {
+                terrainState = MAX(rangeDataDelayed.rng * prevTnb.c.z, rngOnGnd) + stateStruct.position.z;
+            }
+
+            // predict range
+            ftype predRngMeas = MAX((terrainState - stateStruct.position[2]),rngOnGnd) / prevTnb.c.z;
+            // Copy required states to local variable names
+            ftype q0 = stateStruct.quat[0]; // quaternion at optical flow measurement time
+            ftype q1 = stateStruct.quat[1]; // quaternion at optical flow measurement time
+            ftype q2 = stateStruct.quat[2]; // quaternion at optical flow measurement time
+            ftype q3 = stateStruct.quat[3]; // quaternion at optical flow measurement time
+
+            // Set range finder measurement noise variance. TODO make this a function of range and tilt to allow for sensor, alignment and AHRS errors
+            ftype R_RNG = frontend->_rngNoise;
+
+            // calculate Kalman gain
+            ftype SK_RNG = sq(q0) - sq(q1) - sq(q2) + sq(q3);
+            ftype K_RNG = Popt/(SK_RNG*(R_RNG + Popt/sq(SK_RNG)));
+
+            // Calculate the innovation variance for data logging
+            varInnovRng = (R_RNG + Popt/sq(SK_RNG));
+
+            // constrain terrain height to be below the vehicle
+            terrainState = MAX(terrainState, stateStruct.position[2] + rngOnGnd);
+
+            // Calculate the measurement innovation
+            innovRng = predRngMeas - rangeDataDelayed.rng;
+
+            // calculate the innovation consistency test ratio
+            auxRngTestRatio = sq(innovRng) / (sq(MAX(0.01f * (ftype)frontend->_rngInnovGate, 1.0f)) * varInnovRng);
+
+            // Check the innovation test ratio and don't fuse if too large
+            if (auxRngTestRatio < 1.0f) {
+                // correct the state
+                terrainState -= K_RNG * innovRng;
+
+                // constrain the state
+                terrainState = MAX(terrainState, stateStruct.position[2] + rngOnGnd);
+
+                // correct the covariance
+                Popt = Popt - sq(Popt)/(SK_RNG*(R_RNG + Popt/sq(SK_RNG))*(sq(q0) - sq(q1) - sq(q2) + sq(q3)));
+
+                // prevent the state variance from becoming negative
+                Popt = MAX(Popt,0.0f);
+
+                // record the time we last updated the terrain offset state
+                gndHgtValidTime_ms = imuSampleTime_ms;
+            }
+        }
+
+        if (!cantFuseFlowData) {
+
+            Vector3F relVelSensor;          // velocity of sensor relative to ground in sensor axes
+            Vector2F losPred;               // predicted optical flow angular rate measurement
+            ftype q0 = stateStruct.quat[0]; // quaternion at optical flow measurement time
+            ftype q1 = stateStruct.quat[1]; // quaternion at optical flow measurement time
+            ftype q2 = stateStruct.quat[2]; // quaternion at optical flow measurement time
+            ftype q3 = stateStruct.quat[3]; // quaternion at optical flow measurement time
+            ftype K_OPT;
+            ftype H_OPT;
+            Vector2F auxFlowObsInnovVar;
+
+            // predict range to centre of image
+            ftype flowRngPred = MAX((terrainState - stateStruct.position.z),rngOnGnd) / prevTnb.c.z;
+
+            // constrain terrain height to be below the vehicle
+            terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+
+            // calculate relative velocity in sensor frame
+            relVelSensor = prevTnb*stateStruct.velocity;
+
+            // divide velocity by range, subtract body rates and apply scale factor to
+            // get predicted sensed angular optical rates relative to X and Y sensor axes
+            losPred.x =   relVelSensor.y / flowRngPred;
+            losPred.y = - relVelSensor.x / flowRngPred;
+
+            // calculate innovations
+            auxFlowObsInnov = losPred - ofDataDelayed.flowRadXYcomp;
+
+            // calculate observation jacobians 
+            ftype t2 = q0*q0;
+            ftype t3 = q1*q1;
+            ftype t4 = q2*q2;
+            ftype t5 = q3*q3;
+            ftype t6 = stateStruct.position.z - terrainState;
+            ftype t7 = 1.0f / (t6*t6);
+            ftype t8 = q0*q3*2.0f;
+            ftype t9 = t2-t3-t4+t5;
+
+            // prevent the state variances from becoming badly conditioned
+            Popt = MAX(Popt,1E-6f);
+
+            // calculate observation noise variance from parameter
+            ftype flow_noise_variance = sq(MAX(frontend->_flowNoise, 0.05f));
+
+            // Fuse Y axis data
+
+            // Calculate observation partial derivative
+            H_OPT = t7*t9*(-stateStruct.velocity.z*(q0*q2*2.0-q1*q3*2.0)+stateStruct.velocity.x*(t2+t3-t4-t5)+stateStruct.velocity.y*(t8+q1*q2*2.0));
+
+            // calculate innovation variance
+            auxFlowObsInnovVar.y = H_OPT * Popt * H_OPT + flow_noise_variance;
+
+            // calculate Kalman gain
+            K_OPT = Popt * H_OPT / auxFlowObsInnovVar.y;
+
+            // calculate the innovation consistency test ratio
+            auxFlowTestRatio.y = sq(auxFlowObsInnov.y) / (sq(MAX(0.01f * (ftype)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar.y);
+
+            // don't fuse if optical flow data is outside valid range
+            if (auxFlowTestRatio.y < 1.0f) {
+
+                // correct the state
+                terrainState -= K_OPT * auxFlowObsInnov.y;
+
+                // constrain the state
+                terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+
+                // update intermediate variables used when fusing the X axis
+                t6 = stateStruct.position.z - terrainState;
+                t7 = 1.0f / (t6*t6);
+
+                // correct the covariance
+                Popt = Popt - K_OPT * H_OPT * Popt;
+
+                // prevent the state variances from becoming badly conditioned
+                Popt = MAX(Popt,1E-6f);
+
+                // record the time we last updated the terrain offset state
+                gndHgtValidTime_ms = imuSampleTime_ms;
+            }
+
+            // fuse X axis data
+            H_OPT = -t7*t9*(stateStruct.velocity.z*(q0*q1*2.0+q2*q3*2.0)+stateStruct.velocity.y*(t2-t3+t4-t5)-stateStruct.velocity.x*(t8-q1*q2*2.0));
+
+            // calculate innovation variances
+            auxFlowObsInnovVar.x = H_OPT * Popt * H_OPT + flow_noise_variance;
+
+            // calculate Kalman gain
+            K_OPT = Popt * H_OPT / auxFlowObsInnovVar.x;
+
+            // calculate the innovation consistency test ratio
+            auxFlowTestRatio.x = sq(auxFlowObsInnov.x) / (sq(MAX(0.01f * (ftype)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar.x);
+
+            // don't fuse if optical flow data is outside valid range
+            if (auxFlowTestRatio.x < 1.0f) {
+
+                // correct the state
+                terrainState -= K_OPT * auxFlowObsInnov.x;
+
+                // constrain the state
+                terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+
+                // correct the covariance
+                Popt = Popt - K_OPT * H_OPT * Popt;
+
+                // prevent the state variances from becoming badly conditioned
+                Popt = MAX(Popt,1E-6f);
+            }
+        }
+    }
+}
+
+/*
+ * Fuse angular motion compensated optical flow rates using explicit algebraic equations generated with Matlab symbolic toolbox.
+ * The script file used to generate these and other equations in this filter can be found here:
+ * https://github.com/PX4/ecl/blob/master/matlab/scripts/Inertial%20Nav%20EKF/GenerateNavFilterEquations.m
+ * Requires a valid terrain height estimate.
+ *
+ * really_fuse should be true to actually fuse into the main filter, false to only calculate variances
+*/
+void NavEKF3_core::FuseOptFlow(const of_elements &ofDataDelayed, bool really_fuse)
+{
+    Vector24 H_LOS;
+    Vector2 losPred;
+
+    // Copy required states to local variable names
+    ftype q0  = stateStruct.quat[0];
+    ftype q1 = stateStruct.quat[1];
+    ftype q2 = stateStruct.quat[2];
+    ftype q3 = stateStruct.quat[3];
+    ftype vn = stateStruct.velocity.x;
+    ftype ve = stateStruct.velocity.y;
+    ftype vd = stateStruct.velocity.z;
+    ftype pd = stateStruct.position.z;
+
+    // constrain height above ground to be above range measured on ground
+    ftype heightAboveGndEst = MAX((terrainState - pd), rngOnGnd);
+
+    // calculate range from ground plain to centre of sensor fov assuming flat earth
+    ftype range = constrain_ftype((heightAboveGndEst/prevTnb.c.z),rngOnGnd,1000.0f);
+
+    // correct range for flow sensor offset body frame position offset
+    // the corrected value is the predicted range from the sensor focal point to the
+    // centre of the image on the ground assuming flat terrain
+    Vector3F posOffsetBody = ofDataDelayed.body_offset - accelPosOffset;
+    if (!posOffsetBody.is_zero()) {
+        Vector3F posOffsetEarth = prevTnb.mul_transpose(posOffsetBody);
+        range -= posOffsetEarth.z / prevTnb.c.z;
+    }
+    
+#if APM_BUILD_TYPE(APM_BUILD_Rover)
+    // override with user specified height (if given, for rover)
+    if (ofDataDelayed.heightOverride > 0) {
+        range = ofDataDelayed.heightOverride;
+    }
+#endif
+
+    // Fuse X and Y axis measurements sequentially assuming observation errors are uncorrelated
+    for (uint8_t obsIndex=0; obsIndex<=1; obsIndex++) { // fuse X axis data first
+
+        // calculate relative velocity in sensor frame including the relative motion due to rotation
+        const Vector3F relVelSensor = (prevTnb * stateStruct.velocity) + (ofDataDelayed.bodyRadXYZ % posOffsetBody);
+
+        // divide velocity by range to get predicted angular LOS rates relative to X and Y axes
+        losPred[0] =  relVelSensor.y/range;
+        losPred[1] = -relVelSensor.x/range;
+
+        // calculate observation jacobians and Kalman gains
+        memset(&H_LOS[0], 0, sizeof(H_LOS));
+        if (obsIndex == 0) {
+            // calculate X axis observation Jacobian
+            ftype t2 = 1.0f / range;
+            H_LOS[0] = t2*(q1*vd*2.0f+q0*ve*2.0f-q3*vn*2.0f);
+            H_LOS[1] = t2*(q0*vd*2.0f-q1*ve*2.0f+q2*vn*2.0f);
+            H_LOS[2] = t2*(q3*vd*2.0f+q2*ve*2.0f+q1*vn*2.0f);
+            H_LOS[3] = -t2*(q2*vd*-2.0f+q3*ve*2.0f+q0*vn*2.0f);
+            H_LOS[4] = -t2*(q0*q3*2.0f-q1*q2*2.0f);
+            H_LOS[5] = t2*(q0*q0-q1*q1+q2*q2-q3*q3);
+            H_LOS[6] = t2*(q0*q1*2.0f+q2*q3*2.0f);
+
+            // calculate intermediate variables for the X observation innovation variance and Kalman gains
+            ftype t3 = q1*vd*2.0f;
+            ftype t4 = q0*ve*2.0f;
+            ftype t11 = q3*vn*2.0f;
+            ftype t5 = t3+t4-t11;
+            ftype t6 = q0*q3*2.0f;
+            ftype t29 = q1*q2*2.0f;
+            ftype t7 = t6-t29;
+            ftype t8 = q0*q1*2.0f;
+            ftype t9 = q2*q3*2.0f;
+            ftype t10 = t8+t9;
+            ftype t12 = P[0][0]*t2*t5;
+            ftype t13 = q0*vd*2.0f;
+            ftype t14 = q2*vn*2.0f;
+            ftype t28 = q1*ve*2.0f;
+            ftype t15 = t13+t14-t28;
+            ftype t16 = q3*vd*2.0f;
+            ftype t17 = q2*ve*2.0f;
+            ftype t18 = q1*vn*2.0f;
+            ftype t19 = t16+t17+t18;
+            ftype t20 = q3*ve*2.0f;
+            ftype t21 = q0*vn*2.0f;
+            ftype t30 = q2*vd*2.0f;
+            ftype t22 = t20+t21-t30;
+            ftype t23 = q0*q0;
+            ftype t24 = q1*q1;
+            ftype t25 = q2*q2;
+            ftype t26 = q3*q3;
+            ftype t27 = t23-t24+t25-t26;
+            ftype t31 = P[1][1]*t2*t15;
+            ftype t32 = P[6][0]*t2*t10;
+            ftype t33 = P[1][0]*t2*t15;
+            ftype t34 = P[2][0]*t2*t19;
+            ftype t35 = P[5][0]*t2*t27;
+            ftype t79 = P[4][0]*t2*t7;
+            ftype t80 = P[3][0]*t2*t22;
+            ftype t36 = t12+t32+t33+t34+t35-t79-t80;
+            ftype t37 = t2*t5*t36;
+            ftype t38 = P[6][1]*t2*t10;
+            ftype t39 = P[0][1]*t2*t5;
+            ftype t40 = P[2][1]*t2*t19;
+            ftype t41 = P[5][1]*t2*t27;
+            ftype t81 = P[4][1]*t2*t7;
+            ftype t82 = P[3][1]*t2*t22;
+            ftype t42 = t31+t38+t39+t40+t41-t81-t82;
+            ftype t43 = t2*t15*t42;
+            ftype t44 = P[6][2]*t2*t10;
+            ftype t45 = P[0][2]*t2*t5;
+            ftype t46 = P[1][2]*t2*t15;
+            ftype t47 = P[2][2]*t2*t19;
+            ftype t48 = P[5][2]*t2*t27;
+            ftype t83 = P[4][2]*t2*t7;
+            ftype t84 = P[3][2]*t2*t22;
+            ftype t49 = t44+t45+t46+t47+t48-t83-t84;
+            ftype t50 = t2*t19*t49;
+            ftype t51 = P[6][3]*t2*t10;
+            ftype t52 = P[0][3]*t2*t5;
+            ftype t53 = P[1][3]*t2*t15;
+            ftype t54 = P[2][3]*t2*t19;
+            ftype t55 = P[5][3]*t2*t27;
+            ftype t85 = P[4][3]*t2*t7;
+            ftype t86 = P[3][3]*t2*t22;
+            ftype t56 = t51+t52+t53+t54+t55-t85-t86;
+            ftype t57 = P[6][5]*t2*t10;
+            ftype t58 = P[0][5]*t2*t5;
+            ftype t59 = P[1][5]*t2*t15;
+            ftype t60 = P[2][5]*t2*t19;
+            ftype t61 = P[5][5]*t2*t27;
+            ftype t88 = P[4][5]*t2*t7;
+            ftype t89 = P[3][5]*t2*t22;
+            ftype t62 = t57+t58+t59+t60+t61-t88-t89;
+            ftype t63 = t2*t27*t62;
+            ftype t64 = P[6][4]*t2*t10;
+            ftype t65 = P[0][4]*t2*t5;
+            ftype t66 = P[1][4]*t2*t15;
+            ftype t67 = P[2][4]*t2*t19;
+            ftype t68 = P[5][4]*t2*t27;
+            ftype t90 = P[4][4]*t2*t7;
+            ftype t91 = P[3][4]*t2*t22;
+            ftype t69 = t64+t65+t66+t67+t68-t90-t91;
+            ftype t70 = P[6][6]*t2*t10;
+            ftype t71 = P[0][6]*t2*t5;
+            ftype t72 = P[1][6]*t2*t15;
+            ftype t73 = P[2][6]*t2*t19;
+            ftype t74 = P[5][6]*t2*t27;
+            ftype t93 = P[4][6]*t2*t7;
+            ftype t94 = P[3][6]*t2*t22;
+            ftype t75 = t70+t71+t72+t73+t74-t93-t94;
+            ftype t76 = t2*t10*t75;
+            ftype t87 = t2*t22*t56;
+            ftype t92 = t2*t7*t69;
+            ftype t77 = R_LOS+t37+t43+t50+t63+t76-t87-t92;
+            ftype t78;
+
+            // calculate innovation variance for X axis observation and protect against a badly conditioned calculation
+            if (t77 > R_LOS) {
+                t78 = 1.0f/t77;
+                faultStatus.bad_xflow = false;
+            } else {
+                t77 = R_LOS;
+                t78 = 1.0f/R_LOS;
+                faultStatus.bad_xflow = true;
+                return;
+            }
+            flowVarInnov[0] = t77;
+
+            // calculate innovation for X axis observation
+            // flowInnovTime_ms will be updated when Y-axis innovations are calculated
+            flowInnov[0] = losPred[0] - ofDataDelayed.flowRadXYcomp.x;
+
+            // calculate Kalman gains for X-axis observation
+            Kfusion[0] = t78*(t12-P[0][4]*t2*t7+P[0][1]*t2*t15+P[0][6]*t2*t10+P[0][2]*t2*t19-P[0][3]*t2*t22+P[0][5]*t2*t27);
+            Kfusion[1] = t78*(t31+P[1][0]*t2*t5-P[1][4]*t2*t7+P[1][6]*t2*t10+P[1][2]*t2*t19-P[1][3]*t2*t22+P[1][5]*t2*t27);
+            Kfusion[2] = t78*(t47+P[2][0]*t2*t5-P[2][4]*t2*t7+P[2][1]*t2*t15+P[2][6]*t2*t10-P[2][3]*t2*t22+P[2][5]*t2*t27);
+            Kfusion[3] = t78*(-t86+P[3][0]*t2*t5-P[3][4]*t2*t7+P[3][1]*t2*t15+P[3][6]*t2*t10+P[3][2]*t2*t19+P[3][5]*t2*t27);
+            Kfusion[4] = t78*(-t90+P[4][0]*t2*t5+P[4][1]*t2*t15+P[4][6]*t2*t10+P[4][2]*t2*t19-P[4][3]*t2*t22+P[4][5]*t2*t27);
+            Kfusion[5] = t78*(t61+P[5][0]*t2*t5-P[5][4]*t2*t7+P[5][1]*t2*t15+P[5][6]*t2*t10+P[5][2]*t2*t19-P[5][3]*t2*t22);
+            Kfusion[6] = t78*(t70+P[6][0]*t2*t5-P[6][4]*t2*t7+P[6][1]*t2*t15+P[6][2]*t2*t19-P[6][3]*t2*t22+P[6][5]*t2*t27);
+            Kfusion[7] = t78*(P[7][0]*t2*t5-P[7][4]*t2*t7+P[7][1]*t2*t15+P[7][6]*t2*t10+P[7][2]*t2*t19-P[7][3]*t2*t22+P[7][5]*t2*t27);
+            Kfusion[8] = t78*(P[8][0]*t2*t5-P[8][4]*t2*t7+P[8][1]*t2*t15+P[8][6]*t2*t10+P[8][2]*t2*t19-P[8][3]*t2*t22+P[8][5]*t2*t27);
+            Kfusion[9] = t78*(P[9][0]*t2*t5-P[9][4]*t2*t7+P[9][1]*t2*t15+P[9][6]*t2*t10+P[9][2]*t2*t19-P[9][3]*t2*t22+P[9][5]*t2*t27);
+
+            if (!inhibitDelAngBiasStates) {
+                Kfusion[10] = t78*(P[10][0]*t2*t5-P[10][4]*t2*t7+P[10][1]*t2*t15+P[10][6]*t2*t10+P[10][2]*t2*t19-P[10][3]*t2*t22+P[10][5]*t2*t27);
+                Kfusion[11] = t78*(P[11][0]*t2*t5-P[11][4]*t2*t7+P[11][1]*t2*t15+P[11][6]*t2*t10+P[11][2]*t2*t19-P[11][3]*t2*t22+P[11][5]*t2*t27);
+                Kfusion[12] = t78*(P[12][0]*t2*t5-P[12][4]*t2*t7+P[12][1]*t2*t15+P[12][6]*t2*t10+P[12][2]*t2*t19-P[12][3]*t2*t22+P[12][5]*t2*t27);
+            } else {
+                // zero indexes 10 to 12
+                zero_range(&Kfusion[0], 10, 12);
+            }
+
+            if (!inhibitDelVelBiasStates && !badIMUdata) {
+                for (uint8_t index = 0; index < 3; index++) {
+                    const uint8_t stateIndex = index + 13;
+                    if (!dvelBiasAxisInhibit[index]) {
+                        Kfusion[stateIndex] = t78*(P[stateIndex][0]*t2*t5-P[stateIndex][4]*t2*t7+P[stateIndex][1]*t2*t15+P[stateIndex][6]*t2*t10+P[stateIndex][2]*t2*t19-P[stateIndex][3]*t2*t22+P[stateIndex][5]*t2*t27);
+                    } else {
+                        Kfusion[stateIndex] = 0.0f;
+                    }
+                }
+            } else {
+                // zero indexes 13 to 15
+                zero_range(&Kfusion[0], 13, 15);
+            }
+
+            if (!inhibitMagStates) {
+                Kfusion[16] = t78*(P[16][0]*t2*t5-P[16][4]*t2*t7+P[16][1]*t2*t15+P[16][6]*t2*t10+P[16][2]*t2*t19-P[16][3]*t2*t22+P[16][5]*t2*t27);
+                Kfusion[17] = t78*(P[17][0]*t2*t5-P[17][4]*t2*t7+P[17][1]*t2*t15+P[17][6]*t2*t10+P[17][2]*t2*t19-P[17][3]*t2*t22+P[17][5]*t2*t27);
+                Kfusion[18] = t78*(P[18][0]*t2*t5-P[18][4]*t2*t7+P[18][1]*t2*t15+P[18][6]*t2*t10+P[18][2]*t2*t19-P[18][3]*t2*t22+P[18][5]*t2*t27);
+                Kfusion[19] = t78*(P[19][0]*t2*t5-P[19][4]*t2*t7+P[19][1]*t2*t15+P[19][6]*t2*t10+P[19][2]*t2*t19-P[19][3]*t2*t22+P[19][5]*t2*t27);
+                Kfusion[20] = t78*(P[20][0]*t2*t5-P[20][4]*t2*t7+P[20][1]*t2*t15+P[20][6]*t2*t10+P[20][2]*t2*t19-P[20][3]*t2*t22+P[20][5]*t2*t27);
+                Kfusion[21] = t78*(P[21][0]*t2*t5-P[21][4]*t2*t7+P[21][1]*t2*t15+P[21][6]*t2*t10+P[21][2]*t2*t19-P[21][3]*t2*t22+P[21][5]*t2*t27);
+            } else {
+                // zero indexes 16 to 21
+                zero_range(&Kfusion[0], 16, 21);
+            }
+
+            if (!inhibitWindStates && !treatWindStatesAsTruth) {
+                Kfusion[22] = t78*(P[22][0]*t2*t5-P[22][4]*t2*t7+P[22][1]*t2*t15+P[22][6]*t2*t10+P[22][2]*t2*t19-P[22][3]*t2*t22+P[22][5]*t2*t27);
+                Kfusion[23] = t78*(P[23][0]*t2*t5-P[23][4]*t2*t7+P[23][1]*t2*t15+P[23][6]*t2*t10+P[23][2]*t2*t19-P[23][3]*t2*t22+P[23][5]*t2*t27);
+            } else {
+                // zero indexes 22 to 23
+                zero_range(&Kfusion[0], 22, 23);
+            }
+
+        } else {
+
+            // calculate Y axis observation Jacobian
+            ftype t2 = 1.0f / range;
+            H_LOS[0] = -t2*(q2*vd*-2.0f+q3*ve*2.0f+q0*vn*2.0f);
+            H_LOS[1] = -t2*(q3*vd*2.0f+q2*ve*2.0f+q1*vn*2.0f);
+            H_LOS[2] = t2*(q0*vd*2.0f-q1*ve*2.0f+q2*vn*2.0f);
+            H_LOS[3] = -t2*(q1*vd*2.0f+q0*ve*2.0f-q3*vn*2.0f);
+            H_LOS[4] = -t2*(q0*q0+q1*q1-q2*q2-q3*q3);
+            H_LOS[5] = -t2*(q0*q3*2.0f+q1*q2*2.0f);
+            H_LOS[6] = t2*(q0*q2*2.0f-q1*q3*2.0f);
+
+            // calculate intermediate variables for the Y observation innovation variance and Kalman gains
+            ftype t3 = q3*ve*2.0f;
+            ftype t4 = q0*vn*2.0f;
+            ftype t11 = q2*vd*2.0f;
+            ftype t5 = t3+t4-t11;
+            ftype t6 = q0*q3*2.0f;
+            ftype t7 = q1*q2*2.0f;
+            ftype t8 = t6+t7;
+            ftype t9 = q0*q2*2.0f;
+            ftype t28 = q1*q3*2.0f;
+            ftype t10 = t9-t28;
+            ftype t12 = P[0][0]*t2*t5;
+            ftype t13 = q3*vd*2.0f;
+            ftype t14 = q2*ve*2.0f;
+            ftype t15 = q1*vn*2.0f;
+            ftype t16 = t13+t14+t15;
+            ftype t17 = q0*vd*2.0f;
+            ftype t18 = q2*vn*2.0f;
+            ftype t29 = q1*ve*2.0f;
+            ftype t19 = t17+t18-t29;
+            ftype t20 = q1*vd*2.0f;
+            ftype t21 = q0*ve*2.0f;
+            ftype t30 = q3*vn*2.0f;
+            ftype t22 = t20+t21-t30;
+            ftype t23 = q0*q0;
+            ftype t24 = q1*q1;
+            ftype t25 = q2*q2;
+            ftype t26 = q3*q3;
+            ftype t27 = t23+t24-t25-t26;
+            ftype t31 = P[1][1]*t2*t16;
+            ftype t32 = P[5][0]*t2*t8;
+            ftype t33 = P[1][0]*t2*t16;
+            ftype t34 = P[3][0]*t2*t22;
+            ftype t35 = P[4][0]*t2*t27;
+            ftype t80 = P[6][0]*t2*t10;
+            ftype t81 = P[2][0]*t2*t19;
+            ftype t36 = t12+t32+t33+t34+t35-t80-t81;
+            ftype t37 = t2*t5*t36;
+            ftype t38 = P[5][1]*t2*t8;
+            ftype t39 = P[0][1]*t2*t5;
+            ftype t40 = P[3][1]*t2*t22;
+            ftype t41 = P[4][1]*t2*t27;
+            ftype t82 = P[6][1]*t2*t10;
+            ftype t83 = P[2][1]*t2*t19;
+            ftype t42 = t31+t38+t39+t40+t41-t82-t83;
+            ftype t43 = t2*t16*t42;
+            ftype t44 = P[5][2]*t2*t8;
+            ftype t45 = P[0][2]*t2*t5;
+            ftype t46 = P[1][2]*t2*t16;
+            ftype t47 = P[3][2]*t2*t22;
+            ftype t48 = P[4][2]*t2*t27;
+            ftype t79 = P[2][2]*t2*t19;
+            ftype t84 = P[6][2]*t2*t10;
+            ftype t49 = t44+t45+t46+t47+t48-t79-t84;
+            ftype t50 = P[5][3]*t2*t8;
+            ftype t51 = P[0][3]*t2*t5;
+            ftype t52 = P[1][3]*t2*t16;
+            ftype t53 = P[3][3]*t2*t22;
+            ftype t54 = P[4][3]*t2*t27;
+            ftype t86 = P[6][3]*t2*t10;
+            ftype t87 = P[2][3]*t2*t19;
+            ftype t55 = t50+t51+t52+t53+t54-t86-t87;
+            ftype t56 = t2*t22*t55;
+            ftype t57 = P[5][4]*t2*t8;
+            ftype t58 = P[0][4]*t2*t5;
+            ftype t59 = P[1][4]*t2*t16;
+            ftype t60 = P[3][4]*t2*t22;
+            ftype t61 = P[4][4]*t2*t27;
+            ftype t88 = P[6][4]*t2*t10;
+            ftype t89 = P[2][4]*t2*t19;
+            ftype t62 = t57+t58+t59+t60+t61-t88-t89;
+            ftype t63 = t2*t27*t62;
+            ftype t64 = P[5][5]*t2*t8;
+            ftype t65 = P[0][5]*t2*t5;
+            ftype t66 = P[1][5]*t2*t16;
+            ftype t67 = P[3][5]*t2*t22;
+            ftype t68 = P[4][5]*t2*t27;
+            ftype t90 = P[6][5]*t2*t10;
+            ftype t91 = P[2][5]*t2*t19;
+            ftype t69 = t64+t65+t66+t67+t68-t90-t91;
+            ftype t70 = t2*t8*t69;
+            ftype t71 = P[5][6]*t2*t8;
+            ftype t72 = P[0][6]*t2*t5;
+            ftype t73 = P[1][6]*t2*t16;
+            ftype t74 = P[3][6]*t2*t22;
+            ftype t75 = P[4][6]*t2*t27;
+            ftype t92 = P[6][6]*t2*t10;
+            ftype t93 = P[2][6]*t2*t19;
+            ftype t76 = t71+t72+t73+t74+t75-t92-t93;
+            ftype t85 = t2*t19*t49;
+            ftype t94 = t2*t10*t76;
+            ftype t77 = R_LOS+t37+t43+t56+t63+t70-t85-t94;
+            ftype t78;
+
+            // calculate innovation variance for Y axis observation and protect against a badly conditioned calculation
+            if (t77 > R_LOS) {
+                t78 = 1.0f/t77;
+                faultStatus.bad_yflow = false;
+            } else {
+                t77 = R_LOS;
+                t78 = 1.0f/R_LOS;
+                faultStatus.bad_yflow = true;
+                return;
+            }
+            flowVarInnov[1] = t77;
+
+            // calculate innovation for Y observation
+            flowInnov[1] = losPred[1] - ofDataDelayed.flowRadXYcomp.y;
+            flowInnovTime_ms = dal.millis();
+
+            // calculate Kalman gains for the Y-axis observation
+            Kfusion[0] = -t78*(t12+P[0][5]*t2*t8-P[0][6]*t2*t10+P[0][1]*t2*t16-P[0][2]*t2*t19+P[0][3]*t2*t22+P[0][4]*t2*t27);
+            Kfusion[1] = -t78*(t31+P[1][0]*t2*t5+P[1][5]*t2*t8-P[1][6]*t2*t10-P[1][2]*t2*t19+P[1][3]*t2*t22+P[1][4]*t2*t27);
+            Kfusion[2] = -t78*(-t79+P[2][0]*t2*t5+P[2][5]*t2*t8-P[2][6]*t2*t10+P[2][1]*t2*t16+P[2][3]*t2*t22+P[2][4]*t2*t27);
+            Kfusion[3] = -t78*(t53+P[3][0]*t2*t5+P[3][5]*t2*t8-P[3][6]*t2*t10+P[3][1]*t2*t16-P[3][2]*t2*t19+P[3][4]*t2*t27);
+            Kfusion[4] = -t78*(t61+P[4][0]*t2*t5+P[4][5]*t2*t8-P[4][6]*t2*t10+P[4][1]*t2*t16-P[4][2]*t2*t19+P[4][3]*t2*t22);
+            Kfusion[5] = -t78*(t64+P[5][0]*t2*t5-P[5][6]*t2*t10+P[5][1]*t2*t16-P[5][2]*t2*t19+P[5][3]*t2*t22+P[5][4]*t2*t27);
+            Kfusion[6] = -t78*(-t92+P[6][0]*t2*t5+P[6][5]*t2*t8+P[6][1]*t2*t16-P[6][2]*t2*t19+P[6][3]*t2*t22+P[6][4]*t2*t27);
+            Kfusion[7] = -t78*(P[7][0]*t2*t5+P[7][5]*t2*t8-P[7][6]*t2*t10+P[7][1]*t2*t16-P[7][2]*t2*t19+P[7][3]*t2*t22+P[7][4]*t2*t27);
+            Kfusion[8] = -t78*(P[8][0]*t2*t5+P[8][5]*t2*t8-P[8][6]*t2*t10+P[8][1]*t2*t16-P[8][2]*t2*t19+P[8][3]*t2*t22+P[8][4]*t2*t27);
+            Kfusion[9] = -t78*(P[9][0]*t2*t5+P[9][5]*t2*t8-P[9][6]*t2*t10+P[9][1]*t2*t16-P[9][2]*t2*t19+P[9][3]*t2*t22+P[9][4]*t2*t27);
+
+            if (!inhibitDelAngBiasStates) {
+                Kfusion[10] = -t78*(P[10][0]*t2*t5+P[10][5]*t2*t8-P[10][6]*t2*t10+P[10][1]*t2*t16-P[10][2]*t2*t19+P[10][3]*t2*t22+P[10][4]*t2*t27);
+                Kfusion[11] = -t78*(P[11][0]*t2*t5+P[11][5]*t2*t8-P[11][6]*t2*t10+P[11][1]*t2*t16-P[11][2]*t2*t19+P[11][3]*t2*t22+P[11][4]*t2*t27);
+                Kfusion[12] = -t78*(P[12][0]*t2*t5+P[12][5]*t2*t8-P[12][6]*t2*t10+P[12][1]*t2*t16-P[12][2]*t2*t19+P[12][3]*t2*t22+P[12][4]*t2*t27);
+            } else {
+                // zero indexes 10 to 12
+                zero_range(&Kfusion[0], 10, 12);
+            }
+
+            if (!inhibitDelVelBiasStates && !badIMUdata) {
+                for (uint8_t index = 0; index < 3; index++) {
+                    const uint8_t stateIndex = index + 13;
+                    if (!dvelBiasAxisInhibit[index]) {
+                        Kfusion[stateIndex] = -t78*(P[stateIndex][0]*t2*t5+P[stateIndex][5]*t2*t8-P[stateIndex][6]*t2*t10+P[stateIndex][1]*t2*t16-P[stateIndex][2]*t2*t19+P[stateIndex][3]*t2*t22+P[stateIndex][4]*t2*t27);
+                    } else {
+                        Kfusion[stateIndex] = 0.0f;
+                    }
+                }
+            } else {
+                // zero indexes 13 to 15
+                zero_range(&Kfusion[0], 13, 15);
+            }
+
+            if (!inhibitMagStates) {
+                Kfusion[16] = -t78*(P[16][0]*t2*t5+P[16][5]*t2*t8-P[16][6]*t2*t10+P[16][1]*t2*t16-P[16][2]*t2*t19+P[16][3]*t2*t22+P[16][4]*t2*t27);
+                Kfusion[17] = -t78*(P[17][0]*t2*t5+P[17][5]*t2*t8-P[17][6]*t2*t10+P[17][1]*t2*t16-P[17][2]*t2*t19+P[17][3]*t2*t22+P[17][4]*t2*t27);
+                Kfusion[18] = -t78*(P[18][0]*t2*t5+P[18][5]*t2*t8-P[18][6]*t2*t10+P[18][1]*t2*t16-P[18][2]*t2*t19+P[18][3]*t2*t22+P[18][4]*t2*t27);
+                Kfusion[19] = -t78*(P[19][0]*t2*t5+P[19][5]*t2*t8-P[19][6]*t2*t10+P[19][1]*t2*t16-P[19][2]*t2*t19+P[19][3]*t2*t22+P[19][4]*t2*t27);
+                Kfusion[20] = -t78*(P[20][0]*t2*t5+P[20][5]*t2*t8-P[20][6]*t2*t10+P[20][1]*t2*t16-P[20][2]*t2*t19+P[20][3]*t2*t22+P[20][4]*t2*t27);
+                Kfusion[21] = -t78*(P[21][0]*t2*t5+P[21][5]*t2*t8-P[21][6]*t2*t10+P[21][1]*t2*t16-P[21][2]*t2*t19+P[21][3]*t2*t22+P[21][4]*t2*t27);
+            } else {
+                // zero indexes 16 to 21
+                zero_range(&Kfusion[0], 16, 21);
+            }
+
+            if (!inhibitWindStates && !treatWindStatesAsTruth) {
+                Kfusion[22] = -t78*(P[22][0]*t2*t5+P[22][5]*t2*t8-P[22][6]*t2*t10+P[22][1]*t2*t16-P[22][2]*t2*t19+P[22][3]*t2*t22+P[22][4]*t2*t27);
+                Kfusion[23] = -t78*(P[23][0]*t2*t5+P[23][5]*t2*t8-P[23][6]*t2*t10+P[23][1]*t2*t16-P[23][2]*t2*t19+P[23][3]*t2*t22+P[23][4]*t2*t27);
+            } else {
+                // zero indexes 22 to 23
+                zero_range(&Kfusion[0], 22, 23);
+            }
+        }
+
+        // calculate the innovation consistency test ratio
+        flowTestRatio[obsIndex] = sq(flowInnov[obsIndex]) / (sq(MAX(0.01f * (ftype)frontend->_flowInnovGate, 1.0f)) * flowVarInnov[obsIndex]);
+
+        // Check the innovation for consistency and don't fuse if out of bounds or flow is too fast to be reliable
+        if (really_fuse && (flowTestRatio[obsIndex]) < 1.0f && (ofDataDelayed.flowRadXY.x < frontend->_maxFlowRate) && (ofDataDelayed.flowRadXY.y < frontend->_maxFlowRate)) {
+            // record the last time observations were accepted for fusion
+            prevFlowFuseTime_ms = imuSampleTime_ms;
+            // notify first time only
+            if (!flowFusionActive) {
+                flowFusionActive = true;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EKF3 IMU%u fusing optical flow",(unsigned)imu_index);
+            }
+            // correct the covariance P = (I - K*H)*P
+            // take advantage of the empty columns in KH to reduce the
+            // number of operations
+            for (uint8_t i = 0; i<=stateIndexLim; i++) {
+                for (uint8_t j = 0; j<=6; j++) {
+                    KH[i][j] = Kfusion[i] * H_LOS[j];
+                }
+                for (uint8_t j = 7; j<=stateIndexLim; j++) {
+                    KH[i][j] = 0.0f;
+                }
+            }
+            for (uint8_t j = 0; j<=stateIndexLim; j++) {
+                for (uint8_t i = 0; i<=stateIndexLim; i++) {
+                    ftype res = 0;
+                    res += KH[i][0] * P[0][j];
+                    res += KH[i][1] * P[1][j];
+                    res += KH[i][2] * P[2][j];
+                    res += KH[i][3] * P[3][j];
+                    res += KH[i][4] * P[4][j];
+                    res += KH[i][5] * P[5][j];
+                    res += KH[i][6] * P[6][j];
+                    KHP[i][j] = res;
+                }
+            }
+
+            // Check that we are not going to drive any variances negative and skip the update if so
+            bool healthyFusion = true;
+            for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                if (KHP[i][i] > P[i][i]) {
+                    healthyFusion = false;
+                }
+            }
+
+            if (healthyFusion) {
+                // update the covariance matrix
+                for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                    for (uint8_t j= 0; j<=stateIndexLim; j++) {
+                        P[i][j] = P[i][j] - KHP[i][j];
+                    }
+                }
+
+                // force the covariance matrix to be symmetrical and limit the variances to prevent ill-conditioning.
+                ForceSymmetry();
+                ConstrainVariances();
+
+                // correct the state vector
+                for (uint8_t j= 0; j<=stateIndexLim; j++) {
+                    statesArray[j] = statesArray[j] - Kfusion[j] * flowInnov[obsIndex];
+                }
+                stateStruct.quat.normalize();
+
+            } else {
+                // record bad axis
+                if (obsIndex == 0) {
+                    faultStatus.bad_xflow = true;
+                } else if (obsIndex == 1) {
+                    faultStatus.bad_yflow = true;
+                }
+
+            }
+        }
+    }
+
+    // store optical flow rates for use in external calibration
+    flowCalSample.timestamp_ms = imuSampleTime_ms;
+    flowCalSample.flowRate.x = ofDataDelayed.flowRadXY.x;
+    flowCalSample.flowRate.y = ofDataDelayed.flowRadXY.y;
+    flowCalSample.bodyRate.x = ofDataDelayed.bodyRadXYZ.x;
+    flowCalSample.bodyRate.y = ofDataDelayed.bodyRadXYZ.y;
+    flowCalSample.losPred.x = losPred[0];
+    flowCalSample.losPred.y = losPred[1];
+}
+
+// retrieve latest corrected optical flow samples (used for calibration)
+bool NavEKF3_core::getOptFlowSample(uint32_t& timestamp_ms, Vector2f& flowRate, Vector2f& bodyRate, Vector2f& losPred) const
+{
+    if (flowCalSample.timestamp_ms != 0) {
+        timestamp_ms = flowCalSample.timestamp_ms;
+        flowRate = flowCalSample.flowRate;
+        bodyRate = flowCalSample.bodyRate;
+        losPred = flowCalSample.losPred;
+        return true;
+    }
+    return false;
+}
+
+/********************************************************
+*                   MISC FUNCTIONS                      *
+********************************************************/
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #include <AP_HAL/AP_HAL.h>
+
+#include "AP_NavEKF3.h"
+#include "AP_NavEKF3_core.h"
+#include <AP_DAL/AP_DAL.h>
+#include <GCS_MAVLink/GCS.h>
+
+// Check basic filter health metrics and return a consolidated health status
+bool NavEKF3_core::healthy(void) const
+{
+    uint16_t faultInt;
+    getFilterFaults(faultInt);
+    if (faultInt > 0) {
+        return false;
+    }
+    if (velTestRatio > 1 && posTestRatio > 1 && hgtTestRatio > 1) {
+        // all three metrics being above 1 means the filter is
+        // extremely unhealthy.
+        return false;
+    }
+    // Give the filter a second to settle before use
+    if ((imuSampleTime_ms - ekfStartTime_ms) < 1000 ) {
+        return false;
+    }
+    // position and height innovations must be within limits when on-ground and in a static mode of operation
+    float horizErrSq = sq(innovVelPos[3]) + sq(innovVelPos[4]);
+    if (onGround && (PV_AidingMode == AID_NONE) && ((horizErrSq > 1.0f) || (fabsF(hgtInnovFiltState) > 1.0f))) {
+        return false;
+    }
+
+    // all OK
+    return true;
+}
+
+// Return a consolidated error score where higher numbers represent larger errors
+// Intended to be used by the front-end to determine which is the primary EKF
+float NavEKF3_core::errorScore() const
+{
+    float score = 0.0f;
+    if (tiltAlignComplete && yawAlignComplete) {
+        // Check GPS fusion performance
+        score = MAX(score, 0.5f * (velTestRatio + posTestRatio));
+        // Check altimeter fusion performance
+        score = MAX(score, hgtTestRatio);
+        // Check airspeed fusion performance - only when we are using at least 2 airspeed sensors so we can switch lanes with 
+        // a better one. This only comes into effect for a forward flight vehicle. A sensitivity factor of 0.3 is added to keep the
+        // EKF less sensitive to innovations arising due events like strong gusts of wind, thus, prevent reporting high error scores
+        if (assume_zero_sideslip()) {
+            const auto *arsp = dal.airspeed();
+            if (arsp != nullptr && arsp->get_num_sensors() >= 2 && (frontend->_affinity & EKF_AFFINITY_ARSP)) {
+                score = MAX(score, 0.3f * tasTestRatio);
+            }
+        }
+        // Check magnetometer fusion performance - need this when magnetometer affinity is enabled to override the inherent compass
+        // switching mechanism, and instead be able to move to a better lane
+        if (frontend->_affinity & EKF_AFFINITY_MAG) {
+            score = MAX(score, 0.3f * (magTestRatio.x + magTestRatio.y + magTestRatio.z));
+        }
+    }
+    return score;
+}
+
+// provides the height limit to be observed by the control loops
+// returns false if no height limiting is required
+// this is needed to ensure the vehicle does not fly too high when using optical flow navigation
+bool NavEKF3_core::getHeightControlLimit(float &height) const
+{
+    // only ask for limiting if we are doing optical flow navigation
+    if (frontend->sources.useVelXYSource(AP_NavEKF_Source::SourceXY::OPTFLOW) && (PV_AidingMode == AID_RELATIVE) && flowDataValid) {
+        // If are doing optical flow nav, ensure the height above ground is within range finder limits after accounting for vehicle tilt and control errors
+#if AP_RANGEFINDER_ENABLED
+        const auto *_rng = dal.rangefinder();
+        if (_rng == nullptr) {
+            // we really, really shouldn't be here.
+            return false;
+        }
+        height = MAX(float(_rng->max_distance_cm_orient(ROTATION_PITCH_270)) * 0.007f - 1.0f, 1.0f);
+#else
+        return false;
+#endif
+        // If we are are not using the range finder as the height reference, then compensate for the difference between terrain and EKF origin
+        if (frontend->sources.getPosZSource() != AP_NavEKF_Source::SourceZ::RANGEFINDER) {
+            height -= terrainState;
+        }
+        return true;
+    } else {
+        return false;
+    }
+}
+
+
+// return the Euler roll, pitch and yaw angle in radians
+void NavEKF3_core::getEulerAngles(Vector3f &euler) const
+{
+    outputDataNew.quat.to_euler(euler);
+    euler = euler - dal.get_trim();
+}
+
+// return body axis gyro bias estimates in rad/sec
+void NavEKF3_core::getGyroBias(Vector3f &gyroBias) const
+{
+    if (dtEkfAvg < 1e-6f) {
+        gyroBias.zero();
+        return;
+    }
+    gyroBias = (stateStruct.gyro_bias / dtEkfAvg).tofloat();
+}
+
+// return accelerometer bias in m/s/s
+void NavEKF3_core::getAccelBias(Vector3f &accelBias) const
+{
+    if (!statesInitialised) {
+        accelBias.zero();
+        return;
+    }
+    accelBias = (stateStruct.accel_bias / dtEkfAvg).tofloat();
+}
+
+// return the transformation matrix from XYZ (body) to NED axes
+void NavEKF3_core::getRotationBodyToNED(Matrix3f &mat) const
+{
+    outputDataNew.quat.rotation_matrix(mat);
+    mat = mat * dal.get_rotation_vehicle_body_to_autopilot_body();
+}
+
+// return the quaternions defining the rotation from NED to XYZ (body) axes
+void NavEKF3_core::getQuaternion(Quaternion& ret) const
+{
+    ret = outputDataNew.quat.tofloat();
+}
+
+// return the amount of yaw angle change due to the last yaw angle reset in radians
+// returns the time of the last yaw angle reset or 0 if no reset has ever occurred
+uint32_t NavEKF3_core::getLastYawResetAngle(float &yawAng) const
+{
+    yawAng = yawResetAngle;
+    return lastYawReset_ms;
+}
+
+// return the amount of NE position change due to the last position reset in metres
+// returns the time of the last reset or 0 if no reset has ever occurred
+uint32_t NavEKF3_core::getLastPosNorthEastReset(Vector2f &pos) const
+{
+    pos = posResetNE.tofloat();
+    return lastPosReset_ms;
+}
+
+// return the amount of vertical position change due to the last vertical position reset in metres
+// returns the time of the last reset or 0 if no reset has ever occurred
+uint32_t NavEKF3_core::getLastPosDownReset(float &posD) const
+{
+    posD = posResetD;
+    return lastPosResetD_ms;
+}
+
+// return the amount of NE velocity change due to the last velocity reset in metres/sec
+// returns the time of the last reset or 0 if no reset has ever occurred
+uint32_t NavEKF3_core::getLastVelNorthEastReset(Vector2f &vel) const
+{
+    vel = velResetNE.tofloat();
+    return lastVelReset_ms;
+}
+
+// return the NED wind speed estimates in m/s (positive is air moving in the direction of the axis)
+// returns true if wind state estimation is active
+bool NavEKF3_core::getWind(Vector3f &wind) const
+{
+    wind.x = stateStruct.wind_vel.x;
+    wind.y = stateStruct.wind_vel.y;
+    wind.z = 0.0f; // currently don't estimate this
+    return !inhibitWindStates;
+}
+
+// return the NED velocity of the body frame origin in m/s
+//
+void NavEKF3_core::getVelNED(Vector3f &vel) const
+{
+    // correct for the IMU position offset (EKF calculations are at the IMU)
+    vel = (outputDataNew.velocity + velOffsetNED).tofloat();
+}
+
+// return estimate of true airspeed vector in body frame in m/s
+// returns false if estimate is unavailable
+bool NavEKF3_core::getAirSpdVec(Vector3f &vel) const
+{
+    if (PV_AidingMode == AID_NONE) {
+        return false;
+    }
+    vel = (outputDataNew.velocity + velOffsetNED).tofloat();
+    if (!inhibitWindStates) {
+        vel.x -= stateStruct.wind_vel.x;
+        vel.y -= stateStruct.wind_vel.y;
+    }
+    Matrix3f Tnb; // rotation from nav to body frame
+    outputDataNew.quat.inverse().rotation_matrix(Tnb);
+    vel = Tnb * vel;
+    return true;
+}
+
+// return the innovation in m/s, innovation variance in (m/s)^2 and age in msec of the last TAS measurement processed
+// returns false if the data is unavailable
+bool NavEKF3_core::getAirSpdHealthData(float &innovation, float &innovationVariance, uint32_t &age_ms) const
+{
+    if (tasDataDelayed.time_ms == 0) {
+        // no data has been processed since startup
+        return false;
+    }
+    innovation = (float)innovVtas;
+    innovationVariance = (float)varInnovVtas;
+    age_ms = imuSampleTime_ms - tasDataDelayed.time_ms;
+    return true;
+}
+
+// Return the rate of change of vertical position in the down direction (dPosD/dt) of the body frame origin in m/s
+float NavEKF3_core::getPosDownDerivative(void) const
+{
+    // return the value calculated from a complementary filter applied to the EKF height and vertical acceleration
+    // correct for the IMU offset (EKF calculations are at the IMU)
+    return vertCompFiltState.vel + velOffsetNED.z;
+}
+
+// Write the last estimated NE position of the body frame origin relative to the reference point (m).
+// Return true if the estimate is valid
+bool NavEKF3_core::getPosNE(Vector2f &posNE) const
+{
+    // There are three modes of operation, absolute position (GPS fusion), relative position (optical flow fusion) and constant position (no position estimate available)
+    if (PV_AidingMode != AID_NONE) {
+        // This is the normal mode of operation where we can use the EKF position states
+        // correct for the IMU offset (EKF calculations are at the IMU)
+        posNE = (outputDataNew.position.xy() + posOffsetNED.xy() + public_origin.get_distance_NE_ftype(EKF_origin)).tofloat();
+        return true;
+
+    } else {
+        // In constant position mode the EKF position states are at the origin, so we cannot use them as a position estimate
+        if(validOrigin) {
+            auto &gps = dal.gps();
+            if ((gps.status(selected_gps) >= AP_DAL_GPS::GPS_OK_FIX_2D)) {
+                // If the origin has been set and we have GPS, then return the GPS position relative to the origin
+                const Location &gpsloc = gps.location(selected_gps);
+                posNE = public_origin.get_distance_NE_ftype(gpsloc).tofloat();
+                return false;
+#if EK3_FEATURE_BEACON_FUSION
+            } else if (rngBcn.alignmentStarted) {
+                // If we are attempting alignment using range beacon data, then report the position
+                posNE.x = rngBcn.receiverPos.x;
+                posNE.y = rngBcn.receiverPos.y;
+                return false;
+#endif
+            } else {
+                // If no GPS fix is available, all we can do is provide the last known position
+                posNE = outputDataNew.position.xy().tofloat();
+                return false;
+            }
+        } else {
+            // If the origin has not been set, then we have no means of providing a relative position
+            posNE.zero();
+            return false;
+        }
+    }
+    return false;
+}
+
+// Write the last calculated D position of the body frame origin relative to the EKF local origin
+// Return true if the estimate is valid
+bool NavEKF3_core::getPosD_local(float &posD) const
+{
+    posD = outputDataNew.position.z + posOffsetNED.z;
+
+    // Return the current height solution status
+    return filterStatus.flags.vert_pos;
+
+}
+
+// Write the last calculated D position of the body frame origin relative to the public origin
+// Return true if the estimate is valid
+bool NavEKF3_core::getPosD(float &posD) const
+{
+    bool ret = getPosD_local(posD);
+
+    // adjust posD for difference between our origin and the public_origin
+    Location local_origin;
+    if (getOriginLLH(local_origin)) {
+        posD += (public_origin.alt - local_origin.alt) * 0.01;
+    }
+
+    return ret;
+}
+
+// return the estimated height of body frame origin above ground level
+bool NavEKF3_core::getHAGL(float &HAGL) const
+{
+    HAGL = terrainState - outputDataNew.position.z - posOffsetNED.z;
+    // If we know the terrain offset and altitude, then we have a valid height above ground estimate
+    return !hgtTimeout && gndOffsetValid && healthy();
+}
+
+// Return the last calculated latitude, longitude and height in WGS-84
+// If a calculated location isn't available, return a raw GPS measurement
+// The status will return true if a calculation or raw measurement is available
+// The getFilterStatus() function provides a more detailed description of data health and must be checked if data is to be used for flight control
+bool NavEKF3_core::getLLH(Location &loc) const
+{
+    Location origin;
+    if (getOriginLLH(origin)) {
+        float posD;
+        if (getPosD_local(posD) && PV_AidingMode != AID_NONE) {
+            // Altitude returned is an absolute altitude relative to the WGS-84 spherioid
+            loc.set_alt_cm(origin.alt - posD*100.0, Location::AltFrame::ABSOLUTE);
+            if (filterStatus.flags.horiz_pos_abs || filterStatus.flags.horiz_pos_rel) {
+                // The EKF is able to provide a position estimate
+                loc.lat = EKF_origin.lat;
+                loc.lng = EKF_origin.lng;
+                loc.offset(outputDataNew.position.x + posOffsetNED.x,
+                           outputDataNew.position.y + posOffsetNED.y);
+                return true;
+            } else {
+                // We have been be doing inertial dead reckoning for too long so use raw GPS if available
+                if (getGPSLLH(loc)) {
+                    return true;
+                } else {
+                    // Return the EKF estimate but mark it as invalid
+                    loc.lat = EKF_origin.lat;
+                    loc.lng = EKF_origin.lng;
+                    loc.offset(outputDataNew.position.x + posOffsetNED.x,
+                               outputDataNew.position.y + posOffsetNED.y);
+                    return false;
+                }
+            }
+        } else {
+            // Return a raw GPS reading if available and the last recorded positon if not
+            if (getGPSLLH(loc)) {
+                return true;
+            } else {
+                loc.lat = EKF_origin.lat;
+                loc.lng = EKF_origin.lng;
+                loc.offset(lastKnownPositionNE.x + posOffsetNED.x,
+                           lastKnownPositionNE.y + posOffsetNED.y);
+                loc.alt = EKF_origin.alt - lastKnownPositionD*100.0;
+                return false;
+            }
+        }
+    } else {
+        // The EKF is not navigating so use raw GPS if available
+        return getGPSLLH(loc);
+    }
+}
+
+bool NavEKF3_core::getGPSLLH(Location &loc) const
+{
+    const auto &gps = dal.gps();
+    if ((gps.status(selected_gps) >= AP_DAL_GPS::GPS_OK_FIX_3D)) {
+        loc = gps.location(selected_gps);
+        return true;
+    }
+    return false;
+}
+
+// return the horizontal speed limit in m/s set by optical flow sensor limits
+// return the scale factor to be applied to navigation velocity gains to compensate for increase in velocity noise with height when using optical flow
+void NavEKF3_core::getEkfControlLimits(float &ekfGndSpdLimit, float &ekfNavVelGainScaler) const
+{
+    // If in the last 10 seconds we have received flow data and no odometry data, then we are relying on optical flow
+    bool relyingOnFlowData = (imuSampleTime_ms - prevBodyVelFuseTime_ms > 1000)
+            && (imuSampleTime_ms - flowValidMeaTime_ms <= 10000);
+
+    // If relying on optical flow, limit speed to prevent sensor limit being exceeded and adjust
+    // nav gains to prevent body rate feedback into flow rates destabilising the control loop
+    if (PV_AidingMode == AID_RELATIVE && relyingOnFlowData) {
+        // allow 1.0 rad/sec margin for angular motion
+        ekfGndSpdLimit = MAX((frontend->_maxFlowRate - 1.0f), 0.0f) * MAX((terrainState - stateStruct.position[2]), rngOnGnd);
+        // use standard gains up to 5.0 metres height and reduce above that
+        ekfNavVelGainScaler = 4.0f / MAX((terrainState - stateStruct.position[2]),4.0f);
+    } else {
+        ekfGndSpdLimit = 400.0f; //return 80% of max filter speed
+        ekfNavVelGainScaler = 1.0f;
+    }
+}
+
+
+// return the LLH location of the filters NED origin
+bool NavEKF3_core::getOriginLLH(Location &loc) const
+{
+    if (validOrigin) {
+        loc = public_origin;
+        // report internally corrected reference height if enabled
+        if ((frontend->_originHgtMode & (1<<2)) == 0) {
+            loc.alt = (int32_t)(100.0f * (float)ekfGpsRefHgt);
+        }
+    }
+    return validOrigin;
+}
+
+// return earth magnetic field estimates in measurement units / 1000
+void NavEKF3_core::getMagNED(Vector3f &magNED) const
+{
+    magNED = (stateStruct.earth_magfield * 1000.0f).tofloat();
+}
+
+// return body magnetic field estimates in measurement units / 1000
+void NavEKF3_core::getMagXYZ(Vector3f &magXYZ) const
+{
+    magXYZ = (stateStruct.body_magfield*1000.0f).tofloat();
+}
+
+// return magnetometer offsets
+// return true if offsets are valid
+bool NavEKF3_core::getMagOffsets(uint8_t mag_idx, Vector3f &magOffsets) const
+{
+    const auto &compass = dal.compass();
+    if (!compass.available()) {
+        return false;
+    }
+
+    // compass offsets are valid if we have finalised magnetic field initialisation, magnetic field learning is not prohibited,
+    // primary compass is valid and state variances have converged
+    const float maxMagVar = 5E-6f;
+    bool variancesConverged = (P[19][19] < maxMagVar) && (P[20][20] < maxMagVar) && (P[21][21] < maxMagVar);
+    if ((mag_idx == magSelectIndex) &&
+            finalInflightMagInit &&
+            !inhibitMagStates &&
+            compass.healthy(magSelectIndex) &&
+            variancesConverged) {
+        magOffsets = compass.get_offsets(magSelectIndex) - stateStruct.body_magfield.tofloat()*1000.0;
+        return true;
+    } else {
+        magOffsets = compass.get_offsets(magSelectIndex);
+        return false;
+    }
+}
+
+// return the index for the active magnetometer
+// return the index for the active airspeed
+uint8_t NavEKF3_core::getActiveAirspeed() const
+{
+    return (uint8_t)selected_airspeed;
+}
+
+// return the innovations for the NED Pos, NED Vel, XYZ Mag and Vtas measurements
+bool NavEKF3_core::getInnovations(Vector3f &velInnov, Vector3f &posInnov, Vector3f &magInnov, float &tasInnov, float &yawInnov) const
+{
+    velInnov.x = innovVelPos[0];
+    velInnov.y = innovVelPos[1];
+    velInnov.z = innovVelPos[2];
+    posInnov.x = innovVelPos[3];
+    posInnov.y = innovVelPos[4];
+    posInnov.z = innovVelPos[5];
+    magInnov.x = 1e3f*innovMag[0]; // Convert back to sensor units
+    magInnov.y = 1e3f*innovMag[1]; // Convert back to sensor units
+    magInnov.z = 1e3f*innovMag[2]; // Convert back to sensor units
+    tasInnov   = innovVtas;
+    yawInnov   = innovYaw;
+    return true;
+}
+
+// return the synthetic air data drag and sideslip innovations
+void NavEKF3_core::getSynthAirDataInnovations(Vector2f &dragInnov, float &betaInnov) const
+{
+#if EK3_FEATURE_DRAG_FUSION
+    dragInnov.x = innovDrag[0];
+    dragInnov.y = innovDrag[1];
+    betaInnov   = innovBeta;
+#endif
+}
+
+// return the innovation consistency test ratios for the velocity, position, magnetometer and true airspeed measurements
+// this indicates the amount of margin available when tuning the various error traps
+// also return the delta in position due to the last position reset
+bool NavEKF3_core::getVariances(float &velVar, float &posVar, float &hgtVar, Vector3f &magVar, float &tasVar, Vector2f &offset) const
+{
+    velVar   = sqrtF(velTestRatio);
+    posVar   = sqrtF(posTestRatio);
+    hgtVar   = sqrtF(hgtTestRatio);
+    // If we are using simple compass yaw fusion, populate all three components with the yaw test ratio to provide an equivalent output
+    magVar.x = sqrtF(MAX(magTestRatio.x,yawTestRatio));
+    magVar.y = sqrtF(MAX(magTestRatio.y,yawTestRatio));
+    magVar.z = sqrtF(MAX(magTestRatio.z,yawTestRatio));
+    tasVar   = sqrtF(tasTestRatio);
+    offset   = posResetNE.tofloat();
+
+    return true;
+}
+
+// get a particular source's velocity innovations
+// returns true on success and results are placed in innovations and variances arguments
+bool NavEKF3_core::getVelInnovationsAndVariancesForSource(AP_NavEKF_Source::SourceXY source, Vector3f &innovations, Vector3f &variances) const
+{
+    switch (source) {
+    case AP_NavEKF_Source::SourceXY::GPS:
+        // check for timeouts
+        if (dal.millis() - gpsVelInnovTime_ms > 500) {
+            return false;
+        }
+        innovations = gpsVelInnov.tofloat();
+        variances = gpsVelVarInnov.tofloat();
+        return true;
+#if EK3_FEATURE_EXTERNAL_NAV
+    case AP_NavEKF_Source::SourceXY::EXTNAV:
+        // check for timeouts
+        if (dal.millis() - extNavVelInnovTime_ms > 500) {
+            return false;
+        }
+        innovations = extNavVelInnov.tofloat();
+        variances = extNavVelVarInnov.tofloat();
+        return true;
+#endif // EK3_FEATURE_EXTERNAL_NAV
+    case AP_NavEKF_Source::SourceXY::OPTFLOW:
+        // check for timeouts
+        if (dal.millis() - flowInnovTime_ms > 500) {
+            return false;
+        }
+        innovations.x = flowInnov[0];
+        innovations.y = flowInnov[1];
+        innovations.z = 0;
+        variances.x = flowVarInnov[0];
+        variances.y = flowVarInnov[1];
+        variances.z = 0;
+        return true;
+    default:
+        // variances are not available for this source
+        return false;
+    }
+
+    // should never get here but just in case
+    return false;
+}
+
+/*
+return the filter fault status as a bitmasked integer
+ 0 = quaternions are NaN
+ 1 = velocities are NaN
+ 2 = badly conditioned X magnetometer fusion
+ 3 = badly conditioned Y magnetometer fusion
+ 4 = badly conditioned Z magnetometer fusion
+ 5 = badly conditioned airspeed fusion
+ 6 = badly conditioned synthetic sideslip fusion
+ 7 = filter is not initialised
+*/
+void  NavEKF3_core::getFilterFaults(uint16_t &faults) const
+{
+    faults = (stateStruct.quat.is_nan()<<0 |
+              stateStruct.velocity.is_nan()<<1 |
+              faultStatus.bad_xmag<<2 |
+              faultStatus.bad_ymag<<3 |
+              faultStatus.bad_zmag<<4 |
+              faultStatus.bad_airspeed<<5 |
+              faultStatus.bad_sideslip<<6 |
+              !statesInitialised<<7);
+}
+
+// Return the navigation filter status message
+void  NavEKF3_core::getFilterStatus(nav_filter_status &status) const
+{
+    status = filterStatus;
+}
+
+#if HAL_GCS_ENABLED
+// send an EKF_STATUS message to GCS
+void NavEKF3_core::send_status_report(GCS_MAVLINK &link) const
+{
+    // prepare flags
+    uint16_t flags = 0;
+    if (filterStatus.flags.attitude) {
+        flags |= EKF_ATTITUDE;
+    }
+    if (filterStatus.flags.horiz_vel) {
+        flags |= EKF_VELOCITY_HORIZ;
+    }
+    if (filterStatus.flags.vert_vel) {
+        flags |= EKF_VELOCITY_VERT;
+    }
+    if (filterStatus.flags.horiz_pos_rel) {
+        flags |= EKF_POS_HORIZ_REL;
+    }
+    if (filterStatus.flags.horiz_pos_abs) {
+        flags |= EKF_POS_HORIZ_ABS;
+    }
+    if (filterStatus.flags.vert_pos) {
+        flags |= EKF_POS_VERT_ABS;
+    }
+    if (filterStatus.flags.terrain_alt) {
+        flags |= EKF_POS_VERT_AGL;
+    }
+    if (filterStatus.flags.const_pos_mode) {
+        flags |= EKF_CONST_POS_MODE;
+    }
+    if (filterStatus.flags.pred_horiz_pos_rel) {
+        flags |= EKF_PRED_POS_HORIZ_REL;
+    }
+    if (filterStatus.flags.pred_horiz_pos_abs) {
+        flags |= EKF_PRED_POS_HORIZ_ABS;
+    }
+    if (!filterStatus.flags.initalized) {
+        flags |= EKF_UNINITIALIZED;
+    }
+    if (filterStatus.flags.gps_glitching) {
+        flags |= (1<<15);
+    }
+
+    // get variances
+    float velVar = 0, posVar = 0, hgtVar = 0, tasVar = 0;
+    Vector3f magVar;
+    Vector2f offset;
+    getVariances(velVar, posVar, hgtVar, magVar, tasVar, offset);
+
+
+    // Only report range finder normalised innovation levels if the EKF needs the data for primary
+    // height estimation or optical flow operation. This prevents false alarms at the GCS if a
+    // range finder is fitted for other applications
+    float temp = 0;
+    if (((frontend->_useRngSwHgt > 0) && activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER) || (PV_AidingMode == AID_RELATIVE && flowDataValid)) {
+        temp = sqrtF(auxRngTestRatio);
+    }
+
+    const mavlink_ekf_status_report_t packet{
+        velVar,
+        posVar,
+        hgtVar,
+        fmaxf(fmaxf(magVar.x,magVar.y),magVar.z),
+        temp,
+        flags,
+        tasVar
+    };
+
+    // send message
+    mavlink_msg_ekf_status_report_send_struct(link.get_chan(), &packet);
+}
+#endif  // HAL_GCS_ENABLED
+
+// report the reason for why the backend is refusing to initialise
+const char *NavEKF3_core::prearm_failure_reason(void) const
+{
+    if (gpsGoodToAlign) {
+        // we are not failing
+        return nullptr;
+    }
+    return prearm_fail_string;
+}
+
+
+// report the number of frames lapsed since the last state prediction
+// this is used by other instances to level load
+uint8_t NavEKF3_core::getFramesSincePredict(void) const
+{
+    return framesSincePredict;
+}
+                                                                                                                                                                                                                                                                                                                           #include <AP_HAL/AP_HAL.h>
+
+#include "AP_NavEKF3.h"
+#include "AP_NavEKF3_core.h"
+#include <GCS_MAVLink/GCS.h>
+#include <AP_DAL/AP_DAL.h>
+
+/********************************************************
+*                   RESET FUNCTIONS                     *
+********************************************************/
+
+// Reset XY velocity states to last GPS measurement if available or to zero if in constant position mode or if PV aiding is not absolute
+// Do not reset vertical velocity using GPS as there is baro alt available to constrain drift
+void NavEKF3_core::ResetVelocity(resetDataSource velResetSource)
+{
+    // Store the velocity before the reset so that we can record the reset delta
+    velResetNE.x = stateStruct.velocity.x;
+    velResetNE.y = stateStruct.velocity.y;
+
+    // reset the corresponding covariances
+    zeroRows(P,4,5);
+    zeroCols(P,4,5);
+
+    if (PV_AidingMode != AID_ABSOLUTE) {
+        stateStruct.velocity.xy().zero();
+        // set the variances using the measurement noise parameter
+        P[5][5] = P[4][4] = sq(frontend->_gpsHorizVelNoise);
+    } else {
+        // reset horizontal velocity states to the GPS velocity if available
+        if ((imuSampleTime_ms - lastTimeGpsReceived_ms < 250 && velResetSource == resetDataSource::DEFAULT) || velResetSource == resetDataSource::GPS) {
+            // correct for antenna position
+            gps_elements gps_corrected = gpsDataNew;
+            CorrectGPSForAntennaOffset(gps_corrected);
+            stateStruct.velocity.x  = gps_corrected.vel.x;
+            stateStruct.velocity.y  = gps_corrected.vel.y;
+            // set the variances using the reported GPS speed accuracy
+            P[5][5] = P[4][4] = sq(MAX(frontend->_gpsHorizVelNoise,gpsSpdAccuracy));
+#if EK3_FEATURE_EXTERNAL_NAV
+        } else if ((imuSampleTime_ms - extNavVelMeasTime_ms < 250 && velResetSource == resetDataSource::DEFAULT) || velResetSource == resetDataSource::EXTNAV) {
+            // use external nav data as the 2nd preference
+            // already corrected for sensor position
+            stateStruct.velocity.x = extNavVelDelayed.vel.x;
+            stateStruct.velocity.y = extNavVelDelayed.vel.y;
+            P[5][5] = P[4][4] = sq(extNavVelDelayed.err);
+#endif // EK3_FEATURE_EXTERNAL_NAV
+        } else {
+            stateStruct.velocity.x  = 0.0f;
+            stateStruct.velocity.y  = 0.0f;
+            // set the variances using the likely speed range
+            P[5][5] = P[4][4] = sq(25.0f);
+        }
+        // clear the timeout flags and counters
+        velTimeout = false;
+        lastVelPassTime_ms = imuSampleTime_ms;
+    }
+    for (uint8_t i=0; i<imu_buffer_length; i++) {
+        storedOutput[i].velocity.x = stateStruct.velocity.x;
+        storedOutput[i].velocity.y = stateStruct.velocity.y;
+    }
+    outputDataNew.velocity.x = stateStruct.velocity.x;
+    outputDataNew.velocity.y = stateStruct.velocity.y;
+    outputDataDelayed.velocity.x = stateStruct.velocity.x;
+    outputDataDelayed.velocity.y = stateStruct.velocity.y;
+
+    // Calculate the velocity jump due to the reset
+    velResetNE.x = stateStruct.velocity.x - velResetNE.x;
+    velResetNE.y = stateStruct.velocity.y - velResetNE.y;
+
+    // store the time of the reset
+    lastVelReset_ms = imuSampleTime_ms;
+}
+
+// resets position states to last GPS measurement or to zero if in constant position mode
+void NavEKF3_core::ResetPosition(resetDataSource posResetSource)
+{
+    // Store the position before the reset so that we can record the reset delta
+    posResetNE.x = stateStruct.position.x;
+    posResetNE.y = stateStruct.position.y;
+
+    // reset the corresponding covariances
+    zeroRows(P,7,8);
+    zeroCols(P,7,8);
+
+    if (PV_AidingMode != AID_ABSOLUTE) {
+        // reset all position state history to the last known position
+        stateStruct.position.x = lastKnownPositionNE.x;
+        stateStruct.position.y = lastKnownPositionNE.y;
+        // set the variances using the position measurement noise parameter
+        P[7][7] = P[8][8] = sq(frontend->_gpsHorizPosNoise);
+    } else  {
+        // Use GPS data as first preference if fresh data is available
+        if ((imuSampleTime_ms - lastTimeGpsReceived_ms < 250 && posResetSource == resetDataSource::DEFAULT) || posResetSource == resetDataSource::GPS) {
+            // correct for antenna position
+            gps_elements gps_corrected = gpsDataNew;
+            CorrectGPSForAntennaOffset(gps_corrected);
+            // record the ID of the GPS for the data we are using for the reset
+            last_gps_idx = gps_corrected.sensor_idx;
+            // calculate position
+            const Location gpsloc{gps_corrected.lat, gps_corrected.lng, 0, Location::AltFrame::ABSOLUTE};
+            stateStruct.position.xy() = EKF_origin.get_distance_NE_ftype(gpsloc);
+            // compensate for offset  between last GPS measurement and the EKF time horizon. Note that this is an unusual
+            // time delta in that it can be both -ve and +ve
+            const int32_t tdiff = imuDataDelayed.time_ms - gps_corrected.time_ms;
+            stateStruct.position.xy() += gps_corrected.vel.xy()*0.001*tdiff;
+            // set the variances using the position measurement noise parameter
+            P[7][7] = P[8][8] = sq(MAX(gpsPosAccuracy,frontend->_gpsHorizPosNoise));
+#if EK3_FEATURE_BEACON_FUSION
+        } else if ((imuSampleTime_ms - rngBcn.last3DmeasTime_ms < 250 && posResetSource == resetDataSource::DEFAULT) || posResetSource == resetDataSource::RNGBCN) {
+            // use the range beacon data as a second preference
+            stateStruct.position.x = rngBcn.receiverPos.x;
+            stateStruct.position.y = rngBcn.receiverPos.y;
+            // set the variances from the beacon alignment filter
+            P[7][7] = rngBcn.receiverPosCov[0][0];
+            P[8][8] = rngBcn.receiverPosCov[1][1];
+#endif
+#if EK3_FEATURE_EXTERNAL_NAV
+        } else if ((imuSampleTime_ms - extNavDataDelayed.time_ms < 250 && posResetSource == resetDataSource::DEFAULT) || posResetSource == resetDataSource::EXTNAV) {
+            // use external nav data as the third preference
+            stateStruct.position.x = extNavDataDelayed.pos.x;
+            stateStruct.position.y = extNavDataDelayed.pos.y;
+            // set the variances as received from external nav system data
+            P[7][7] = P[8][8] = sq(extNavDataDelayed.posErr);
+#endif // EK3_FEATURE_EXTERNAL_NAV
+        }
+    }
+    for (uint8_t i=0; i<imu_buffer_length; i++) {
+        storedOutput[i].position.x = stateStruct.position.x;
+        storedOutput[i].position.y = stateStruct.position.y;
+    }
+    outputDataNew.position.x = stateStruct.position.x;
+    outputDataNew.position.y = stateStruct.position.y;
+    outputDataDelayed.position.x = stateStruct.position.x;
+    outputDataDelayed.position.y = stateStruct.position.y;
+
+    // Calculate the position jump due to the reset
+    posResetNE.x = stateStruct.position.x - posResetNE.x;
+    posResetNE.y = stateStruct.position.y - posResetNE.y;
+
+    // store the time of the reset
+    lastPosReset_ms = imuSampleTime_ms;
+
+    // clear the timeout flags and counters
+    posTimeout = false;
+    lastPosPassTime_ms = imuSampleTime_ms;
+}
+
+#if EK3_FEATURE_POSITION_RESET
+// Sets the EKF's NE horizontal position states and their corresponding variances from a supplied WGS-84 location and optionally uncertainty
+// The altitude element of the location is not used. If accuracy is not known should be passed as NaN.
+// Returns true if the set was successful
+bool NavEKF3_core::setLatLng(const Location &loc, float posAccuracy, uint32_t timestamp_ms)
+{
+    if ((imuSampleTime_ms - lastPosPassTime_ms) < frontend->deadReckonDeclare_ms ||
+        (PV_AidingMode == AID_NONE)
+        || !validOrigin) {
+        return false;
+    }
+
+    // Store the position before the reset so that we can record the reset delta
+    posResetNE.x = stateStruct.position.x;
+    posResetNE.y = stateStruct.position.y;
+
+    // reset the corresponding covariances
+    zeroRows(P,7,8);
+    zeroCols(P,7,8);
+
+    // handle unknown accuracy
+    if (isnan(posAccuracy)) {
+        posAccuracy = 0.0f; // will be ignored due to MAX below
+    }
+
+    // set the variances using the position measurement noise parameter
+    P[7][7] = P[8][8] = sq(MAX(posAccuracy,frontend->_gpsHorizPosNoise));
+
+    // Correct the position for time delay relative to fusion time horizon assuming a constant velocity
+    // Limit time stamp to a range between current time and 5 seconds ago
+    const uint32_t timeStampConstrained_ms = MAX(MIN(timestamp_ms, imuSampleTime_ms), imuSampleTime_ms - 5000);
+    const int32_t delta_ms = int32_t(imuDataDelayed.time_ms - timeStampConstrained_ms);
+    const ftype delaySec = 1E-3F * ftype(delta_ms);
+    const Vector2F newPosNE = EKF_origin.get_distance_NE_ftype(loc) + stateStruct.velocity.xy() * delaySec;
+    ResetPositionNE(newPosNE.x,newPosNE.y);
+
+    return true;
+}
+#endif // EK3_FEATURE_POSITION_RESET
+
+
+// reset the stateStruct's NE position to the specified position
+//    posResetNE is updated to hold the change in position
+//    storedOutput, outputDataNew and outputDataDelayed are updated with the change in position
+//    lastPosReset_ms is updated with the time of the reset
+void NavEKF3_core::ResetPositionNE(ftype posN, ftype posE)
+{
+    // Store the position before the reset so that we can record the reset delta
+    const Vector3F posOrig = stateStruct.position;
+
+    // Set the position states to the new position
+    stateStruct.position.x = posN;
+    stateStruct.position.y = posE;
+
+    // Calculate the position offset due to the reset
+    posResetNE.x = stateStruct.position.x - posOrig.x;
+    posResetNE.y = stateStruct.position.y - posOrig.y;
+
+    // Add the offset to the output observer states
+    for (uint8_t i=0; i<imu_buffer_length; i++) {
+        storedOutput[i].position.x += posResetNE.x;
+        storedOutput[i].position.y += posResetNE.y;
+    }
+    outputDataNew.position.x += posResetNE.x;
+    outputDataNew.position.y += posResetNE.y;
+    outputDataDelayed.position.x += posResetNE.x;
+    outputDataDelayed.position.y += posResetNE.y;
+
+    // store the time of the reset
+    lastPosReset_ms = imuSampleTime_ms;
+}
+
+// reset the stateStruct's D position
+//    posResetD is updated to hold the change in position
+//    storedOutput, outputDataNew and outputDataDelayed are updated with the change in position
+//    lastPosResetD_ms is updated with the time of the reset
+void NavEKF3_core::ResetPositionD(ftype posD)
+{
+    // Store the position before the reset so that we can record the reset delta
+    const ftype posDOrig = stateStruct.position.z;
+
+    // write to the state vector
+    stateStruct.position.z = posD;
+
+    // Calculate the position jump due to the reset
+    posResetD = stateStruct.position.z - posDOrig;
+
+    // Add the offset to the output observer states
+    outputDataNew.position.z += posResetD;
+    vertCompFiltState.pos = outputDataNew.position.z;
+    outputDataDelayed.position.z += posResetD;
+    for (uint8_t i=0; i<imu_buffer_length; i++) {
+        storedOutput[i].position.z += posResetD;
+    }
+
+    // store the time of the reset
+    lastPosResetD_ms = imuSampleTime_ms;
+}
+
+// reset the vertical position state using the last height measurement
+void NavEKF3_core::ResetHeight(void)
+{
+    // Store the position before the reset so that we can record the reset delta
+    posResetD = stateStruct.position.z;
+
+    // write to the state vector
+    stateStruct.position.z = -hgtMea;
+    outputDataNew.position.z = stateStruct.position.z;
+    outputDataDelayed.position.z = stateStruct.position.z;
+
+    // reset the terrain state height
+    if (onGround) {
+        // assume vehicle is sitting on the ground
+        terrainState = stateStruct.position.z + rngOnGnd;
+    } else {
+        // can make no assumption other than vehicle is not below ground level
+        terrainState = MAX(stateStruct.position.z + rngOnGnd , terrainState);
+    }
+    for (uint8_t i=0; i<imu_buffer_length; i++) {
+        storedOutput[i].position.z = stateStruct.position.z;
+    }
+    vertCompFiltState.pos = stateStruct.position.z;
+
+    // Calculate the position jump due to the reset
+    posResetD = stateStruct.position.z - posResetD;
+
+    // store the time of the reset
+    lastPosResetD_ms = imuSampleTime_ms;
+
+    // clear the timeout flags and counters
+    hgtTimeout = false;
+    lastHgtPassTime_ms = imuSampleTime_ms;
+
+    // reset the corresponding covariances
+    zeroRows(P,9,9);
+    zeroCols(P,9,9);
+
+    // set the variances to the measurement variance
+    P[9][9] = posDownObsNoise;
+
+    // Reset the vertical velocity state using GPS vertical velocity if we are airborne
+    // Check that GPS vertical velocity data is available and can be used
+    if (inFlight &&
+        (gpsIsInUse || badIMUdata) &&
+        frontend->sources.useVelZSource(AP_NavEKF_Source::SourceZ::GPS) &&
+        gpsDataNew.have_vz &&
+        (imuSampleTime_ms - gpsDataDelayed.time_ms < 500)) {
+        stateStruct.velocity.z =  gpsDataNew.vel.z;
+#if EK3_FEATURE_EXTERNAL_NAV
+    } else if (inFlight && useExtNavVel && (activeHgtSource == AP_NavEKF_Source::SourceZ::EXTNAV)) {
+        stateStruct.velocity.z = extNavVelDelayed.vel.z;
+#endif
+    } else if (onGround) {
+        stateStruct.velocity.z = 0.0f;
+    }
+    for (uint8_t i=0; i<imu_buffer_length; i++) {
+        storedOutput[i].velocity.z = stateStruct.velocity.z;
+    }
+    outputDataNew.velocity.z = stateStruct.velocity.z;
+    outputDataDelayed.velocity.z = stateStruct.velocity.z;
+    vertCompFiltState.vel = outputDataNew.velocity.z;
+
+    // reset the corresponding covariances
+    zeroRows(P,6,6);
+    zeroCols(P,6,6);
+
+    // set the variances to the measurement variance
+#if EK3_FEATURE_EXTERNAL_NAV
+    if (useExtNavVel) {
+        P[6][6] = sq(extNavVelDelayed.err);
+    } else
+#endif
+    {
+        P[6][6] = sq(frontend->_gpsVertVelNoise);
+    }
+    vertVelVarClipCounter = 0;
+}
+
+// Zero the EKF height datum
+// Return true if the height datum reset has been performed
+bool NavEKF3_core::resetHeightDatum(void)
+{
+    if (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER || !onGround) {
+        // only allow resets when on the ground.
+        // If using using rangefinder for height then never perform a
+        // reset of the height datum
+        return false;
+    }
+    // record the old height estimate
+    ftype oldHgt = -stateStruct.position.z;
+    // reset the barometer so that it reads zero at the current height
+    dal.baro().update_calibration();
+    // reset the height state
+    stateStruct.position.z = 0.0f;
+    // adjust the height of the EKF origin so that the origin plus baro height before and after the reset is the same
+    if (validOrigin) {
+        if (!gpsGoodToAlign) {
+            // if we don't have GPS lock then we shouldn't be doing a
+            // resetHeightDatum, but if we do then the best option is
+            // to maintain the old error
+            EKF_origin.alt += (int32_t)(100.0f * oldHgt);
+        } else {
+            // if we have a good GPS lock then reset to the GPS
+            // altitude. This ensures the reported AMSL alt from
+            // getLLH() is equal to GPS altitude, while also ensuring
+            // that the relative alt is zero
+            EKF_origin.alt = dal.gps().location().alt;
+        }
+        ekfGpsRefHgt = (double)0.01 * (double)EKF_origin.alt;
+    }
+
+    // set the terrain state to zero (on ground). The adjustment for
+    // frame height will get added in the later constraints
+    terrainState = 0;
+
+    return true;
+}
+
+/*
+  correct GPS data for position offset of antenna phase centre relative to the IMU
+ */
+void NavEKF3_core::CorrectGPSForAntennaOffset(gps_elements &gps_data) const
+{
+    // return immediately if already corrected
+    if (gps_data.corrected) {
+        return;
+    }
+    gps_data.corrected = true;
+
+    const Vector3F posOffsetBody = dal.gps().get_antenna_offset(gps_data.sensor_idx).toftype() - accelPosOffset;
+    if (posOffsetBody.is_zero()) {
+        return;
+    }
+
+    // TODO use a filtered angular rate with a group delay that matches the GPS delay
+    Vector3F angRate = imuDataDelayed.delAng * (1.0f/imuDataDelayed.delAngDT);
+    Vector3F velOffsetBody = angRate % posOffsetBody;
+    Vector3F velOffsetEarth = prevTnb.mul_transpose(velOffsetBody);
+    gps_data.vel -= velOffsetEarth;
+
+    Vector3F posOffsetEarth = prevTnb.mul_transpose(posOffsetBody);
+    Location::offset_latlng(gps_data.lat, gps_data.lng, -posOffsetEarth.x, -posOffsetEarth.y);
+    gps_data.hgt += posOffsetEarth.z;
+}
+
+// correct external navigation earth-frame position using sensor body-frame offset
+void NavEKF3_core::CorrectExtNavForSensorOffset(ext_nav_elements &ext_nav_data)
+{
+    // return immediately if already corrected
+    if (ext_nav_data.corrected) {
+        return;
+    }
+    ext_nav_data.corrected = true;
+
+    // external nav data is against the public_origin, so convert to offset from EKF_origin
+    ext_nav_data.pos.xy() += EKF_origin.get_distance_NE_ftype(public_origin);
+
+#if HAL_VISUALODOM_ENABLED
+    const auto *visual_odom = dal.visualodom();
+    if (visual_odom == nullptr) {
+        return;
+    }
+    const Vector3F posOffsetBody = visual_odom->get_pos_offset().toftype() - accelPosOffset;
+    if (posOffsetBody.is_zero()) {
+        return;
+    }
+    Vector3F posOffsetEarth = prevTnb.mul_transpose(posOffsetBody);
+    ext_nav_data.pos.x -= posOffsetEarth.x;
+    ext_nav_data.pos.y -= posOffsetEarth.y;
+    ext_nav_data.pos.z -= posOffsetEarth.z;
+#endif
+}
+
+// correct external navigation earth-frame velocity using sensor body-frame offset
+void NavEKF3_core::CorrectExtNavVelForSensorOffset(ext_nav_vel_elements &ext_nav_vel_data) const
+{
+    // return immediately if already corrected
+    if (ext_nav_vel_data.corrected) {
+        return;
+    }
+    ext_nav_vel_data.corrected = true;
+
+#if HAL_VISUALODOM_ENABLED
+    const auto *visual_odom = dal.visualodom();
+    if (visual_odom == nullptr) {
+        return;
+    }
+    const Vector3F posOffsetBody = visual_odom->get_pos_offset().toftype() - accelPosOffset;
+    if (posOffsetBody.is_zero()) {
+        return;
+    }
+    // TODO use a filtered angular rate with a group delay that matches the sensor delay
+    const Vector3F angRate = imuDataDelayed.delAng * (1.0/imuDataDelayed.delAngDT);
+    ext_nav_vel_data.vel += get_vel_correction_for_sensor_offset(posOffsetBody, prevTnb, angRate);
+#endif
+}
+
+// calculate velocity variance helper function
+void NavEKF3_core::CalculateVelInnovationsAndVariances(const Vector3F &velocity, ftype noise, ftype accel_scale, Vector3F &innovations, Vector3F &variances) const
+{
+    // innovations are latest estimate - latest observation
+    innovations = stateStruct.velocity - velocity;
+
+    const ftype obs_data_chk = sq(constrain_ftype(noise, 0.05, 5.0)) + sq(accel_scale * accNavMag);
+
+    // calculate innovation variance.  velocity states start at index 4
+    variances.x = P[4][4] + obs_data_chk;
+    variances.y = P[5][5] + obs_data_chk;
+    variances.z = P[6][6] + obs_data_chk;
+}
+
+/********************************************************
+*                   FUSE MEASURED_DATA                  *
+********************************************************/
+// select fusion of velocity, position and height measurements
+void NavEKF3_core::SelectVelPosFusion()
+{
+    // Check if the magnetometer has been fused on that time step and the filter is running at faster than 200 Hz
+    // If so, don't fuse measurements on this time step to reduce frame over-runs
+    // Only allow one time slip to prevent high rate magnetometer data preventing fusion of other measurements
+    if (magFusePerformed && dtIMUavg < 0.005f && !posVelFusionDelayed) {
+        posVelFusionDelayed = true;
+        return;
+    } else {
+        posVelFusionDelayed = false;
+    }
+
+#if EK3_FEATURE_EXTERNAL_NAV
+    // Check for data at the fusion time horizon
+    extNavDataToFuse = storedExtNav.recall(extNavDataDelayed, imuDataDelayed.time_ms);
+    if (extNavDataToFuse) {
+        CorrectExtNavForSensorOffset(extNavDataDelayed);
+    }
+    extNavVelToFuse = storedExtNavVel.recall(extNavVelDelayed, imuDataDelayed.time_ms);
+    if (extNavVelToFuse) {
+        CorrectExtNavVelForSensorOffset(extNavVelDelayed);
+
+        // calculate innovations and variances for reporting purposes only
+        CalculateVelInnovationsAndVariances(extNavVelDelayed.vel, extNavVelDelayed.err, frontend->extNavVelVarAccScale, extNavVelInnov, extNavVelVarInnov);
+
+        // record time innovations were calculated (for timeout checks)
+        extNavVelInnovTime_ms = dal.millis();
+    }
+#endif // EK3_FEATURE_EXTERNAL_NAV
+
+    // Read GPS data from the sensor
+    readGpsData();
+    readGpsYawData();
+
+    // get data that has now fallen behind the fusion time horizon
+    gpsDataToFuse = storedGPS.recall(gpsDataDelayed,imuDataDelayed.time_ms) && !waitingForGpsChecks;
+
+    if (gpsDataToFuse) {
+        CorrectGPSForAntennaOffset(gpsDataDelayed);
+        // calculate innovations and variances for reporting purposes only
+        CalculateVelInnovationsAndVariances(gpsDataDelayed.vel, frontend->_gpsHorizVelNoise, frontend->gpsNEVelVarAccScale, gpsVelInnov, gpsVelVarInnov);
+        // record time innovations were calculated (for timeout checks)
+        gpsVelInnovTime_ms = dal.millis();
+    }
+
+    // detect position source changes.  Trigger position reset if position source is valid
+    const AP_NavEKF_Source::SourceXY posxy_source = frontend->sources.getPosXYSource();
+    if (posxy_source != posxy_source_last) {
+        posxy_source_reset = (posxy_source != AP_NavEKF_Source::SourceXY::NONE);
+        posxy_source_last = posxy_source;
+    }
+
+    // initialise all possible data we may fuse
+    fusePosData = false;
+    fuseVelData = false;
+
+    // Determine if we need to fuse position and velocity data on this time step
+    if (gpsDataToFuse && (PV_AidingMode == AID_ABSOLUTE) && (posxy_source == AP_NavEKF_Source::SourceXY::GPS)) {
+
+        // Don't fuse velocity data if GPS doesn't support it
+        fuseVelData = frontend->sources.useVelXYSource(AP_NavEKF_Source::SourceXY::GPS);
+        fusePosData = true;
+#if EK3_FEATURE_EXTERNAL_NAV
+        extNavUsedForPos = false;
+#endif
+
+        // copy corrected GPS data to observation vector
+        if (fuseVelData) {
+            velPosObs[0] = gpsDataDelayed.vel.x;
+            velPosObs[1] = gpsDataDelayed.vel.y;
+            velPosObs[2] = gpsDataDelayed.vel.z;
+        }
+        const Location gpsloc{gpsDataDelayed.lat, gpsDataDelayed.lng, 0, Location::AltFrame::ABSOLUTE};
+        const Vector2F posxy = EKF_origin.get_distance_NE_ftype(gpsloc);
+        velPosObs[3] = posxy.x;
+        velPosObs[4] = posxy.y;
+#if EK3_FEATURE_EXTERNAL_NAV
+    } else if (extNavDataToFuse && (PV_AidingMode == AID_ABSOLUTE) && (posxy_source == AP_NavEKF_Source::SourceXY::EXTNAV)) {
+        // use external nav system for horizontal position
+        extNavUsedForPos = true;
+        fusePosData = true;
+        velPosObs[3] = extNavDataDelayed.pos.x;
+        velPosObs[4] = extNavDataDelayed.pos.y;
+#endif // EK3_FEATURE_EXTERNAL_NAV
+    }
+
+#if EK3_FEATURE_EXTERNAL_NAV
+    // fuse external navigation velocity data if available
+    // extNavVelDelayed is already corrected for sensor position
+    if (extNavVelToFuse && frontend->sources.useVelXYSource(AP_NavEKF_Source::SourceXY::EXTNAV)) {
+        fuseVelData = true;
+        velPosObs[0] = extNavVelDelayed.vel.x;
+        velPosObs[1] = extNavVelDelayed.vel.y;
+        velPosObs[2] = extNavVelDelayed.vel.z;
+    }
+#endif
+
+    // we have GPS data to fuse and a request to align the yaw using the GPS course
+    if (gpsYawResetRequest) {
+        realignYawGPS(false);
+    }
+
+    // Select height data to be fused from the available baro, range finder and GPS sources
+    selectHeightForFusion();
+
+    // if we are using GPS, check for a change in receiver and reset position and height
+    if (gpsDataToFuse && (PV_AidingMode == AID_ABSOLUTE) && (posxy_source == AP_NavEKF_Source::SourceXY::GPS) && (gpsDataDelayed.sensor_idx != last_gps_idx || posxy_source_reset)) {
+        // mark a source reset as consumed
+        posxy_source_reset = false;
+
+        // record the ID of the GPS that we are using for the reset
+        last_gps_idx = gpsDataDelayed.sensor_idx;
+
+        // reset the position to the GPS position
+        const Location gpsloc{gpsDataDelayed.lat, gpsDataDelayed.lng, 0, Location::AltFrame::ABSOLUTE};
+        const Vector2F posxy = EKF_origin.get_distance_NE_ftype(gpsloc);
+        ResetPositionNE(posxy.x, posxy.y);
+
+        // If we are also using GPS as the height reference, reset the height
+        if (activeHgtSource == AP_NavEKF_Source::SourceZ::GPS) {
+            ResetPositionD(-hgtMea);
+        }
+    }
+
+#if EK3_FEATURE_EXTERNAL_NAV
+    // check for external nav position reset
+    if (extNavDataToFuse && (PV_AidingMode == AID_ABSOLUTE) && (posxy_source == AP_NavEKF_Source::SourceXY::EXTNAV) && (extNavDataDelayed.posReset || posxy_source_reset)) {
+        // mark a source reset as consumed
+        posxy_source_reset = false;
+        ResetPositionNE(extNavDataDelayed.pos.x, extNavDataDelayed.pos.y);
+        if (activeHgtSource == AP_NavEKF_Source::SourceZ::EXTNAV) {
+            ResetPositionD(-hgtMea);
+        }
+    }
+#endif // EK3_FEATURE_EXTERNAL_NAV
+
+    // If we are operating without any aiding, fuse in constant position of constant
+    // velocity measurements to constrain tilt drift. This assumes a non-manoeuvring
+    // vehicle. Do this to coincide with the height fusion.
+    if (fuseHgtData && PV_AidingMode == AID_NONE) {
+        if (assume_zero_sideslip() && tiltAlignComplete && motorsArmed) {
+            // handle special case where we are launching a FW aircraft without magnetometer
+            fusePosData = false;
+            velPosObs[0] = 0.0f;
+            velPosObs[1] = 0.0f;
+            velPosObs[2] = stateStruct.velocity.z;
+            bool resetVelNE = !prevMotorsArmed;
+            // reset states to stop launch accel causing tilt error
+            if  (imuDataDelayed.delVel.x > 1.1f * GRAVITY_MSS * imuDataDelayed.delVelDT) {
+                lastLaunchAccelTime_ms = imuSampleTime_ms;
+                fuseVelData = false;
+                resetVelNE = true;
+            } else if (lastLaunchAccelTime_ms != 0 && (imuSampleTime_ms - lastLaunchAccelTime_ms) < 10000) {
+                fuseVelData = false;
+                resetVelNE = true;
+            } else {
+                fuseVelData = true;
+            }
+            if (resetVelNE) {
+                stateStruct.velocity.x = 0.0f;
+                stateStruct.velocity.y = 0.0f;
+            }
+        } else {
+            fusePosData = true;
+            fuseVelData = false;
+            velPosObs[3] = lastKnownPositionNE.x;
+            velPosObs[4] = lastKnownPositionNE.y;
+        }
+    }
+
+    // perform fusion
+    if (fuseVelData || fusePosData || fuseHgtData) {
+        FuseVelPosNED();
+        // clear the flags to prevent repeated fusion of the same data
+        fuseVelData = false;
+        fuseHgtData = false;
+        fusePosData = false;
+    }
+}
+
+// fuse selected position, velocity and height measurements
+void NavEKF3_core::FuseVelPosNED()
+{
+    // health is set bad until test passed
+    bool velCheckPassed = false; // boolean true if velocity measurements have passed innovation consistency checks
+    bool posCheckPassed = false; // boolean true if position measurements have passed innovation consistency check
+    bool hgtCheckPassed = false; // boolean true if height measurements have passed innovation consistency check
+
+    // declare variables used to control access to arrays
+    bool fuseData[6] {};
+    uint8_t stateIndex;
+    uint8_t obsIndex;
+
+    // declare variables used by state and covariance update calculations
+    Vector6 R_OBS; // Measurement variances used for fusion
+    Vector6 R_OBS_DATA_CHECKS; // Measurement variances used for data checks only
+    ftype SK;
+
+    // perform sequential fusion of GPS measurements. This assumes that the
+    // errors in the different velocity and position components are
+    // uncorrelated which is not true, however in the absence of covariance
+    // data from the GPS receiver it is the only assumption we can make
+    // so we might as well take advantage of the computational efficiencies
+    // associated with sequential fusion
+    if (fuseVelData || fusePosData || fuseHgtData) {
+        // calculate additional error in GPS position caused by manoeuvring
+        ftype posErr = frontend->gpsPosVarAccScale * accNavMag;
+
+        // To-Do: this posErr should come from external nav when fusing external nav position
+
+        // estimate the GPS Velocity, GPS horiz posit

@@ -1,0 +1,2797 @@
+                     GIMBAL_MANAGER_CAP_FLAGS_CAN_POINT_LOCATION_LOCAL |
+                         GIMBAL_MANAGER_CAP_FLAGS_CAN_POINT_LOCATION_GLOBAL;
+
+    // roll control
+    if (has_roll_control()) {
+        cap_flags |= GIMBAL_MANAGER_CAP_FLAGS_HAS_ROLL_AXIS |
+                     GIMBAL_MANAGER_CAP_FLAGS_HAS_ROLL_FOLLOW |
+                     GIMBAL_MANAGER_CAP_FLAGS_HAS_ROLL_LOCK;
+    }
+
+    // pitch control
+    if (has_pitch_control()) {
+        cap_flags |= GIMBAL_MANAGER_CAP_FLAGS_HAS_PITCH_AXIS |
+                     GIMBAL_MANAGER_CAP_FLAGS_HAS_PITCH_FOLLOW |
+                     GIMBAL_MANAGER_CAP_FLAGS_HAS_PITCH_LOCK;
+    }
+
+    // yaw control
+    if (has_pan_control()) {
+        cap_flags |= GIMBAL_MANAGER_CAP_FLAGS_HAS_YAW_AXIS |
+                     GIMBAL_MANAGER_CAP_FLAGS_HAS_YAW_FOLLOW |
+                     GIMBAL_MANAGER_CAP_FLAGS_HAS_YAW_LOCK;
+    }
+
+    return cap_flags;
+}
+
+// send a GIMBAL_MANAGER_INFORMATION message to GCS
+void AP_Mount_Backend::send_gimbal_manager_information(mavlink_channel_t chan)
+{
+    mavlink_msg_gimbal_manager_information_send(chan,
+                                                AP_HAL::millis(),                       // autopilot system time
+                                                get_gimbal_manager_capability_flags(),  // bitmap of gimbal manager capability flags
+                                                _instance + 1,                          // gimbal device id
+                                                radians(_params.roll_angle_min),        // roll_min in radians
+                                                radians(_params.roll_angle_max),        // roll_max in radians
+                                                radians(_params.pitch_angle_min),       // pitch_min in radians
+                                                radians(_params.pitch_angle_max),       // pitch_max in radians
+                                                radians(_params.yaw_angle_min),         // yaw_min in radians
+                                                radians(_params.yaw_angle_max));        // yaw_max in radians
+}
+
+// send a GIMBAL_MANAGER_STATUS message to GCS
+void AP_Mount_Backend::send_gimbal_manager_status(mavlink_channel_t chan)
+{
+    uint32_t flags = GIMBAL_MANAGER_FLAGS_ROLL_LOCK | GIMBAL_MANAGER_FLAGS_PITCH_LOCK;
+
+    if (_yaw_lock) {
+        flags |= GIMBAL_MANAGER_FLAGS_YAW_LOCK;
+    }
+
+    mavlink_msg_gimbal_manager_status_send(chan,
+                                           AP_HAL::millis(),    // autopilot system time
+                                           flags,               // bitmap of gimbal manager flags
+                                           _instance + 1,       // gimbal device id
+                                           mavlink_control_id.sysid,    // primary control system id
+                                           mavlink_control_id.compid,   // primary control component id
+                                           0,                           // secondary control system id
+                                           0);                          // secondary control component id
+}
+
+#if AP_MAVLINK_MSG_MOUNT_CONTROL_ENABLED
+// process MOUNT_CONTROL messages received from GCS. deprecated.
+void AP_Mount_Backend::handle_mount_control(const mavlink_mount_control_t &packet)
+{
+    switch (get_mode()) {
+    case MAV_MOUNT_MODE_MAVLINK_TARGETING:
+        // input_a : Pitch in centi-degrees (earth-frame)
+        // input_b : Roll in centi-degrees (earth-frame)
+        // input_c : Yaw in centi-degrees (interpreted as body-frame)
+        set_angle_target(packet.input_b * 0.01, packet.input_a * 0.01, packet.input_c * 0.01, false);
+        break;
+
+    case MAV_MOUNT_MODE_GPS_POINT: {
+        // input_a : lat in degE7
+        // input_b : lon in degE7
+        // input_c : alt  in cm (interpreted as above home)
+        const Location target_location {
+            packet.input_a,
+            packet.input_b,
+            packet.input_c,
+            Location::AltFrame::ABOVE_HOME
+        };
+        set_roi_target(target_location);
+        break;
+    }
+
+    case MAV_MOUNT_MODE_RETRACT:
+    case MAV_MOUNT_MODE_NEUTRAL:
+    case MAV_MOUNT_MODE_RC_TARGETING:
+    case MAV_MOUNT_MODE_SYSID_TARGET:
+    case MAV_MOUNT_MODE_HOME_LOCATION:
+    default:
+        // no effect in these modes
+        break;
+    }
+}
+#endif
+
+// handle do_mount_control command.  Returns MAV_RESULT_ACCEPTED on success
+MAV_RESULT AP_Mount_Backend::handle_command_do_mount_control(const mavlink_command_int_t &packet)
+{
+    const MAV_MOUNT_MODE new_mode = (MAV_MOUNT_MODE)packet.z;
+
+    // interpret message fields based on mode
+    switch (new_mode) {
+    case MAV_MOUNT_MODE_RETRACT:
+    case MAV_MOUNT_MODE_NEUTRAL:
+    case MAV_MOUNT_MODE_RC_TARGETING:
+    case MAV_MOUNT_MODE_HOME_LOCATION:
+        // simply set mode
+        set_mode(new_mode);
+        return MAV_RESULT_ACCEPTED;
+
+    case MAV_MOUNT_MODE_MAVLINK_TARGETING: {
+        // set target angles (in degrees) from mavlink message
+        const float pitch_deg = packet.param1;  // param1: pitch (earth-frame, degrees)
+        const float roll_deg = packet.param2;   // param2: roll (earth-frame, degrees)
+        const float yaw_deg = packet.param3;    // param3: yaw (body-frame, degrees)
+
+        // warn if angles are invalid to catch angles sent in centi-degrees
+        if ((fabsf(pitch_deg) > 90) || (fabsf(roll_deg) > 180) || (fabsf(yaw_deg) > 360)) {
+            send_warning_to_GCS("invalid angle targets");
+            return MAV_RESULT_FAILED;
+        }
+
+        set_angle_target(packet.param2, packet.param1, packet.param3, false);
+        return MAV_RESULT_ACCEPTED;
+    }
+
+    case MAV_MOUNT_MODE_GPS_POINT: {
+        // set lat, lon, alt position targets from mavlink message
+
+        // warn if lat, lon appear to be in param1,2 instead of param x,y as this indicates
+        // sender is relying on a bug in AP-4.2's (and earlier) handling of MAV_CMD_DO_MOUNT_CONTROL
+        if (!is_zero(packet.param1) && !is_zero(packet.param2) && packet.x == 0 && packet.y == 0) {
+            send_warning_to_GCS("GPS_POINT target invalid");
+            return MAV_RESULT_FAILED;
+        }
+
+        // param4: altitude in meters
+        // x: latitude in degrees * 1E7
+        // y: longitude in degrees * 1E7
+        const Location target_location {
+            packet.x,                       // latitude in degrees * 1E7
+            packet.y,                       // longitude in degrees * 1E7
+            (int32_t)packet.param4 * 100,   // alt converted from meters to cm
+            Location::AltFrame::ABOVE_HOME
+        };
+        set_roi_target(target_location);
+        return MAV_RESULT_ACCEPTED;
+    }
+
+    default:
+        // invalid mode
+        return MAV_RESULT_FAILED;
+    }
+}
+
+// handle do_gimbal_manager_configure.  Returns MAV_RESULT_ACCEPTED on success
+// requires original message in order to extract caller's sysid and compid
+MAV_RESULT AP_Mount_Backend::handle_command_do_gimbal_manager_configure(const mavlink_command_int_t &packet, const mavlink_message_t &msg)
+{
+    // sanity check param1 and param2 values
+    if ((packet.param1 < -3) || (packet.param1 > UINT8_MAX) || (packet.param2 < -3) || (packet.param2 > UINT8_MAX)) {
+        return MAV_RESULT_FAILED;
+    }
+
+    // backup the current values so we can detect a change
+    mavlink_control_id_t prev_control_id = mavlink_control_id;
+
+    // convert negative packet1 and packet2 values
+    int16_t new_sysid = packet.param1;
+    switch (new_sysid) {
+        case -1:
+            // leave unchanged
+            break;
+        case -2:
+            // set itself in control
+            mavlink_control_id.sysid = msg.sysid;
+            mavlink_control_id.compid = msg.compid;
+            break;
+        case -3:
+            // remove control if currently in control
+            if ((mavlink_control_id.sysid == msg.sysid) && (mavlink_control_id.compid == msg.compid)) {
+                mavlink_control_id.sysid = 0;
+                mavlink_control_id.compid = 0;
+            }
+            break;
+        default:
+            mavlink_control_id.sysid = packet.param1;
+            mavlink_control_id.compid = packet.param2;
+            break;
+    }
+
+    // send gimbal_manager_status if control has changed
+    if (prev_control_id != mavlink_control_id) {
+        GCS_SEND_MESSAGE(MSG_GIMBAL_MANAGER_STATUS);
+    }
+
+    return MAV_RESULT_ACCEPTED;
+}
+
+// handle a GLOBAL_POSITION_INT message
+bool AP_Mount_Backend::handle_global_position_int(uint8_t msg_sysid, const mavlink_global_position_int_t &packet)
+{
+    if (_target_sysid != msg_sysid) {
+        return false;
+    }
+
+    _target_sysid_location.lat = packet.lat;
+    _target_sysid_location.lng = packet.lon;
+    // global_position_int.alt is *UP*, so is location.
+    _target_sysid_location.set_alt_cm(packet.alt*0.1, Location::AltFrame::ABSOLUTE);
+    _target_sysid_location_set = true;
+
+    return true;
+}
+
+#if HAL_LOGGING_ENABLED
+// write mount log packet
+void AP_Mount_Backend::write_log(uint64_t timestamp_us)
+{
+    // return immediately if no yaw estimate
+    float ahrs_yaw = AP::ahrs().get_yaw();
+    if (isnan(ahrs_yaw)) {
+        return;
+    }
+
+    const auto nanf = AP::logger().quiet_nanf();
+
+    // get_attitude_quaternion and convert to Euler angles
+    float roll = nanf;
+    float pitch = nanf;
+    float yaw_bf = nanf;
+    float yaw_ef = nanf;
+    if (_frontend.get_attitude_euler(_instance, roll, pitch, yaw_bf)) {
+        yaw_ef = wrap_180(yaw_bf + degrees(ahrs_yaw));
+    }
+
+    // get mount's target (desired) angles and convert yaw to earth frame
+    float target_roll = nanf;
+    float target_pitch = nanf;
+    float target_yaw = nanf;
+    bool target_yaw_is_ef = false;
+    IGNORE_RETURN(get_angle_target(target_roll, target_pitch, target_yaw, target_yaw_is_ef));
+
+    // get rangefinder distance
+    float rangefinder_dist = nanf;
+    IGNORE_RETURN(get_rangefinder_distance(rangefinder_dist));
+
+    const struct log_Mount pkt {
+        LOG_PACKET_HEADER_INIT(static_cast<uint8_t>(LOG_MOUNT_MSG)),
+        time_us       : (timestamp_us > 0) ? timestamp_us : AP_HAL::micros64(),
+        instance      : _instance,
+        desired_roll  : target_roll,
+        actual_roll   : roll,
+        desired_pitch : target_pitch,
+        actual_pitch  : pitch,
+        desired_yaw_bf: target_yaw_is_ef ? nanf : target_yaw,
+        actual_yaw_bf : yaw_bf,
+        desired_yaw_ef: target_yaw_is_ef ? target_yaw : nanf,
+        actual_yaw_ef : yaw_ef,
+        rangefinder_dist : rangefinder_dist,
+    };
+    AP::logger().WriteCriticalBlock(&pkt, sizeof(pkt));
+}
+#endif
+
+#if AP_MOUNT_POI_TO_LATLONALT_ENABLED
+// get poi information.  Returns true on success and fills in gimbal attitude, location and poi location
+bool AP_Mount_Backend::get_poi(uint8_t instance, Quaternion &quat, Location &loc, Location &poi_loc)
+{
+    WITH_SEMAPHORE(poi_calculation.sem);
+
+    // record time of request
+    const uint32_t now_ms = AP_HAL::millis();
+    poi_calculation.poi_request_ms = now_ms;
+
+    // check if poi calculated recently
+    if (now_ms - poi_calculation.poi_update_ms > AP_MOUNT_POI_RESULT_TIMEOUT_MS) {
+        return false;
+    }
+
+    // check attitude is valid
+    if (poi_calculation.att_quat.is_nan()) {
+        return false;
+    }
+
+    quat = poi_calculation.att_quat;
+    loc = poi_calculation.loc;
+    poi_loc = poi_calculation.poi_loc;
+    return true;
+}
+
+// calculate the Location that the gimbal is pointing at
+void AP_Mount_Backend::calculate_poi()
+{
+    while (true) {
+        // run this loop at 10hz
+        hal.scheduler->delay(100);
+
+        // calculate poi if requested within last 30 seconds
+        {
+            WITH_SEMAPHORE(poi_calculation.sem);
+            if ((poi_calculation.poi_request_ms == 0) ||
+                (AP_HAL::millis() - poi_calculation.poi_request_ms > AP_MOUNT_POI_REQUEST_TIMEOUT_MS)) {
+                continue;
+            }
+        }
+
+        // get the current location of vehicle
+        const AP_AHRS &ahrs = AP::ahrs();
+        Location curr_loc;
+        if (!ahrs.get_location(curr_loc)) {
+            continue;
+        }
+
+        // change vehicle alt to AMSL
+        curr_loc.change_alt_frame(Location::AltFrame::ABSOLUTE);
+
+        // project forward from vehicle looking for terrain
+        // start testing at vehicle's location
+        Location test_loc = curr_loc;
+        Location prev_test_loc = curr_loc;
+
+        // get terrain altitude (AMSL) at test_loc
+        auto terrain = AP_Terrain::get_singleton();
+        float terrain_amsl_m;
+        if ((terrain == nullptr) || !terrain->height_amsl(test_loc, terrain_amsl_m, true)) {
+            continue;
+        }
+
+        // retrieve gimbal attitude
+        Quaternion quat;
+        if (!get_attitude_quaternion(quat)) {
+            // gimbal attitude unavailable
+            continue;
+        }
+
+        // iteratively move test_loc forward until its alt-above-sea-level is below terrain-alt-above-sea-level
+        const float dist_increment_m = MAX(terrain->get_grid_spacing(), 10);
+        const float mount_pitch_deg = degrees(quat.get_euler_pitch());
+        const float mount_yaw_ef_deg = wrap_180(degrees(quat.get_euler_yaw()) + degrees(ahrs.get_yaw()));
+        float total_dist_m = 0;
+        bool get_terrain_alt_success = true;
+        float prev_terrain_amsl_m = terrain_amsl_m;
+        while (total_dist_m < AP_MOUNT_POI_DIST_M_MAX && (test_loc.alt * 0.01) > terrain_amsl_m) {
+            total_dist_m += dist_increment_m;
+
+            // backup previous test location and terrain amsl
+            prev_test_loc = test_loc;
+            prev_terrain_amsl_m = terrain_amsl_m;
+
+            // move test location forward
+            test_loc.offset_bearing_and_pitch(mount_yaw_ef_deg, mount_pitch_deg, dist_increment_m);
+
+            // get terrain's alt-above-sea-level (at test_loc)
+            // fail if terrain alt cannot be retrieved
+            if (!terrain->height_amsl(test_loc, terrain_amsl_m, true) || std::isnan(terrain_amsl_m)) {
+                get_terrain_alt_success = false;
+                continue;
+            }
+        }
+
+        // if a fail occurred above when getting terrain alt then restart calculations from the beginning
+        if (!get_terrain_alt_success) {
+            continue;
+        }
+
+        if (total_dist_m >= AP_MOUNT_POI_DIST_M_MAX) {
+            // unable to find terrain within dist_max
+            continue;
+        }
+
+        // test location has dropped below terrain
+        // interpolate along line between prev_test_loc and test_loc
+        float dist_interp_m = linear_interpolate(0, dist_increment_m, 0, prev_test_loc.alt * 0.01 - prev_terrain_amsl_m, test_loc.alt * 0.01 - terrain_amsl_m);
+        {
+            WITH_SEMAPHORE(poi_calculation.sem);
+            poi_calculation.poi_loc = prev_test_loc;
+            poi_calculation.poi_loc.offset_bearing_and_pitch(mount_yaw_ef_deg, mount_pitch_deg, dist_interp_m);
+            poi_calculation.att_quat = {quat[0], quat[1], quat[2], quat[3]};
+            poi_calculation.loc = curr_loc;
+            poi_calculation.poi_update_ms = AP_HAL::millis();
+        }
+    }
+}
+#endif
+
+// change to RC_TARGETING mode if rc inputs have changed by more than the dead zone
+// should be called on every update
+void AP_Mount_Backend::set_rctargeting_on_rcinput_change()
+{
+    // exit immediately if no RC input
+    if (!rc().has_valid_input()) {
+        return;
+    }
+
+    const RC_Channel *roll_ch = rc().find_channel_for_option(_instance == 0 ? RC_Channel::AUX_FUNC::MOUNT1_ROLL : RC_Channel::AUX_FUNC::MOUNT2_ROLL);
+    const RC_Channel *pitch_ch = rc().find_channel_for_option(_instance == 0 ? RC_Channel::AUX_FUNC::MOUNT1_PITCH : RC_Channel::AUX_FUNC::MOUNT2_PITCH);
+    const RC_Channel *yaw_ch = rc().find_channel_for_option(_instance == 0 ? RC_Channel::AUX_FUNC::MOUNT1_YAW : RC_Channel::AUX_FUNC::MOUNT2_YAW);
+
+    // get rc input
+    const int16_t roll_in = (roll_ch == nullptr) ? 0 : roll_ch->get_radio_in();
+    const int16_t pitch_in = (pitch_ch == nullptr) ? 0 : pitch_ch->get_radio_in();
+    const int16_t yaw_in = (yaw_ch == nullptr) ? 0 : yaw_ch->get_radio_in();
+
+    if (!last_rc_input.initialised) {
+            // The first time through, initial RC inputs should be set, but not used
+            last_rc_input.initialised = true;
+            last_rc_input.roll_in = roll_in;
+            last_rc_input.pitch_in = pitch_in;
+            last_rc_input.yaw_in = yaw_in;
+    }
+    // if not in RC_TARGETING or RETRACT modes then check for RC change
+    if (get_mode() != MAV_MOUNT_MODE_RC_TARGETING && get_mode() != MAV_MOUNT_MODE_RETRACT) {
+        // get dead zones
+        const int16_t roll_dz = (roll_ch == nullptr) ? 10 : MAX(roll_ch->get_dead_zone(), 10);
+        const int16_t pitch_dz = (pitch_ch == nullptr) ? 10 : MAX(pitch_ch->get_dead_zone(), 10);
+        const int16_t yaw_dz = (yaw_ch == nullptr) ? 10 : MAX(yaw_ch->get_dead_zone(), 10);
+
+        // check if RC input has changed by more than the dead zone
+        if ((abs(last_rc_input.roll_in - roll_in) > roll_dz) ||
+            (abs(last_rc_input.pitch_in - pitch_in) > pitch_dz) ||
+            (abs(last_rc_input.yaw_in - yaw_in) > yaw_dz)) {
+                set_mode(MAV_MOUNT_MODE_RC_TARGETING);
+        }
+    }
+
+    // if NOW in RC_TARGETING or RETRACT mode then store last RC input (mode might have changed)
+    if (get_mode() == MAV_MOUNT_MODE_RC_TARGETING || get_mode() == MAV_MOUNT_MODE_RETRACT) {
+        last_rc_input.roll_in = roll_in;
+        last_rc_input.pitch_in = pitch_in;
+        last_rc_input.yaw_in = yaw_in;
+    }
+}
+
+// get pilot input (in the range -1 to +1) received through RC
+void AP_Mount_Backend::get_rc_input(float& roll_in, float& pitch_in, float& yaw_in) const
+{
+    const RC_Channel *roll_ch = rc().find_channel_for_option(_instance == 0 ? RC_Channel::AUX_FUNC::MOUNT1_ROLL : RC_Channel::AUX_FUNC::MOUNT2_ROLL);
+    const RC_Channel *pitch_ch = rc().find_channel_for_option(_instance == 0 ? RC_Channel::AUX_FUNC::MOUNT1_PITCH : RC_Channel::AUX_FUNC::MOUNT2_PITCH);
+    const RC_Channel *yaw_ch = rc().find_channel_for_option(_instance == 0 ? RC_Channel::AUX_FUNC::MOUNT1_YAW : RC_Channel::AUX_FUNC::MOUNT2_YAW);
+
+    roll_in = 0;
+    if ((roll_ch != nullptr) && (roll_ch->get_radio_in() > 0)) {
+        roll_in = roll_ch->norm_input_dz();
+    }
+
+    pitch_in = 0;
+    if ((pitch_ch != nullptr) && (pitch_ch->get_radio_in() > 0)) {
+        pitch_in = pitch_ch->norm_input_dz();
+    }
+
+    yaw_in = 0;
+    if ((yaw_ch != nullptr) && (yaw_ch->get_radio_in() > 0)) {
+        yaw_in = yaw_ch->norm_input_dz();
+    }
+}
+
+// get angle or rate targets from pilot RC
+// target_type will be either ANGLE or RATE, rpy will be the target angle in deg or rate in deg/s
+void AP_Mount_Backend::get_rc_target(MountTargetType& target_type, MountTarget& target_rpy) const
+{
+    // get RC input from pilot
+    float roll_in, pitch_in, yaw_in;
+    get_rc_input(roll_in, pitch_in, yaw_in);
+
+    // yaw frame
+    target_rpy.yaw_is_ef = _yaw_lock;
+
+    // if RC_RATE is zero, targets are angle
+    if (_params.rc_rate_max <= 0) {
+        target_type = MountTargetType::ANGLE;
+
+        // roll angle
+        target_rpy.roll = radians(((roll_in + 1.0f) * 0.5f * (_params.roll_angle_max - _params.roll_angle_min) + _params.roll_angle_min));
+
+        // pitch angle
+        target_rpy.pitch = radians(((pitch_in + 1.0f) * 0.5f * (_params.pitch_angle_max - _params.pitch_angle_min) + _params.pitch_angle_min));
+
+        // yaw angle
+        if (target_rpy.yaw_is_ef) {
+            // if yaw is earth-frame pilot yaw input control angle from -180 to +180 deg
+            target_rpy.yaw = yaw_in * M_PI;
+        } else {
+            // yaw target in body frame so apply body frame limits
+            target_rpy.yaw = radians(((yaw_in + 1.0f) * 0.5f * (_params.yaw_angle_max - _params.yaw_angle_min) + _params.yaw_angle_min));
+        }
+        return;
+    }
+
+    // calculate rate targets
+    target_type = MountTargetType::RATE;
+    const float rc_rate_max_rads = radians(_params.rc_rate_max.get());
+    target_rpy.roll = roll_in * rc_rate_max_rads;
+    target_rpy.pitch = pitch_in * rc_rate_max_rads;
+    target_rpy.yaw = yaw_in * rc_rate_max_rads;
+}
+
+// get angle targets (in radians) to a Location
+// returns true on success, false on failure
+bool AP_Mount_Backend::get_angle_target_to_location(const Location &loc, MountTarget& angle_rad) const
+{
+    // exit immediately if vehicle's location is unavailable
+    Location current_loc;
+    if (!AP::ahrs().get_location(current_loc)) {
+        return false;
+    }
+
+    // exit immediate if location is invalid
+    if (!loc.initialised()) {
+        return false;
+    }
+
+    const float GPS_vector_x = Location::diff_longitude(loc.lng, current_loc.lng)*cosf(ToRad((current_loc.lat + loc.lat) * 0.00000005f)) * 0.01113195f;
+    const float GPS_vector_y = (loc.lat - current_loc.lat) * 0.01113195f;
+    int32_t target_alt_cm = 0;
+    if (!loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, target_alt_cm)) {
+        return false;
+    }
+    int32_t current_alt_cm = 0;
+    if (!current_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, current_alt_cm)) {
+        return false;
+    }
+    float GPS_vector_z = target_alt_cm - current_alt_cm;
+    float target_distance = 100.0f*norm(GPS_vector_x, GPS_vector_y);      // Careful , centimeters here locally. Baro/alt is in cm, lat/lon is in meters.
+
+    // calculate roll, pitch, yaw angles
+    angle_rad.roll = 0;
+    angle_rad.pitch = atan2f(GPS_vector_z, target_distance);
+    angle_rad.yaw = atan2f(GPS_vector_x, GPS_vector_y);
+    angle_rad.yaw_is_ef = true;
+
+    return true;
+}
+
+// get angle targets (in radians) to ROI location
+// returns true on success, false on failure
+bool AP_Mount_Backend::get_angle_target_to_roi(MountTarget& angle_rad) const
+{
+    if (!_roi_target_set) {
+        return false;
+    }
+    return get_angle_target_to_location(_roi_target, angle_rad);
+}
+
+// return body-frame yaw angle from a mount target
+float AP_Mount_Backend::MountTarget::get_bf_yaw() const
+{
+    if (yaw_is_ef) {
+        // convert to body-frame
+        return wrap_PI(yaw - AP::ahrs().get_yaw());
+    }
+
+    // target is already body-frame
+    return yaw;
+}
+
+// return earth-frame yaw angle from a mount target
+float AP_Mount_Backend::MountTarget::get_ef_yaw() const
+{
+    if (yaw_is_ef) {
+        // target is already earth-frame
+        return yaw;
+    }
+
+    // convert to earth-frame
+    return wrap_PI(yaw + AP::ahrs().get_yaw());
+}
+
+// sets roll, pitch, yaw and yaw_is_ef
+void AP_Mount_Backend::MountTarget::set(const Vector3f& rpy, bool yaw_is_ef_in)
+{
+    roll  = rpy.x;
+    pitch = rpy.y;
+    yaw   = rpy.z;
+    yaw_is_ef = yaw_is_ef_in;
+}
+
+// update angle targets using a given rate target
+// the resulting angle_rad yaw frame will match the rate_rad yaw frame
+// assumes a 50hz update rate
+void AP_Mount_Backend::update_angle_target_from_rate(const MountTarget& rate_rad, MountTarget& angle_rad) const
+{
+    // update roll and pitch angles and apply limits
+    angle_rad.roll = constrain_float(angle_rad.roll + rate_rad.roll * AP_MOUNT_UPDATE_DT, radians(_params.roll_angle_min), radians(_params.roll_angle_max));
+    angle_rad.pitch = constrain_float(angle_rad.pitch + rate_rad.pitch * AP_MOUNT_UPDATE_DT, radians(_params.pitch_angle_min), radians(_params.pitch_angle_max));
+
+    // ensure angle yaw frames matches rate yaw frame
+    if (angle_rad.yaw_is_ef != rate_rad.yaw_is_ef) {
+        if (rate_rad.yaw_is_ef) {
+            angle_rad.yaw = angle_rad.get_ef_yaw();
+        } else {
+            angle_rad.yaw = angle_rad.get_bf_yaw();
+        }
+        angle_rad.yaw_is_ef = rate_rad.yaw_is_ef;
+    }
+
+    // update yaw angle target
+    angle_rad.yaw = angle_rad.yaw + rate_rad.yaw * AP_MOUNT_UPDATE_DT;
+    if (angle_rad.yaw_is_ef) {
+        // if earth-frame yaw wraps between += 180 degrees
+        angle_rad.yaw = wrap_PI(angle_rad.yaw);
+    } else {
+        // if body-frame constrain yaw to body-frame limits
+        angle_rad.yaw = constrain_float(angle_rad.yaw, radians(_params.yaw_angle_min), radians(_params.yaw_angle_max));
+    }
+}
+
+// helper function to provide GIMBAL_DEVICE_FLAGS for use in GIMBAL_DEVICE_ATTITUDE_STATUS message
+uint16_t AP_Mount_Backend::get_gimbal_device_flags() const
+{
+    // get yaw lock state by mode
+    bool yaw_lock_state = false;
+    switch (_mode) {
+    case MAV_MOUNT_MODE_RETRACT:
+    case MAV_MOUNT_MODE_NEUTRAL:
+        // these modes always use body-frame yaw (aka follow)
+        yaw_lock_state = false;
+        break;
+    case MAV_MOUNT_MODE_MAVLINK_TARGETING:
+        switch (mnt_target.target_type) {
+        case MountTargetType::RATE:
+            yaw_lock_state = mnt_target.rate_rads.yaw_is_ef;
+            break;
+        case MountTargetType::ANGLE:
+            yaw_lock_state = mnt_target.angle_rad.yaw_is_ef;
+            break;
+        }
+        break;
+    case MAV_MOUNT_MODE_RC_TARGETING:
+        yaw_lock_state = _yaw_lock;
+        break;
+    case MAV_MOUNT_MODE_GPS_POINT:
+    case MAV_MOUNT_MODE_SYSID_TARGET:
+    case MAV_MOUNT_MODE_HOME_LOCATION:
+        // these modes always use earth-frame yaw (aka lock)
+        yaw_lock_state = true;
+        break;
+    case MAV_MOUNT_MODE_ENUM_END:
+        // unsupported
+        yaw_lock_state = false;
+        break;
+    }
+
+    const uint16_t flags = (get_mode() == MAV_MOUNT_MODE_RETRACT ? GIMBAL_DEVICE_FLAGS_RETRACT : 0) |
+                           (get_mode() == MAV_MOUNT_MODE_NEUTRAL ? GIMBAL_DEVICE_FLAGS_NEUTRAL : 0) |
+                           GIMBAL_DEVICE_FLAGS_ROLL_LOCK | // roll angle is always earth-frame
+                           GIMBAL_DEVICE_FLAGS_PITCH_LOCK| // pitch angle is always earth-frame, yaw_angle is always body-frame
+                           GIMBAL_DEVICE_FLAGS_YAW_IN_VEHICLE_FRAME | // yaw angle is always in vehicle-frame
+                           (yaw_lock_state ? GIMBAL_DEVICE_FLAGS_YAW_LOCK : 0);
+    return flags;
+}
+
+// get angle targets (in radians) to home location
+// returns true on success, false on failure
+bool AP_Mount_Backend::get_angle_target_to_home(MountTarget& angle_rad) const
+{
+    // exit immediately if home is not set
+    if (!AP::ahrs().home_is_set()) {
+        return false;
+    }
+    return get_angle_target_to_location(AP::ahrs().get_home(), angle_rad);
+}
+
+// get angle targets (in radians) to a vehicle with sysid of  _target_sysid
+// returns true on success, false on failure
+bool AP_Mount_Backend::get_angle_target_to_sysid(MountTarget& angle_rad) const
+{
+    // exit immediately if sysid is not set or no location available
+    if (!_target_sysid_location_set) {
+        return false;
+    }
+    if (!_target_sysid) {
+        return false;
+    }
+    return get_angle_target_to_location(_target_sysid_location, angle_rad);
+}
+
+// get target rate in deg/sec. returns true on success
+bool AP_Mount_Backend::get_rate_target(float& roll_degs, float& pitch_degs, float& yaw_degs, bool& yaw_is_earth_frame)
+{
+    if (mnt_target.target_type == MountTargetType::RATE) {
+        roll_degs = degrees(mnt_target.rate_rads.roll);
+        pitch_degs = degrees(mnt_target.rate_rads.pitch);
+        yaw_degs = degrees(mnt_target.rate_rads.yaw);
+        yaw_is_earth_frame = mnt_target.rate_rads.yaw_is_ef;
+        return true;
+    }
+    return false;
+}
+
+// get target angle in deg. returns true on success
+bool AP_Mount_Backend::get_angle_target(float& roll_deg, float& pitch_deg, float& yaw_deg, bool& yaw_is_earth_frame)
+{
+    if (mnt_target.target_type == MountTargetType::ANGLE) {
+        roll_deg = degrees(mnt_target.angle_rad.roll);
+        pitch_deg = degrees(mnt_target.angle_rad.pitch);
+        yaw_deg = degrees(mnt_target.angle_rad.yaw);
+        yaw_is_earth_frame = mnt_target.angle_rad.yaw_is_ef;
+        return true;
+    }
+    return false;
+}
+
+// sent warning to GCS.  Warnings are throttled to at most once every 30 seconds
+void AP_Mount_Backend::send_warning_to_GCS(const char* warning_str)
+{
+    uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - _last_warning_ms < 30000) {
+        return;
+    }
+
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mount: %s", warning_str);
+    _last_warning_ms = now_ms;
+}
+
+#endif // HAL_MOUNT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  Mount driver backend class. Each supported mount type
+  needs to have an object derived from this class.
+ */
+#pragma once
+
+#include "AP_Mount_config.h"
+
+#if HAL_MOUNT_ENABLED
+
+#include <GCS_MAVLink/GCS_MAVLink.h>
+#include <AP_Common/AP_Common.h>
+#include <AP_Common/Location.h>
+#include <RC_Channel/RC_Channel.h>
+#include <AP_Camera/AP_Camera_shareddefs.h>
+#include "AP_Mount.h"
+
+class AP_Mount_Backend
+{
+public:
+    // Constructor
+    AP_Mount_Backend(class AP_Mount &frontend, class AP_Mount_Params &params, uint8_t instance) :
+        _frontend(frontend),
+        _params(params),
+        _instance(instance)
+    {}
+
+    // init - performs any required initialisation for this instance
+    virtual void init();
+
+    // set device id of this instance, for MNTx_DEVID parameter
+    void set_dev_id(uint32_t id);
+
+    // update mount position - should be called periodically
+    virtual void update() = 0;
+
+    // used for gimbals that need to read INS data at full rate
+    virtual void update_fast() {}
+
+    // return true if healthy
+    virtual bool healthy() const { return true; }
+
+    // return true if this mount accepts roll or pitch targets
+    virtual bool has_roll_control() const;
+    virtual bool has_pitch_control() const;
+
+    // returns true if this mount can control its pan (required for multicopters)
+    virtual bool has_pan_control() const = 0;
+
+    // get attitude as a quaternion.  returns true on success.
+    // att_quat will be an earth-frame quaternion rotated such that
+    // yaw is in body-frame.
+    virtual bool get_attitude_quaternion(Quaternion& att_quat) = 0;
+
+    // get angular velocity of mount. Only available on some backends
+    virtual bool get_angular_velocity(Vector3f& rates) { return false; }
+
+    // returns true if mode is a valid mode, false otherwise:
+    bool valid_mode(MAV_MOUNT_MODE mode) const;
+
+    // get mount's mode
+    enum MAV_MOUNT_MODE get_mode() const { return _mode; }
+
+    // set mount's mode
+    bool set_mode(enum MAV_MOUNT_MODE mode);
+
+    // set yaw_lock used in RC_TARGETING mode.  If true, the gimbal's yaw target is maintained in earth-frame meaning it will lock onto an earth-frame heading (e.g. North)
+    // If false (aka "follow") the gimbal's yaw is maintained in body-frame meaning it will rotate with the vehicle
+    void set_yaw_lock(bool yaw_lock) { _yaw_lock = yaw_lock; }
+
+    // set angle target in degrees
+    // roll and pitch are in earth-frame
+    // yaw_is_earth_frame (aka yaw_lock) should be true if yaw angle is earth-frame, false if body-frame
+    void set_angle_target(float roll_deg, float pitch_deg, float yaw_deg, bool yaw_is_earth_frame);
+
+    // sets rate target in deg/s
+    // yaw_lock should be true if the yaw rate is earth-frame, false if body-frame (e.g. rotates with body of vehicle)
+    void set_rate_target(float roll_degs, float pitch_degs, float yaw_degs, bool yaw_is_earth_frame);
+
+    // set_roi_target - sets target location that mount should attempt to point towards
+    void set_roi_target(const Location &target_loc);
+    // clear_roi_target - clears target location that mount should attempt to point towards
+    void clear_roi_target();
+
+    // set_sys_target - sets system that mount should attempt to point towards
+    void set_target_sysid(uint8_t sysid);
+
+    // handle do_mount_control command.  Returns MAV_RESULT_ACCEPTED on success
+    MAV_RESULT handle_command_do_mount_control(const mavlink_command_int_t &packet);
+
+    // handle do_gimbal_manager_configure.  Returns MAV_RESULT_ACCEPTED on success
+    // requires original message in order to extract caller's sysid and compid
+    MAV_RESULT handle_command_do_gimbal_manager_configure(const mavlink_command_int_t &packet, const mavlink_message_t &msg);
+
+#if AP_MAVLINK_MSG_MOUNT_CONFIGURE_ENABLED
+    // process MOUNT_CONFIGURE messages received from GCS. deprecated.
+    void handle_mount_configure(const mavlink_mount_configure_t &msg);
+#endif
+
+#if AP_MAVLINK_MSG_MOUNT_CONTROL_ENABLED
+    // process MOUNT_CONTROL messages received from GCS. deprecated.
+    void handle_mount_control(const mavlink_mount_control_t &packet);
+#endif
+
+    // send a GIMBAL_DEVICE_ATTITUDE_STATUS message to GCS
+    void send_gimbal_device_attitude_status(mavlink_channel_t chan);
+
+    // return gimbal capabilities sent to GCS in the GIMBAL_MANAGER_INFORMATION
+    virtual uint32_t get_gimbal_manager_capability_flags() const;
+
+    // send a GIMBAL_MANAGER_INFORMATION message to GCS
+    void send_gimbal_manager_information(mavlink_channel_t chan);
+
+    // send a GIMBAL_MANAGER_STATUS message to GCS
+    void send_gimbal_manager_status(mavlink_channel_t chan);
+
+    // handle a GIMBAL_REPORT message
+    virtual void handle_gimbal_report(mavlink_channel_t chan, const mavlink_message_t &msg) {}
+
+    // handle a PARAM_VALUE message
+    virtual void handle_param_value(const mavlink_message_t &msg) {}
+
+    // handle a GLOBAL_POSITION_INT message
+    bool handle_global_position_int(uint8_t msg_sysid, const mavlink_global_position_int_t &packet);
+
+    // handle GIMBAL_DEVICE_INFORMATION message
+    virtual void handle_gimbal_device_information(const mavlink_message_t &msg) {}
+
+    // handle GIMBAL_DEVICE_ATTITUDE_STATUS message
+    virtual void handle_gimbal_device_attitude_status(const mavlink_message_t &msg) {}
+
+    // get target rate in deg/sec. returns true on success
+    bool get_rate_target(float& roll_degs, float& pitch_degs, float& yaw_degs, bool& yaw_is_earth_frame);
+
+    // get target angle in deg. returns true on success
+    bool get_angle_target(float& roll_deg, float& pitch_deg, float& yaw_deg, bool& yaw_is_earth_frame);
+
+    // accessors for scripting backends
+    virtual bool get_location_target(Location &target_loc) { return false; }
+    virtual void set_attitude_euler(float roll_deg, float pitch_deg, float yaw_bf_deg) {};
+
+    // write mount log packet
+    void write_log(uint64_t timestamp_us);
+
+    //
+    // camera controls for gimbals that include a camera
+    //
+
+    // take a picture.  returns true on success
+    virtual bool take_picture() { return false; }
+
+    // start or stop video recording.  returns true on success
+    // set start_recording = true to start record, false to stop recording
+    virtual bool record_video(bool start_recording) { return false; }
+
+    // set zoom specified as a rate or percentage
+    virtual bool set_zoom(ZoomType zoom_type, float zoom_value) { return false; }
+
+    // set focus specified as rate, percentage or auto
+    // focus in = -1, focus hold = 0, focus out = 1
+    virtual SetFocusResult set_focus(FocusType focus_type, float focus_value) { return SetFocusResult::UNSUPPORTED; }
+
+    // set tracking to none, point or rectangle (see TrackingType enum)
+    // if POINT only p1 is used, if RECTANGLE then p1 is top-left, p2 is bottom-right
+    // p1,p2 are in range 0 to 1.  0 is left or top, 1 is right or bottom
+    virtual bool set_tracking(TrackingType tracking_type, const Vector2f& p1, const Vector2f& p2) { return false; }
+
+    // set camera lens as a value from 0 to 5
+    virtual bool set_lens(uint8_t lens) { return false; }
+
+#if HAL_MOUNT_SET_CAMERA_SOURCE_ENABLED
+    // set_camera_source is functionally the same as set_lens except primary and secondary lenses are specified by type
+    // primary and secondary sources use the AP_Camera::CameraSource enum cast to uint8_t
+    virtual bool set_camera_source(uint8_t primary_source, uint8_t secondary_source) { return false; }
+#endif
+
+    // send camera information message to GCS
+    virtual void send_camera_information(mavlink_channel_t chan) const {}
+
+    // send camera settings message to GCS
+    virtual void send_camera_settings(mavlink_channel_t chan) const {}
+
+    // send camera capture status message to GCS
+    virtual void send_camera_capture_status(mavlink_channel_t chan) const {}
+
+#if AP_MOUNT_POI_TO_LATLONALT_ENABLED
+    // get poi information.  Returns true on success and fills in gimbal attitude, location and poi location
+    bool get_poi(uint8_t instance, Quaternion &quat, Location &loc, Location &poi_loc);
+#endif
+
+    //
+    // rangefinder
+    //
+
+    // get rangefinder distance.  Returns true on success
+    virtual bool get_rangefinder_distance(float& distance_m) const { return false; }
+
+    // enable/disable rangefinder.  Returns true on success
+    virtual bool set_rangefinder_enable(bool enable) { return false; }
+
+protected:
+
+    enum class MountTargetType {
+        ANGLE,
+        RATE,
+    };
+
+    // class for a single angle or rate target
+    class MountTarget {
+    public:
+        float roll;
+        float pitch;
+        float yaw;
+        bool yaw_is_ef;
+
+        // return body-frame yaw angle from a mount target (in radians)
+        float get_bf_yaw() const;
+
+        // return earth-frame yaw angle from a mount target (in radians)
+        float get_ef_yaw() const;
+
+        // set roll, pitch, yaw and yaw_is_ef from Vector3f
+        void set(const Vector3f& rpy, bool yaw_is_ef_in);
+    };
+
+    // options parameter bitmask handling
+    enum class Options : uint8_t {
+        RCTARGETING_LOCK_FROM_PREVMODE = (1U << 0), // RC_TARGETING mode's lock/follow state maintained from previous mode
+    };
+    bool option_set(Options opt) const { return (_params.options.get() & (uint8_t)opt) != 0; }
+
+    // returns true if user has configured a valid roll angle range
+    // allows user to disable roll even on 3-axis gimbal
+    bool roll_range_valid() const { return (_params.roll_angle_min < _params.roll_angle_max); }
+
+    // returns true if user has configured a valid pitch angle range
+    // allows user to disable pitch even on 3-axis gimbal
+    bool pitch_range_valid() const { return (_params.pitch_angle_min < _params.pitch_angle_max); }
+
+    // returns true if user has configured a valid yaw angle range
+    // allows user to disable yaw even on 3-axis gimbal
+    bool yaw_range_valid() const { return (_params.yaw_angle_min < _params.yaw_angle_max); }
+
+    // returns true if mavlink heartbeat should be suppressed for this gimbal (only used by Solo gimbal)
+    virtual bool suppress_heartbeat() const { return false; }
+
+#if AP_MOUNT_POI_TO_LATLONALT_ENABLED
+    // calculate the Location that the gimbal is pointing at
+    void calculate_poi();
+#endif
+
+    // change to RC_TARGETTING mode if rc inputs have changed by more than the dead zone
+    // should be called on every update
+    void set_rctargeting_on_rcinput_change();
+
+    // get pilot input (in the range -1 to +1) received through RC
+    void get_rc_input(float& roll_in, float& pitch_in, float& yaw_in) const;
+
+    // get angle or rate targets from pilot RC
+    // target_type will be either ANGLE or RATE, rpy will be the target angle in deg or rate in deg/s
+    void get_rc_target(MountTargetType& target_type, MountTarget& rpy) const;
+
+    // get angle targets (in radians) to a Location
+    // returns true on success, false on failure
+    bool get_angle_target_to_location(const Location &loc, MountTarget& angle_rad) const WARN_IF_UNUSED;
+
+    // get angle targets (in radians) to ROI location
+    // returns true on success, false on failure
+    bool get_angle_target_to_roi(MountTarget& angle_rad) const WARN_IF_UNUSED;
+
+    // get angle targets (in radians) to home location
+    // returns true on success, false on failure
+    bool get_angle_target_to_home(MountTarget& angle_rad) const WARN_IF_UNUSED;
+
+    // get angle targets (in radians) to a vehicle with sysid of _target_sysid
+    // returns true on success, false on failure
+    bool get_angle_target_to_sysid(MountTarget& angle_rad) const WARN_IF_UNUSED;
+
+    // update angle targets using a given rate target
+    // the resulting angle_rad yaw frame will match the rate_rad yaw frame
+    // assumes a 50hz update rate
+    void update_angle_target_from_rate(const MountTarget& rate_rad, MountTarget& angle_rad) const;
+
+    // helper function to provide GIMBAL_DEVICE_FLAGS for use in GIMBAL_DEVICE_ATTITUDE_STATUS message
+    uint16_t get_gimbal_device_flags() const;
+
+    // sent warning to GCS
+    void send_warning_to_GCS(const char* warning_str);
+
+    AP_Mount    &_frontend; // reference to the front end which holds parameters
+    AP_Mount_Params &_params; // parameters for this backend
+    uint8_t     _instance;  // this instance's number
+
+    MAV_MOUNT_MODE  _mode;          // current mode (see MAV_MOUNT_MODE enum)
+    bool _yaw_lock;                 // yaw_lock used in RC_TARGETING mode. True if the gimbal's yaw target is maintained in earth-frame, if false (aka "follow") it is maintained in body-frame
+
+    // structure for MAVLink Targeting angle and rate targets
+    struct {
+        MountTargetType target_type;// MAVLink targeting mode's current target type (e.g. angle or rate)
+        MountTarget angle_rad;      // angle target in radians
+        MountTarget rate_rads;      // rate target in rad/s
+    } mnt_target;
+
+#if AP_MOUNT_POI_TO_LATLONALT_ENABLED
+    struct {
+        HAL_Semaphore sem;        // semaphore protecting this structure
+        uint32_t poi_request_ms;  // system time POI was last requested
+        uint32_t poi_update_ms;   // system time POI was calculated
+        Location loc;             // gimbal location used for poi calculation
+        Location poi_loc;         // location of the POI
+        Quaternion att_quat;      // attitude quaternion of the gimbal
+    } poi_calculation;
+#endif
+
+    Location _roi_target;           // roi target location
+    bool _roi_target_set;           // true if the roi target has been set
+
+    uint8_t _target_sysid;          // sysid to track
+    Location _target_sysid_location;// sysid target location
+    bool _target_sysid_location_set;// true if _target_sysid has been set
+
+    uint32_t _last_warning_ms;      // system time of last warning sent to GCS
+
+    // structure holding the last RC inputs
+    struct {
+        bool    initialised;
+        int16_t roll_in;
+        int16_t pitch_in;
+        int16_t yaw_in;
+    } last_rc_input;
+
+    // structure holding mavlink sysid and compid of controller of this gimbal
+    // see MAV_CMD_DO_GIMBAL_MANAGER_CONFIGURE and GIMBAL_MANAGER_STATUS
+    struct mavlink_control_id_t {
+        uint8_t sysid;
+        uint8_t compid;
+
+        // equality operators
+        bool operator==(const mavlink_control_id_t &rhs) const { return (sysid == rhs.sysid && compid == rhs.compid); }
+        bool operator!=(const mavlink_control_id_t &rhs) const { return !(*this == rhs); }
+    } mavlink_control_id;
+};
+
+#endif // HAL_MOUNT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #include "AP_Mount_Backend_Serial.h"
+
+#if HAL_MOUNT_ENABLED
+#include <AP_SerialManager/AP_SerialManager.h>
+
+// Default init function for every mount
+void AP_Mount_Backend_Serial::init()
+{
+    const AP_SerialManager& serial_manager = AP::serialmanager();
+
+    // search for serial port.  hild classes should check that uart is not nullptr
+    _uart = serial_manager.find_serial(AP_SerialManager::SerialProtocol_Gimbal, _serial_instance);
+    if (_uart == nullptr) {
+        return;
+    }
+
+    // initialised successfully if uart is found
+    _initialised = true;
+
+    // call the parent class init
+    AP_Mount_Backend::init();
+}
+
+#endif // HAL_MOUNT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  Mount driver backend class for serial drivers
+  Mounts using custom serial protocols should be derived from this class
+ */
+#pragma once
+
+#include "AP_Mount_config.h"
+
+#if HAL_MOUNT_ENABLED
+
+#include "AP_Mount_Backend.h"
+
+class AP_Mount_Backend_Serial : public AP_Mount_Backend
+{
+public:
+    // Constructor
+    AP_Mount_Backend_Serial(class AP_Mount &frontend, class AP_Mount_Params &params, uint8_t instance, uint8_t serial_instance) :
+        AP_Mount_Backend(frontend, params, instance),
+        _serial_instance(serial_instance)
+    {}
+
+    // perform any required initialisation for this instance
+    void init() override;
+
+protected:
+
+    // internal variables
+    AP_HAL::UARTDriver *_uart;      // uart connected to gimbal
+    uint8_t _serial_instance;       // this instance's serial instance number
+    bool _initialised;              // true if uart has been initialised
+};
+
+#endif // HAL_MOUNT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #include "AP_Mount_Gremsy.h"
+
+#if HAL_MOUNT_GREMSY_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define AP_MOUNT_GREMSY_RESEND_MS  1000     // resend angle targets to gimbal at least once per second
+#define AP_MOUNT_GREMSY_SEARCH_MS  60000    // search for gimbal for 1 minute after startup
+#define AP_MOUNT_GREMSY_ATTITUDE_INTERVAL_US    20000  // send ATTITUDE and AUTOPILOT_STATE_FOR_GIMBAL_DEVICE at 50hz
+
+// update mount position
+void AP_Mount_Gremsy::update()
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        find_gimbal();
+        return;
+    }
+
+    // change to RC_TARGETING mode if RC input has changed
+    set_rctargeting_on_rcinput_change();
+
+    // update based on mount mode
+    switch (get_mode()) {
+
+        // move mount to a "retracted" position.  We disable motors
+        case MAV_MOUNT_MODE_RETRACT:
+            // handled below
+            mnt_target.target_type = MountTargetType::ANGLE;
+            mnt_target.angle_rad.set(Vector3f{0,0,0}, false);
+            send_gimbal_device_retract();
+            break;
+
+        // move mount to a neutral position, typically pointing forward
+        case MAV_MOUNT_MODE_NEUTRAL: {
+            const Vector3f &angle_bf_target = _params.neutral_angles.get();
+            mnt_target.target_type = MountTargetType::ANGLE;
+            mnt_target.angle_rad.set(angle_bf_target*DEG_TO_RAD, false);
+            break;
+        }
+
+        case MAV_MOUNT_MODE_MAVLINK_TARGETING: {
+            // mavlink targets are stored while handling the incoming message set_angle_target() or set_rate_target()
+            break;
+        }
+
+        // RC radio manual angle control, but with stabilization from the AHRS
+        case MAV_MOUNT_MODE_RC_TARGETING: {
+            // update targets using pilot's RC inputs
+            MountTarget rc_target;
+            get_rc_target(mnt_target.target_type, rc_target);
+            switch (mnt_target.target_type) {
+            case MountTargetType::ANGLE:
+                mnt_target.angle_rad = rc_target;
+                break;
+            case MountTargetType::RATE:
+                mnt_target.rate_rads = rc_target;
+                break;
+            }
+            break;
+        }
+
+        // point mount to a GPS point given by the mission planner
+        case MAV_MOUNT_MODE_GPS_POINT:
+            if (get_angle_target_to_roi(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+            }
+            break;
+
+        // point mount to Home location
+        case MAV_MOUNT_MODE_HOME_LOCATION:
+            if (get_angle_target_to_home(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+            }
+            break;
+
+        // point mount to another vehicle
+        case MAV_MOUNT_MODE_SYSID_TARGET:
+            if (get_angle_target_to_sysid(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+            }
+            break;
+
+        default:
+            // unknown mode so do nothing
+            break;
+    }
+
+    // send target angles or rates depending on the target type
+    switch (mnt_target.target_type) {
+        case MountTargetType::ANGLE:
+            send_gimbal_device_set_attitude(mnt_target.angle_rad.roll, mnt_target.angle_rad.pitch, mnt_target.angle_rad.yaw, mnt_target.angle_rad.yaw_is_ef);
+            break;
+        case MountTargetType::RATE:
+            send_gimbal_device_set_rate(mnt_target.rate_rads.roll, mnt_target.rate_rads.pitch, mnt_target.rate_rads.yaw, mnt_target.rate_rads.yaw_is_ef);
+            break;
+    }
+}
+
+// return true if healthy
+bool AP_Mount_Gremsy::healthy() const
+{
+    // unhealthy until gimbal has been found and replied with device info
+    if (_link == nullptr || !_got_device_info) {
+        return false;
+    }
+
+    // unhealthy if attitude information NOT received within the last second
+    if (AP_HAL::millis() - _last_attitude_status_ms > 1000) {
+        return false;
+    }
+
+    // check failure flags
+    uint32_t critical_failure_flags = GIMBAL_DEVICE_ERROR_FLAGS_ENCODER_ERROR |
+                                      GIMBAL_DEVICE_ERROR_FLAGS_POWER_ERROR |
+                                      GIMBAL_DEVICE_ERROR_FLAGS_MOTOR_ERROR |
+                                      GIMBAL_DEVICE_ERROR_FLAGS_SOFTWARE_ERROR |
+                                      GIMBAL_DEVICE_ERROR_FLAGS_COMMS_ERROR;
+
+    if ((_gimbal_device_attitude_status.failure_flags & critical_failure_flags) > 0) {
+        return false;
+    }
+
+    // if we get this far return mount is healthy
+    return true;
+}
+
+// get attitude as a quaternion.  returns true on success
+bool AP_Mount_Gremsy::get_attitude_quaternion(Quaternion& att_quat)
+{
+    att_quat = _gimbal_device_attitude_status.q;
+    return true;
+}
+
+// search for gimbal in GCS_MAVLink routing table
+void AP_Mount_Gremsy::find_gimbal()
+{
+    // do not look for gimbal for first 10 seconds so user may see banner
+    uint32_t now_ms = AP_HAL::millis();
+    if (now_ms < 10000) {
+        return;
+    }
+
+    // search for gimbal for 60 seconds or until armed
+    if ((now_ms > AP_MOUNT_GREMSY_SEARCH_MS) && hal.util->get_soft_armed()) {
+        return;
+    }
+
+    // search for a mavlink enabled gimbal
+    if (_link == nullptr) {
+        // we expect that instance 0 has compid = MAV_COMP_ID_GIMBAL, instance 1 has compid = MAV_COMP_ID_GIMBAL2, etc
+        uint8_t compid = (_instance == 0) ? MAV_COMP_ID_GIMBAL : MAV_COMP_ID_GIMBAL2 + (_instance - 1);
+        _link = GCS_MAVLINK::find_by_mavtype_and_compid(MAV_TYPE_GIMBAL, compid, _sysid);
+        if (_link == nullptr) {
+            // have not yet found a gimbal so return
+            return;
+        }
+
+        _compid = compid;
+    }
+
+    // request GIMBAL_DEVICE_INFORMATION
+    if (!_got_device_info) {
+        if (now_ms - _last_devinfo_req_ms > 1000) {
+            _last_devinfo_req_ms = now_ms;
+            request_gimbal_device_information();
+        }
+        return;
+    }
+
+    // start sending autopilot attitude to gimbal
+    if (start_sending_attitude_to_gimbal()) {
+        _initialised = true;
+    }
+}
+
+// handle GIMBAL_DEVICE_INFORMATION message
+void AP_Mount_Gremsy::handle_gimbal_device_information(const mavlink_message_t &msg)
+{
+    // exit immediately if this is not our message
+    if (msg.sysid != _sysid || msg.compid != _compid) {
+        return;
+    }
+
+    mavlink_gimbal_device_information_t info;
+    mavlink_msg_gimbal_device_information_decode(&msg, &info);
+
+    // set parameter defaults from gimbal information
+    _params.roll_angle_min.set_default(degrees(info.roll_min));
+    _params.roll_angle_max.set_default(degrees(info.roll_max));
+    _params.pitch_angle_min.set_default(degrees(info.pitch_min));
+    _params.pitch_angle_max.set_default(degrees(info.pitch_max));
+    _params.yaw_angle_min.set_default(degrees(info.yaw_min));
+    _params.yaw_angle_max.set_default(degrees(info.yaw_max));
+
+    const uint8_t fw_ver_major = info.firmware_version & 0x000000FF;
+    const uint8_t fw_ver_minor = (info.firmware_version & 0x0000FF00) >> 8;
+    const uint8_t fw_ver_revision = (info.firmware_version & 0x00FF0000) >> 16;
+    const uint8_t fw_ver_build = (info.firmware_version & 0xFF000000) >> 24;
+
+    // display gimbal info to user
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mount: %s %s fw:%u.%u.%u.%u",
+            info.vendor_name,
+            info.model_name,
+            (unsigned)fw_ver_major,
+            (unsigned)fw_ver_minor,
+            (unsigned)fw_ver_revision,
+            (unsigned)fw_ver_build);
+
+    _got_device_info = true;
+}
+
+// handle GIMBAL_DEVICE_ATTITUDE_STATUS message
+void AP_Mount_Gremsy::handle_gimbal_device_attitude_status(const mavlink_message_t &msg)
+{
+    // exit immediately if this is not our message
+    if (msg.sysid != _sysid || msg.compid != _compid) {
+        return;
+    }
+
+    // take copy of message so it can be forwarded onto GCS later
+    mavlink_msg_gimbal_device_attitude_status_decode(&msg, &_gimbal_device_attitude_status);
+    _last_attitude_status_ms = AP_HAL::millis();
+}
+
+// request GIMBAL_DEVICE_INFORMATION message
+void AP_Mount_Gremsy::request_gimbal_device_information() const
+{
+    if (_link == nullptr) {
+        return;
+    }
+
+    const mavlink_command_long_t pkt {
+        MAVLINK_MSG_ID_GIMBAL_DEVICE_INFORMATION,  // param1
+        0,  // param2
+        0,  // param3
+        0,  // param4
+        0,  // param5
+        0,  // param6
+        0,  // param7
+        MAV_CMD_REQUEST_MESSAGE,
+        _sysid,
+        _compid,
+        0  // confirmation
+    };
+
+    _link->send_message(MAVLINK_MSG_ID_COMMAND_LONG, (const char*)&pkt);
+}
+
+// start sending ATTITUDE and AUTOPILOT_STATE_FOR_GIMBAL_DEVICE to gimbal
+bool AP_Mount_Gremsy::start_sending_attitude_to_gimbal()
+{
+    // better safe than sorry:
+    if (_link == nullptr) {
+        return false;
+    }
+    // send AUTOPILOT_STATE_FOR_GIMBAL_DEVICE
+    const MAV_RESULT res = _link->set_message_interval(MAVLINK_MSG_ID_AUTOPILOT_STATE_FOR_GIMBAL_DEVICE, AP_MOUNT_GREMSY_ATTITUDE_INTERVAL_US);
+
+    // return true on success
+    return (res == MAV_RESULT_ACCEPTED);
+}
+
+// send GIMBAL_DEVICE_SET_ATTITUDE to gimbal to command gimbal to retract (aka relax)
+void AP_Mount_Gremsy::send_gimbal_device_retract() const
+{
+    const mavlink_gimbal_device_set_attitude_t pkt {
+        {NAN, NAN, NAN, NAN},  // attitude
+        0,   // angular velocity x
+        0,  // angular velocity y
+        0,    // angular velocity z
+        GIMBAL_DEVICE_FLAGS_RETRACT,  // flags
+        _sysid,
+        _compid
+    };
+
+    _link->send_message(MAVLINK_MSG_ID_GIMBAL_DEVICE_SET_ATTITUDE, (const char*)&pkt);
+}
+
+// send GIMBAL_DEVICE_SET_ATTITUDE to gimbal to control rate
+// earth_frame should be true if yaw_rads target is an earth frame rate, false if body_frame
+void AP_Mount_Gremsy::send_gimbal_device_set_rate(float roll_rads, float pitch_rads, float yaw_rads, bool earth_frame) const
+{
+    // prepare flags
+    const uint16_t flags = earth_frame ? (GIMBAL_DEVICE_FLAGS_ROLL_LOCK | GIMBAL_DEVICE_FLAGS_PITCH_LOCK | GIMBAL_DEVICE_FLAGS_YAW_LOCK) : 0;
+
+    const mavlink_gimbal_device_set_attitude_t pkt {
+        {NAN, NAN, NAN, NAN},  // attitude
+        roll_rads,   // angular velocity x
+        pitch_rads,  // angular velocity y
+        yaw_rads,    // angular velocity z
+        flags,
+        _sysid,
+        _compid
+    };
+
+    _link->send_message(MAVLINK_MSG_ID_GIMBAL_DEVICE_SET_ATTITUDE, (const char*)&pkt);
+}
+
+// send GIMBAL_DEVICE_SET_ATTITUDE to gimbal to control attitude
+// earth_frame should be true if yaw_rad target is in earth frame angle, false if body_frame
+void AP_Mount_Gremsy::send_gimbal_device_set_attitude(float roll_rad, float pitch_rad, float yaw_rad, bool earth_frame) const
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return;
+    }
+
+    // prepare flags
+    const uint16_t flags = earth_frame ? (GIMBAL_DEVICE_FLAGS_ROLL_LOCK | GIMBAL_DEVICE_FLAGS_PITCH_LOCK | GIMBAL_DEVICE_FLAGS_YAW_LOCK) : 0;
+
+    // convert euler angles to quaternion
+    Quaternion q;
+    q.from_euler(roll_rad, pitch_rad, yaw_rad);
+
+    const mavlink_gimbal_device_set_attitude_t pkt {
+        {q.q1, q.q2, q.q3, q.q4},
+        NAN,  // angular velocity x
+        NAN,  // angular velocity y
+        NAN,  // angular velocity z
+        flags,
+        _sysid,
+        _compid
+    };
+
+    _link->send_message(MAVLINK_MSG_ID_GIMBAL_DEVICE_SET_ATTITUDE, (const char*)&pkt);
+}
+
+#endif // HAL_MOUNT_GREMSY_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+  Gremsy mount backend class
+ */
+#pragma once
+
+#include "AP_Mount_Backend.h"
+
+#if HAL_MOUNT_GREMSY_ENABLED
+
+#include <AP_Math/AP_Math.h>
+#include <AP_Common/AP_Common.h>
+#include <GCS_MAVLink/GCS_MAVLink.h>
+
+class AP_Mount_Gremsy : public AP_Mount_Backend
+{
+
+public:
+    // Constructor
+    using AP_Mount_Backend::AP_Mount_Backend;
+
+    // update mount position
+    void update() override;
+
+    // return true if healthy
+    bool healthy() const override;
+
+    // has_pan_control
+    bool has_pan_control() const override { return yaw_range_valid(); }
+
+    // handle GIMBAL_DEVICE_INFORMATION message
+    void handle_gimbal_device_information(const mavlink_message_t &msg) override;
+
+    // handle GIMBAL_DEVICE_ATTITUDE_STATUS message
+    void handle_gimbal_device_attitude_status(const mavlink_message_t &msg) override;
+
+protected:
+
+    // get attitude as a quaternion.  returns true on success
+    bool get_attitude_quaternion(Quaternion& att_quat) override;
+
+private:
+
+    // search for gimbal in GCS_MAVLink routing table
+    void find_gimbal();
+
+    // request GIMBAL_DEVICE_INFORMATION from gimbal (holds vendor and model name, max lean angles)
+    void request_gimbal_device_information() const;
+
+    // start sending ATTITUDE and AUTOPILOT_STATE_FOR_GIMBAL_DEVICE to gimbal
+    // returns true on success, false on failure to start sending
+    bool start_sending_attitude_to_gimbal();
+
+    // send GIMBAL_DEVICE_SET_ATTITUDE to gimbal to command gimbal to retract (aka relax)
+    void send_gimbal_device_retract() const;
+
+    // send GIMBAL_DEVICE_SET_ATTITUDE to gimbal to control rate
+    // earth_frame should be true if yaw_rads target is an earth frame rate, false if body_frame
+    void send_gimbal_device_set_rate(float roll_rads, float pitch_rads, float yaw_rads, bool earth_frame) const;
+
+    // send GIMBAL_DEVICE_SET_ATTITUDE to gimbal to control attitude
+    // earth_frame should be true if yaw_rad target is an earth frame angle, false if body_frame
+    void send_gimbal_device_set_attitude(float roll_rad, float pitch_rad, float yaw_rad, bool earth_frame) const;
+
+    // internal variables
+    bool _got_device_info;          // true once gimbal has provided device info
+    bool _initialised;              // true once the gimbal has provided a GIMBAL_DEVICE_INFORMATION
+    uint32_t _last_devinfo_req_ms;  // system time that GIMBAL_DEVICE_INFORMATION was last requested (used to throttle requests)
+    class GCS_MAVLINK *_link;       // link we have found gimbal on; nullptr if not seen yet
+    uint8_t _sysid;                 // sysid of gimbal
+    uint8_t _compid;                // component id of gimbal
+    mavlink_gimbal_device_attitude_status_t _gimbal_device_attitude_status;  // copy of most recently received gimbal status
+    uint32_t _last_attitude_status_ms;  // system time last attitude status was received (used for health reporting)
+};
+#endif // HAL_MOUNT_GREMSY_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include "AP_Mount_Params.h"
+#include <GCS_MAVLink/GCS_MAVLink.h>
+
+// table of user settable parameters
+const AP_Param::GroupInfo AP_Mount_Params::var_info[] = {
+
+    // 0 should not be used
+
+    // @Param: _TYPE
+    // @DisplayName: Mount Type
+    // @Description: Mount Type
+    // @Values: 0:None, 1:Servo, 2:3DR Solo, 3:Alexmos Serial, 4:SToRM32 MAVLink, 5:SToRM32 Serial, 6:Gremsy, 7:BrushlessPWM, 8:Siyi, 9:Scripting, 10:Xacti, 11:Viewpro, 12:Topotek
+    // @RebootRequired: True
+    // @User: Standard
+    AP_GROUPINFO_FLAGS("_TYPE", 1, AP_Mount_Params, type, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: _DEFLT_MODE
+    // @DisplayName: Mount default operating mode
+    // @Description: Mount default operating mode on startup and after control is returned from autopilot
+    // @Values: 0:Retracted,1:Neutral,2:MavLink Targeting,3:RC Targeting,4:GPS Point,5:SysID Target,6:Home Location
+    // @User: Standard
+    AP_GROUPINFO("_DEFLT_MODE", 2, AP_Mount_Params, default_mode, MAV_MOUNT_MODE_RC_TARGETING),
+
+    // @Param: _RC_RATE
+    // @DisplayName: Mount RC Rate
+    // @Description: Pilot rate control's maximum rate.  Set to zero to use angle control
+    // @Units: deg/s
+    // @Range: 0 90
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_RC_RATE", 3, AP_Mount_Params, rc_rate_max, 0),
+
+    // @Param: _ROLL_MIN
+    // @DisplayName: Mount Roll angle minimum
+    // @Description: Mount Roll angle minimum
+    // @Units: deg
+    // @Range: -180 180
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_ROLL_MIN", 4, AP_Mount_Params, roll_angle_min, -30),
+
+    // @Param: _ROLL_MAX
+    // @DisplayName: Mount Roll angle maximum
+    // @Description: Mount Roll angle maximum
+    // @Units: deg
+    // @Range: -180 180
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_ROLL_MAX", 5, AP_Mount_Params, roll_angle_max, 30),
+
+    // @Param: _PITCH_MIN
+    // @DisplayName: Mount Pitch angle minimum
+    // @Description: Mount Pitch angle minimum
+    // @Units: deg
+    // @Range: -90 90
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_PITCH_MIN", 6, AP_Mount_Params, pitch_angle_min, -90),
+
+    // @Param: _PITCH_MAX
+    // @DisplayName: Mount Pitch angle maximum
+    // @Description: Mount Pitch angle maximum
+    // @Units: deg
+    // @Range: -90 90
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_PITCH_MAX", 7, AP_Mount_Params, pitch_angle_max, 20),
+
+    // @Param: _YAW_MIN
+    // @DisplayName: Mount Yaw angle minimum
+    // @Description: Mount Yaw angle minimum
+    // @Units: deg
+    // @Range: -180 180
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_YAW_MIN", 8, AP_Mount_Params, yaw_angle_min,  -180),
+
+    // @Param: _YAW_MAX
+    // @DisplayName: Mount Yaw angle maximum
+    // @Description: Mount Yaw angle maximum
+    // @Units: deg
+    // @Range: -180 180
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_YAW_MAX", 9, AP_Mount_Params, yaw_angle_max,  180),
+
+    // @Param: _RETRACT_X
+    // @DisplayName: Mount roll angle when in retracted position
+    // @Description: Mount roll angle when in retracted position
+    // @Units: deg
+    // @Range: -180.0 180.0
+    // @Increment: 1
+    // @User: Standard
+
+    // @Param: _RETRACT_Y
+    // @DisplayName: Mount pitch angle when in retracted position
+    // @Description: Mount pitch angle when in retracted position
+    // @Units: deg
+    // @Range: -180.0 180.0
+    // @Increment: 1
+    // @User: Standard
+
+    // @Param: _RETRACT_Z
+    // @DisplayName: Mount yaw angle when in retracted position
+    // @Description: Mount yaw angle when in retracted position
+    // @Units: deg
+    // @Range: -180.0 180.0
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_RETRACT", 10, AP_Mount_Params, retract_angles, 0),
+
+    // @Param: _NEUTRAL_X
+    // @DisplayName: Mount roll angle when in neutral position
+    // @Description: Mount roll angle when in neutral position
+    // @Units: deg
+    // @Range: -180.0 180.0
+    // @Increment: 1
+    // @User: Standard
+
+    // @Param: _NEUTRAL_Y
+    // @DisplayName: Mount pitch angle when in neutral position
+    // @Description: Mount pitch angle when in neutral position
+    // @Units: deg
+    // @Range: -180.0 180.0
+    // @Increment: 1
+    // @User: Standard
+
+    // @Param: _NEUTRAL_Z
+    // @DisplayName: Mount yaw angle when in neutral position
+    // @Description: Mount yaw angle when in neutral position
+    // @Units: deg
+    // @Range: -180.0 180.0
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("_NEUTRAL", 11, AP_Mount_Params, neutral_angles, 0),
+
+    // @Param: _LEAD_RLL
+    // @DisplayName: Mount Roll stabilization lead time
+    // @Description: Servo mount roll angle output leads the vehicle angle by this amount of time based on current roll rate. Increase until the servo is responsive but does not overshoot
+    // @Units: s
+    // @Range: 0.0 0.2
+    // @Increment: .005
+    // @User: Standard
+    AP_GROUPINFO("_LEAD_RLL", 12, AP_Mount_Params, roll_stb_lead, 0.0f),
+
+    // @Param: _LEAD_PTCH
+    // @DisplayName: Mount Pitch stabilization lead time
+    // @Description: Servo mount pitch angle output leads the vehicle angle by this amount of time based on current pitch rate. Increase until the servo is responsive but does not overshoot
+    // @Units: s
+    // @Range: 0.0 0.2
+    // @Increment: .005
+    // @User: Standard
+    AP_GROUPINFO("_LEAD_PTCH", 13, AP_Mount_Params, pitch_stb_lead, 0.0f),
+
+    // @Param: _SYSID_DFLT
+    // @DisplayName: Mount Target sysID
+    // @Description: Default Target sysID for the mount to point to
+    // @RebootRequired: True
+    // @User: Standard
+    AP_GROUPINFO("_SYSID_DFLT", 14, AP_Mount_Params, sysid_default, 0),
+
+    // @Param: _DEVID
+    // @DisplayName: Mount Device ID
+    // @Description: Mount device ID, taking into account its type, bus and instance
+    // @User: Advanced
+    AP_GROUPINFO_FLAGS("_DEVID", 15, AP_Mount_Params, dev_id, 0, AP_PARAM_FLAG_INTERNAL_USE_ONLY),
+
+    // @Param: _OPTIONS
+    // @DisplayName: Mount options
+    // @Description: Mount options bitmask
+    // @Bitmask: 0:RC lock state from previous mode
+    // @User: Standard
+    AP_GROUPINFO("_OPTIONS", 16, AP_Mount_Params, options, 0),
+
+    AP_GROUPEND
+};
+
+AP_Mount_Params::AP_Mount_Params(void) {
+    AP_Param::setup_object_defaults(this, var_info);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+#include <AP_Param/AP_Param.h>
+#include <AP_Math/AP_Math.h>
+
+class AP_Mount_Params {
+
+public:
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    AP_Mount_Params(void);
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Mount_Params);
+
+    AP_Int8     type;               // mount type (see Mount::Type enum)
+    AP_Int8     default_mode;       // default mode on startup and when control is returned from autopilot
+    AP_Int16    rc_rate_max;        // Pilot rate control's maximum rate.  Set to zero to use angle control
+    AP_Int16    roll_angle_min;     // roll angle min in degrees
+    AP_Int16    roll_angle_max;     // roll angle max in degrees
+    AP_Int16    pitch_angle_min;    // pitch angle min in degrees
+    AP_Int16    pitch_angle_max;    // pitch angle max in degrees
+    AP_Int16    yaw_angle_min;      // yaw angle min in degrees
+    AP_Int16    yaw_angle_max;      // yaw angle max in degrees
+
+    AP_Vector3f retract_angles;     // retracted position in degrees. vector.x = roll vector.y = pitch, vector.z=yaw
+    AP_Vector3f neutral_angles;     // neutral position in degrees.  vector.x = roll vector.y = pitch, vector.z=yaw
+
+    AP_Float    roll_stb_lead;      // roll lead control gain (only used by servo backend)
+    AP_Float    pitch_stb_lead;     // pitch lead control gain (only used by servo backend)
+    AP_Int8     sysid_default;      // target sysid for mount to follow
+    AP_Int32    dev_id;             // Device id taking into account bus
+    AP_Int8     options;            // mount options bitmask
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #include "AP_Mount_SToRM32.h"
+
+#if HAL_MOUNT_STORM32MAVLINK_ENABLED
+#include <AP_HAL/AP_HAL.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define AP_MOUNT_STORM32_RESEND_MS  1000    // resend angle targets to gimbal once per second
+#define AP_MOUNT_STORM32_SEARCH_MS  60000   // search for gimbal for 1 minute after startup
+
+// update mount position - should be called periodically
+void AP_Mount_SToRM32::update()
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        find_gimbal();
+        return;
+    }
+
+    // change to RC_TARGETING mode if RC input has changed
+    set_rctargeting_on_rcinput_change();
+
+    // flag to trigger sending target angles to gimbal
+    bool resend_now = false;
+
+    // update based on mount mode
+    switch(get_mode()) {
+        // move mount to a "retracted" position.  To-Do: remove support and replace with a relaxed mode?
+        case MAV_MOUNT_MODE_RETRACT: {
+            const Vector3f &target = _params.retract_angles.get();
+            mnt_target.angle_rad.set(target*DEG_TO_RAD, false);
+            mnt_target.target_type = MountTargetType::ANGLE;
+            break;
+        }
+
+        // move mount to a neutral position, typically pointing forward
+        case MAV_MOUNT_MODE_NEUTRAL: {
+            const Vector3f &target = _params.neutral_angles.get();
+            mnt_target.angle_rad.set(target*DEG_TO_RAD, false);
+            mnt_target.target_type = MountTargetType::ANGLE;
+            break;
+        }
+
+        // point to the angles given by a mavlink message
+        case MAV_MOUNT_MODE_MAVLINK_TARGETING:
+            // mnt_target should have already been populated by set_angle_target() or set_rate_target(). Update target angle from rate if necessary
+            if (mnt_target.target_type == MountTargetType::RATE) {
+                update_angle_target_from_rate(mnt_target.rate_rads, mnt_target.angle_rad);
+            }
+            resend_now = true;
+            break;
+
+        // RC radio manual angle control, but with stabilization from the AHRS
+        case MAV_MOUNT_MODE_RC_TARGETING: {
+            // update targets using pilot's RC inputs
+            MountTarget rc_target;
+            get_rc_target(mnt_target.target_type, rc_target);
+            switch (mnt_target.target_type) {
+            case MountTargetType::ANGLE:
+                mnt_target.angle_rad = rc_target;
+                break;
+            case MountTargetType::RATE:
+                mnt_target.rate_rads = rc_target;
+                break;
+            }
+            resend_now = true;
+            break;
+        }
+
+        // point mount to a GPS point given by the mission planner
+        case MAV_MOUNT_MODE_GPS_POINT:
+            if (get_angle_target_to_roi(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+                resend_now = true;
+            }
+            break;
+
+        // point mount to Home location
+        case MAV_MOUNT_MODE_HOME_LOCATION:
+            if (get_angle_target_to_home(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+                resend_now = true;
+            }
+            break;
+
+        // point mount to another vehicle
+        case MAV_MOUNT_MODE_SYSID_TARGET:
+            if (get_angle_target_to_sysid(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+                resend_now = true;
+            }
+            break;
+
+        default:
+            // we do not know this mode so do nothing
+            break;
+    }
+
+    // resend target angles at least once per second
+    if (resend_now || ((AP_HAL::millis() - _last_send) > AP_MOUNT_STORM32_RESEND_MS)) {
+        send_do_mount_control(mnt_target.angle_rad);
+    }
+}
+
+// get attitude as a quaternion.  returns true on success
+bool AP_Mount_SToRM32::get_attitude_quaternion(Quaternion& att_quat)
+{
+    att_quat.from_euler(mnt_target.angle_rad.roll, mnt_target.angle_rad.pitch, mnt_target.angle_rad.get_bf_yaw());
+    return true;
+}
+
+// search for gimbal in GCS_MAVLink routing table
+void AP_Mount_SToRM32::find_gimbal()
+{
+    // return immediately if initialised
+    if (_initialised) {
+        return;
+    }
+
+    // return if search time has has passed
+    if (AP_HAL::millis() > AP_MOUNT_STORM32_SEARCH_MS) {
+        return;
+    }
+
+    // we expect that instance 0 has compid = MAV_COMP_ID_GIMBAL, instance 1 has compid = MAV_COMP_ID_GIMBAL2, etc
+    uint8_t compid = (_instance == 0) ? MAV_COMP_ID_GIMBAL : MAV_COMP_ID_GIMBAL2 + (_instance - 1);
+    if (GCS_MAVLINK::find_by_mavtype_and_compid(MAV_TYPE_GIMBAL, compid, _sysid, _chan)) {
+        _compid = compid;
+        _initialised = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mount: SToRM32");
+    }
+}
+
+// send_do_mount_control - send a COMMAND_LONG containing a do_mount_control message
+void AP_Mount_SToRM32::send_do_mount_control(const MountTarget& angle_target_rad)
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return;
+    }
+
+    // check we have space for the message
+    if (!HAVE_PAYLOAD_SPACE(_chan, COMMAND_LONG)) {
+        return;
+    }
+
+    // send command_long command containing a do_mount_control command
+    // Note: pitch and yaw are reversed
+    mavlink_msg_command_long_send(_chan,
+                                  _sysid,
+                                  _compid,
+                                  MAV_CMD_DO_MOUNT_CONTROL,
+                                  0,        // confirmation of zero means this is the first time this message has been sent
+                                  -degrees(angle_target_rad.pitch),
+                                  degrees(angle_target_rad.roll),
+                                  -degrees(angle_target_rad.get_bf_yaw()),
+                                  0, 0, 0,  // param4 ~ param6 unused
+                                  MAV_MOUNT_MODE_MAVLINK_TARGETING);
+
+    // store time of send
+    _last_send = AP_HAL::millis();
+}
+#endif // HAL_MOUNT_STORM32MAVLINK_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+  Siyi gimbal driver using custom serial protocol
+
+  Packet format (courtesy of Siyi's SDK document)
+
+  -------------------------------------------------------------------------------------------
+  Field     Index   Bytes       Description
+  -------------------------------------------------------------------------------------------
+  STX       0       2           0x5566: starting mark
+  CTRL      2       1           bit 0: need_ack.  set if the current data packet needs ack
+                                bit 1: ack_pack.  set if the current data packate IS an ack
+                                bit 2-7: reserved
+  Data_len  3       2           Data field byte length.  Low byte in the front
+  SEQ       5       2           Frame sequence (0 ~ 65535).  Low byte in the front.  May be used to detect packet loss
+  CMD_ID    7       1           Command ID
+  DATA      8       Data_len    Data
+  CRC16             2           CRC16 check the complete data package.  Low byte in the front
+ */
+
+#pragma once
+
+#include "AP_Mount_Backend_Serial.h"
+
+#if HAL_MOUNT_SIYI_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Common/AP_Common.h>
+
+#define AP_MOUNT_SIYI_PACKETLEN_MAX     42  // maximum number of bytes in a packet sent to or received from the gimbal
+
+class AP_Mount_Siyi : public AP_Mount_Backend_Serial
+{
+
+public:
+    // Constructor
+    using AP_Mount_Backend_Serial::AP_Mount_Backend_Serial;
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Mount_Siyi);
+
+    // update mount position - should be called periodically
+    void update() override;
+
+    // return true if healthy
+    bool healthy() const override;
+
+    // return true if this mount accepts roll targets
+    bool has_roll_control() const override { return false; }
+
+    // has_pan_control - returns true if this mount can control its pan (required for multicopters)
+    bool has_pan_control() const override { return yaw_range_valid(); };
+
+    //
+    // camera controls
+    //
+
+    // take a picture.  returns true on success
+    bool take_picture() override;
+
+    // start or stop video recording
+    // set start_recording = true to start record, false to stop recording
+    bool record_video(bool start_recording) override;
+
+    // set zoom specified as a rate or percentage
+    bool set_zoom(ZoomType zoom_type, float zoom_value) override;
+
+    // set focus specified as rate, percentage or auto
+    // focus in = -1, focus hold = 0, focus out = 1
+    SetFocusResult set_focus(FocusType focus_type, float focus_value) override;
+
+    // set camera lens as a value from 0 to 8.  ZT30 only
+    bool set_lens(uint8_t lens) override;
+
+    // set_camera_source is functionally the same as set_lens except primary and secondary lenses are specified by type
+    // primary and secondary sources use the AP_Camera::CameraSource enum cast to uint8_t
+    bool set_camera_source(uint8_t primary_source, uint8_t secondary_source) override;
+
+    // send camera information message to GCS
+    void send_camera_information(mavlink_channel_t chan) const override;
+
+    // send camera settings message to GCS
+    void send_camera_settings(mavlink_channel_t chan) const override;
+
+    //
+    // rangefinder
+    //
+
+    // get rangefinder distance.  Returns true on success
+    bool get_rangefinder_distance(float& distance_m) const override;
+
+protected:
+
+    // get attitude as a quaternion.  returns true on success
+    bool get_attitude_quaternion(Quaternion& att_quat) override;
+
+    // get angular velocity of mount. Only available on some backends
+    bool get_angular_velocity(Vector3f& rates) override {
+        rates = _current_rates_rads;
+        return true;
+    }
+    
+private:
+
+    // serial protocol command ids
+    enum class SiyiCommandId {
+        ACQUIRE_FIRMWARE_VERSION = 0x01,
+        HARDWARE_ID = 0x02,
+        AUTO_FOCUS = 0x04,
+        MANUAL_ZOOM_AND_AUTO_FOCUS = 0x05,
+        MANUAL_FOCUS = 0x06,
+        GIMBAL_ROTATION = 0x07,
+        CENTER = 0x08,
+        ACQUIRE_GIMBAL_CONFIG_INFO = 0x0A,
+        FUNCTION_FEEDBACK_INFO = 0x0B,
+        PHOTO = 0x0C,
+        ACQUIRE_GIMBAL_ATTITUDE = 0x0D,
+        ABSOLUTE_ZOOM = 0x0F,
+        SET_CAMERA_IMAGE_TYPE = 0x11,
+        READ_RANGEFINDER = 0x15,
+        EXTERNAL_ATTITUDE = 0x22,
+        SET_TIME = 0x30,
+        POSITION_DATA = 0x3e,
+    };
+
+    // Function Feedback Info packet info_type values
+    enum class FunctionFeedbackInfo : uint8_t {
+        SUCCESS = 0,
+        FAILED_TO_TAKE_PHOTO = 1,
+        HDR_ON = 2,
+        HDR_OFF = 3,
+        FAILED_TO_RECORD_VIDEO = 4
+    };
+
+    // Photo Function packet func_type values
+    enum class PhotoFunction : uint8_t {
+        TAKE_PICTURE = 0,
+        HDR_TOGGLE = 1,
+        RECORD_VIDEO_TOGGLE = 2,
+        LOCK_MODE = 3,
+        FOLLOW_MODE = 4,
+        FPV_MODE = 5
+    };
+
+    // parsing state
+    enum class ParseState : uint8_t {
+        WAITING_FOR_HEADER_LOW,
+        WAITING_FOR_HEADER_HIGH,
+        WAITING_FOR_CTRL,
+        WAITING_FOR_DATALEN_LOW,
+        WAITING_FOR_DATALEN_HIGH,
+        WAITING_FOR_SEQ_LOW,
+        WAITING_FOR_SEQ_HIGH,
+        WAITING_FOR_CMDID,
+        WAITING_FOR_DATA,
+        WAITING_FOR_CRC_LOW,
+        WAITING_FOR_CRC_HIGH,
+    };
+
+    // hardware model enum
+    enum class HardwareModel : uint8_t {
+        UNKNOWN = 0,
+        A2,
+        A8,
+        ZR10,
+        ZR30,
+        ZT6,
+        ZT30
+    } _hardware_model;
+
+    enum class HdrStatus : uint8_t {
+        OFF = 0,
+        ON  = 1,
+    };
+
+    enum class RecordingStatus : uint8_t {
+        OFF       = 0,
+        ON        = 1,
+        NO_CARD   = 2,
+        DATA_LOSS = 3,
+    };
+
+    enum class GimbalMotionMode : uint8_t {
+        LOCK   = 0,
+        FOLLOW = 1,
+        FPV    = 2,
+    };
+
+    enum class GimbalMountingDirection : uint8_t {
+        UNDEFINED = 0,
+        NORMAL = 1,
+        UPSIDE_DOWN = 2,
+    };
+
+    enum class VideoOutputStatus : uint8_t {
+        HDMI = 0,
+        CVBS = 1,
+    };
+
+    // Response message for "Acquire Gimbal Confuguration Information" (0x0A)
+    typedef struct {
+        uint8_t _reserved1;
+        HdrStatus hdr_status;
+        uint8_t _reserved3;
+        RecordingStatus record_status;
+        GimbalMotionMode motion_mode;
+        GimbalMountingDirection mounting_dir;
+        VideoOutputStatus video_mode;
+    } GimbalConfigInfo;
+    static_assert(sizeof(GimbalConfigInfo) == 7, "GimbalConfigInfo must be 7 bytes");
+
+    // camera image types (aka lens)
+    enum class CameraImageType : uint8_t {
+        MAIN_PIP_ZOOM_THERMAL_SUB_WIDEANGLE = 0,
+        MAIN_PIP_WIDEANGLE_THERMAL_SUB_ZOOM = 1,
+        MAIN_PIP_ZOOM_WIDEANGLE_SUB_THERMAL = 2,
+        MAIN_ZOOM_SUB_THERMAL = 3,
+        MAIN_ZOOM_SUB_WIDEANGLE = 4,
+        MAIN_WIDEANGLE_SUB_THERMAL = 5,
+        MAIN_WIDEANGLE_SUB_ZOOM = 6,
+        MAIN_THERMAL_SUB_ZOOM = 7,
+        MAIN_THERMAL_SUB_WIDEANGLE = 8
+    };
+
+    typedef struct {
+        uint8_t major;
+        uint8_t minor;
+        uint8_t patch;
+    } Version;
+    typedef struct {
+        Version camera;
+        Version gimbal;
+        Version zoom;
+        bool received; // true once version information has been received
+    } FirmwareVersion;
+
+    // reading incoming packets from gimbal and confirm they are of the correct format
+    // results are held in the _parsed_msg structure
+    void read_incoming_packets();
+
+    // process successfully decoded packets held in the _parsed_msg structure
+    void process_packet();
+
+    // send packet to gimbal
+    // returns true on success, false if outgoing serial buffer is full
+    bool send_packet(SiyiCommandId cmd_id, const uint8_t* databuff, uint8_t databuff_len);
+    bool send_1byte_packet(SiyiCommandId cmd_id, uint8_t data_byte);
+
+    // request info from gimbal
+    void request_firmware_version() { send_packet(SiyiCommandId::ACQUIRE_FIRMWARE_VERSION, nullptr, 0); }
+    void request_hardware_id() { send_packet(SiyiCommandId::HARDWARE_ID, nullptr, 0); }
+    void request_configuration() { send_packet(SiyiCommandId::ACQUIRE_GIMBAL_CONFIG_INFO, nullptr, 0); }
+    void request_function_feedback_info() { send_packet(SiyiCommandId::FUNCTION_FEEDBACK_INFO, nullptr, 0); }
+    void request_gimbal_attitude() { send_packet(SiyiCommandId::ACQUIRE_GIMBAL_ATTITUDE, nullptr, 0); }
+    void request_rangefinder_distance() { send_packet(SiyiCommandId::READ_RANGEFINDER, nullptr, 0); }
+
+    // rotate gimbal.  pitch_rate and yaw_rate are scalars in the range -100 ~ +100
+    // yaw_is_ef should be true if gimbal should maintain an earth-frame target (aka lock)
+    void rotate_gimbal(int8_t pitch_scalar, int8_t yaw_scalar, bool yaw_is_ef);
+
+    // Set gimbal's motion mode if it has changed. Use force=true to always send.
+    //   FOLLOW: roll and pitch are in earth-frame, yaw is in body-frame
+    //   LOCK: roll, pitch and yaw are all in earth-frame
+    //   FPV: roll, pitch and yaw are all in body-frame
+    // Returns true if message successfully sent to Gimbal
+    bool set_motion_mode(const GimbalMotionMode mode, const bool force=false);
+
+    // send target pitch and yaw rates to gimbal
+    // yaw_is_ef should be true if yaw_rads target is an earth frame rate, false if body_frame
+    void send_target_rates(float pitch_rads, float yaw_rads, bool yaw_is_ef);
+
+    // send target pitch and yaw angles to gimbal
+    // yaw_is_ef should be true if yaw_rad target is an earth frame angle, false if body_frame
+    void send_target_angles(float pitch_rad, float yaw_rad, bool yaw_is_ef);
+
+    // send zoom rate command to camera. zoom out = -1, hold = 0, zoom in = 1
+    bool send_zoom_rate(float zoom_value);
+
+    // send zoom multiple command to camera. e.g. 1x, 10x, 30x
+    bool send_zoom_mult(float zoom_mult);
+
+    // get zoom multiple max
+    float get_zoom_mult_max() const;
+
+    // update zoom controller
+    void update_zoom_control();
+
+    // get model name string, returns nullptr if hardware id is unknown
+    const char* get_model_name() const;
+
+    // Checks that the firmware version on the Gimbal meets the minimum supported version.
+    void check_firmware_version() const;
+
+    // internal variables
+    bool _got_hardware_id;                          // true once hardware id ha been received
+
+    FirmwareVersion _fw_version;                    // firmware version (for reporting for GCS)
+
+    // buffer holding bytes from latest packet.  This is only used to calculate the crc
+    uint8_t _msg_buff[AP_MOUNT_SIYI_PACKETLEN_MAX];
+    uint8_t _msg_buff_len;
+    const uint8_t _msg_buff_data_start = 8;         // data starts at this byte of _msg_buff
+
+    // parser state and unpacked fields
+    struct PACKED {
+        uint16_t data_len;                          // expected number of data bytes
+        uint8_t command_id;                         // command id
+        uint16_t data_bytes_received;               // number of data bytes received so far
+        uint16_t crc16;                             // latest message's crc
+        ParseState state;                           // state of incoming message processing
+    } _parsed_msg;
+
+    // variables for sending packets to gimbal
+    uint32_t _last_send_ms;                         // system time (in milliseconds) of last packet sent to gimbal
+    uint16_t _last_seq;                             // last sequence number used (should be increment for each send)
+
+    // actual attitude received from gimbal
+    Vector3f _current_angle_rad;                    // current angles in radians received from gimbal (x=roll, y=pitch, z=yaw)
+    Vector3f _current_rates_rads;                   // current angular rates in rad/s (x=roll, y=pitch, z=yaw)
+    uint32_t _last_current_angle_rad_ms;            // system time _current_angle_rad was updated
+    uint32_t _last_req_current_angle_rad_ms;        // system time that this driver last requested current angle
+
+    // absolute zoom control.  only used for A8 that does not support abs zoom control
+    ZoomType _zoom_type;                            // current zoom type
+    float _zoom_rate_target;                        // current zoom rate target
+    float _zoom_mult;                               // most recent actual zoom multiple received from camera
+    uint32_t _last_zoom_control_ms;                 // system time that zoom control was last run
+
+    // Configuration info received from gimbal
+    GimbalConfigInfo _config_info;
+    
+    // rangefinder variables
+    uint32_t _last_rangefinder_req_ms;              // system time of last request for rangefinder distance
+    uint32_t _last_rangefinder_dist_ms;             // system time of last successful read of rangefinder distance
+    float _rangefinder_dist_m;                      // distance received from rangefinder
+
+    // sending of attitude and position to gimbal
+    uint32_t _last_attitude_send_ms;
+    void send_attitude_position(void);
+
+    // hardware lookup table indexed by HardwareModel enum values (see above)
+    struct HWInfo {
+        uint8_t hwid[2];
+        const char* model_name;
+    };
+    static const HWInfo hardware_lookup_table[];
+
+    // count of SET_TIME packets, we send 5 times to cope with packet loss
+    uint8_t sent_time_count;
+};
+
+#endif // HAL_MOUNT_SIYISERIAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #include "AP_Mount_config.h"
+
+#if HAL_SOLO_GIMBAL_ENABLED
+
+#include "AP_Mount_SoloGimbal.h"
+
+#include "SoloGimbal.h"
+#include <AP_Logger/AP_Logger.h>
+#include <GCS_MAVLink/GCS_MAVLink.h>
+#include <GCS_MAVLink/GCS.h>
+
+AP_Mount_SoloGimbal::AP_Mount_SoloGimbal(AP_Mount &frontend, AP_Mount_Params &params, uint8_t instance) :
+    AP_Mount_Backend(frontend, params, instance),
+    _gimbal()
+{}
+
+// init - performs any required initialisation for this instance
+void AP_Mount_SoloGimbal::init()
+{
+    _initialised = true;
+    AP_Mount_Backend::init();
+}
+
+void AP_Mount_SoloGimbal::update_fast()
+{
+    _gimbal.update_fast();
+}
+
+// update mount position - should be called periodically
+void AP_Mount_SoloGimbal::update()
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return;
+    }
+
+    // change to RC_TARGETING mode if RC input has changed
+    set_rctargeting_on_rcinput_change();
+
+    // update based on mount mode
+    switch(get_mode()) {
+        // move mount to a "retracted" position.  we do not implement a separate servo based retract mechanism
+        case MAV_MOUNT_MODE_RETRACT:
+            _gimbal.set_lockedToBody(true);
+            mnt_target.target_type = MountTargetType::ANGLE;
+            mnt_target.angle_rad.set(Vector3f{0,0,0}, false);
+            break;
+
+        // move mount to a neutral position, typically pointing forward
+        case MAV_MOUNT_MODE_NEUTRAL: {
+            _gimbal.set_lockedToBody(false);
+            const Vector3f &target = _params.neutral_angles.get();
+            mnt_target.target_type = MountTargetType::ANGLE;
+            mnt_target.angle_rad.set(target*DEG_TO_RAD, false);
+            break;
+        }
+
+        // point to the angles given by a mavlink message
+        case MAV_MOUNT_MODE_MAVLINK_TARGETING:
+            // targets are stored while handling the incoming mavlink message
+            _gimbal.set_lockedToBody(false);
+            if (mnt_target.target_type == MountTargetType::RATE) {
+                update_angle_target_from_rate(mnt_target.rate_rads, mnt_target.angle_rad);
+            }
+            break;
+
+        // RC radio manual angle control, but with stabilization from the AHRS
+        case MAV_MOUNT_MODE_RC_TARGETING: {
+            _gimbal.set_lockedToBody(false);
+            MountTarget rc_target;
+            get_rc_target(mnt_target.target_type, rc_target);
+            switch (mnt_target.target_type) {
+            case MountTargetType::ANGLE:
+                mnt_target.angle_rad = rc_target;
+                break;
+            case MountTargetType::RATE:
+                mnt_target.rate_rads = rc_target;
+                break;
+            }
+            break;
+        }
+
+        // point mount to a GPS point given by the mission planner
+        case MAV_MOUNT_MODE_GPS_POINT:
+            if (get_angle_target_to_roi(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+                _gimbal.set_lockedToBody(false);
+            }
+            break;
+
+        // point mount to Home location
+        case MAV_MOUNT_MODE_HOME_LOCATION:
+            if (get_angle_target_to_home(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+                _gimbal.set_lockedToBody(false);
+            }
+            break;
+
+        // point mount to another vehicle
+        case MAV_MOUNT_MODE_SYSID_TARGET:
+            if (get_angle_target_to_sysid(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+                _gimbal.set_lockedToBody(false);
+            }
+            break;
+
+        default:
+            // we do not know this mode so do nothing
+            break;
+    }
+}
+
+// get attitude as a quaternion.  returns true on success
+bool AP_Mount_SoloGimbal::get_attitude_quaternion(Quaternion& att_quat)
+{
+    if (!_gimbal.aligned()) {
+        return false;
+    }
+    att_quat.from_euler(mnt_target.angle_rad.roll, mnt_target.angle_rad.pitch, mnt_target.angle_rad.get_bf_yaw());
+    return true;
+}
+
+/*
+  handle a GIMBAL_REPORT message
+ */
+void AP_Mount_SoloGimbal::handle_gimbal_report(mavlink_channel_t chan, const mavlink_message_t &msg)
+{
+    _gimbal.update_target(Vector3f{mnt_target.angle_rad.roll, mnt_target.angle_rad.pitch, mnt_target.angle_rad.get_bf_yaw()});
+    _gimbal.receive_feedback(chan,msg);
+
+#if HAL_LOGGING_ENABLED
+    AP_Logger *logger = AP_Logger::get_singleton();
+    if (logger == nullptr) {
+        return;
+    }
+#endif
+    if(!_params_saved
+#if HAL_LOGGING_ENABLED
+       && logger->logging_started()
+#endif
+        ) {
+        _gimbal.fetch_params();       //last parameter save might not be stored in logger so retry
+        _params_saved = true;
+    }
+
+#if HAL_LOGGING_ENABLED
+    if (_gimbal.get_log_dt() > 1.0f/25.0f) {
+        _gimbal.write_logs();
+    }
+#endif
+}
+
+void AP_Mount_SoloGimbal::handle_param_value(const mavlink_message_t &msg)
+{
+    _gimbal.handle_param_value(msg);
+}
+
+/*
+  handle a GIMBAL_REPORT message
+ */
+void AP_Mount_SoloGimbal::handle_gimbal_torque_report(mavlink_channel_t chan, const mavlink_message_t &msg)
+{
+    _gimbal.disable_torque_report();
+}
+
+#endif // HAL_SOLO_GIMBAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+  MAVLink enabled mount backend class
+ */
+#pragma once
+
+#include "AP_Mount_config.h"
+
+#if HAL_SOLO_GIMBAL_ENABLED
+
+#include "AP_Mount_Backend.h"
+#include <AP_Math/AP_Math.h>
+#include <AP_Common/AP_Common.h>
+#include <GCS_MAVLink/GCS_MAVLink.h>
+#include "SoloGimbal.h"
+
+class AP_Mount_SoloGimbal : public AP_Mount_Backend
+{
+
+public:
+    // Constructor
+    AP_Mount_SoloGimbal(AP_Mount &frontend, AP_Mount_Params &params, uint8_t instance);
+
+    // init - performs any required initialisation for this instance
+    void init() override;
+
+    // update mount position - should be called periodically
+    void update() override;
+
+    // has_pan_control - returns true if this mount can control its pan (required for multicopters)
+    bool has_pan_control() const override { return false; }
+
+    // handle a GIMBAL_REPORT message
+    void handle_gimbal_report(mavlink_channel_t chan, const mavlink_message_t &msg) override;
+    void handle_gimbal_torque_report(mavlink_channel_t chan, const mavlink_message_t &msg);
+    void handle_param_value(const mavlink_message_t &msg) override;
+
+    void update_fast() override;
+
+protected:
+
+    // returns true if heart beat should be suppressed for this gimbal
+    bool suppress_heartbeat() const override { return true; }
+
+    // get attitude as a quaternion.  returns true on success
+    bool get_attitude_quaternion(Quaternion& att_quat) override;
+
+private:
+    // internal variables
+    bool _initialised;              // true once the driver has been initialised
+
+    // Write a gimbal measurament and estimation data packet
+    void Log_Write_Gimbal(SoloGimbal &gimbal);
+
+    bool _params_saved;
+    SoloGimbal _gimbal;
+};
+
+#endif // HAL_SOLO_GIMBAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #include "AP_Mount_Topotek.h"
+
+#if HAL_MOUNT_TOPOTEK_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_RTC/AP_RTC.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define ANGULAR_VELOCITY_CONVERSION         1.220740379         // gimbal angular velocity conversion ratio
+#define TRACK_TOTAL_WIDTH                   1920                // track the maximum width of the image range
+#define TRACK_TOTAL_HEIGHT                  1080                // track the maximum height of the image range
+#define TRACK_RANGE                         60                  // the size of the image at point tracking
+#define AP_MOUNT_TOPOTEK_UPDATE_INTERVAL_MS 100                 // resend angle or rate targets to gimbal at this interval
+#define AP_MOUNT_TOPOTEK_HEALTH_TIMEOUT_MS  1000                // timeout for health and rangefinder readings
+#define AP_MOUNT_TOPOTEK_PACKETLEN_MIN      12                  // packet length not including the data segment
+#define AP_MOUNT_TOPOTEK_DATALEN_MAX        (AP_MOUNT_TOPOTEK_PACKETLEN_MAX - AP_MOUNT_TOPOTEK_PACKETLEN_MIN) // data segment lens can be no more tha this
+
+// 3 character identifiers
+# define AP_MOUNT_TOPOTEK_ID3CHAR_CAPTURE       "CAP"           // take picture, data bytes: 01:RGB + thermal, 02:RGB, 03:thermal, 05:RGB + thermal (with temp measurement)
+# define AP_MOUNT_TOPOTEK_ID3CHAR_RECORD_VIDEO  "REC"           // record video, data bytes: 00:stop, 01:start, 0A:toggle start/stop
+# define AP_MOUNT_TOPOTEK_ID3CHAR_CONTROL_ZOOM  "ZMC"           // control zoom, data bytes: 00:stop, 01:zoom out, 02:zoom in
+# define AP_MOUNT_TOPOTEK_ID3CHAR_GET_ZOOM      "ZOM"           // get zoom, no data bytes
+# define AP_MOUNT_TOPOTEK_ID3CHAR_CONTROL_FOCUS "FCC"           // control focus, data bytes: 00:stop, 01:focus+, 02:focus-, 0x10:auto focus, 0x11:manual focus, 0x12:manu focus (save), 0x13:auto focus (save)
+# define AP_MOUNT_TOPOTEK_ID3CHAR_GET_FOCUS     "FOC"           // get focus, no data bytes
+# define AP_MOUNT_TOPOTEK_ID3CHAR_SET_ZOOM_AND_FOCU "ZFP"       // set zoom and focus
+# define AP_MOUNT_TOPOTEK_ID3CHAR_DAY_NIGHT_SWITCHING "IRC"     // set day/night setting, data bytes: 00:day, 01:night, 0A:toggle state
+# define AP_MOUNT_TOPOTEK_ID3CHAR_TRACKING      "TRC"           // get/set image tracking, data bytes: 00:get status (use with "r"), 01:stop (use with "w")
+# define AP_MOUNT_TOPOTEK_ID3CHAR_START_TRACKING "LOC"          // start image tracking
+# define AP_MOUNT_TOPOTEK_ID3CHAR_LRF           "LRF"           // laser rangefinder control, data bytes: 00:ranging stop, 01:ranging start, 02:single measurement, 03:continuous measurement
+# define AP_MOUNT_TOPOTEK_ID3CHAR_PIP           "PIP"           // set picture-in-picture setting, data bytes: // 00:main only, 01:main+sub, 02:sub+main, 03:sub only, 0A:next
+# define AP_MOUNT_TOPOTEK_ID3CHAR_GIMBAL_ATT    "GAA"           // get gimbal attitude, data bytes: 00:stop, 01:start
+# define AP_MOUNT_TOPOTEK_ID3CHAR_SD_CARD       "SDC"           // get SD card state, data bytes: 00:get remaining capacity, 01:get total capacity
+# define AP_MOUNT_TOPOTEK_ID3CHAR_TIME          "UTC"           // set time and date, data bytes: HHMMSSDDMMYY
+# define AP_MOUNT_TOPOTEK_ID3CHAR_GET_VERSION   "VSN"           // get firmware version, data bytes always 00
+# define AP_MOUNT_TOPOTEK_ID3CHAR_GET_MODEL_NAME "PA2"          // get model name, data bytes always 00
+# define AP_MOUNT_TOPOTEK_ID3CHAR_GIMBAL_MODE   "PTZ"           // set gimbal mode, data bytes: 00:stop, 01:up, 02:down, 03:left, 04:right, 05:home position, 06:lock, 07:follow, 08:lock/follow toggle, 09:calibration, 0A:one button down
+# define AP_MOUNT_TOPOTEK_ID3CHAR_YPR_RATE      "YPR"           // set the rate yaw, pitch and roll targets of the gimbal yaw in range -99 ~ +99
+# define AP_MOUNT_TOPOTEK_ID3CHAR_YAW_ANGLE     "GIY"           // set the yaw angle target in the range -150 ~ 150, speed 0 ~ 99 (0.1deg/sec)
+# define AP_MOUNT_TOPOTEK_ID3CHAR_YAW_ANGLE_BF  "GAY"           // set the yaw angle target in body-frame in the range -150 ~ 150, speed 0 ~ 99 (0.1deg/sec)
+# define AP_MOUNT_TOPOTEK_ID3CHAR_PITCH_ANGLE   "GIP"           // set the pitch angle target in the range -90 ~ 90, speed 0 ~ 99 (0.1deg/sec)
+# define AP_MOUNT_TOPOTEK_ID3CHAR_ROLL_ANGLE    "GIR"           // set the roll angle target in the range -90 ~ 90, speed 0 ~ 99 (0.1deg/sec)
+# define AP_MOUNT_TOPOTEK_ID3CHAR_SET_LAT       "LAT"           // set the gimbal's latitude
+# define AP_MOUNT_TOPOTEK_ID3CHAR_SET_LON       "LON"           // set the gimbal's longitude
+# define AP_MOUNT_TOPOTEK_ID3CHAR_SET_ALT       "ALT"           // set the gimbal's altitude
+# define AP_MOUNT_TOPOTEK_ID3CHAR_SET_AZIMUTH   "AZI"           // set the gimbal's yaw (aka azimuth)
+
+#define AP_MOUNT_TOPOTEK_DEBUG 0
+#define debug(fmt, args ...) do { if (AP_MOUNT_TOPOTEK_DEBUG) { GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Topotek: " fmt, ## args); } } while (0)
+
+const char* AP_Mount_Topotek::send_message_prefix = "Mount: Topotek";
+
+// update mount position - should be called periodically
+void AP_Mount_Topotek::update()
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return;
+    }
+
+    // reading incoming packets from gimbal
+    read_incoming_packets();
+
+    // everything below updates at 10hz
+    uint32_t now_ms = AP_HAL::millis();
+    if ((now_ms - _last_req_current_info_ms) < 100) {
+        return;
+    }
+    _last_req_current_info_ms = now_ms;
+
+    // re-send the stop zoom command a second time to prevent data transmission errors.
+    if (_last_zoom_stop) {
+        _last_zoom_stop = false;
+        send_fixedlen_packet(AddressByte::LENS, AP_MOUNT_TOPOTEK_ID3CHAR_CONTROL_ZOOM, true, 0);
+    }
+
+    // re-send the stop focus command a second time to prevent data transmission errors.
+    if (_last_focus_stop) {
+        _last_focus_stop = false;
+        send_fixedlen_packet(AddressByte::LENS, AP_MOUNT_TOPOTEK_ID3CHAR_CONTROL_FOCUS, true, 0);
+    }
+
+    // send GPS-related information to the gimbal
+    send_location_info();
+
+    // calls below here called at 1hz
+    _last_req_step++;
+    if (_last_req_step >= 10) {
+        _last_req_step = 0;
+    }
+    switch (_last_req_step) {
+    case 0:
+        // get gimbal version
+        if (!_got_gimbal_version) {
+            request_gimbal_version();
+        }
+        break;
+    case 2:
+        // request gimbal attitude at 1hz
+        // gimbal will continue to send attitude information during the next period
+        request_gimbal_attitude();
+        break;
+    case 4:
+        // request memory card information
+        request_gimbal_sdcard_info();
+        break;
+    case 6:
+        // request tracking info
+        request_track_status();
+        break;
+    case 8:
+        // get gimbal model name
+        if (!_got_gimbal_model_name) {
+            request_gimbal_model_name();
+        }
+        break;
+    }
+
+    // change to RC_TARGETING mode if RC input has changed
+    set_rctargeting_on_rcinput_change();
+
+    // handle tracking state
+    if (_is_tracking) {
+        // cancel tracking if mode has changed
+        if (_last_mode != _mode) {
+            _last_mode = _mode;
+            cancel_tracking();
+        }
+        return;
+    }
+    _last_mode = _mode;
+
+    // update based on mount mode
+    switch (get_mode()) {
+        // move mount to a "retracted" position.  To-Do: remove support and replace with a relaxed mode?
+        case MAV_MOUNT_MODE_RETRACT: {
+            const Vector3f &angle_bf_target = _params.retract_angles.get();
+            mnt_target.target_type = MountTargetType::ANGLE;
+            mnt_target.angle_rad.set(angle_bf_target*DEG_TO_RAD, false);
+            break;
+        }
+
+        // move mount to a neutral position, typically pointing forward
+        case MAV_MOUNT_MODE_NEUTRAL: {
+            const Vector3f &angle_bf_target = _params.neutral_angles.get();
+            mnt_target.target_type = MountTargetType::ANGLE;
+            mnt_target.angle_rad.set(angle_bf_target*DEG_TO_RAD, false);
+            break;
+        }
+
+        // point to the angles given by a mavlink message
+        case MAV_MOUNT_MODE_MAVLINK_TARGETING:
+            // mavlink targets are stored while handling the incoming message
+            break;
+
+        // RC radio manual angle control, but with stabilization from the AHRS
+        case MAV_MOUNT_MODE_RC_TARGETING: {
+            // update targets using pilot's RC inputs
+            MountTarget rc_target;
+            get_rc_target(mnt_target.target_type, rc_target);
+            switch (mnt_target.target_type) {
+            case MountTargetType::ANGLE:
+                mnt_target.angle_rad = rc_target;
+                break;
+            case MountTargetType::RATE:
+                mnt_target.rate_rads = rc_target;
+                break;
+            }
+            break;
+        }
+
+        // point mount to a GPS point given by the mission planner
+        case MAV_MOUNT_MODE_GPS_POINT:
+            if (get_angle_target_to_roi(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+            }
+            break;
+
+        // point mount to Home location
+        case MAV_MOUNT_MODE_HOME_LOCATION:
+            if (get_angle_target_to_home(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+            }
+            break;
+
+        // point mount to another vehicle
+        case MAV_MOUNT_MODE_SYSID_TARGET:
+            if (get_angle_target_to_sysid(mnt_target.angle_rad)) {
+                mnt_target.target_type = MountTargetType::ANGLE;
+            }
+            break;
+
+        default:
+            // we do not know this mode so raise internal error
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+            break;
+    }
+
+    // send target angles or rates depending on the target type
+    switch (mnt_target.target_type) {
+        case MountTargetType::ANGLE:
+            send_angle_target(mnt_target.angle_rad);
+            break;
+        case MountTargetType::RATE:
+            send_rate_target(mnt_target.rate_rads);
+            break;
+    }
+}
+
+// return true if healthy
+bool AP_Mount_Topotek::healthy() const
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return false;
+    }
+
+    // unhealthy if attitude information not received recently
+    const uint32_t last_current_angle_ms = _last_current_angle_ms;
+    return (AP_HAL::millis() - last_current_angle_ms < AP_MOUNT_TOPOTEK_HEALTH_TIMEOUT_MS);
+}
+
+// take a picture.  returns true on success
+bool AP_Mount_Topotek::take_picture()
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return false;
+    }
+
+    // exit immediately if the memory card is abnormal
+    if (!_sdcard_status) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "%s SD card error", send_message_prefix);
+        return false;
+    }
+
+    // sample command: #TPUD2wCAP01
+    return send_fixedlen_packet(AddressByte::SYSTEM_AND_IMAGE, AP_MOUNT_TOPOTEK_ID3CHAR_CAPTURE, true, 1);
+}
+
+// start or stop video recording.  returns true on success
+// set start_recording = true to start record, false to stop recording
+bool AP_Mount_Topotek::record_video(bool start_recording)
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return false;
+    }
+
+    // exit immediately if the memory card is abnormal
+    if (!_sdcard_status) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "%s SD card error", send_message_prefix);
+        return false;
+    }
+
+    // sample command: #TPUD2wREC01
+    return send_fixedlen_packet(AddressByte::SYSTEM_AND_IMAGE, AP_MOUNT_TOPOTEK_ID3CHAR_RECORD_VIDEO, true, start_recording ? 1 : 0);
+}
+
+// set zoom specified as a rate
+bool AP_Mount_Topotek::set_zoom(ZoomType zoom_type, float zoom_value)
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return false;
+    }
+
+    // zoom rate
+    if (zoom_type == ZoomType::RATE) {
+        uint8_t zoom_cmd;
+        if (is_zero(zoom_value)) {
+            // stop zoom
+            zoom_cmd = 0;
+            _last_zoom_stop = true;
+        } else if (zoom_value < 0) {
+            // zoom out
+            zoom_cmd = 1;
+        } else {
+            // zoom in
+            zoom_cmd = 2;
+        }
+        // sample command: #TPUM2wZMC00
+    

@@ -1,0 +1,2122 @@
+
+            tmp = (tmp ~ (tmp << 4)) & 0xFF
+            crc = (crc >> 8) ~ (tmp << 8) ~ (tmp << 3) ~ (tmp >> 4)
+            crc = crc & 0xFFFF
+        end
+        return string.pack("<H", crc)
+    end
+
+    function self.parseMAVLink(byte)
+        -- parse a new byte and see if we've got MAVLink message
+        -- returns true if a packet was decoded, false otherwise
+        _mavbuffer = _mavbuffer .. string.char(byte)
+
+        -- parse buffer to find MAVLink packets
+        if #_mavbuffer == 1 and string.byte(_mavbuffer, 1) == PROTOCOL_MARKER_V1 and
+            _mavdecodestate == 0 then
+            -- we have a packet start
+            _mavdecodestate = 1
+            return
+        end
+
+        -- if we have a full header, try parsing
+        if #_mavbuffer == HEADER_LEN_V1 and _mavdecodestate == 1 then
+            local read_marker = 1
+            _, read_marker = string.unpack("<B", _mavbuffer, read_marker)
+            _payload_len, read_marker = string.unpack("<B", _mavbuffer,
+                                                      read_marker) -- payload is always the second byte
+            -- fetch seq/sysid/compid
+            _mavresult.seq, _mavresult.sysid, _mavresult.compid, read_marker =
+                string.unpack("<BBB", _mavbuffer, read_marker)
+            -- fetch the message id
+            _mavresult.msgid, _ =
+                string.unpack("<B", _mavbuffer, read_marker)
+
+            _mavdecodestate = 2
+            return
+        end
+
+        -- get payload
+        if _mavdecodestate == 2 and #_mavbuffer ==
+            (_payload_len + HEADER_LEN_V1) then
+            _mavdecodestate = 3
+            _mavresult.payload = string.sub(_mavbuffer, HEADER_LEN_V1 + 1)
+            return
+        end
+
+        -- get crc, then process if CRC ok
+        if _mavdecodestate == 3 and #_mavbuffer ==
+            (_payload_len + HEADER_LEN_V1 + 2) then
+            _mavdecodestate = 0
+            _mavresult.crc = string.sub(_mavbuffer, -2, -1)
+
+            local message_map = _messages[_mavresult.msgid]
+            if not message_map then
+                -- we don't know how to decode this message, bail on it
+                _mavbuffer = ""
+                return true
+            end
+
+            -- check CRC, if message defined
+            local crc_extra_msg = _crc_extra[_mavresult.msgid]
+            if crc_extra_msg ~= nil then
+                local calccrc = self.generateCRC(
+                                    string.sub(_mavbuffer, 2, -3) ..
+                                        string.char(crc_extra_msg))
+                if _mavresult.crc ~= calccrc then
+                    gcs:send_text(3,
+                                  "Bad CRC: " ..
+                                      self.bytesToString(_mavbuffer, -2, -1) ..
+                                      ", " .. self.bytesToString(calccrc, 1, 2))
+                    _mavbuffer = ""
+                    return
+                end
+            end
+
+            -- map all the fields out
+            local offset = 1
+            for _, v in ipairs(message_map) do
+                if v[3] then
+                    _mavresult[v[1]] = {}
+                    for j = 1, v[3] do
+                        _mavresult[v[1]][j], offset = string.unpack(v[2],
+                                                                    _mavresult.payload,
+                                                                    offset)
+                    end
+                else
+                    _mavresult[v[1]], offset = string.unpack(v[2],
+                                                             _mavresult.payload,
+                                                             offset)
+                end
+            end
+            -- only process COMMAND_LONG and COMMAND_INT and  MISSION_ITEM_INT messages
+            if _mavresult.msgid == self.MISSION_ITEM_INT then
+                -- goto somewhere (guided mode target)
+                if _mavresult.command == 16 then -- MAV_CMD_NAV_WAYPOINT
+                    local loc = Location()
+                    loc:lat(_mavresult.x)
+                    loc:lng(_mavresult.y)
+                    loc:alt(_mavresult.z * 100)
+                    if _mavresult.frame == 10 then -- MAV_FRAME_GLOBAL_TERRAIN_ALT
+                        loc:terrain_alt(true)
+                    elseif _mavresult.frame == 3 then -- MAV_FRAME_GLOBAL_RELATIVE_ALT
+                        loc:relative_alt(true)
+                    end
+                    vehicle:set_target_location(loc)
+                end
+            elseif _mavresult.msgid == self.SET_MODE then
+                vehicle:set_mode(_mavresult.custom_mode)
+            elseif _mavresult.msgid == self.COMMAND_LONG or _mavresult.msgid ==
+                self.COMMAND_INT then
+                if _mavresult.command == 400 then -- MAV_CMD_COMPONENT_ARM_DISARM
+                    if _mavresult.param1 == 1 then
+                        arming:arm()
+                    elseif _mavresult.param1 == 0 then
+                        arming:disarm()
+                    end
+                elseif _mavresult.command == 176 then -- MAV_CMD_DO_SET_MODE
+                    vehicle:set_mode(_mavresult.param2)
+                elseif _mavresult.command == 20 then -- MAV_CMD_NAV_RETURN_TO_LAUNCH (Mode RTL) may vary depending on frame
+                    if FWVersion:type() == 2 then -- copter
+                        vehicle:set_mode(6)
+                    elseif FWVersion:type() == 3 then -- plane
+                        vehicle:set_mode(11)
+                    elseif FWVersion:type() == 1 then -- rover
+                        vehicle:set_mode(11)
+                    end
+                elseif _mavresult.command == 21 then -- MAV_CMD_NAV_LAND (Mode LAND) may vary depending on frame
+                    if FWVersion:type() == 2 then -- copter
+                        vehicle:set_mode(9)
+                    elseif FWVersion:type() == 12 then -- blimp
+                        vehicle:set_mode(0)
+                    end
+                elseif _mavresult.command == 22 then -- MAV_CMD_NAV_TAKEOFF
+                    vehicle:start_takeoff(_mavresult.param7)
+                elseif _mavresult.command == 84 then -- MAV_CMD_NAV_VTOL_TAKEOFF
+                    vehicle:start_takeoff(_mavresult.param7)
+                elseif _mavresult.command == 85 then -- MAV_CMD_NAV_VTOL_LAND (Mode QLAND)
+                    vehicle:set_mode(20)
+                elseif _mavresult.command == 300 then -- MAV_CMD_MISSION_START --mode auto and then start mission
+                    if FWVersion:type() == 2 then -- copter
+                        vehicle:set_mode(3)
+                    elseif FWVersion:type() == 3 then -- plane
+                        vehicle:set_mode(10)
+                    elseif FWVersion:type() == 1 then -- rover
+                        vehicle:set_mode(10)
+                    elseif FWVersion:type() == 7 then -- sub
+                        vehicle:set_mode(3)
+                    end
+                elseif _mavresult.command == 2600 then -- MAV_CMD_CONTROL_HIGH_LATENCY
+                    if _mavresult.param1 == 1 then
+                        gcs:enable_high_latency_connections(true)
+                    else
+                        gcs:enable_high_latency_connections(false)
+                    end
+                end
+            end
+            _mavbuffer = ""
+            return true
+        end
+
+        -- packet too big ... start again
+        if #_mavbuffer > 263 then _mavbuffer = "" end
+        return false
+    end
+
+    function self.bytesToString(buf, start, stop)
+        local ret = ""
+        for idx = start, stop do
+            ret = ret .. string.format("0x%x ", buf:byte(idx), 1, -1) .. " "
+        end
+        return ret
+    end
+
+    function self.createMAVLink(message, msgid)
+        -- generate a mavlink message (V1 only)
+
+        -- create the payload
+        local message_map = _messages[msgid]
+        if not message_map then
+            -- we don't know how to encode this message, bail on it
+            gcs:send_text(3, "Unknown MAVLink message " .. msgid)
+            return nil
+        end
+
+        local packString = "<"
+        local packedTable = {}
+        local packedIndex = 1
+        for i, v in ipairs(message_map) do
+            if v[3] then
+                packString = (packString ..
+                                 string.rep(string.sub(v[2], 2), v[3]))
+                for j = 1, v[3] do
+                    packedTable[packedIndex] = message[message_map[i][1]][j]
+                    packedIndex = packedIndex + 1
+                end
+            else
+                packString = (packString .. string.sub(v[2], 2))
+                packedTable[packedIndex] = message[message_map[i][1]]
+                packedIndex = packedIndex + 1
+            end
+        end
+
+        local payload = string.pack(packString, table.unpack(packedTable))
+
+        -- create the header. Assume componentid of 1
+        local header = string.pack('<BBBBBB', PROTOCOL_MARKER_V1, #payload,
+                                   _txseqid, param:get('SYSID_THISMAV'), 1,
+                                   msgid)
+
+        -- generate the CRC
+        local crc_extra_msg = _crc_extra[msgid]
+        local crc = self.generateCRC(string.sub(header, 2) .. payload ..
+                                         string.char(crc_extra_msg))
+
+        -- iterate sequence id
+        _txseqid = (_txseqid + 1) % 255
+
+        return header .. payload .. crc
+    end
+
+    -- return the instance
+    return self
+end
+
+-- Transmitted HIGH_LATENCY2 packet
+local hl2 = {}
+hl2.timestamp = 0
+hl2.latitude = 0
+hl2.longitude = 0
+hl2.custom_mode = 0
+hl2.altitude = 0
+hl2.target_altitude = 0
+hl2.target_distance = 0
+hl2.wp_num = 0
+hl2.failure_flags = 0
+hl2.type = gcs:frame_type()
+hl2.autopilot = 3 -- MAV_AUTOPILOT_ARDUPILOTMEGA
+hl2.heading = 0
+hl2.target_heading = 0
+hl2.throttle = 0
+hl2.airspeed = 0
+hl2.airspeed_sp = 0
+hl2.groundspeed = 0
+hl2.windspeed = 0
+hl2.wind_heading = 0
+hl2.eph = 0
+hl2.epv = 0
+hl2.temperature_air = 0
+hl2.climb_rate = 0
+hl2.battery = 0
+hl2.custom0 = 1 -- MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+hl2.custom1 = 0
+hl2.custom2 = 0
+
+function wrap_360(angle)
+    local res = angle % 360
+    if res < 0 then res = res + 360 end
+    return res
+end
+
+-- Define the MAVLink processor
+local mavlink = MAVLinkProcessor()
+
+function HLSatcom()
+    -- read in any bytes from GCS and and send to MAVLink processor
+    -- only read in 1 packet at a time to avoid time overruns
+    while port:available() > 0 do
+        local byte = port:read()
+        if mavlink.parseMAVLink(byte) then break end
+    end
+
+    -- send HL2 packet every 5 sec
+    if gcs:get_high_latency_status() and (millis():tofloat() * 0.001) -
+        time_last_tx > 5 then
+
+        -- update HL2 packet
+        hl2.timestamp = millis():tofloat()
+        local position = ahrs:get_location()
+        local wind = ahrs:wind_estimate()
+
+        if position then
+            hl2.latitude = tonumber(position:lat())
+            hl2.longitude = tonumber(position:lng())
+            hl2.altitude = math.floor(tonumber(position:alt()) * 0.01)
+        end
+        if wind then
+            wind_xy = Vector2f()
+            wind_xy:x(wind:x())
+            wind_xy:y(wind:y())
+            hl2.windspeed = math.abs(math.floor(wind_xy:length() * 5))
+            hl2.wind_heading = math.floor(wrap_360(wind_xy:angle()) / 2)
+        end
+        hl2.custom_mode = vehicle:get_mode()
+
+        if vehicle:get_wp_distance_m() ~= nil then
+            hl2.target_distance = math.floor(vehicle:get_wp_distance_m() / 10)
+        end
+        if mission:get_current_nav_index() ~= nil then
+            hl2.wp_num = mission:get_current_nav_index()
+        end
+        if vehicle:get_wp_bearing_deg() ~= nil then
+            hl2.target_heading = math.floor(wrap_360(
+                                                vehicle:get_wp_bearing_deg()) /
+                                                2)
+        end
+
+        -- failure flags
+        hl2.failure_flags = 0
+        if not ahrs:healthy() then
+            hl2.failure_flags = hl2.failure_flags + 4096 -- HL_FAILURE_FLAG_ESTIMATOR
+        end
+        if battery:num_instances() > 0 and not battery:healthy(0) then
+            hl2.failure_flags = hl2.failure_flags + 128 -- HL_FAILURE_FLAG_BATTERY
+        end
+        if gps:num_sensors() > 0 and gps:status(0) <= gps.NO_FIX then
+            hl2.failure_flags = hl2.failure_flags + 1 -- HL_FAILURE_FLAG_GPS
+        end
+        if (FWVersion:type() == 2 or FWVersion:type() == 3) and terrain:status() ==
+            terrain.TerrainStatusUnhealthy then
+            -- only for copter and plane
+            hl2.failure_flags = hl2.failure_flags + 64 -- HL_FAILURE_FLAG_TERRAIN
+        end
+        if not rc:has_valid_input() then
+            hl2.failure_flags = hl2.failure_flags + 256 -- HL_FAILURE_FLAG_RC_RECEIVER
+        end
+
+        hl2.heading = math.floor(wrap_360(math.deg(ahrs:get_yaw())) / 2)
+        hl2.throttle = math.floor(gcs:get_hud_throttle())
+        if ahrs:airspeed_estimate() ~= nil then
+            hl2.airspeed = math.abs(math.floor(ahrs:airspeed_estimate() * 5))
+        end
+        -- hl2.airspeed_sp = 0
+        hl2.groundspeed = math.abs(math.floor(
+                                       ahrs:groundspeed_vector():length() * 5))
+
+        hl2.temperature_air = math.floor(baro:get_external_temperature())
+
+        if battery:num_instances() > 0 and battery:capacity_remaining_pct(0) ~= nil then
+            hl2.battery = battery:capacity_remaining_pct(0)
+        else
+            hl2.battery = 0
+        end
+        
+        -- just sending armed state here for simplicity. Flight mode is in the custom_mode field
+        if arming:is_armed() then
+            hl2.custom0 = 129 -- MAV_MODE_FLAG_SAFETY_ARMED + MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        else
+            hl2.custom0 = 1 -- MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        end
+
+        local newpkt = mavlink.createMAVLink(hl2, mavlink.HIGH_LATENCY2)
+        gcs:send_text(3,
+                      "Sent HL2 packet, size: " .. tostring(#newpkt) .. ", seq " ..
+                          mavlink.getSeqID())
+
+        for idx = 1, #newpkt do port:write(newpkt:byte(idx)) end
+
+        time_last_tx = millis():tofloat() * 0.001
+
+    end
+
+    return HLSatcom, 100
+end
+
+return HLSatcom, 100
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              -- Example of receiving MAVLink commands
+
+local mavlink_msgs = require("MAVLink/mavlink_msgs")
+
+local COMMAND_ACK_ID = mavlink_msgs.get_msgid("COMMAND_ACK")
+local COMMAND_LONG_ID = mavlink_msgs.get_msgid("COMMAND_LONG")
+
+local msg_map = {}
+msg_map[COMMAND_ACK_ID] = "COMMAND_ACK"
+msg_map[COMMAND_LONG_ID] = "COMMAND_LONG"
+
+-- initialize MAVLink rx with number of messages, and buffer depth
+mavlink:init(1, 10)
+
+-- register message id to receive
+mavlink:register_rx_msgid(COMMAND_LONG_ID)
+
+local MAV_CMD_DO_SET_MODE = 176
+local MAV_CMD_WAYPOINT_USER_1 = 31000
+
+-- Block AP parsing user1 so we can deal with it in the script
+-- Prevents "unsupported" ack
+mavlink:block_command(MAV_CMD_WAYPOINT_USER_1)
+
+function handle_command_long(cmd)
+    if (cmd.command == MAV_CMD_DO_SET_MODE) then
+        gcs:send_text(0, "Got mode change")
+
+    elseif (cmd.command == MAV_CMD_WAYPOINT_USER_1) then
+        -- return ack from command param value
+        return math.min(math.max(math.floor(cmd.param1), 0), 5)
+    end
+    return nil
+end
+
+function update()
+    local msg, chan = mavlink:receive_chan()
+    if (msg ~= nil) then
+        local parsed_msg = mavlink_msgs.decode(msg, msg_map)
+        if (parsed_msg ~= nil) then
+
+            local result
+            if parsed_msg.msgid == COMMAND_LONG_ID then
+                result = handle_command_long(parsed_msg)
+            end
+
+            if (result ~= nil) then
+                -- Send ack if the command is one were intrested in
+                local ack = {}
+                ack.command = parsed_msg.command
+                ack.result = result
+                ack.progress = 0
+                ack.result_param2 = 0
+                ack.target_system = parsed_msg.sysid
+                ack.target_component = parsed_msg.compid
+
+                mavlink:send_chan(chan, mavlink_msgs.encode("COMMAND_ACK", ack))
+            end
+        end
+    end
+
+    return update, 1000
+end
+
+return update()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     -- This script is a test for AP_Mission bindings
+
+local last_mission_index = mission:get_current_nav_index()
+
+function update() -- this is the loop which periodically runs
+
+  -- check for scripting DO commands in the mission
+  local time_ms, param1, param2, param3, param4 = mission_receive()
+  if time_ms then
+    gcs:send_text(0, string.format("Scripting CMD @ %u ms, %i, %0.2f, %0.2f, %0.2f", time_ms:tofloat(), param1, param2, param3, param4))
+  end
+
+  local mission_state = mission:state()
+
+  -- make sure the mission is running
+  if mission_state == mission.MISSION_COMPLETE then
+    gcs:send_text(0, "LUA: Mission Complete")
+    return update, 1000 -- reschedules the loop
+  elseif mission_state == mission.MISSION_STOPPED then
+    gcs:send_text(0, "LUA: Mission stopped")
+    return update, 1000 -- reschedules the loop
+  end
+
+  local mission_index = mission:get_current_nav_index()
+
+  -- see if we have changed since we last checked
+  if mission_index ~= last_mission_index then
+
+    gcs:send_text(0, "LUA: New Mission Item") -- we spotted a change
+
+    -- print the current and previous nav commands
+    gcs:send_text(0, string.format("Prev: %d, Current: %d",mission:get_prev_nav_cmd_id(),mission:get_current_nav_id()))
+
+    last_mission_index = mission_index;
+
+    -- num commands includes home so - 1
+    local mission_length = mission:num_commands() - 1
+    if mission_length > 1 and mission_index == mission_length then
+      local jump_to = 1
+      if mission_length > 2 then
+        -- jump back to a random mission item
+        jump_to = math.random(mission_length - 1)  -- no point jump to the end so - 1
+      end
+      if mission:set_current_cmd(jump_to) then
+        gcs:send_text(0, string.format("LUA: jumped to mission item %d",jump_to))
+      else
+        gcs:send_text(0, "LUA: mission item jump failed")
+      end
+    end
+  end
+
+  return update, 1000 -- reschedules the loop
+end
+
+return update() -- run immediately before starting to reschedule
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            -- This script is an example setting up a custom motor matrix mix
+
+-- this is the config for hexacopter with the motor rotations configured for improved fault tolerance
+-- see: https://arxiv.org/pdf/1403.5986.pdf
+
+-- duplicate the #defines from AP_Motors
+local AP_MOTORS_MATRIX_YAW_FACTOR_CW = -1
+local AP_MOTORS_MATRIX_YAW_FACTOR_CCW = 1
+
+local AP_MOTORS_MOT_1 = 0
+local AP_MOTORS_MOT_2 = 1
+local AP_MOTORS_MOT_3 = 2
+local AP_MOTORS_MOT_4 = 3
+local AP_MOTORS_MOT_5 = 4
+local AP_MOTORS_MOT_6 = 5
+
+-- helper function duplication of the one found in AP_MotorsMatrix
+local function add_motor(motor_num, angle_degrees, yaw_factor, testing_order)
+
+    MotorsMatrix:add_motor_raw(motor_num,math.cos(math.rad(angle_degrees + 90)),
+                                         math.cos(math.rad(angle_degrees)),
+                                         yaw_factor,
+                                         testing_order)
+
+end
+
+-- this duplicates the add motor format used in AP_Motors for ease of modification of existing mixes
+add_motor(AP_MOTORS_MOT_1,  90, AP_MOTORS_MATRIX_YAW_FACTOR_CW,  2)
+add_motor(AP_MOTORS_MOT_2, -90, AP_MOTORS_MATRIX_YAW_FACTOR_CCW, 5)
+add_motor(AP_MOTORS_MOT_3, -30, AP_MOTORS_MATRIX_YAW_FACTOR_CCW, 6)
+add_motor(AP_MOTORS_MOT_4, 150, AP_MOTORS_MATRIX_YAW_FACTOR_CCW, 3)
+add_motor(AP_MOTORS_MOT_5,  30, AP_MOTORS_MATRIX_YAW_FACTOR_CW,  1)
+add_motor(AP_MOTORS_MOT_6,-150, AP_MOTORS_MATRIX_YAW_FACTOR_CW,  4)
+
+assert(MotorsMatrix:init(6), "Failed to init MotorsMatrix")
+
+motors:set_frame_string("fault tolerant hex")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    -- This script is an example setting up a custom motor matrix mix
+
+-- duplicate the standard + Quad mix
+MotorsMatrix:add_motor_raw(0,-1, 0, 1, 2)
+MotorsMatrix:add_motor_raw(1, 1, 0, 1, 4)
+MotorsMatrix:add_motor_raw(2, 0, 1,-1, 1)
+MotorsMatrix:add_motor_raw(3, 0,-1,-1, 3)
+
+assert(MotorsMatrix:init(4), "Failed to init MotorsMatrix")
+
+motors:set_frame_string("scripting plus example")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                -- This script is an example setting up a custom dynamic motor matrix
+-- allowing a vehicle to change geometry in flight
+
+-- this mixer is for a plus quad copter, the default SITL vehicle.
+-- Setup motor number (zero indexed) and testing order (1 indexed)
+Motors_dynamic:add_motor(0, 2)
+Motors_dynamic:add_motor(1, 4)
+Motors_dynamic:add_motor(2, 1)
+Motors_dynamic:add_motor(3, 3)
+
+factors = motor_factor_table()
+
+-- Roll for motors 1 - 4
+factors:roll(0, -0.5)
+factors:roll(1,  0.5)
+factors:roll(2,  0)
+factors:roll(3,  0)
+
+-- pitch for motors 1 -4
+factors:pitch(0,  0)
+factors:pitch(1,  0)
+factors:pitch(2,  0.5)
+factors:pitch(3, -0.5)
+
+-- yaw for motors 1 -4
+factors:yaw(0,  0.5)
+factors:yaw(1,  0.5)
+factors:yaw(2, -0.5)
+factors:yaw(3, -0.5)
+
+-- throttle for motors 1 -4
+factors:throttle(0,  1)
+factors:throttle(1,  1)
+factors:throttle(2,  1)
+factors:throttle(3,  1)
+
+-- must load factors before init
+Motors_dynamic:load_factors(factors)
+
+-- were expecting 4 motors
+assert(Motors_dynamic:init(4), "Failed to init Motors_dynamic")
+
+-- at any time we can then re-load new factors
+Motors_dynamic:load_factors(factors)
+
+motors:set_frame_string("Dynamic example")
+
+-- if doing changes in flight it is a good idea to use pcall to protect the script from crashing
+-- see 'protected_call.lua' example
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 -- Script decodes, checks and prints NMEA messages
+-- luacheck: only 0
+
+-- find the serial first (0) scripting serial port instance
+local port = serial:find_serial(0)
+
+if not port then
+    gcs:send_text(0, "No Scripting Serial Port")
+    return
+end
+
+-- begin the serial port
+-- NMEA is usually 4800 or 9600
+port:begin(4800)
+port:set_flow_control(0)
+
+-- table for strings used in decoding
+local term = {}
+local term_is_checksum = false
+local term_number = 1
+local checksum = 0
+local string_complete = false
+
+-- maximum number of terms we expect in the message
+local max_terms = 15
+-- maximum length of terms we expect
+local max_term_length = 5
+
+-- decode a basic NMEA string, only check the checksum
+local function decode_NMEA(byte)
+    local char = string.char(byte)
+    if (char == ',' or char == '\r' or char == '\n' or char == '*') and not string_complete then
+        if char == ',' then
+            -- end of a term, but still counted for checksum
+            checksum = checksum ~ byte
+        end
+
+        -- null terminate and decode latest term
+        if term_is_checksum then
+            -- test the checksum
+            string_complete = true
+            return checksum == tonumber(term[term_number],16)
+        else
+            -- we could further decode the message data here
+        end
+
+        if char == '*' then
+            -- the next characters make up the checksum
+            term_is_checksum = true
+        end
+
+        -- nothing in current term, add a space, makes the print work
+        if not term[term_number] then
+            term[term_number] = ' '
+        end
+
+        -- move onto next term
+        term_number = term_number + 1
+
+        return false
+    end
+    if char == '$' then
+        -- sentence begin
+        -- clear all flags, reset the term table and checksum
+        term_is_checksum = false
+        term_number = 1
+        checksum = 0
+        term = {}
+        string_complete = false
+        return false
+    end
+    
+    -- ordinary characters are added to term
+    -- if we have too many terms or they are too long then don't add to them
+    if term_number < max_terms then
+        if term[term_number] then
+            if string.len(term[term_number]) < max_term_length then
+                term[term_number] = term[term_number] .. char
+            end
+        else
+            term[term_number] = char
+        end
+    end
+    -- update the checksum
+    if not term_is_checksum then
+        -- checksum is bit wise xor of all characters in the string before the checksum
+        checksum = checksum ~ byte
+    end
+    return false
+end
+
+-- the main update function that is used to read in data from serial port
+function update()
+
+    if not port then
+        gcs:send_text(0, "no Scripting Serial Port")
+        return update, 100
+    end
+
+    local n_bytes = port:available()
+    while n_bytes > 0 do
+        local byte = port:read()
+        if decode_NMEA(byte) then
+            -- we have got a full NMEA message that has passed the checksum
+            -- concatenate back to full message and print
+            -- don't print the checksum
+            gcs:send_text(0, table.concat(term,",",1,#term-1))
+
+        end
+        n_bytes = n_bytes - 1
+    end
+
+    return update, 100
+end
+
+return update, 100
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the NMEA serial rangefinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:rf_mavlink --speedup=1
+
+param set SERIAL5_PROTOCOL 1
+param set RNGFND1_TYPE 10
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_MAVLink : public SerialRangeFinder {
+public:
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+private:
+    mavlink_status_t mav_status;
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the MaxsonarSerialLV rangefinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:maxsonarseriallv --speedup=1
+
+param set SERIAL5_PROTOCOL 9
+param set RNGFND1_TYPE 13
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_MaxsonarSerialLV : public SerialRangeFinder {
+public:
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the NMEA Serial rangefinder
+*/
+
+#include "SIM_RF_NMEA.h"
+
+#include <GCS_MAVLink/GCS.h>
+
+#include <stdio.h>
+#include <string.h>
+
+using namespace SITL;
+
+uint32_t RF_NMEA::packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen)
+{
+// Format 2 DBT NMEA mode (e.g. $SMDBT,5.94,f,1.81,M,67)
+// Format 3 DPT NMEA mode (e.g. $SMDPT,1.81,0.066)
+
+    ssize_t ret = snprintf((char*)buffer, buflen, "$SMDPT,%f,%f", alt_cm/100.0f, 0.01f);
+    uint8_t checksum = 0;
+    for (uint8_t i=1; i<ret; i++) { // 1 because the initial $ is skipped
+        checksum ^= buffer[i];
+    }
+    ret += snprintf((char*)&buffer[ret], buflen-ret, "*%02X\r\n", checksum);
+    return ret;
+}
+
+uint32_t RF_NMEA::packet_for_temperature(float temperature, uint8_t *buffer, uint8_t buflen)
+{
+    ssize_t ret = snprintf((char*)buffer, buflen, "$SMMTW,%f %f", temperature, 0.01);
+    uint8_t checksum = 0;
+    for (uint8_t i=1; i<ret; i++) { // 1 because the initial $ is skipped
+        checksum ^= buffer[i];
+    }
+    ret += snprintf((char*)&buffer[ret], buflen-ret, "*%02X\r\n", checksum);
+    return ret;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the NMEA serial rangefinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:nmea --speedup=1
+
+param set SERIAL5_PROTOCOL 9
+param set SERIAL5_BAUD 9600
+param set RNGFND1_TYPE 17
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_NMEA : public SerialRangeFinder {
+public:
+
+    uint32_t device_baud() const override { return 9600; }
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+    bool has_temperature() const override { return true; }
+    uint32_t packet_for_temperature(float temperature, uint8_t *buffer, uint8_t buflen) override;
+
+private:
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the RDS02UF rangefinder
+*/
+
+#include "SIM_RF_RDS02UF.h"
+
+#include <stdio.h>
+#include <AP_Math/crc.h>
+
+using namespace SITL;
+
+uint32_t RF_RDS02UF::packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen)
+{
+    const uint16_t fc_code = 0x3ff;  // NFI what this means
+    const uint16_t data_fc = 0x70c;  // NFI what this means
+
+    // bodgy fixed-length response to keep things simple:
+    union response_t {
+        struct {
+            uint8_t header1;
+            uint8_t header2;
+            uint8_t address;
+            uint8_t error_code;
+            uint8_t fc_code_l;
+            uint8_t fc_code_h;
+            uint8_t length_l;
+            uint8_t length_h;
+            uint8_t data0;  // used
+            uint8_t data1;  // used
+            uint8_t data2;
+            uint8_t data3;
+            uint8_t data4;
+            uint8_t data5;  // distance-low
+            uint8_t data6;  // distance-high
+            uint8_t data7;
+            uint8_t data8;
+            uint8_t data9;
+            uint8_t crc8;
+            uint8_t footer1;
+            uint8_t footer2;
+        };
+        uint8_t buffer[21];
+    } response{};
+
+    response.header1 = 0x55;
+    response.header2 = 0x55;
+    response.fc_code_l = fc_code & 0xff;
+    response.fc_code_h = fc_code >> 8;
+    response.length_l = 10;
+    response.length_h = 0;
+    response.data0 = data_fc & 0xff;
+    response.data1 = data_fc >> 8;
+    response.data5 = alt_cm  & 0xff;
+    response.data6 = alt_cm >> 8;
+    response.crc8 = crc8_rds02uf(&response.buffer[2], 16);
+    response.footer1 = 0xAA;
+    response.footer2 = 0xAA;
+
+    if (buflen < ARRAY_SIZE(response.buffer)) {
+        AP_HAL::panic("Too short a buffer");
+    }
+
+    memcpy(buffer, response.buffer, ARRAY_SIZE(response.buffer));
+
+    return ARRAY_SIZE(response.buffer);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the RDS02UF rangefinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:rds02uf --speedup=1
+
+param set SERIAL5_PROTOCOL 9
+param set RNGFND1_TYPE 43
+module load graph
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_RDS02UF : public SerialRangeFinder {
+public:
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Base class for simulator for the TeraRanger Serial RangeFinders
+*/
+
+#include "SIM_RF_TeraRanger_Serial.h"
+
+using namespace SITL;
+
+uint32_t RF_TeraRanger_Serial::packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen)
+{
+    uint16_t alt_mm = alt_cm * 10;
+    buffer[0] = 0x54; //header byte
+    buffer[1] = alt_mm >> 8; //MSB mm
+    buffer[2] = alt_mm & 0xff; //LSB mm
+
+    if (alt_cm > 3000) {
+       buffer[3] = 0xC4; //full strength, out of range, no overtemp
+    }
+    else {
+       buffer[3] = 0xC0; //full strength, no reading error, no overtemp
+    }
+    
+    // calculate CRC8:
+    buffer[4] = crc_crc8(buffer,4);;
+
+    return 5;
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the TeraRanger NEO RangeFinder
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:teraranger_serial --speedup=1
+param set SERIAL5_PROTOCOL 9
+param set RNGFND1_TYPE 35
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_TeraRanger_Serial : public SerialRangeFinder {
+public:
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Base class for simulator for the Benewake Serial RangeFinders
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_USD1 : public SerialRangeFinder {
+public:
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the USD1 v0 rangefinder
+*/
+
+#include "SIM_RF_USD1_v0.h"
+
+using namespace SITL;
+
+uint32_t RF_USD1_v0::packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen)
+{
+    const uint16_t reading = alt_cm / 2.5f;
+    buffer[0] = 0x48;
+    buffer[1] = reading & 0x7f;
+    buffer[2] = (reading >> 7) & 0xff;
+
+    // the detection routine is crap, frankly.  Needs lots of bytes
+    // *in one read* to work.
+    buffer[3] = 0x48;
+    buffer[4] = reading & 0x7f;
+    buffer[5] = (reading >> 7) & 0xff;
+    return 6;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the USD1 v0 Serial RangeFinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:USD1_v0 --speedup=1
+
+param set SERIAL5_PROTOCOL 9
+param set RNGFND1_TYPE 11
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_RF_USD1.h"
+
+namespace SITL {
+
+class RF_USD1_v0 : public RF_USD1 {
+public:
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the USD1 v1 rangefinder
+*/
+
+#include "SIM_RF_USD1_v1.h"
+
+using namespace SITL;
+
+uint32_t RF_USD1_v1::packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen)
+{
+    buffer[0] = 0xFE;
+    buffer[1] = 0; // unused?
+    buffer[2] = alt_cm & 0xff;
+    buffer[3] = alt_cm >> 8;
+    buffer[4] = 0; // unused?
+    // checksum:
+    buffer[5] = buffer[1] + buffer[2] + buffer[3] + buffer[4];
+
+    return 6;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the USD1 v1 Serial RangeFinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:USD1_v1 --speedup=1
+
+param set SERIAL5_PROTOCOL 9
+param set RNGFND1_TYPE 11
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_RF_USD1.h"
+
+namespace SITL {
+
+class RF_USD1_v1 : public RF_USD1 {
+public:
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the Wasp Serial rangefinder
+*/
+
+#include "SIM_RF_Wasp.h"
+
+#include <GCS_MAVLink/GCS.h>
+
+#include <stdio.h>
+#include <string.h>
+
+using namespace SITL;
+
+void RF_Wasp::check_configuration()
+{
+    const ssize_t n = read_from_autopilot(&_buffer[_buflen], ARRAY_SIZE(_buffer) - _buflen - 1);
+    if (n <= 0) {
+        return;
+    }
+    _buflen += n;
+
+    // ensure we have an entire line:
+    const char *cr = strchr(_buffer, '\n');
+    if (cr == nullptr) {
+        if (_buflen == ARRAY_SIZE(_buffer) - 1) {
+            // nuke it all
+            memset(_buffer, '\0', ARRAY_SIZE(_buffer));
+            _buflen = 0;
+        }
+        return;
+    }
+    if (!strncmp(_buffer, ">GO\n", _buflen)) {
+        config.go = true;
+        const char *response = "GO\n";
+        write_to_autopilot(response, strlen(response));
+    } else if (_buffer[0] == '>') {
+        bool set = false;
+        if (!set) {
+            // check for string settings
+            for (uint8_t i=0; i<ARRAY_SIZE(string_configs); i++) {
+                if (!strncmp(&_buffer[1], string_configs[i].name, strlen(string_configs[i].name))) {
+                    uint8_t offs = strlen(string_configs[i].name);
+                    offs += 1; // for '>'
+                    offs += 1; // for space
+                    strncpy(string_configs[i].value, &_buffer[offs], MIN(ARRAY_SIZE(config.format), unsigned(cr - _buffer - offs - 1))); // -1 for the lf, -1 for the cr
+//                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Wasp: config (%s) (%s)", string_configs[i].name, string_configs[i].value);
+                    char response[128];
+                    const size_t x = snprintf(response,
+                                              ARRAY_SIZE(response),
+                                              "%s %s\n",
+                                              string_configs[i].name,
+                                              string_configs[i].value);
+                    write_to_autopilot(response, x);
+                    set = true;
+                    break;
+                }
+            }
+        }
+        if (!set) {
+            // check for integer settings
+            for (uint8_t i=0; i<ARRAY_SIZE(integer_configs); i++) {
+                if (!strncmp(&_buffer[1], integer_configs[i].name, strlen(integer_configs[i].name))) {
+                    uint8_t offs = strlen(integer_configs[i].name);
+                    offs += 1; // for '>'
+                    offs += 1; // for space
+                    char tmp[32]{};
+                    strncpy(tmp, &_buffer[offs], MIN(ARRAY_SIZE(config.format), unsigned(cr - _buffer - offs - 1))); // -1 for the lf, -1 for the cr
+                    *(integer_configs[i].value) = atoi(tmp);
+//                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Wasp: config (%s) (%d)", integer_configs[i].name, *(integer_configs[i].value));
+                    char response[128];
+                    const size_t x = snprintf(response,
+                                              ARRAY_SIZE(response),
+                                              "%s %d\n",
+                                              integer_configs[i].name,
+                                              *(integer_configs[i].value));
+                    write_to_autopilot(response, x);
+                    set = true;
+                    break;
+                }
+            }
+        }
+        if (!set) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Wasp: unknown setting (%s)", &_buffer[0]);
+        }
+    }
+
+    // just nuke everything in the buffer, not just what we just
+    // processed.  This is until we sort out the extra-cr thing
+    memset(_buffer, '\0', ARRAY_SIZE(_buffer));
+    _buflen = 0;
+}
+
+void RF_Wasp::update(float range)
+{
+    check_configuration();
+    return SerialRangeFinder::update(range);
+}
+
+
+uint32_t RF_Wasp::packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen)
+{
+    return snprintf((char*)buffer, buflen, "%f\n", alt_cm/100.0f);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the Wasp serial rangefinder
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:wasp --speedup=1
+
+param set SERIAL5_PROTOCOL 9
+param set RNGFND1_TYPE 18
+graph RANGEFINDER.distance
+graph GLOBAL_POSITION_INT.relative_alt/1000-RANGEFINDER.distance
+reboot
+
+arm throttle
+rc 3 1600
+*/
+
+#pragma once
+
+#include "SIM_SerialRangeFinder.h"
+
+namespace SITL {
+
+class RF_Wasp : public SerialRangeFinder {
+public:
+
+    void update(float range) override;
+
+    uint32_t packet_for_alt(uint16_t alt_cm, uint8_t *buffer, uint8_t buflen) override;
+
+    // 20Hz; if Wasp driver doesn't get a reading each time its update
+    // is called it goes NoData
+    uint16_t reading_interval_ms() const override { return 50; }
+
+private:
+
+    void check_configuration();
+
+    struct {
+        bool go;
+        char format[16]; // e.g. ASCII
+        char baud[5]; // low or high
+        char lbe[7]; // big or little
+        int frq;
+        int aut;
+        int mavg;
+        int medf;
+        int avg;
+        int auv;
+    } config;
+
+    const struct {
+        const char *name;
+        char *value;
+    } string_configs[3] {
+        { "FMT", config.format },
+        { "BAUD", config.baud },
+        { "LBE", config.lbe },
+    };
+    const struct {
+        const char *name;
+        int *value;
+    } integer_configs[6] {
+        { "FRQ", &config.frq },
+        { "AUT", &config.aut },
+        { "MAVG", &config.mavg },
+        { "MEDF", &config.medf },
+        { "AVG", &config.avg },
+        { "AUV", &config.auv },
+    };
+
+    char _buffer[256]; // from-autopilot
+    uint8_t _buflen;
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #include "SIM_RGBLED.h"
+
+#ifdef WITH_SITL_RGBLED
+
+#include <AP_HAL/HAL.h>
+
+#ifdef HAVE_SFML_GRAPHICS_H
+#include <SFML/Graphics.h>
+#else
+#include <SFML/Graphics.hpp>
+#endif
+
+#include <AP_Notify/AP_Notify.h>
+
+void SIM_RGBLED::update_thread(void)
+{
+    sf::RenderWindow *w = nullptr;
+    {
+        WITH_SEMAPHORE(AP::notify().sf_window_mutex);
+        w = NEW_NOTHROW sf::RenderWindow(sf::VideoMode(width, height), name);
+    }
+
+    if (w == nullptr) {
+        AP_HAL::panic("Unable to create SIM_RGBLED window");
+    }
+
+    while (true) {
+        {
+            WITH_SEMAPHORE(AP::notify().sf_window_mutex);
+            sf::Event event;
+            while (w->pollEvent(event)) {
+                if (event.type == sf::Event::Closed) {
+                    w->close();
+                    break;
+                }
+            }
+            if (!w->isOpen()) {
+                break;
+            }
+            const uint32_t colour = red<<16 | green<<8 | blue;
+            if (colour != last_colour) {
+                last_colour = colour;
+                w->clear(sf::Color(red, green, blue, 255));
+                w->display();
+            }
+        }
+        usleep(10000);
+    }
+}
+
+// trampoline for update thread
+void *SIM_RGBLED::update_thread_start(void *obj)
+{
+    ((SIM_RGBLED *)obj)->update_thread();
+    return nullptr;
+}
+
+#endif  // WITH_SITL_RGBLED
+
+void SIM_RGBLED::init()
+{
+#ifdef WITH_SITL_RGBLED
+    pthread_create(&thread, NULL, update_thread_start, this);
+#endif
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #pragma once
+
+#include <stdint.h>
+#include <pthread.h>
+
+/*
+  A class to create output of some description or another for RGB LEDs.
+
+  Hopefully something visual, but perhaps just text
+*/
+
+class SIM_RGBLED
+{
+public:
+    SIM_RGBLED(const char *_name) :
+        name{_name}
+        { }
+
+    void init();
+
+    void set_colours(uint8_t _red, uint8_t _green, uint8_t _blue) {
+        red = _red;
+        green = _green;
+        blue = _blue;
+    }
+
+private:
+
+    const char *name;
+
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+
+    static constexpr uint8_t height = 50;
+    static constexpr uint8_t width = height;
+
+    pthread_t thread;
+    static void *update_thread_start(void *obj);
+    void update_thread(void);
+
+    uint32_t last_colour;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the RichenPower Hybrid generators
+*/
+
+#include <AP_Math/AP_Math.h>
+
+#include "SIM_RichenPower.h"
+#include "SITL.h"
+#include <AP_HAL/utility/sparse-endian.h>
+
+#include <stdio.h>
+#include <errno.h>
+
+using namespace SITL;
+
+extern const AP_HAL::HAL& hal;
+
+// table of user settable parameters
+const AP_Param::GroupInfo RichenPower::var_info[] = {
+
+    // @Param: ENABLE
+    // @DisplayName: RichenPower Generator sim enable/disable
+    // @Description: Allows you to enable (1) or disable (0) the RichenPower simulator
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("ENABLE", 0, RichenPower, _enabled, 0),
+
+    // @Param: CTRL_PIN
+    // @DisplayName: Pin RichenPower is connectred to
+    // @Description: The pin number that the RichenPower spinner servo is connected to. (start at 1)
+    // @Range: 0 15
+    // @User: Advanced
+    AP_GROUPINFO("CTRL", 2, RichenPower, _ctrl_pin, -1),
+
+    AP_GROUPEND
+};
+
+RichenPower::RichenPower() : SerialDevice::SerialDevice()
+{
+    ASSERT_STORAGE_SIZE(RichenPacket, 70);
+
+    AP_Param::setup_object_defaults(this, var_info);
+
+    u.packet.magic1 = 0xAA;
+    u.packet.magic2 = 0x55;
+
+    u.packet.version_major = 0x0A;
+    u.packet.version_minor = 0x00;
+
+    u.packet.footermagic1 = 0x55;
+    u.packet.footermagic2 = 0xAA;
+}
+
+void RichenPower::set_run_state(State newstate) {
+    hal.console->printf("Moving to state %u from %u\n", (unsigned)newstate, (unsigned)_state);
+    _state = newstate;
+}
+
+void RichenPower::update(const struct sitl_input &input)
+{
+    if (!_enabled.get()) {
+        return;
+    }
+    update_control_pin(input);
+    update_send();
+}
+
+void RichenPower::update_control_pin(const struct sitl_input &input)
+{
+    const uint32_t now = AP_HAL::millis();
+
+    static const uint16_t INPUT_SERVO_PWM_STOP = 1200;
+    static const uint16_t INPUT_SERVO_PWM_IDLE = 1500;
+    // static const uint16_t INPUT_SERVO_PWM_RUN = 1900;
+
+    // RICHENPOWER, 13:47
+    // 1100~1300 for engine stop, 1300~1800 for idle, and 1800~2000 for run
+
+    const uint16_t control_pwm = _ctrl_pin >= 1 ? input.servos[_ctrl_pin-1] : -1;
+    if (_state != State::STOPPING) {
+        if (control_pwm <= INPUT_SERVO_PWM_STOP && _state != State::STOP) {
+            if (stop_start_ms == 0) {
+                stop_start_ms = now;
+            }
+        } else {
+            stop_start_ms = 0;
+        }
+    }
+    // ::fprintf(stderr, "stop_start_ms=%u\n", stop_start_ms);
+    State newstate;
+    if (control_pwm <= INPUT_SERVO_PWM_STOP) {
+        // stop
+        if (stop_start_ms == 0 || now - stop_start_ms > 30000) {
+            newstate = State::STOP;
+        } else {
+            newstate = State::STOPPING;
+        }
+    } else if (control_pwm <= INPUT_SERVO_PWM_IDLE) {
+        newstate = State::IDLE;
+    } else {
+        newstate = State::RUN;
+    }
+    if (newstate != _state) {
+        set_run_state(newstate);
+    } else {
+        if (_state == State::STOP) {
+            // pass
+        } else {
+            _runtime_ms += now - _last_runtime_ms;
+        }
+        _last_runtime_ms = now;
+    }
+
+    // RICHENPOWER, 13:49
+    // Idle RMP 4800 +-300, RUN RPM 13000 +- 1500
+
+    switch (_state) {
+    case State::STOP:
+        generatorengine.desired_rpm = 0;
+        break;
+    case State::IDLE:
+    case State::STOPPING:
+        generatorengine.desired_rpm = 4800; // +/- 300
+        break;
+    case State::RUN:
+        generatorengine.desired_rpm = 13000; // +/- 1500
+        break;
+    }
+
+    _current_current = AP::sitl()->state.battery_current;
+    _current_current = MIN(_current_current, max_current);
+
+    generatorengine.current_current = _current_current;
+    generatorengine.max_current = max_current;
+    generatorengine.max_slew_rpm_per_second = 2000;
+
+    generatorengine.update();
+
+    _current_rpm = generatorengine.current_rpm;
+}
+
+void RichenPower::RichenUnion::update_checksum()
+{
+    packet.checksum = 0;
+    for (uint8_t i=1; i<6; i++) {
+        packet.checksum += htobe16(checksum_buffer[i]);
+    }
+    packet.checksum = htobe16(packet.checksum);
+}
+
+void RichenPower::update_send()
+{
+    // just send a chunk of data at 1Hz:
+    const uint32_t now = AP_HAL::millis();
+    if (now - last_sent_ms < 1000) {
+        return;
+    }
+    last_sent_ms = now;
+
+    u.packet.rpm = htobe16(_current_rpm);
+    uint32_t runtime_seconds_remainder = _runtime_ms / 1000;
+    u.packet.runtime_hours = runtime_seconds_remainder / 3600;
+    runtime_seconds_remainder %= 3600;
+    u.packet.runtime_minutes = runtime_seconds_remainder / 60;
+    runtime_seconds_remainder %= 60;
+    u.packet.runtime_seconds = runtime_seconds_remainder;
+
+    u.packet.runtime_seconds = runtime_seconds_remainder;
+
+    const int32_t seconds_until_maintenance = (original_seconds_until_maintenance - _runtime_ms/1000.0f);
+    uint16_t errors = htobe16(u.packet.errors);
+    if (seconds_until_maintenance <= 0) {
+        u.packet.seconds_until_maintenance = htobe32(0);
+        errors |= (1U<<(uint8_t(Errors::MaintenanceRequired)));
+    } else {
+        u.packet.seconds_until_maintenance = htobe32(seconds_until_maintenance);
+        errors &= ~(1U<<(uint8_t(Errors::MaintenanceRequired)));
+    }
+    u.packet.errors = htobe16(errors);
+
+    switch (_state) {
+    case State::IDLE:
+    case State::RUN:
+        u.packet.output_current = htobe16(_current_current * 100);
+        // +/- 3V, depending on draw
+        u.packet.output_voltage = htobe16(100*base_supply_voltage - 3 * (_current_current / max_current));
+        break;
+    case State::STOP:
+    default:
+        u.packet.output_current = 0;
+        u.packet.output_voltage = 0;
+        break;
+    }
+
+    enum class Mode {
+        IDLE = 0,
+        RUN = 1,
+        CHARGE = 2,
+        BALANCE = 3,
+        OFF = 4,
+    };
+    switch (_state) {
+    case State::STOP:
+        u.packet.mode = (uint8_t)Mode::OFF;
+        break;
+    case State::STOPPING:
+    case State::IDLE:
+        u.packet.mode = (uint8_t)Mode::IDLE;
+        break;
+    case State::RUN:
+        u.packet.mode = (uint8_t)Mode::RUN;
+        break;
+    }
+
+    u.update_checksum();
+
+    // const uint8_t data[] = {
+    //     0xAA, 0x55, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x1E, 0xB0, 0x00, 0x10, 0x00, 0x00, 0x23, 0x7A, 0x23,
+    //     0x7A, 0x11, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0xBE, 0x55, 0xAA,
+    // };
+
+    if (write_to_autopilot((char*)u.parse_buffer, ARRAY_SIZE(u.parse_buffer)) != ARRAY_SIZE(u.parse_buffer)) {
+        AP_HAL::panic("Failed to write to autopilot: %s", strerror(errno));
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Simulator for the RichenPower Hybrid generators
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -A --serial5=sim:richenpower --speedup=1 --console
+
+param set SERIAL5_PROTOCOL 30
+param set SERIAL5_BAUD 9600
+param set SIM_RICH_ENABLE 1
+param set SERVO8_FUNCTION 42
+param fetch
+param set SIM_RICH_CTRL 8
+param set RC9_OPTION 85
+param set GEN_TYPE 3
+
+reboot
+
+graph SERVO_OUTPUT_RAW.servo8_raw
+graph RC_CHANNELS.chan9_raw
+module load generator
+
+arm throttle (denied because generator not running)
+
+./Tools/autotest/autotest.py --gdb --debug build.ArduCopter fly.ArduCopter.RichenPower
+
+*/
+
+#pragma once
+
+#include <AP_Param/AP_Param.h>
+
+#include "SITL_Input.h"
+
+#include "SIM_SerialDevice.h"
+#include "SIM_GeneratorEngine.h"
+
+namespace SITL {
+
+class RichenPower : public SerialDevice {
+public:
+
+    RichenPower();
+
+    // update state
+    void update(const struct sitl_input &input);
+
+    static const AP_Param::GroupInfo var_info[];
+
+private:
+
+    // this is what the generator supplies when running full-tilt but
+    // with no load
+    const float base_supply_voltage = 50.0f;
+    const float max_current = 50.0f;
+    const uint32_t original_seconds_until_maintenance = 20*60; // 20 minutes
+
+// They have been... we know that the voltage drops to mid 46v
+// typically if gennie stops
+// So we set batt fs high 46s
+// Gennie keeps batts charged to 49v + typically
+
+    uint32_t last_sent_ms;
+
+    void update_control_pin(const struct sitl_input &input);
+    void update_send();
+
+    enum class State {
+        STOP = 21,
+        IDLE = 22,
+        RUN = 23,
+        STOPPING = 24, // idle cool-down period
+    };
+    State _state = State::STOP;
+    void set_run_state(State newstate);
+
+    AP_Int8  _enabled;  // enable richenpower sim
+    AP_Int8  _ctrl_pin;
+
+    float _current_rpm;
+    uint32_t _runtime_ms;
+    uint32_t _last_runtime_ms;
+
+    float _current_current;
+
+    enum class Errors {
+        MaintenanceRequired = 0,
+    };
+
+    // packet to send:
+    struct PACKED RichenPacket {
+        uint8_t magic1;
+        uint8_t magic2;
+        uint8_t version_minor;
+        uint8_t version_major;
+        uint8_t runtime_minutes;
+        uint8_t runtime_seconds;
+        uint16_t runtime_hours;
+        uint32_t seconds_until_maintenance;
+        uint16_t errors;
+        uint16_t rpm;
+        uint16_t throttle;
+        uint16_t idle_throttle;
+        uint16_t output_voltage;
+        uint16_t output_current;
+        uint16_t dynamo_current;
+        uint8_t unknown1;
+        uint8_t mode;
+        uint8_t unknown6[38]; // "data"?!
+        uint16_t checksum;
+        uint8_t footermagic1;
+        uint8_t footermagic2;
+    };
+
+    union RichenUnion {
+        uint8_t parse_buffer[70];
+        uint16_t checksum_buffer[35];
+        struct RichenPacket packet;
+
+        void update_checksum();
+    };
+    RichenUnion u;
+
+    // time we were asked to stop; 
+    uint32_t stop_start_ms;
+
+    SIM_GeneratorEngine generatorengine;
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  rover simulator class
+*/
+
+#include "SIM_Rover.h"
+
+#include <string.h>
+#include <stdio.h>
+
+#include <AP_Math/AP_Math.h>
+
+namespace SITL {
+
+SimRover::SimRover(const char *frame_str) :
+    Aircraft(frame_str)
+{
+    skid_steering = strstr(frame_str, "skid") != nullptr;
+
+    if (skid_steering) {
+        printf("SKID Steering Rover Simulation Started\n");
+        // these are taken from a 6V wild thumper with skid steering,
+        // with a sabertooth controller
+        max_accel = 14;
+        max_speed = 4;
+        return;
+    }
+
+    vectored_thrust = strstr(frame_str, "vector") != nullptr;
+    if (vectored_thrust) {
+        printf("Vectored Thrust Rover Simulation Started\n");
+    }
+
+    omni3 = strstr(frame_str, "omni3mecanum") != nullptr;
+    if (omni3) {
+        printf("Omni3 Mecanum Rover Simulation Started\n");
+    }
+
+    lock_step_scheduled = true;
+}
+
+/*
+  return turning circle (diameter) in meters for steering angle proportion in degrees
+*/
+float SimRover::turn_circle(float steering) const
+{
+    if (fabsf(steering) < 1.0e-6) {
+        return 0;
+    }
+    return turning_circle * sinf(radians(max_wheel_turn)) / sinf(radians(steering*max_wheel_turn));
+}
+
+/*
+   return yaw rate in degrees/second given steering_angle and speed
+*/
+float SimRover::calc_yaw_rate(float steering, float speed)
+{
+    if (skid_steering) {
+        return constrain_float(steering * skid_turn_rate, -MAX_YAW_RATE, MAX_YAW_RATE);
+    }
+    if (vectored_thrust) {
+        return constrain_float(steering * vectored_turn_rate_max, -MAX_YAW_RATE, MAX_YAW_RATE);
+    }
+    if (fabsf(steering) < 1.0e-6 or fabsf(speed) < 1.0e-6) {
+        return 0;
+    }
+    float d = turn_circle(steering);
+    float c = M_PI * d;
+    float t = c / speed;
+    float rate = constrain_float(360.0f / t, -MAX_YAW_RATE, MAX_YAW_RATE);
+    return rate;
+}
+
+/*
+  return lateral acceleration in m/s/s
+*/
+float SimRover::calc_lat_accel(float steering_angle, float speed)
+{
+    float yaw_rate = calc_yaw_rate(steering_angle, speed);
+    float accel = radians(yaw_rate) * speed;
+    return accel;
+}
+
+/*
+  update the rover simulation by one time step
+ */
+void SimRover::update(const struct sitl_input &input)
+{
+    // how much time has passed?
+    float delta_time = frame_time_us * 1.0e-6f;
+
+    // update gyro and accel_body according to frame type
+    if (omni3) {
+        update_omni3(input, delta_time);
+    } else {
+        update_ackermann_or_skid(input, delta_time);
+    }
+
+    // common to all rovers
+
+    // now in earth frame
+    Vector3f accel_earth = dcm * accel_body;
+    accel_earth += Vector3f(0, 0, GRAVITY_MSS);
+
+    // we are on the ground, so our vertical accel is zero
+    accel_earth.z = 0;
+
+    // work out acceleration as seen by the accelerometers. It sees the kinematic
+    // acceleration (ie. real movement), plus gravity
+    accel_body = dcm.transposed() * (accel_earth + Vector3f(0, 0, -GRAVITY_MSS));
+
+    // new velocity vector
+    velocity_ef += accel_earth * delta_time;
+
+    // new position vector
+    position += (velocity_ef * delta_time).todouble();
+
+    update_external_payload(input);
+
+    // update lat/lon/altitude
+    update_position();
+    time_advance();
+
+    // update magnetic field
+    update_mag_field_bf();
+}
+
+/*
+  update the ackermann or skid rover simulation by one time step
+ */
+void SimRover::update_ackermann_or_skid(const struct sitl_input &input, float delta_time)
+{
+    float steering, throttle;
+
+    // if in skid steering 

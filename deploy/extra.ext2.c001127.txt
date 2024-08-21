@@ -1,0 +1,2720 @@
+s_leg;
+        }
+    } else {
+
+        // get current alt above terrain
+        float origin_terr_offset;
+        if (!get_terrain_offset(origin_terr_offset)) {
+            return false;
+        }
+
+        // convert origin to alt-above-terrain if necessary
+        if (terrain_alt) {
+            // new destination is alt-above-terrain, previous destination was alt-above-ekf-origin
+            _origin.z -= origin_terr_offset;
+            _pos_control.set_pos_offset_z_cm(_pos_control.get_pos_offset_z_cm() + origin_terr_offset);
+        } else {
+            // new destination is alt-above-ekf-origin, previous destination was alt-above-terrain
+            _origin.z += origin_terr_offset;
+            _pos_control.set_pos_offset_z_cm(_pos_control.get_pos_offset_z_cm() - origin_terr_offset);
+        }
+    }
+
+    // update destination
+    _destination = destination;
+    _terrain_alt = terrain_alt;
+
+    if (_flags.fast_waypoint && !_this_leg_is_spline && !_next_leg_is_spline && !_scurve_next_leg.finished()) {
+        _scurve_this_leg = _scurve_next_leg;
+    } else {
+        _scurve_this_leg.calculate_track(_origin, _destination,
+                                         _pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms(),
+                                         get_wp_acceleration(), _wp_accel_z_cmss,
+                                         _scurve_snap * 100.0f, _scurve_jerk * 100.0f);
+        if (!is_zero(origin_speed)) {
+            // rebuild start of scurve if we have a non-zero origin speed
+            _scurve_this_leg.set_origin_speed_max(origin_speed);
+        }
+    }
+
+    _this_leg_is_spline = false;
+    _scurve_next_leg.init();
+    _next_destination.zero();       // clear next destination
+    _flags.fast_waypoint = false;   // default waypoint back to slow
+    _flags.reached_destination = false;
+
+    return true;
+}
+
+/// set next destination using position vector (distance from ekf origin in cm)
+///     terrain_alt should be true if destination.z is a desired altitude above terrain
+///     provide next_destination
+bool AC_WPNav::set_wp_destination_next(const Vector3f& destination, bool terrain_alt)
+{
+    // do not add next point if alt types don't match
+    if (terrain_alt != _terrain_alt) {
+        return true;
+    }
+
+    _scurve_next_leg.calculate_track(_destination, destination,
+                                     _pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms(),
+                                     get_wp_acceleration(), _wp_accel_z_cmss,
+                                     _scurve_snap * 100.0f, _scurve_jerk * 100.0);
+    if (_this_leg_is_spline) {
+        const float this_leg_dest_speed_max = _spline_this_leg.get_destination_speed_max();
+        const float next_leg_origin_speed_max = _scurve_next_leg.set_origin_speed_max(this_leg_dest_speed_max);
+        _spline_this_leg.set_destination_speed_max(next_leg_origin_speed_max);
+    }
+    _next_leg_is_spline = false;
+
+    // next destination provided so fast waypoint
+    _flags.fast_waypoint = true;
+
+    // record next destination
+    _next_destination = destination;
+
+    return true;
+}
+
+/// set waypoint destination using NED position vector from ekf origin in meters
+bool AC_WPNav::set_wp_destination_NED(const Vector3f& destination_NED)
+{
+    // convert NED to NEU and do not use terrain following
+    return set_wp_destination(Vector3f(destination_NED.x * 100.0f, destination_NED.y * 100.0f, -destination_NED.z * 100.0f), false);
+}
+
+/// set waypoint destination using NED position vector from ekf origin in meters
+bool AC_WPNav::set_wp_destination_next_NED(const Vector3f& destination_NED)
+{
+    // convert NED to NEU and do not use terrain following
+    return set_wp_destination_next(Vector3f(destination_NED.x * 100.0f, destination_NED.y * 100.0f, -destination_NED.z * 100.0f), false);
+}
+
+/// shifts the origin and destination horizontally to the current position
+///     used to reset the track when taking off without horizontal position control
+///     relies on set_wp_destination or set_wp_origin_and_destination having been called first
+void AC_WPNav::shift_wp_origin_and_destination_to_current_pos_xy()
+{
+    // Reset position controller to current location
+    _pos_control.init_xy_controller();
+
+    // get current and target locations
+    const Vector2f& curr_pos = _inav.get_position_xy_cm();
+
+    // shift origin and destination horizontally
+    _origin.xy() = curr_pos;
+    _destination.xy() = curr_pos;
+}
+
+/// shifts the origin and destination horizontally to the achievable stopping point
+///     used to reset the track when horizontal navigation is enabled after having been disabled (see Copter's wp_navalt_min)
+///     relies on set_wp_destination or set_wp_origin_and_destination having been called first
+void AC_WPNav::shift_wp_origin_and_destination_to_stopping_point_xy()
+{
+    // relax position control in xy axis
+    // removing velocity error also impacts stopping point calculation
+    _pos_control.relax_velocity_controller_xy();
+
+    // get current and target locations
+    Vector2f stopping_point;
+    get_wp_stopping_point_xy(stopping_point);
+
+    // shift origin and destination horizontally
+    _origin.xy() = stopping_point;
+    _destination.xy() = stopping_point;
+
+    // move pos controller target horizontally
+    _pos_control.set_pos_target_xy_cm(stopping_point.x, stopping_point.y);
+}
+
+/// get_wp_stopping_point_xy - returns vector to stopping point based on a horizontal position and velocity
+void AC_WPNav::get_wp_stopping_point_xy(Vector2f& stopping_point) const
+{
+    Vector2p stop;
+    _pos_control.get_stopping_point_xy_cm(stop);
+    stopping_point = stop.tofloat();
+}
+
+/// get_wp_stopping_point - returns vector to stopping point based on 3D position and velocity
+void AC_WPNav::get_wp_stopping_point(Vector3f& stopping_point) const
+{
+    Vector3p stop;
+    _pos_control.get_stopping_point_xy_cm(stop.xy());
+    _pos_control.get_stopping_point_z_cm(stop.z);
+    stopping_point = stop.tofloat();
+}
+
+/// advance_wp_target_along_track - move target location along track from origin to destination
+bool AC_WPNav::advance_wp_target_along_track(float dt)
+{
+    // calculate terrain adjustments
+    float terr_offset = 0.0f;
+    if (_terrain_alt && !get_terrain_offset(terr_offset)) {
+        return false;
+    }
+    const float offset_z_scaler = _pos_control.pos_offset_z_scaler(terr_offset, get_terrain_margin() * 100.0);
+
+    // input shape the terrain offset
+    _pos_control.update_pos_offset_z(terr_offset);
+
+    // get current position and adjust altitude to origin and destination's frame (i.e. _frame)
+    const Vector3f &curr_pos = _inav.get_position_neu_cm() - Vector3f{0, 0, terr_offset};
+    Vector3f curr_target_vel = _pos_control.get_vel_desired_cms();
+    curr_target_vel.z -= _pos_control.get_vel_offset_z_cms();
+
+    // Use _track_scalar_dt to slow down progression of the position target moving too far in front of aircraft
+    // _track_scalar_dt does not scale the velocity or acceleration
+    float track_scaler_dt = 1.0f;
+    // check target velocity is non-zero
+    if (is_positive(curr_target_vel.length_squared())) {
+        Vector3f track_direction = curr_target_vel.normalized();
+        const float track_error = _pos_control.get_pos_error_cm().dot(track_direction);
+        const float track_velocity = _inav.get_velocity_neu_cms().dot(track_direction);
+        // set time scaler to be consistent with the achievable aircraft speed with a 5% buffer for short term variation.
+        track_scaler_dt = constrain_float(0.05f + (track_velocity - _pos_control.get_pos_xy_p().kP() * track_error) / curr_target_vel.length(), 0.0f, 1.0f);
+    }
+
+    // Use vel_scaler_dt to slow down the trajectory time
+    // vel_scaler_dt scales the velocity and acceleration to be kinematically consistent
+    float vel_scaler_dt = 1.0;
+    if (is_positive(_wp_desired_speed_xy_cms)) {
+        update_vel_accel(_offset_vel, _offset_accel, dt, 0.0, 0.0);
+        const float vel_input = !_paused ? _wp_desired_speed_xy_cms * offset_z_scaler : 0.0;
+        shape_vel_accel(vel_input, 0.0, _offset_vel, _offset_accel, -get_wp_acceleration(), get_wp_acceleration(),
+                        _pos_control.get_shaping_jerk_xy_cmsss(), dt, true);
+        vel_scaler_dt = _offset_vel / _wp_desired_speed_xy_cms;
+    }
+
+    // change s-curve time speed with a time constant of maximum acceleration / maximum jerk
+    float track_scaler_tc = 1.0f;
+    if (!is_zero(_wp_jerk)) {
+        track_scaler_tc = 0.01f * get_wp_acceleration()/_wp_jerk;
+    }
+    _track_scalar_dt += (track_scaler_dt - _track_scalar_dt) * (dt / track_scaler_tc);
+
+    // target position, velocity and acceleration from straight line or spline calculators
+    Vector3f target_pos, target_vel, target_accel;
+
+    bool s_finished;
+    if (!_this_leg_is_spline) {
+        // update target position, velocity and acceleration
+        target_pos = _origin;
+        s_finished = _scurve_this_leg.advance_target_along_track(_scurve_prev_leg, _scurve_next_leg, _wp_radius_cm, get_corner_acceleration(), _flags.fast_waypoint, _track_scalar_dt * vel_scaler_dt * dt, target_pos, target_vel, target_accel);
+    } else {
+        // splinetarget_vel
+        target_vel = curr_target_vel;
+        _spline_this_leg.advance_target_along_track(_track_scalar_dt * vel_scaler_dt * dt, target_pos, target_vel);
+        s_finished = _spline_this_leg.reached_destination();
+    }
+
+    Vector3f accel_offset;
+    if (is_positive(target_vel.length_squared())) {
+        Vector3f track_direction = target_vel.normalized();
+        accel_offset = track_direction * _offset_accel * target_vel.length() / _wp_desired_speed_xy_cms;
+    }
+
+    target_vel *= vel_scaler_dt;
+    target_accel *= sq(vel_scaler_dt);
+    target_accel += accel_offset;
+
+    // convert final_target.z to altitude above the ekf origin
+    target_pos.z += _pos_control.get_pos_offset_z_cm();
+    target_vel.z += _pos_control.get_vel_offset_z_cms();
+    target_accel.z += _pos_control.get_accel_offset_z_cmss();
+
+    // pass new target to the position controller
+    _pos_control.set_pos_vel_accel(target_pos.topostype(), target_vel, target_accel);
+
+    // check if we've reached the waypoint
+    if (!_flags.reached_destination) {
+        if (s_finished) {
+            // "fast" waypoints are complete once the intermediate point reaches the destination
+            if (_flags.fast_waypoint) {
+                _flags.reached_destination = true;
+            } else {
+                // regular waypoints also require the copter to be within the waypoint radius
+                const Vector3f dist_to_dest = curr_pos - _destination;
+                if (dist_to_dest.length_squared() <= sq(_wp_radius_cm)) {
+                    _flags.reached_destination = true;
+                }
+            }
+        }
+    }
+
+    // successfully advanced along track
+    return true;
+}
+
+/// recalculate path with update speed and/or acceleration limits
+void AC_WPNav::update_track_with_speed_accel_limits()
+{
+    // update this leg
+    if (_this_leg_is_spline) {
+        _spline_this_leg.set_speed_accel(_pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms(),
+                                         get_wp_acceleration(), _wp_accel_z_cmss);
+    } else {
+        _scurve_this_leg.set_speed_max(_pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms());
+    }
+
+    // update next leg
+    if (_next_leg_is_spline) {
+        _spline_next_leg.set_speed_accel(_pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms(),
+                                         get_wp_acceleration(), _wp_accel_z_cmss);
+    } else {
+        _scurve_next_leg.set_speed_max(_pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms());
+    }
+}
+
+/// get_wp_distance_to_destination - get horizontal distance to destination in cm
+float AC_WPNav::get_wp_distance_to_destination() const
+{
+    return get_horizontal_distance_cm(_inav.get_position_xy_cm(), _destination.xy());
+}
+
+/// get_wp_bearing_to_destination - get bearing to next waypoint in centi-degrees
+int32_t AC_WPNav::get_wp_bearing_to_destination() const
+{
+    return get_bearing_cd(_inav.get_position_xy_cm(), _destination.xy());
+}
+
+/// update_wpnav - run the wp controller - should be called at 100hz or higher
+bool AC_WPNav::update_wpnav()
+{
+    // check for changes in speed parameter values
+    if (_check_wp_speed_change) {
+        if (!is_equal(_wp_speed_cms.get(), _last_wp_speed_cms)) {
+            set_speed_xy(_wp_speed_cms);
+            _last_wp_speed_cms = _wp_speed_cms;
+        }
+    }
+    if (!is_equal(_wp_speed_up_cms.get(), _last_wp_speed_up_cms)) {
+        set_speed_up(_wp_speed_up_cms);
+        _last_wp_speed_up_cms = _wp_speed_up_cms;
+    }
+    if (!is_equal(_wp_speed_down_cms.get(), _last_wp_speed_down_cms)) {
+        set_speed_down(_wp_speed_down_cms);
+        _last_wp_speed_down_cms = _wp_speed_down_cms;
+    }
+
+    // advance the target if necessary
+    bool ret = true;
+    if (!advance_wp_target_along_track(_pos_control.get_dt())) {
+        // To-Do: handle inability to advance along track (probably because of missing terrain data)
+        ret = false;
+    }
+
+    _pos_control.update_xy_controller();
+
+    _wp_last_update = AP_HAL::millis();
+
+    return ret;
+}
+
+// returns true if update_wpnav has been run very recently
+bool AC_WPNav::is_active() const
+{
+    return (AP_HAL::millis() - _wp_last_update) < 200;
+}
+
+// force stopping at next waypoint.  Used by Dijkstra's object avoidance when path from destination to next destination is not clear
+// only affects regular (e.g. non-spline) waypoints
+// returns true if this had any affect on the path
+bool AC_WPNav::force_stop_at_next_wp()
+{
+    // exit immediately if vehicle was going to stop anyway
+    if (!_flags.fast_waypoint) {
+        return false;
+    }
+
+    _flags.fast_waypoint = false;
+
+    // update this_leg's final velocity and next leg's initial velocity to zero
+    if (!_this_leg_is_spline) {
+        _scurve_this_leg.set_destination_speed_max(0);
+    }
+    if (!_next_leg_is_spline) {
+        _scurve_next_leg.init();
+    }
+
+    return true;
+}
+
+// get terrain's altitude (in cm above the ekf origin) at the current position (+ve means terrain below vehicle is above ekf origin's altitude)
+bool AC_WPNav::get_terrain_offset(float& offset_cm)
+{
+    // calculate offset based on source (rangefinder or terrain database)
+    switch (get_terrain_source()) {
+    case AC_WPNav::TerrainSource::TERRAIN_UNAVAILABLE:
+        return false;
+    case AC_WPNav::TerrainSource::TERRAIN_FROM_RANGEFINDER:
+        if (_rangefinder_healthy) {
+            offset_cm = _rangefinder_terrain_offset_cm;
+            return true;
+        }
+        return false;
+    case AC_WPNav::TerrainSource::TERRAIN_FROM_TERRAINDATABASE:
+#if AP_TERRAIN_AVAILABLE
+        float terr_alt = 0.0f;
+        AP_Terrain *terrain = AP::terrain();
+        if (terrain != nullptr &&
+            terrain->height_above_terrain(terr_alt, true)) {
+            offset_cm = _inav.get_position_z_up_cm() - (terr_alt * 100.0);
+            return true;
+        }
+#endif
+        return false;
+    }
+
+    // we should never get here
+    return false;
+}
+
+///
+/// spline methods
+///
+
+/// set_spline_destination waypoint using location class
+///     returns false if conversion from location to vector from ekf origin cannot be calculated
+///     next_destination should be the next segment's destination
+///     next_is_spline should be true if path to next_destination should be a spline
+bool AC_WPNav::set_spline_destination_loc(const Location& destination, const Location& next_destination, bool next_is_spline)
+{
+    // convert destination location to vector
+    Vector3f dest_neu;
+    bool dest_terr_alt;
+    if (!get_vector_NEU(destination, dest_neu, dest_terr_alt)) {
+        return false;
+    }
+
+    // convert next destination to vector
+    Vector3f next_dest_neu;
+    bool next_dest_terr_alt;
+    if (!get_vector_NEU(next_destination, next_dest_neu, next_dest_terr_alt)) {
+        return false;
+    }
+
+    // set target as vector from EKF origin
+    return set_spline_destination(dest_neu, dest_terr_alt, next_dest_neu, next_dest_terr_alt, next_is_spline);
+}
+
+/// set next destination (e.g. the one after the current destination) as a spline segment specified as a location
+///     returns false if conversion from location to vector from ekf origin cannot be calculated
+///     next_next_destination should be the next segment's destination
+bool AC_WPNav::set_spline_destination_next_loc(const Location& next_destination, const Location& next_next_destination, bool next_next_is_spline)
+{
+    // convert next_destination location to vector
+    Vector3f next_dest_neu;
+    bool next_dest_terr_alt;
+    if (!get_vector_NEU(next_destination, next_dest_neu, next_dest_terr_alt)) {
+        return false;
+    }
+
+    // convert next_next_destination to vector
+    Vector3f next_next_dest_neu;
+    bool next_next_dest_terr_alt;
+    if (!get_vector_NEU(next_next_destination, next_next_dest_neu, next_next_dest_terr_alt)) {
+        return false;
+    }
+
+    // set target as vector from EKF origin
+    return set_spline_destination_next(next_dest_neu, next_dest_terr_alt, next_next_dest_neu, next_next_dest_terr_alt, next_next_is_spline);
+}
+
+/// set_spline_destination waypoint using position vector (distance from ekf origin in cm)
+///     terrain_alt should be true if destination.z is a desired altitude above terrain (false if its desired altitudes above ekf origin)
+///     next_destination should be set to the next segment's destination
+///     next_terrain_alt should be true if next_destination.z is a desired altitude above terrain (false if its desired altitudes above ekf origin)
+///     next_destination.z  must be in the same "frame" as destination.z (i.e. if destination is a alt-above-terrain, next_destination should be too)
+bool AC_WPNav::set_spline_destination(const Vector3f& destination, bool terrain_alt, const Vector3f& next_destination, bool next_terrain_alt, bool next_is_spline)
+{
+    // re-initialise if previous destination has been interrupted
+    if (!is_active() || !_flags.reached_destination) {
+        wp_and_spline_init(_wp_desired_speed_xy_cms);
+    }
+
+    // update spline calculators speeds and accelerations
+    _spline_this_leg.set_speed_accel(_pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms(),
+                                     _pos_control.get_max_accel_xy_cmss(), _pos_control.get_max_accel_z_cmss());
+
+    // calculate origin and origin velocity vector
+    Vector3f origin_vector;
+    if (terrain_alt == _terrain_alt) {
+        if (_flags.fast_waypoint) {
+            // calculate origin vector
+            if (_this_leg_is_spline) {
+                // if previous leg was a spline we can use destination velocity vector for origin velocity vector
+                origin_vector = _spline_this_leg.get_destination_vel();
+            } else {
+                // use direction of the previous straight line segment
+                origin_vector = _destination - _origin;
+            }
+        }
+
+        // use previous destination as origin
+        _origin = _destination;
+    } else {
+
+        // use previous destination as origin
+        _origin = _destination;
+
+        // get current alt above terrain
+        float origin_terr_offset;
+        if (!get_terrain_offset(origin_terr_offset)) {
+            return false;
+        }
+
+        // convert origin to alt-above-terrain if necessary
+        if (terrain_alt) {
+            // new destination is alt-above-terrain, previous destination was alt-above-ekf-origin
+            _origin.z -= origin_terr_offset;
+            _pos_control.set_pos_offset_z_cm(_pos_control.get_pos_offset_z_cm() + origin_terr_offset);
+        } else {
+            // new destination is alt-above-ekf-origin, previous destination was alt-above-terrain
+            _origin.z += origin_terr_offset;
+            _pos_control.set_pos_offset_z_cm(_pos_control.get_pos_offset_z_cm() - origin_terr_offset);
+        }
+    }
+
+    // store destination location
+    _destination = destination;
+    _terrain_alt = terrain_alt;
+
+    // calculate destination velocity vector
+    Vector3f destination_vector;
+    if (terrain_alt == next_terrain_alt) {
+        if (next_is_spline) {
+            // leave this segment moving parallel to vector from origin to next destination
+            destination_vector = next_destination - _origin;
+        } else {
+            // leave this segment moving parallel to next segment
+            destination_vector = next_destination - _destination;
+        }
+    }
+    _flags.fast_waypoint = !destination_vector.is_zero();
+
+    // setup spline leg
+    _spline_this_leg.set_origin_and_destination(_origin, _destination, origin_vector, destination_vector);
+    _this_leg_is_spline = true;
+    _flags.reached_destination = false;
+
+    return true;
+}
+
+/// set next destination (e.g. the one after the current destination) as an offset (in cm, NEU frame) from the EKF origin
+///     next_terrain_alt should be true if next_destination.z is a desired altitude above terrain (false if its desired altitudes above ekf origin)
+///     next_next_destination should be set to the next segment's destination
+///     next_next_terrain_alt should be true if next_next_destination.z is a desired altitude above terrain (false if it is desired altitude above ekf origin)
+///     next_next_destination.z  must be in the same "frame" as destination.z (i.e. if next_destination is a alt-above-terrain, next_next_destination should be too)
+bool AC_WPNav::set_spline_destination_next(const Vector3f& next_destination, bool next_terrain_alt, const Vector3f& next_next_destination, bool next_next_terrain_alt, bool next_next_is_spline)
+{
+    // do not add next point if alt types don't match
+    if (next_terrain_alt != _terrain_alt) {
+        return true;
+    }
+
+    // calculate origin and origin velocity vector
+    Vector3f origin_vector;
+    if (_this_leg_is_spline) {
+        // if previous leg was a spline we can use destination velocity vector for origin velocity vector
+        origin_vector = _spline_this_leg.get_destination_vel();
+    } else {
+        // use the direction of the previous straight line segment
+        origin_vector = _destination - _origin;
+    }
+
+    // calculate destination velocity vector
+    Vector3f destination_vector;
+    if (next_terrain_alt == next_next_terrain_alt) {
+        if (next_next_is_spline) {
+            // leave this segment moving parallel to vector from this leg's origin (i.e. prev leg's destination) to next next destination
+            destination_vector = next_next_destination - _destination;
+        } else {
+            // leave this segment moving parallel to next segment
+            destination_vector = next_next_destination - next_destination;
+        }
+    }
+
+    // update spline calculators speeds and accelerations
+    _spline_next_leg.set_speed_accel(_pos_control.get_max_speed_xy_cms(), _pos_control.get_max_speed_up_cms(), _pos_control.get_max_speed_down_cms(),
+                                     _pos_control.get_max_accel_xy_cmss(), _pos_control.get_max_accel_z_cmss());
+
+    // setup next spline leg.  Note this could be made local
+    _spline_next_leg.set_origin_and_destination(_destination, next_destination, origin_vector, destination_vector);
+    _next_leg_is_spline = true;
+
+    // next destination provided so fast waypoint
+    _flags.fast_waypoint = true;
+
+    // update this_leg's final velocity to match next spline leg
+    if (!_this_leg_is_spline) {
+        _scurve_this_leg.set_destination_speed_max(_spline_next_leg.get_origin_speed_max());
+    } else {
+        _spline_this_leg.set_destination_speed_max(_spline_next_leg.get_origin_speed_max());
+    }
+
+    return true;
+}
+
+// convert location to vector from ekf origin.  terrain_alt is set to true if resulting vector's z-axis should be treated as alt-above-terrain
+//      returns false if conversion failed (likely because terrain data was not available)
+bool AC_WPNav::get_vector_NEU(const Location &loc, Vector3f &vec, bool &terrain_alt)
+{
+    // convert location to NE vector2f
+    Vector2f res_vec;
+    if (!loc.get_vector_xy_from_origin_NE(res_vec)) {
+        return false;
+    }
+
+    // convert altitude
+    if (loc.get_alt_frame() == Location::AltFrame::ABOVE_TERRAIN) {
+        int32_t terr_alt;
+        if (!loc.get_alt_cm(Location::AltFrame::ABOVE_TERRAIN, terr_alt)) {
+            return false;
+        }
+        vec.z = terr_alt;
+        terrain_alt = true;
+    } else {
+        terrain_alt = false;
+        int32_t temp_alt;
+        if (!loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, temp_alt)) {
+            return false;
+        }
+        vec.z = temp_alt;
+        terrain_alt = false;
+    }
+
+    // copy xy (we do this to ensure we do not adjust vector unless the overall conversion is successful
+    vec.x = res_vec.x;
+    vec.y = res_vec.y;
+
+    return true;
+}
+
+// helper function to calculate scurve jerk and jerk_time values
+// updates _scurve_jerk and _scurve_snap
+void AC_WPNav::calc_scurve_jerk_and_snap()
+{
+    // calculate jerk
+    _scurve_jerk = MIN(_attitude_control.get_ang_vel_roll_max_rads() * GRAVITY_MSS, _attitude_control.get_ang_vel_pitch_max_rads() * GRAVITY_MSS);
+    if (is_zero(_scurve_jerk)) {
+        _scurve_jerk = _wp_jerk;
+    } else {
+        _scurve_jerk = MIN(_scurve_jerk, _wp_jerk);
+    }
+
+    // calculate maximum snap
+    // Snap (the rate of change of jerk) uses the attitude control input time constant because multicopters
+    // lean to accelerate. This means the change in angle is equivalent to the change in acceleration
+    _scurve_snap = (_scurve_jerk * M_PI) / (2.0 * MAX(_attitude_control.get_input_tc(), 0.1f));
+    const float snap = MIN(_attitude_control.get_accel_roll_max_radss(), _attitude_control.get_accel_pitch_max_radss()) * GRAVITY_MSS;
+    if (is_positive(snap)) {
+        _scurve_snap = MIN(_scurve_snap, snap);
+    }
+    // reduce maximum snap by a factor of two from what the aircraft is capable of
+    _scurve_snap *= 0.5;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #pragma once
+
+#include <AP_Common/AP_Common.h>
+#include <AP_Param/AP_Param.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/SCurve.h>
+#include <AP_Math/SplineCurve.h>
+#include <AP_Common/Location.h>
+#include <AP_InertialNav/AP_InertialNav.h>     // Inertial Navigation library
+#include <AC_AttitudeControl/AC_PosControl.h>      // Position control library
+#include <AC_AttitudeControl/AC_AttitudeControl.h> // Attitude control library
+#include <AP_Terrain/AP_Terrain.h>
+#include <AC_Avoidance/AC_Avoid.h>                 // Stop at fence library
+
+// maximum velocities and accelerations
+#define WPNAV_ACCELERATION              250.0f      // maximum horizontal acceleration in cm/s/s that wp navigation will request
+
+class AC_WPNav
+{
+public:
+
+    /// Constructor
+    AC_WPNav(const AP_InertialNav& inav, const AP_AHRS_View& ahrs, AC_PosControl& pos_control, const AC_AttitudeControl& attitude_control);
+
+    /// provide rangefinder based terrain offset
+    /// terrain offset is the terrain's height above the EKF origin
+    void set_rangefinder_terrain_offset(bool use, bool healthy, float terrain_offset_cm) { _rangefinder_available = use; _rangefinder_healthy = healthy; _rangefinder_terrain_offset_cm = terrain_offset_cm;}
+
+    // return true if range finder may be used for terrain following
+    bool rangefinder_used() const { return _rangefinder_use; }
+    bool rangefinder_used_and_healthy() const { return _rangefinder_use && _rangefinder_healthy; }
+
+    // get expected source of terrain data if alt-above-terrain command is executed (used by Copter's ModeRTL)
+    enum class TerrainSource {
+        TERRAIN_UNAVAILABLE,
+        TERRAIN_FROM_RANGEFINDER,
+        TERRAIN_FROM_TERRAINDATABASE,
+    };
+    AC_WPNav::TerrainSource get_terrain_source() const;
+
+    // get terrain's altitude (in cm above the ekf origin) at the current position (+ve means terrain below vehicle is above ekf origin's altitude)
+    bool get_terrain_offset(float& offset_cm);
+
+    // return terrain following altitude margin.  vehicle will stop if distance from target altitude is larger than this margin
+    float get_terrain_margin() const { return MAX(_terrain_margin, 0.1); }
+
+    // convert location to vector from ekf origin.  terrain_alt is set to true if resulting vector's z-axis should be treated as alt-above-terrain
+    //      returns false if conversion failed (likely because terrain data was not available)
+    bool get_vector_NEU(const Location &loc, Vector3f &vec, bool &terrain_alt);
+
+    ///
+    /// waypoint controller
+    ///
+
+    /// wp_and_spline_init - initialise straight line and spline waypoint controllers
+    ///     speed_cms is the desired max speed to travel between waypoints.  should be a positive value or omitted to use the default speed
+    ///     updates target roll, pitch targets and I terms based on vehicle lean angles
+    ///     should be called once before the waypoint controller is used but does not need to be called before subsequent updates to destination
+    void wp_and_spline_init(float speed_cms = 0.0f, Vector3f stopping_point = Vector3f{});
+
+    /// set current target horizontal speed during wp navigation
+    void set_speed_xy(float speed_cms);
+
+    /// set pause or resume during wp navigation
+    void set_pause() { _paused = true; }
+    void set_resume() { _paused = false; }
+
+    /// get paused status
+    bool paused() { return _paused; }
+
+    /// set current target climb or descent rate during wp navigation
+    void set_speed_up(float speed_up_cms);
+    void set_speed_down(float speed_down_cms);
+
+    /// get default target horizontal velocity during wp navigation
+    float get_default_speed_xy() const { return _wp_speed_cms; }
+
+    /// get default target climb speed in cm/s during missions
+    float get_default_speed_up() const { return _wp_speed_up_cms; }
+
+    /// get default target descent rate in cm/s during missions.  Note: always positive
+    float get_default_speed_down() const { return fabsf(_wp_speed_down_cms); }
+
+    /// get_speed_z - returns target descent speed in cm/s during missions.  Note: always positive
+    float get_accel_z() const { return _wp_accel_z_cmss; }
+
+    /// get_wp_acceleration - returns acceleration in cm/s/s during missions
+    float get_wp_acceleration() const { return (is_positive(_wp_accel_cmss)) ? _wp_accel_cmss : WPNAV_ACCELERATION; }
+
+    /// get_corner_acceleration - returns maximum acceleration in cm/s/s used during cornering in missions
+    float get_corner_acceleration() const { return (is_positive(_wp_accel_c_cmss)) ? _wp_accel_c_cmss : 2.0 * get_wp_acceleration(); }
+
+    /// get_wp_destination waypoint using position vector
+    /// x,y are distance from ekf origin in cm
+    /// z may be cm above ekf origin or terrain (see origin_and_destination_are_terrain_alt method)
+    const Vector3f &get_wp_destination() const { return _destination; }
+
+    /// get origin using position vector (distance from ekf origin in cm)
+    const Vector3f &get_wp_origin() const { return _origin; }
+
+    /// true if origin.z and destination.z are alt-above-terrain, false if alt-above-ekf-origin
+    bool origin_and_destination_are_terrain_alt() const { return _terrain_alt; }
+
+    /// set_wp_destination waypoint using location class
+    ///     provide the next_destination if known
+    ///     returns false if conversion from location to vector from ekf origin cannot be calculated
+    bool set_wp_destination_loc(const Location& destination);
+    bool set_wp_destination_next_loc(const Location& destination);
+
+    // get destination as a location.  Altitude frame will be absolute (AMSL) or above terrain
+    // returns false if unable to return a destination (for example if origin has not yet been set)
+    bool get_wp_destination_loc(Location& destination) const;
+
+    // returns object avoidance adjusted destination which is always the same as get_wp_destination
+    // having this function unifies the AC_WPNav_OA and AC_WPNav interfaces making vehicle code simpler
+    virtual bool get_oa_wp_destination(Location& destination) const { return get_wp_destination_loc(destination); }
+
+    /// set_wp_destination waypoint using position vector (distance from ekf origin in cm)
+    ///     terrain_alt should be true if destination.z is a desired altitude above terrain
+    virtual bool set_wp_destination(const Vector3f& destination, bool terrain_alt = false);
+    bool set_wp_destination_next(const Vector3f& destination, bool terrain_alt = false);
+
+    /// set waypoint destination using NED position vector from ekf origin in meters
+    ///     provide next_destination_NED if known
+    bool set_wp_destination_NED(const Vector3f& destination_NED);
+    bool set_wp_destination_next_NED(const Vector3f& destination_NED);
+
+    /// shifts the origin and destination horizontally to the current position
+    ///     used to reset the track when taking off without horizontal position control
+    ///     relies on set_wp_destination or set_wp_origin_and_destination having been called first
+    void shift_wp_origin_and_destination_to_current_pos_xy();
+
+    /// shifts the origin and destination horizontally to the achievable stopping point
+    ///     used to reset the track when horizontal navigation is enabled after having been disabled (see Copter's wp_navalt_min)
+    ///     relies on set_wp_destination or set_wp_origin_and_destination having been called first
+    void shift_wp_origin_and_destination_to_stopping_point_xy();
+
+    /// get_wp_stopping_point_xy - calculates stopping point based on current position, velocity, waypoint acceleration
+    ///		results placed in stopping_position vector
+    void get_wp_stopping_point_xy(Vector2f& stopping_point) const;
+    void get_wp_stopping_point(Vector3f& stopping_point) const;
+
+    /// get_wp_distance_to_destination - get horizontal distance to destination in cm
+    virtual float get_wp_distance_to_destination() const;
+
+    /// get_bearing_to_destination - get bearing to next waypoint in centi-degrees
+    virtual int32_t get_wp_bearing_to_destination() const;
+
+    /// reached_destination - true when we have come within RADIUS cm of the waypoint
+    virtual bool reached_wp_destination() const { return _flags.reached_destination; }
+
+    // reached_wp_destination_xy - true if within RADIUS_CM of waypoint in x/y
+    bool reached_wp_destination_xy() const {
+        return get_wp_distance_to_destination() < _wp_radius_cm;
+    }
+
+    // get wp_radius parameter value in cm
+    float get_wp_radius_cm() const { return _wp_radius_cm; }
+
+    /// update_wpnav - run the wp controller - should be called at 100hz or higher
+    virtual bool update_wpnav();
+
+    // returns true if update_wpnav has been run very recently
+    bool is_active() const;
+
+    // force stopping at next waypoint.  Used by Dijkstra's object avoidance when path from destination to next destination is not clear
+    // only affects regular (e.g. non-spline) waypoints
+    // returns true if this had any affect on the path
+    bool force_stop_at_next_wp();
+
+    ///
+    /// spline methods
+    ///
+
+    /// set_spline_destination waypoint using location class
+    ///     returns false if conversion from location to vector from ekf origin cannot be calculated
+    ///     next_destination should be the next segment's destination
+    ///     next_is_spline should be true if next_destination is a spline segment
+    bool set_spline_destination_loc(const Location& destination, const Location& next_destination, bool next_is_spline);
+
+    /// set next destination (e.g. the one after the current destination) as a spline segment specified as a location
+    ///     returns false if conversion from location to vector from ekf origin cannot be calculated
+    ///     next_next_destination should be the next segment's destination
+    ///     next_next_is_spline should be true if next_next_destination is a spline segment
+    bool set_spline_destination_next_loc(const Location& next_destination, const Location& next_next_destination, bool next_next_is_spline);
+
+    /// set_spline_destination waypoint using position vector (distance from ekf origin in cm)
+    ///     terrain_alt should be true if destination.z is a desired altitude above terrain (false if its desired altitudes above ekf origin)
+    ///     next_destination is the next segment's destination
+    ///     next_terrain_alt should be true if next_destination.z is a desired altitude above terrain (false if its desired altitudes above ekf origin)
+    ///     next_destination.z must be in the same "frame" as destination.z (i.e. if destination is a alt-above-terrain, next_destination must be too)
+    ///     next_is_spline should be true if next_destination is a spline segment
+    bool set_spline_destination(const Vector3f& destination, bool terrain_alt, const Vector3f& next_destination, bool next_terrain_alt, bool next_is_spline);
+
+    /// set next destination (e.g. the one after the current destination) as an offset (in cm, NEU frame) from the EKF origin
+    ///     next_terrain_alt should be true if next_destination.z is a desired altitude above terrain (false if its desired altitudes above ekf origin)
+    ///     next_next_destination is the next segment's destination
+    ///     next_next_terrain_alt should be true if next_next_destination.z is a desired altitude above terrain (false if it is desired altitude above ekf origin)
+    ///     next_next_destination.z must be in the same "frame" as destination.z (i.e. if next_destination is a alt-above-terrain, next_next_destination must be too)
+    ///     next_next_is_spline should be true if next_next_destination is a spline segment
+    bool set_spline_destination_next(const Vector3f& next_destination, bool next_terrain_alt, const Vector3f& next_next_destination, bool next_next_terrain_alt, bool next_next_is_spline);
+
+    ///
+    /// shared methods
+    ///
+
+    /// get desired roll, pitch which should be fed into stabilize controllers
+    float get_roll() const { return _pos_control.get_roll_cd(); }
+    float get_pitch() const { return _pos_control.get_pitch_cd(); }
+    Vector3f get_thrust_vector() const { return _pos_control.get_thrust_vector(); }
+
+    // get target yaw in centi-degrees
+    float get_yaw() const { return _pos_control.get_yaw_cd(); }
+    /// advance_wp_target_along_track - move target location along track from origin to destination
+    bool advance_wp_target_along_track(float dt);
+
+    /// recalculate path with update speed and/or acceleration limits
+    void update_track_with_speed_accel_limits();
+
+    /// return the crosstrack_error - horizontal error of the actual position vs the desired position
+    float crosstrack_error() const { return _pos_control.crosstrack_error();}
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+protected:
+
+    // flags structure
+    struct wpnav_flags {
+        uint8_t reached_destination     : 1;    // true if we have reached the destination
+        uint8_t fast_waypoint           : 1;    // true if we should ignore the waypoint radius and consider the waypoint complete once the intermediate target has reached the waypoint
+        uint8_t wp_yaw_set              : 1;    // true if yaw target has been set
+    } _flags;
+
+    // helper function to calculate scurve jerk and jerk_time values
+    // updates _scurve_jerk and _scurve_snap
+    void calc_scurve_jerk_and_snap();
+
+    // references and pointers to external libraries
+    const AP_InertialNav&   _inav;
+    const AP_AHRS_View&     _ahrs;
+    AC_PosControl&          _pos_control;
+    const AC_AttitudeControl& _attitude_control;
+
+    // parameters
+    AP_Float    _wp_speed_cms;          // default maximum horizontal speed in cm/s during missions
+    AP_Float    _wp_speed_up_cms;       // default maximum climb rate in cm/s
+    AP_Float    _wp_speed_down_cms;     // default maximum descent rate in cm/s
+    AP_Float    _wp_radius_cm;          // distance from a waypoint in cm that, when crossed, indicates the wp has been reached
+    AP_Float    _wp_accel_cmss;         // horizontal acceleration in cm/s/s during missions
+    AP_Float    _wp_accel_c_cmss;       // cornering acceleration in cm/s/s during missions
+    AP_Float    _wp_accel_z_cmss;       // vertical acceleration in cm/s/s during missions
+    AP_Float    _wp_jerk;               // maximum jerk used to generate scurve trajectories in m/s/s/s
+    AP_Float    _terrain_margin;        // terrain following altitude margin. vehicle will stop if distance from target altitude is larger than this margin
+
+    // WPNAV_SPEED param change checker
+    bool _check_wp_speed_change;        // if true WPNAV_SPEED param should be checked for changes in-flight
+    float _last_wp_speed_cms;  // last recorded WPNAV_SPEED, used for changing speed in-flight
+    float _last_wp_speed_up_cms;  // last recorded WPNAV_SPEED_UP, used for changing speed in-flight
+    float _last_wp_speed_down_cms;  // last recorded WPNAV_SPEED_DN, used for changing speed in-flight
+
+    // scurve
+    SCurve _scurve_prev_leg;            // previous scurve trajectory used to blend with current scurve trajectory
+    SCurve _scurve_this_leg;            // current scurve trajectory
+    SCurve _scurve_next_leg;            // next scurve trajectory used to blend with current scurve trajectory
+    float _scurve_jerk;                 // scurve jerk max in m/s/s/s
+    float _scurve_snap;                 // scurve snap in m/s/s/s/s
+
+    // spline curves
+    SplineCurve _spline_this_leg;      // spline curve for current segment
+    SplineCurve _spline_next_leg;      // spline curve for next segment
+
+    // the type of this leg
+    bool _this_leg_is_spline;           // true if this leg is a spline
+    bool _next_leg_is_spline;           // true if the next leg is a spline
+
+    // waypoint controller internal variables
+    uint32_t    _wp_last_update;        // time of last update_wpnav call
+    float       _wp_desired_speed_xy_cms;   // desired wp speed in cm/sec
+    Vector3f    _origin;                // starting point of trip to next waypoint in cm from ekf origin
+    Vector3f    _destination;           // target destination in cm from ekf origin
+    Vector3f    _next_destination;      // next target destination in cm from ekf origin
+    float       _track_scalar_dt;       // time compression multiplier to slow the progress along the track
+    float       _offset_vel;            // horizontal velocity reference used to slow the aircraft for pause and to ensure the aircraft can maintain height above terrain
+    float       _offset_accel;          // horizontal acceleration reference used to slow the aircraft for pause and to ensure the aircraft can maintain height above terrain
+    bool        _paused;                // flag for pausing waypoint controller
+
+    // terrain following variables
+    bool        _terrain_alt;   // true if origin and destination.z are alt-above-terrain, false if alt-above-ekf-origin
+    bool        _rangefinder_available; // true if rangefinder is enabled (user switch can turn this true/false)
+    AP_Int8     _rangefinder_use;       // parameter that specifies if the range finder should be used for terrain following commands
+    bool        _rangefinder_healthy;   // true if rangefinder distance is healthy (i.e. between min and maximum)
+    float       _rangefinder_terrain_offset_cm; // latest rangefinder based terrain offset (e.g. terrain's height above EKF origin)
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #include "AC_WPNav_config.h"
+
+#if AC_WPNAV_OA_ENABLED
+
+#include <AP_Math/control.h>
+#include <AP_InternalError/AP_InternalError.h>
+#include "AC_WPNav_OA.h"
+
+AC_WPNav_OA::AC_WPNav_OA(const AP_InertialNav& inav, const AP_AHRS_View& ahrs, AC_PosControl& pos_control, const AC_AttitudeControl& attitude_control) :
+    AC_WPNav(inav, ahrs, pos_control, attitude_control)
+{
+}
+
+// returns object avoidance adjusted wp location using location class
+// returns false if unable to convert from target vector to global coordinates
+bool AC_WPNav_OA::get_oa_wp_destination(Location& destination) const
+{
+    // if oa inactive return unadjusted location
+    if (_oa_state == AP_OAPathPlanner::OA_NOT_REQUIRED) {
+        return get_wp_destination_loc(destination);
+    }
+
+    // return latest destination provided by oa path planner
+    destination = _oa_destination;
+    return true;
+}
+
+/// set_wp_destination waypoint using position vector (distance from ekf origin in cm)
+///     terrain_alt should be true if destination.z is a desired altitude above terrain
+///     returns false on failure (likely caused by missing terrain data)
+bool AC_WPNav_OA::set_wp_destination(const Vector3f& destination, bool terrain_alt)
+{
+    const bool ret = AC_WPNav::set_wp_destination(destination, terrain_alt);
+
+    if (ret) {
+        // reset object avoidance state
+        _oa_state = AP_OAPathPlanner::OA_NOT_REQUIRED;
+    }
+
+    return ret;
+}
+
+/// get_wp_distance_to_destination - get horizontal distance to destination in cm
+/// always returns distance to final destination (i.e. does not use oa adjusted destination)
+float AC_WPNav_OA::get_wp_distance_to_destination() const
+{
+    if (_oa_state == AP_OAPathPlanner::OA_NOT_REQUIRED) {
+        return AC_WPNav::get_wp_distance_to_destination();
+    }
+
+    return get_horizontal_distance_cm(_inav.get_position_xy_cm(), _destination_oabak.xy());
+}
+
+/// get_wp_bearing_to_destination - get bearing to next waypoint in centi-degrees
+/// always returns bearing to final destination (i.e. does not use oa adjusted destination)
+int32_t AC_WPNav_OA::get_wp_bearing_to_destination() const
+{
+    if (_oa_state == AP_OAPathPlanner::OA_NOT_REQUIRED) {
+        return AC_WPNav::get_wp_bearing_to_destination();
+    }
+
+    return get_bearing_cd(_inav.get_position_xy_cm(), _destination_oabak.xy());
+}
+
+/// true when we have come within RADIUS cm of the waypoint
+bool AC_WPNav_OA::reached_wp_destination() const
+{
+    return (_oa_state == AP_OAPathPlanner::OA_NOT_REQUIRED) && AC_WPNav::reached_wp_destination();
+}
+
+/// update_wpnav - run the wp controller - should be called at 100hz or higher
+bool AC_WPNav_OA::update_wpnav()
+{
+    // run path planning around obstacles
+    AP_OAPathPlanner *oa_ptr = AP_OAPathPlanner::get_singleton();
+    Location current_loc;
+    if ((oa_ptr != nullptr) && AP::ahrs().get_location(current_loc)) {
+
+        // backup _origin and _destination when not doing oa
+        if (_oa_state == AP_OAPathPlanner::OA_NOT_REQUIRED) {
+            _origin_oabak = _origin;
+            _destination_oabak = _destination;
+            _terrain_alt_oabak = _terrain_alt;
+            _next_destination_oabak = _next_destination;
+        }
+
+        // convert origin, destination and next_destination to Locations and pass into oa
+        const Location origin_loc(_origin_oabak, _terrain_alt_oabak ? Location::AltFrame::ABOVE_TERRAIN : Location::AltFrame::ABOVE_ORIGIN);
+        const Location destination_loc(_destination_oabak, _terrain_alt_oabak ? Location::AltFrame::ABOVE_TERRAIN : Location::AltFrame::ABOVE_ORIGIN);
+        const Location next_destination_loc(_next_destination_oabak, _terrain_alt_oabak ? Location::AltFrame::ABOVE_TERRAIN : Location::AltFrame::ABOVE_ORIGIN);
+        Location oa_origin_new, oa_destination_new, oa_next_destination_new;
+        bool dest_to_next_dest_clear = true;
+        AP_OAPathPlanner::OAPathPlannerUsed path_planner_used = AP_OAPathPlanner::OAPathPlannerUsed::None;
+        const AP_OAPathPlanner::OA_RetState oa_retstate = oa_ptr->mission_avoidance(current_loc,
+                                                                                    origin_loc,
+                                                                                    destination_loc,
+                                                                                    next_destination_loc,
+                                                                                    oa_origin_new,
+                                                                                    oa_destination_new,
+                                                                                    oa_next_destination_new,
+                                                                                    dest_to_next_dest_clear,
+                                                                                    path_planner_used);
+
+        switch (oa_retstate) {
+
+        case AP_OAPathPlanner::OA_NOT_REQUIRED:
+            if (_oa_state != oa_retstate) {
+                // object avoidance has become inactive so reset target to original destination
+                if (!set_wp_destination(_destination_oabak, _terrain_alt_oabak)) {
+                    // trigger terrain failsafe
+                    return false;
+                }
+
+                // if path from destination to next_destination is clear
+                if (dest_to_next_dest_clear && (oa_ptr->get_options() & AP_OAPathPlanner::OA_OPTION_FAST_WAYPOINTS)) {
+                    // set next destination if non-zero
+                    if (!_next_destination_oabak.is_zero()) {
+                        set_wp_destination_next(_next_destination_oabak);
+                    }
+                }
+                _oa_state = oa_retstate;
+            }
+
+            // ensure we stop at next waypoint
+            // Note that this check is run on every iteration even if the path planner is not active
+            if (!dest_to_next_dest_clear) {
+                force_stop_at_next_wp();
+            }
+            break;
+
+        case AP_OAPathPlanner::OA_PROCESSING:
+            if (oa_ptr->get_options() & AP_OAPathPlanner::OA_OPTION_FAST_WAYPOINTS) {
+                // if fast waypoint option is set, proceed during processing
+                break;
+            }
+            FALLTHROUGH;
+
+        case AP_OAPathPlanner::OA_ERROR:
+            // during processing or in case of error stop the vehicle
+            // by setting the oa_destination to a stopping point
+            if ((_oa_state != AP_OAPathPlanner::OA_PROCESSING) && (_oa_state != AP_OAPathPlanner::OA_ERROR)) {
+                // calculate stopping point
+                Vector3f stopping_point;
+                get_wp_stopping_point(stopping_point);
+                _oa_destination = Location(stopping_point, Location::AltFrame::ABOVE_ORIGIN);
+                _oa_next_destination.zero();
+                if (set_wp_destination(stopping_point, false)) {
+                    _oa_state = oa_retstate;
+                }
+            }
+            break;
+
+        case AP_OAPathPlanner::OA_SUCCESS:
+
+            // handling of returned destination depends upon path planner used
+            switch (path_planner_used) {
+
+            case AP_OAPathPlanner::OAPathPlannerUsed::None:
+                // this should never happen.  this means the path planner has returned success but has failed to set the path planner used
+                INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+                return false;
+
+            case AP_OAPathPlanner::OAPathPlannerUsed::Dijkstras:
+                // Dijkstra's.  Action is only needed if path planner has just became active or the target destination's lat or lon has changed
+                if ((_oa_state != AP_OAPathPlanner::OA_SUCCESS) || !oa_destination_new.same_latlon_as(_oa_destination)) {
+                    Location origin_oabak_loc(_origin_oabak, _terrain_alt_oabak ? Location::AltFrame::ABOVE_TERRAIN : Location::AltFrame::ABOVE_ORIGIN);
+                    Location destination_oabak_loc(_destination_oabak, _terrain_alt_oabak ? Location::AltFrame::ABOVE_TERRAIN : Location::AltFrame::ABOVE_ORIGIN);
+                    oa_destination_new.linearly_interpolate_alt(origin_oabak_loc, destination_oabak_loc);
+
+                    // set new OA adjusted destination
+                    if (!set_wp_destination_loc(oa_destination_new)) {
+                        // trigger terrain failsafe
+                        return false;
+                    }
+                    // if new target set successfully, update oa state and destination
+                    _oa_state = oa_retstate;
+                    _oa_destination = oa_destination_new;
+
+                    // if a next destination was provided then use it
+                    if ((oa_ptr->get_options() & AP_OAPathPlanner::OA_OPTION_FAST_WAYPOINTS) && !oa_next_destination_new.is_zero()) {
+                        // calculate oa_next_destination_new's altitude using linear interpolation between original origin and destination
+                        // this "next destination" is still an intermediate point between the origin and destination
+                        Location next_destination_oabak_loc(_next_destination_oabak, _terrain_alt_oabak ? Location::AltFrame::ABOVE_TERRAIN : Location::AltFrame::ABOVE_ORIGIN);
+                        oa_next_destination_new.linearly_interpolate_alt(origin_oabak_loc, destination_oabak_loc);
+                        if (set_wp_destination_next_loc(oa_next_destination_new)) {
+                            _oa_next_destination = oa_next_destination_new;
+                        }
+                    }
+                }
+                break;
+
+            case AP_OAPathPlanner::OAPathPlannerUsed::BendyRulerHorizontal: {
+                _oa_state = oa_retstate;
+                _oa_destination = oa_destination_new;
+
+                // altitude target interpolated from current_loc's distance along the original path
+                Location target_alt_loc = current_loc;
+                target_alt_loc.linearly_interpolate_alt(origin_loc, destination_loc);
+
+                // correct target_alt_loc's alt-above-ekf-origin if using terrain altitudes
+                // positive terr_offset means terrain below vehicle is above ekf origin's altitude
+                float terr_offset = 0;
+                if (_terrain_alt_oabak && !get_terrain_offset(terr_offset)) {
+                    // trigger terrain failsafe
+                    return false;
+                }
+
+                // calculate final destination as an offset from EKF origin in NEU
+                Vector2f dest_NE;
+                if (!_oa_destination.get_vector_xy_from_origin_NE(dest_NE)) {
+                    // this should never happen because we can only get here if we have an EKF origin
+                    INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+                    return false;
+                }
+                Vector3p dest_NEU{dest_NE.x, dest_NE.y, (float)target_alt_loc.alt};
+
+                // pass the desired position directly to the position controller
+                _pos_control.input_pos_xyz(dest_NEU, terr_offset, 1000.0);
+
+                // update horizontal position controller (vertical is updated in vehicle code)
+                _pos_control.update_xy_controller();
+
+                // return success without calling parent AC_WPNav
+                return true;
+            }
+
+            case AP_OAPathPlanner::OAPathPlannerUsed::BendyRulerVertical: {
+                _oa_state = oa_retstate;
+                _oa_destination = oa_destination_new;
+
+                // calculate final destination as an offset from EKF origin in NEU
+                Vector3f dest_NEU;
+                if (!_oa_destination.get_vector_from_origin_NEU(dest_NEU)) {
+                    // this should never happen because we can only get here if we have an EKF origin
+                    INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+                    return false;
+                }
+
+                // pass the desired position directly to the position controller as an offset from EKF origin in NEU
+                Vector3p dest_NEU_p{dest_NEU.x, dest_NEU.y, dest_NEU.z};
+                _pos_control.input_pos_xyz(dest_NEU_p, 0, 1000.0);
+
+                // update horizontal position controller (vertical is updated in vehicle code)
+                _pos_control.update_xy_controller();
+
+                // return success without calling parent AC_WPNav
+                return true;
+            }
+
+            }
+        }
+    }
+
+    // run the non-OA update
+    return AC_WPNav::update_wpnav();
+}
+
+#endif  // Ac_WPNAV_OA_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include "AC_WPNav_config.h"
+
+#if AC_WPNAV_OA_ENABLED
+
+#include <AC_WPNav/AC_WPNav.h>
+#include <AC_Avoidance/AP_OAPathPlanner.h>
+#include <AC_Avoidance/AP_OABendyRuler.h>
+
+class AC_WPNav_OA : public AC_WPNav
+{
+
+public:
+    /// Constructor
+    AC_WPNav_OA(const AP_InertialNav& inav, const AP_AHRS_View& ahrs, AC_PosControl& pos_control, const AC_AttitudeControl& attitude_control);
+
+    // returns object avoidance adjusted wp location using location class
+    // returns false if unable to convert from target vector to global coordinates
+    bool get_oa_wp_destination(Location& destination) const override;
+
+    /// set_wp_destination waypoint using position vector (distance from ekf origin in cm)
+    ///     terrain_alt should be true if destination.z is a desired altitude above terrain
+    ///     returns false on failure (likely caused by missing terrain data)
+    bool set_wp_destination(const Vector3f& destination, bool terrain_alt = false) override;
+
+    /// get horizontal distance to destination in cm
+    /// always returns distance to final destination (i.e. does not use oa adjusted destination)
+    float get_wp_distance_to_destination() const override;
+
+    /// get bearing to next waypoint in centi-degrees
+    /// always returns bearing to final destination (i.e. does not use oa adjusted destination)
+    int32_t get_wp_bearing_to_destination() const override;
+
+    /// true when we have come within RADIUS cm of the final destination
+    bool reached_wp_destination() const override;
+
+    /// run the wp controller
+    bool update_wpnav() override;
+
+protected:
+
+    // oa path planning variables
+    AP_OAPathPlanner::OA_RetState _oa_state;    // state of object avoidance, if OA_SUCCESS we use _oa_destination to avoid obstacles
+    Vector3f    _origin_oabak;          // backup of _origin so it can be restored when oa completes
+    Vector3f    _destination_oabak;     // backup of _destination so it can be restored when oa completes
+    Vector3f    _next_destination_oabak;// backup of _next_destination so it can be restored when oa completes
+    bool        _terrain_alt_oabak;     // true if backup origin and destination z-axis are terrain altitudes
+    Location    _oa_destination;        // intermediate destination during avoidance
+    Location    _oa_next_destination;   // intermediate next destination during avoidance
+};
+
+#endif  // AC_WPNAV_OA_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #pragma once
+
+#include <AC_Avoidance/AC_Avoidance_config.h>
+
+#ifndef AC_WPNAV_OA_ENABLED
+#define AC_WPNAV_OA_ENABLED AP_OAPATHPLANNER_ENABLED
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #include "AP_RollController.h"
+#include "AP_PitchController.h"
+#include "AP_YawController.h"
+#include "AP_SteerController.h"
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/**
+   The strategy for roll/pitch autotune is to give the user a AUTOTUNE
+   flight mode which behaves just like FBWA, but does automatic
+   tuning.
+*/
+
+#include "AP_AutoTune.h"
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Logger/AP_Logger.h>
+#include <AP_Math/AP_Math.h>
+#include <AC_PID/AC_PID.h>
+#include <AP_Scheduler/AP_Scheduler.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
+
+// step size for changing FF gains, percentage
+#define AUTOTUNE_INCREASE_FF_STEP 12
+#define AUTOTUNE_DECREASE_FF_STEP 15
+
+// limits on IMAX
+#define AUTOTUNE_MIN_IMAX 0.4
+#define AUTOTUNE_MAX_IMAX 0.9
+
+// ratio of I to P
+#define AUTOTUNE_I_RATIO 0.75
+
+// time constant of rate trim loop
+#define TRIM_TCONST 1.0f
+
+// constructor
+AP_AutoTune::AP_AutoTune(ATGains &_gains, ATType _type,
+                         const AP_FixedWing &parms,
+                         AC_PID &_rpid) :
+    current(_gains),
+    rpid(_rpid),
+    type(_type),
+    aparm(parms),
+    ff_filter(2)
+{}
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include <stdio.h>
+# define Debug(fmt, args ...)  do {::printf("%s:%d: " fmt "\n", __FUNCTION__, __LINE__, ## args); } while(0)
+#else
+# define Debug(fmt, args ...)
+#endif
+
+/*
+  auto-tuning table. This table gives the starting values for key
+  tuning parameters based on a user chosen AUTOTUNE_LEVEL parameter
+  from 1 to 10. Level 1 is a very soft tune. Level 10 is a very
+  aggressive tune.
+  Level 0 means use the existing RMAX and TCONST parameters
+ */
+static const struct {
+    float tau;
+    float rmax;
+} tuning_table[] = {
+    { 1.00, 20 },   // level 1
+    { 0.90, 30 },   // level 2
+    { 0.80, 40 },   // level 3
+    { 0.70, 50 },   // level 4
+    { 0.60, 60 },   // level 5
+    { 0.50, 75 },   // level 6
+    { 0.30, 90 },   // level 7
+    { 0.2, 120 },   // level 8
+    { 0.15, 160 },   // level 9
+    { 0.1, 210 },   // level 10
+    { 0.1, 300 },   // (yes, it goes to 11)
+};
+
+/*
+  start an autotune session
+*/
+void AP_AutoTune::start(void)
+{
+    running = true;
+    state = ATState::IDLE;
+
+    current = restore = last_save = get_gains();
+
+    // do first update of rmax and tau now
+    update_rmax();
+
+    dt = AP::scheduler().get_loop_period_s();
+
+    rpid.kIMAX().set(constrain_float(rpid.kIMAX(), AUTOTUNE_MIN_IMAX, AUTOTUNE_MAX_IMAX));
+
+    // use 0.75Hz filters on the actuator, rate and target to reduce impact of noise
+    actuator_filter.set_cutoff_frequency(AP::scheduler().get_loop_rate_hz(), 0.75);
+    rate_filter.set_cutoff_frequency(AP::scheduler().get_loop_rate_hz(), 0.75);
+
+    // target filter is a bit broader
+    target_filter.set_cutoff_frequency(AP::scheduler().get_loop_rate_hz(), 4);
+
+    ff_filter.reset();
+    actuator_filter.reset();
+    rate_filter.reset();
+    D_limit = 0;
+    P_limit = 0;
+    ff_count = 0;
+    D_set_ms = 0;
+    P_set_ms = 0;
+    done_count = 0;
+
+    if (!is_positive(rpid.slew_limit())) {
+        // we must have a slew limit, default to 150 deg/s
+        rpid.slew_limit().set_and_save(150);
+    }
+
+    if (current.FF < 0.01) {
+        // don't allow for zero FF
+        current.FF = 0.01;
+        rpid.ff().set(current.FF);
+    }
+
+    Debug("START FF -> %.3f\n", rpid.ff().get());
+}
+
+/*
+  called when we change state to see if we should change gains
+ */
+void AP_AutoTune::stop(void)
+{
+    if (running) {
+        running = false;
+        if (is_positive(D_limit) && is_positive(P_limit)) {
+            save_gains();
+        } else {
+            restore_gains();
+        }
+    }
+}
+
+const char *AP_AutoTune::axis_string(void) const
+{
+    switch (type) {
+    case AUTOTUNE_ROLL:
+        return "Roll";
+    case AUTOTUNE_PITCH:
+        return "Pitch";
+    case AUTOTUNE_YAW:
+        return "Yaw";
+    }
+    return "";
+}
+
+/*
+  one update cycle of the autotuner
+ */
+void AP_AutoTune::update(AP_PIDInfo &pinfo, float scaler, float angle_err_deg)
+{
+    if (!running) {
+        return;
+    }
+
+    // see what state we are in
+    ATState new_state = state;
+    const float desired_rate = target_filter.apply(pinfo.target);
+
+    // filter actuator without I term so we can take ratios without
+    // accounting for trim offsets. We first need to include the I and
+    // clip to 45 degrees to get the right value of the real surface
+    const float clipped_actuator = constrain_float(pinfo.FF + pinfo.P + pinfo.D + pinfo.DFF + pinfo.I, -45, 45) - pinfo.I;
+    const float actuator = actuator_filter.apply(clipped_actuator);
+    const float actual_rate = rate_filter.apply(pinfo.actual);
+
+    max_actuator = MAX(max_actuator, actuator);
+    min_actuator = MIN(min_actuator, actuator);
+    max_rate = MAX(max_rate, actual_rate);
+    min_rate = MIN(min_rate, actual_rate);
+    max_target = MAX(max_target, desired_rate);
+    min_target = MIN(min_target, desired_rate);
+    max_P = MAX(max_P, fabsf(pinfo.P));
+    max_D = MAX(max_D, fabsf(pinfo.D));
+    min_Dmod = MIN(min_Dmod, pinfo.Dmod);
+    max_Dmod = MAX(max_Dmod, pinfo.Dmod);
+
+    // update the P and D slew rates, using P and D values from before Dmod was applied
+    const float slew_limit_scale = 45.0 / degrees(1);
+    slew_limit_max = rpid.slew_limit();
+    slew_limit_tau = 1.0;
+    slew_limiter_P.modifier((pinfo.P/pinfo.Dmod)*slew_limit_scale, dt);
+    slew_limiter_D.modifier((pinfo.D/pinfo.Dmod)*slew_limit_scale, dt);
+
+    // remember maximum slew rates for this cycle
+    max_SRate_P = MAX(max_SRate_P, slew_limiter_P.get_slew_rate());
+    max_SRate_D = MAX(max_SRate_D, slew_limiter_D.get_slew_rate());
+
+    float att_limit_deg = 0;
+    switch (type) {
+    case AUTOTUNE_ROLL:
+        att_limit_deg = aparm.roll_limit;
+        break;
+    case AUTOTUNE_PITCH:
+        att_limit_deg = MIN(abs(aparm.pitch_limit_max*100),abs(aparm.pitch_limit_min*100))*0.01;
+        break;
+    case AUTOTUNE_YAW:
+        // arbitrary value for yaw angle
+        att_limit_deg = 20;
+        break;
+    }
+
+
+    // thresholds for when we consider an event to start and end
+    const float rate_threshold1 = 0.4 * MIN(att_limit_deg / current.tau.get(), current.rmax_pos);
+    const float rate_threshold2 = 0.25 * rate_threshold1;
+    bool in_att_demand = fabsf(angle_err_deg) >= 0.3 * att_limit_deg;
+
+    switch (state) {
+    case ATState::IDLE:
+        if (desired_rate > rate_threshold1 && in_att_demand) {
+            new_state = ATState::DEMAND_POS;
+        } else if (desired_rate < -rate_threshold1 && in_att_demand) {
+            new_state = ATState::DEMAND_NEG;
+        }
+        break;
+    case ATState::DEMAND_POS:
+        if (desired_rate < rate_threshold2) {
+            new_state = ATState::IDLE;
+        }
+        break;
+    case ATState::DEMAND_NEG:
+        if (desired_rate > -rate_threshold2) {
+            new_state = ATState::IDLE;
+        }
+        break;
+    }
+
+    const uint32_t now = AP_HAL::millis();
+
+#if HAL_LOGGING_ENABLED
+    if (now - last_log_ms >= 40) {
+        // log at 25Hz
+        struct log_ATRP pkt = {
+            LOG_PACKET_HEADER_INIT(LOG_ATRP_MSG),
+            time_us : AP_HAL::micros64(),
+            type : uint8_t(type),
+            state: uint8_t(new_state),
+            actuator : actuator,
+            P_slew : max_SRate_P,
+            D_slew : max_SRate_D,
+            FF_single: FF_single,
+            FF: current.FF,
+            P: current.P,
+            I: current.I,
+            D: current.D,
+            action: uint8_t(action),
+            rmax: float(current.rmax_pos.get()),
+            tau: current.tau.get()
+        };
+        AP::logger().WriteBlock(&pkt, sizeof(pkt));
+        last_log_ms = now;
+    }
+#endif
+
+    if (new_state == state) {
+        if (state == ATState::IDLE &&
+            now - state_enter_ms > 500 &&
+            max_Dmod < 0.9) {
+            // we've been oscillating while idle, reduce P or D
+            const float slew_sum = max_SRate_P + max_SRate_D;
+            const float gain_mul = 0.5;
+            current.P *= linear_interpolate(gain_mul, 1.0,
+                                            max_SRate_P,
+                                            slew_sum, 0);
+            current.D *= linear_interpolate(gain_mul, 1.0,
+                                            max_SRate_D,
+                                            slew_sum, 0);
+            rpid.kP().set(current.P);
+            rpid.kD().set(current.D);
+            action = Action::IDLE_LOWER_PD;
+            P_limit = MIN(P_limit, current.P);
+            D_limit = MIN(D_limit, current.D);
+            state_change(state);
+        }
+        return;
+    }
+
+    if (new_state != ATState::IDLE) {
+        // starting an event
+        min_actuator = max_actuator = min_rate = max_rate = 0;
+        state_enter_ms = now;
+        state = new_state;
+        return;
+    }
+
+    if ((state == ATState::DEMAND_POS && max_rate < 0.01 * current.rmax_pos) ||
+        (state == ATState::DEMAND_NEG && min_rate > -0.01 * current.rmax_neg)) {
+        // we didn't get enough rate
+        action = Action::LOW_RATE;
+        state_change(ATState::IDLE);
+        return;
+    }
+
+    if (now - state_enter_ms < 100) {
+        // not long enough sample
+        action = Action::SHORT;
+        state_change(ATState::IDLE);
+        return;
+    }
+
+    // we've finished an event. calculate the single-event FF value
+    if (state == ATState::DEMAND_POS) {
+        FF_single = max_actuator / (max_rate * scaler);
+    } else {
+        FF_single = min_actuator / (min_rate * scaler);
+    }
+
+    // apply median filter
+    float FF = ff_filter.apply(FF_single);
+    ff_count++;
+
+    const float old_FF = rpid.ff();
+
+    // limit size of change in FF
+    FF = constrain_float(FF,
+                         old_FF*(1-AUTOTUNE_DECREASE_FF_STEP*0.01),
+                         old_FF*(1+AUTOTUNE_INCREASE_FF_STEP*0.01));
+
+    // adjust P and D
+    float D = rpid.kD();
+    float P = rpid.kP();
+
+    if (ff_count == 1) {
+        // apply minimum D and P values
+        D = MAX(D, 0.0005);
+        P = MAX(P, 0.01);
+    } else if (ff_count == 4) {
+        // we got a good ff estimate, halve P ready to start raising D
+        P *= 0.5;
+    }
+
+    // see if the slew limiter kicked in
+    if (min_Dmod < 1.0 && !is_positive(D_limit)) {
+        // oscillation, without D_limit set
+        if (max_P > 0.5 * max_D) {
+            // lower P and D to get us to a non-oscillating state
+            P *= 0.35;
+            D *= 0.75;
+            action = Action::LOWER_PD;
+        } else {
+            // set D limit to 30% of current D, remember D limit and start to work on P
+            D *= 0.3;
+            D_limit = D;
+            D_set_ms = now;
+            action = Action::LOWER_D;
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%sD: %.4f", axis_string(), D_limit);
+        }
+    } else if (min_Dmod < 1.0) {
+        // oscillation, with D_limit set
+        if (now - D_set_ms > 2000) {
+            // leave 2s for Dmod to settle after lowering D
+            if (max_D > 0.8 * max_P) {
+                // lower D limit some more
+                D *= 0.35;
+                D_limit = D;
+                D_set_ms = now;
+                action = Action::LOWER_D;
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%sD: %.4f", axis_string(), D_limit);
+                done_count = 0;
+            } else if (now - P_set_ms > 2500) {
+                if (is_positive(P_limit)) {
+                    // if we've already got a P estimate then don't
+                    // reduce as quickly, stopping small spikes at the
+                    // later part of the tune from giving us a very
+                    // low P gain
+                    P *= 0.7;
+                } else {
+                    P *= 0.35;
+                }
+                P_limit = P;
+                P_set_ms = now;
+                action = Action::LOWER_P;
+                done_count = 0;
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%sP: %.4f", axis_string(), P_limit);
+            }
+        }
+    } else if (ff_count < 4) {
+        // we don't have a good FF estimate yet, keep going
+
+    } else if (!is_positive(D_limit)) {
+        /* we haven't detected D oscillation yet, keep raising D */
+        D *= 1.3;
+        action = Action::RAISE_D;
+    } else if (!is_positive(P_limit)) {
+        /* not oscillating, increase P gain */
+        P *= 1.3;
+        action = Action::RAISE_PD;
+    } else {
+        // after getting P_limit we consider the tune done when we
+        // have done 3 cycles without reducing P
+        if (done_count < 3) {
+            if (++done_count == 3) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s: Finished", axis_string());
+                save_gains();
+            }
+        }
+    }
+
+    rpid.ff().set(FF);
+    rpid.kP().set(P);
+    rpid.kD().set(D);
+    if (type == AUTOTUNE_ROLL) {  // for roll set I = smaller of FF or P
+        rpid.kI().set(MIN(P, (FF / TRIM_TCONST)));
+    } else {                      // for pitch/yaw naturally damped axes) set I usually = FF to get 1 sec I closure
+        rpid.kI().set(MAX(P*AUTOTUNE_I_RATIO, (FF / TRIM_TCONST)));
+    }
+
+    // setup filters to be suitable for time constant and gyro filter
+    // filtering T can  prevent P/D oscillation being seen, so allow the
+    // user to switch it off
+    if (!has_option(DISABLE_FLTT_UPDATE)) {
+        rpid.filt_T_hz().set(10.0/(current.tau * 2 * M_PI));
+    }
+    rpid.filt_E_hz().set(0);
+    // filtering D at the same level as VTOL can allow unwanted oscillations to be seen,
+    // so allow the user to switch it off and select their own (usually lower) value
+    if (!has_option(DISABLE_FLTD_UPDATE)) {
+        rpid.filt_D_hz().set(AP::ins().get_gyro_filter_hz()*0.5);
+    }
+
+    current.FF = FF;
+    current.P = P;
+    current.I = rpid.kI().get();
+    current.D = D;
+
+    Debug("FPID=(%.3f, %.3f, %.3f, %.3f) Dmod=%.2f\n",
+          rpid.ff().get(),
+          rpid.kP().get(),
+          rpid.kI().get(),
+          rpid.kD().get(),
+          min_Dmod);
+
+    // move rmax and tau towards target
+    update_rmax();
+
+    state_change(new_state);
+}
+
+/*
+  record a state change
+ */
+void AP_AutoTune::state_change(ATState new_state)
+{
+    min_Dmod = 1;
+    max_Dmod = 0;
+    max_SRate_P = 1;
+    max_SRate_D = 1;
+    max_P = max_D = 0;
+    state = new_state;
+    state_enter_ms = AP_HAL::millis();
+}
+
+/*
+  save a float if it has changed
+ */
+void AP_AutoTune::save_float_if_changed(AP_Float &v, float old_value)
+{
+    if (!is_equal(old_value, v.get())) {
+        v.save();
+    }
+}
+
+/*
+  save a int16_t if it has changed
+ */
+void AP_AutoTune::save_int16_if_changed(AP_Int16 &v, int16_t old_value)
+{
+    if (old_value != v.get()) {
+        v.save();
+    }
+}
+
+
+/*
+  save a set of gains
+ */
+void AP_AutoTune::save_gains(void)
+{
+    const auto &v = last_save;
+    save_float_if_changed(current.tau, v.tau);
+    save_int16_if_changed(current.rmax_pos, v.rmax_pos);
+    save_int16_if_changed(current.rmax_neg, v.rmax_neg);
+    save_float_if_changed(rpid.ff(), v.FF);
+    save_float_if_changed(rpid.kP(), v.P);
+    save_float_if_changed(rpid.kI(), v.I);
+    save_float_if_changed(rpid.kD(), v.D);
+    save_float_if_changed(rpid.kIMAX(), v.IMAX);
+    save_float_if_changed(rpid.filt_T_hz(), v.flt_T);
+    save_float_if_changed(rpid.filt_E_hz(), v.flt_E);
+    save_float_if_changed(rpid.filt_D_hz(), v.flt_D);
+    last_save = get_gains();
+}
+
+/*
+  get gains with PID components
+ */
+AP_AutoTune::ATGains AP_AutoTune::get_gains(void)
+{
+    ATGains ret = current;
+    ret.FF = rpid.ff();
+    ret.P = rpid.kP();
+    ret.I = rpid.kI();
+    ret.D = rpid.kD();
+    ret.IMAX = rpid.kIMAX();
+    ret.flt_T = rpid.filt_T_hz();
+    ret.flt_E = rpid.filt_E_hz();
+    ret.flt_D = rpid.filt_D_hz();
+    return ret;
+}
+
+/*
+  set gains with PID components
+ */
+void AP_AutoTune::restore_gains(void)
+{
+    current = restore;
+    rpid.ff().set(restore.FF);
+    rpid.kP().set(restore.P);
+    rpid.kI().set(restore.I);
+    rpid.kD().set(restore.D);
+    rpid.kIMAX().set(restore.IMAX);
+    rpid.filt_T_hz().set(restore.flt_T);
+    rpid.filt_E_hz().set(restore.flt_E);
+    rpid.filt_D_hz().set(restore.flt_D);
+}
+
+/*
+  update RMAX and TAU parameters on each step. We move them gradually
+  towards the target to allow for a user going straight to a level 10
+  tune while starting with a poorly tuned plane
+ */
+void AP_AutoTune::update_rmax(void)
+{
+    uint8_t level = constrain_int32(aparm.autotune_level, 0, ARRAY_SIZE(tuning_table));
+
+    int16_t target_rmax;
+    float target_tau;
+
+    if (level == 0) {
+        // this level means to keep current values of RMAX and TCONST
+        target_rmax = constrain_float(current.rmax_pos, 20, 720);
+        target_tau = constrain_float(current.tau, 0.1, 2);
+    } else {
+        target_rmax = tuning_table[level-1].rmax;
+        target_tau = tuning_table[level-1].tau;
+        if (type == AUTOTUNE_PITCH) {
+            // 50% longer time constant on pitch
+            target_tau *= 1.5;
+        }
+    }
+
+    if (level > 0 && is_positive(current.FF)) {
+        const float invtau = ((1.0f / target_tau) + (current.I / current.FF));
+        if (is_positive(invtau)) {
+            target_tau = MAX(target_tau,1.0f / invtau);
+        }
+    }
+
+    if (current.rmax_pos == 0) {
+        // conservative initial value
+        current.rmax_pos.set(75);
+    }
+    // move RMAX by 20 deg/s per step
+    current.rmax_pos.set(constrain_int32(target_rmax,
+                                         current.rmax_pos.get()-20,
+                                         current.rmax_pos.get()+20));
+
+    if (level != 0 || current.rmax_neg.get() == 0) {
+        current.rmax_neg.set(current.rmax_pos.get());
+    }
+
+    // move tau by max 15% per loop
+    current.tau.set(constrain_float(target_tau,
+                                    current.tau*0.85,
+                                    current.tau*1.15));
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #pragma once
+
+#include <AP_Logger/AP_Logger.h>
+#include <AP_Logger/LogStructure.h>
+#include <AP_Param/AP_Param.h>
+#include <AP_Vehicle/AP_FixedWing.h>
+#include <Filter/SlewLimiter.h>
+
+#include <Filter/ModeFilter.h>
+
+class AP_AutoTune
+{
+public:
+    struct ATGains {
+        AP_Float tau;
+        AP_Int16 rmax_pos;
+        AP_Int16 rmax_neg;
+        float FF, P, I, D, IMAX;
+        float flt_T, flt_E, flt_D;
+    };
+
+    enum ATType {
+        AUTOTUNE_ROLL  = 0,
+        AUTOTUNE_PITCH = 1,
+        AUTOTUNE_YAW = 2,
+    };
+
+    enum Options {
+        DISABLE_FLTD_UPDATE = 0,
+        DISABLE_FLTT_UPDATE = 1
+    };
+
+    struct PACKED log_ATRP {
+        LOG_PACKET_HEADER;
+        uint64_t time_us;
+        uint8_t type;
+        uint8_t state;
+        float actuator;
+        float P_slew;
+        float D_slew;
+        float FF_single;
+        float FF;
+        float P;
+        float I;
+        float D;
+        uint8_t action;
+        float rmax;
+        float tau;
+    };
+
+    // constructor
+    AP_AutoTune(ATGains &_gains, ATType type, const AP_FixedWing &parms, class AC_PID &rpid);
+
+    // called when autotune mode is entered
+    void start(void);
+
+    // called to stop autotune and restore gains when user leaves
+    // autotune
+    void stop(void);
+
+    // update called whenever autotune mode is active. This is
+    // called at the main loop rate
+    void update(struct AP_PIDInfo &pid_info, float scaler, float angle_err_deg);
+
+    // are we running?
+    bool running;
+
+private:
+    // the current gains
+    ATGains &current;
+    class AC_PID &rpid;
+
+    // what type of autotune is this
+    ATType type;
+
+    const AP_FixedWing &aparm;
+
+    // values to restore if we leave autotune mode
+    ATGains restore;
+    ATGains last_save;
+
+    // last logging time
+    uint32_t last_log_ms;
+
+    // the demanded/achieved state
+    enum class ATState {IDLE,
+                        DEMAND_POS,
+                        DEMAND_NEG
+                       };
+    ATState state;
+
+    // the demanded/achieved state
+    enum class Action {NONE,
+                       LOW_RATE,
+                       SHORT,
+                       RAISE_PD,
+                       LOWER_PD,
+                       IDLE_LOWER_PD,
+                       RAISE_D,
+                       RAISE_P,
+                       LOWER_D,
+                       LOWER_P
+                      };
+    Action action;
+
+    // when we entered the current state
+    uint32_t state_enter_ms;
+
+    void check_state_exit(uint32_t state_time_ms);
+    void save_gains(void);
+
+    void save_float_if_changed(AP_Float &v, float value);
+    void save_int16_if_changed(AP_Int16 &v, int16_t value);
+    void state_change(ATState newstate);
+    const char *axis_string(void) const;
+
+    // get gains with PID components
+    ATGains get_gains(void);
+    void restore_gains(void);
+
+    // update rmax and tau towards target
+    void update_rmax();
+
+    bool has_option(Options option) {
+        return (aparm.autotune_options.get() & uint32_t(1<<uint32_t(option))) != 0;
+    }
+
+    // 5 point mode filter for FF estimate
+    ModeFilterFloat_Size5 ff_filter;
+
+    LowPassFilterConstDtFloat actuator_filter;
+    LowPassFilterConstDtFloat rate_filter;
+    LowPassFilterConstDtFloat target_filter;
+
+    // separate slew limiters for P and D
+    float slew_limit_max, slew_limit_tau;
+    SlewLimiter slew_limiter_P{slew_limit_max, slew_limit_tau};
+    SlewLimiter slew_limiter_D{slew_limit_max, slew_limit_tau};
+
+    float max_actuator;
+    float min_actuator;
+    float max_rate;
+    float min_rate;
+    float max_target;
+    float min_target;
+    float max_P;
+    float max_D;
+    float min_Dmod;
+    float max_Dmod;
+    float max_SRate_P;
+    float max_SRate_D;
+    float FF_single;
+    uint16_t ff_count;
+    float dt;
+    float D_limit;
+    float P_limit;
+    uint32_t D_set_ms;
+    uint32_t P_set_ms;
+    uint8_t done_count;
+};
+                                                                                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+//	Initial Code by Jon Challinger
+//  Modified by Paul Riseborough
+
+#include <AP_HAL/AP_HAL.h>
+#include "AP_PitchController.h"
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Scheduler/AP_Scheduler.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
+
+const AP_Param::GroupInfo AP_PitchController::var_info[] = {
+
+    // @Param: 2SRV_TCONST
+    // @DisplayName: Pitch Time Constant
+    // @Description: Time constant in seconds from demanded to achieved pitch angle. Most models respond well to 0.5. May be reduced for faster responses, but setting lower than a model can achieve will not help.
+    // @Range: 0.4 1.0
+    // @Units: s
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("2SRV_TCONST",      0, AP_PitchController, gains.tau,       0.5f),
+
+    // index 1 to 3 reserved for old PID values
+
+    // @Param: 2SRV_RMAX_UP
+    // @DisplayName: Pitch up max rate
+    // @Description: This sets the maximum nose up pitch rate that the attitude controller will demand (degrees/sec) in angle stabilized modes. Setting it to zero disables the limit.
+    // @Range: 0 100
+    // @Units: deg/s
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("2SRV_RMAX_UP",     4, AP_PitchController, gains.rmax_pos,   0.0f),
+
+    // @Param: 2SRV_RMAX_DN
+    // @DisplayName: Pitch down max rate
+    // @Description: This sets the maximum nose down pitch rate that the attitude controller will demand (degrees/sec) in angle stabilized modes. Setting it to zero disables the limit.
+    // @Range: 0 100
+    // @Units: deg/s
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("2SRV_RMAX_DN",     5, AP_PitchController, gains.rmax_neg,   0.0f),
+
+    // @Param: 2SRV_RLL
+    // @DisplayName: Roll compensation
+    // @Description: Gain added to pitch to keep aircraft from descending or ascending in turns. Increase in increments of 0.05 to reduce altitude loss. Decrease for altitude gain.
+    // @Range: 0.7 1.5
+    // @Increment: 0.05
+    // @User: Standard
+    AP_GROUPINFO("2SRV_RLL",      6, AP_PitchController, _roll_ff,        1.0f),
+
+    // index 7, 8 reserved for old IMAX, FF
+
+    // @Param: _RATE_P
+    // @DisplayName: Pitch axis rate controller P gain
+    // @Description: Pitch axis rate controller P gain. Corrects in proportion to the difference between the desired pitch rate vs actual pitch rate
+    // @Range: 0.08 0.35
+    // @Increment: 0.005
+    // @User: Standard
+
+    // @Param: _RATE_I
+    // @DisplayName: Pitch axis rate controller I gain
+    // @Description: Pitch axis rate controller I gain.  Corrects long-term difference in desired roll rate vs actual roll rate
+    // @Range: 0.01 0.6
+    // @Increment: 0.01
+    // @User: Standard
+
+    // @Param: _RATE_IMAX
+    // @DisplayName: Pitch axis rate controller I gain maximum
+    // @Description: Pitch axis rate controller I gain maximum.  Constrains the maximum that the I term will output
+    // @Range: 0 1
+    // @Increment: 0.01
+    // @User: Standard
+
+    // @Param: _RATE_D
+    // @DisplayName: Pitch axis rate controller D gain
+    // @Description: Pitch axis rate controller D gain.  Compensates for short-term change in desired roll rate vs actual roll rate
+    // @Range: 0.001 0.03
+    // @Increment: 0.001
+    // @User: Standard
+
+    // @Param: _RATE_FF
+    // @DisplayName: Pitch axis rate controller feed forward
+    // @Description: Pitch axis rate controller feed forward
+    // @Range: 0 3.0
+    // @Increment: 0.001
+    // @User: Standard
+
+    // @Param: _RATE_FLTT
+    // @DisplayName: Pitch axis rate controller target frequency in Hz
+    // @Description: Pitch axis rate controller target frequency in Hz
+    // @Range: 2 50
+    // @Increment: 1
+    // @Units: Hz
+    // @User: Standard
+
+    // @Param: _RATE_FLTE
+    // @DisplayName: Pitch axis rate controller error frequency in Hz
+    // @Description: Pitch axis rate controller error frequency in Hz
+    // @Range: 2 50
+    // @Increment: 1
+    // @Units: Hz
+    // @User: Standard
+
+    // @Param: _RATE_FLTD
+    // @DisplayName: Pitch axis rate controller derivative frequency in Hz
+    // @Description: Pitch axis rate controller derivative frequency in Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @Units: Hz
+    // @User: Standard
+
+    // @Param: _RATE_SMAX
+    // @DisplayName: Pitch slew rate limit
+    // @Description: Sets an upper limit on the slew rate produced by the combined P and D gains. If the amplitude of the control action produced by the rate feedback exceeds this value, then the D+P gain is reduced to respect the limit. This limits the amplitude of high frequency oscillations caused by an excessive gain. The limit should be set to no more than 25% of the actuators maximum slew rate to allow for load effects. Note: The gain will not be reduced to less than 10% of the nominal value. A value of zero will disable this feature.
+    // @Range: 0 200
+    // @Increment: 0.5
+    // @User: Advanced
+
+    // @Param: _RATE_PDMX
+    // @DisplayName: Pitch axis rate controller PD sum maximum
+    // @Description: Pitch axis rate controller PD sum maximum.  The maximum/minimum value that the sum of the P and D term can output
+    // @Range: 0 1
+    // @Increment: 0.01
+
+    // @Param: _RATE_D_FF
+    // @DisplayName: Pitch Derivative FeedForward Gain
+    // @Description: FF D Gain which produces an output that is proportional to the rate of change of the target
+    // @Range: 0 0.03
+    // @Increment: 0.001
+    // @User: Advanced
+
+    // @Param: _RATE_NTF
+    // @DisplayName: Pitch Target notch filter index
+    // @Description: Pitch Target notch filter index
+    // @Range: 1 8
+    // @User: Advanced
+
+    // @Param: _RATE_NEF
+    // @DisplayName: Pitch Error notch filter index
+    // @Description: Pitch Error notch filter index
+    // @Range: 1 8
+    // @User: Advanced
+
+    AP_SUBGROUPINFO(rate_pid, "_RATE_", 11, AP_PitchController, AC_PID),
+
+    AP_GROUPEND
+};
+
+AP_PitchController::AP_PitchController(const AP_FixedWing &parms)
+    : aparm(parms)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+    rate_pid.set_slew_limit_scale(45);
+}
+
+/*
+  AC_PID based rate controller
+*/
+float AP_PitchController::_get_rate_out(float desired_rate, float scaler, bool disable_integrator, float aspeed, bool ground_mode)
+{
+    const float dt = AP::scheduler().get_loop_period_s();
+
+    const AP_AHRS &_ahrs = AP::ahrs();
+
+    const float eas2tas = _ahrs.get_EAS2TAS();
+    bool limit_I = fabsf(_last_out) >= 45;
+    float rate_y = _ahrs.get_gyro().y;
+    float old_I = rate_pid.get_i();
+
+    bool underspeed = aspeed <= 0.5*float(aparm.airspeed_min);
+    if (underspeed) {
+        limit_I = true;
+    }
+
+    // the P and I elements are scaled by sq(scaler). To use an
+    // unmodified AC_PID object we scale the inputs and calculate FF separately
+    //
+    // note that we run AC_PID in radians so that the normal scaling
+    // range for IMAX in AC_PID applies (usually an IMAX value less than 1.0)
+    rate_pid.update_all(radians(desired_rate) * scaler * scaler, rate_y * scaler * scaler, dt, limit_I);
+
+    if (underspeed) {
+        // when underspeed we lock the integrator
+        rate_pid.set_integrator(old_I);
+    }
+
+    // FF should be scaled by scaler/eas2tas, but since we have scaled
+    // the AC_PID target above by scaler*scaler we need to instead
+    // divide by scaler*eas2tas to get the right scaling
+    const float ff = degrees(ff_scale * rate_pid.get_ff() / (scaler * eas2tas));
+    ff_scale = 1.0;
+
+    if (disable_integrator) {
+        rate_pid.reset_I();
+    }
+
+    // convert AC_PID info object to same scale as old controller
+    _pid_info = rate_pid.get_pid_info();
+    auto &pinfo = _pid_info;
+
+    const float deg_scale = degrees(1);
+    pinfo.FF = ff;
+    pinfo.P *= deg_scale;
+    pinfo.I *= deg_scale;
+    pinfo.D *= deg_scale;
+    pinfo.DFF *= deg_scale;
+
+    // fix the logged target and actual values to not have the scalers applied
+    pinfo.target = desired_rate;
+    pinfo.actual = degrees(rate_y);
+
+    // sum components
+    float out = pinfo.FF + pinfo.P + pinfo.I + pinfo.D + pinfo.DFF;
+    if (ground_mode) {
+        // when on ground suppress D and half P term to prevent oscillations
+        out -= pinfo.D + 0.5*pinfo.P;
+    }
+
+    // remember the last output to trigger the I limit
+    _last_out = out;
+
+    if (autotune != nullptr && autotune->running && aspeed > aparm.airspeed_min) {
+        // let autotune have a go at the values
+        autotune->update(pinfo, scaler, angle_err_deg);
+    }
+
+    // output is scaled to notional centidegrees of deflection
+    return constrain_float(out * 100, -4500, 4500);
+}
+
+/*
+ Function returns an equivalent elevator deflection in centi-degrees in the range from -4500 to 4500
+ A positive demand is up
+ Inputs are:
+ 1) demanded pitch rate in degrees/second
+ 2) control gain scaler = scaling_speed / aspeed
+ 3) boolean which is true when stabilise mode is active
+ 4) minimum FBW airspeed (metres/sec)
+ 5) maximum FBW airspeed (metres/sec)
+*/
+float AP_PitchController::get_rate_out(float desired_rate, float scaler)
+{
+    float aspeed;
+    if (!AP::ahrs().airspeed_estimate(aspeed)) {
+        // If no airspeed available use average of min and max
+        aspeed = 0.5f*(float(aparm.airspeed_min) + float(aparm.airspeed_max));
+    }
+    return _get_rate_out(desired_rate, scaler, false, aspeed, false);
+}
+
+/*
+  get the rate offset in degrees/second needed for pitch in body frame
+  to maintain height in a coordinated turn.
+
+  Also returns the inverted flag and the estimated airspeed in m/s for
+  use by the rest of the pitch controller
+ */
+float AP_PitchController::_get_coordination_rate_offset(float &aspeed, bool &inverted) const
+{
+    float rate_offset;
+    float bank_angle = AP::ahrs().get_roll();
+
+    // limit bank angle between +- 80 deg if right way up
+    if (fabsf(bank_angle) < radians(90))	{
+        bank_angle = constrain_float(bank_angle,-radians(80),radians(80));
+        inverted = false;
+    } else {
+        inverted = true;
+        if (bank_angle > 0.0f) {
+            bank_angle = constrain_float(bank_angle,radians(100),radians(180));
+        } else {
+            bank_angle = constrain_float(bank_angle,-radians(180),-radians(100));
+        }
+    }
+    const AP_AHRS &_ahrs = AP::ahrs();
+    if (!_ahrs.airspeed_estimate(aspeed)) {
+        // If no airspeed available use average of min and max
+        aspeed = 0.5f*(float(aparm.airspeed_min) + float(aparm.airspeed_max));
+    }
+    if (abs(_ahrs.pitch_sensor) > 7000) {
+        // don't do turn coordination handling when at very high pitch angles
+        rate_offset = 0;
+    } else {
+        rate_offset = cosf(_ahrs.get_pitch())*fabsf(ToDeg((GRAVITY_MSS / MAX((aspeed * _ahrs.get_EAS2TAS()), MAX(aparm.airspeed_min, 1))) * tanf(bank_angle) * sinf(bank_angle))) * _roll_ff;
+    }
+    if (inverted) {
+        rate_offset = -rate_offset;
+    }
+    return rate_offset;
+}
+
+// Function returns an equivalent elevator deflection in centi-degrees in the range from -4500 to 4500
+// A positive demand is up
+// Inputs are:
+// 1) demanded pitch angle in centi-degrees
+// 2) control gain scaler = scaling_speed / aspeed
+// 3) boolean which is true when stabilise mode is active
+// 4) minimum FBW airspeed (metres/sec)
+// 5) maximum FBW airspeed (metres/sec)
+//
+float AP_PitchController::get_servo_out(int32_t angle_err, float scaler, bool disable_integrator, bool ground_mode)
+{
+    // Calculate offset to pitch rate demand required to maintain pitch angle whilst banking
+    // Calculate ideal turn rate from bank angle and airspeed assuming a level coordinated turn
+    // Pitch rate offset is the component of turn rate about the pitch axis
+    float aspeed;
+    float rate_offset;
+    bool inverted;
+
+    if (gains.tau < 0.05f) {
+        gains.tau.set(0.05f);
+    }
+
+    rate_offset = _get_coordination_rate_offset(aspeed, inverted);
+
+    // Calculate the desired pitch rate (deg/sec) from the angle error
+    angle_err_deg = angle_err * 0.01;
+    float desired_rate = angle_err_deg / gains.tau;
+
+    // limit the maximum pitch rate demand. Don't apply when inverted
+    // as the rates will be tuned when upright, and it is common that
+    // much higher rates are needed inverted
+    if (!inverted) {
+        desired_rate += rate_offset;
+        if (gains.rmax_neg && desired_rate < -gains.rmax_neg) {
+            desired_rate = -gains.rmax_neg;
+        } else if (gains.rmax_pos && desired_rate > gains.rmax_pos) {
+            desired_rate = gains.rmax_pos;
+        }
+    } else {
+        // Make sure not to invert the turn coordination offset
+        desired_rate = -desired_rate + rate_offset;
+    }
+
+    /*
+      when we are past the users defined roll limit for the aircraft
+      our priority should be to bring the aircraft back within the
+      roll limit. Using elevator for pitch control at large roll
+      angles is ineffective, and can be counter productive as it
+      induces earth-frame yaw which can reduce the ability to roll. We
+      linearly reduce pitch demanded rate when beyond the configured
+      roll limit, reducing to zero at 90 degrees
+    */
+    const AP_AHRS &_ahrs = AP::ahrs();
+    float roll_wrapped = labs(_ahrs.roll_sensor);
+    if (roll_wrapped > 9000) {
+        roll_wrapped = 18000 - roll_wrapped;
+    }
+    const float roll_limit_margin = MIN(aparm.roll_limit*100 + 500.0, 8500.0);
+    if (roll_wrapped > roll_limit_margin && labs(_ahrs.pitch_sensor) < 7000) {
+        float roll_prop = (roll_wrapped - roll_limit_margin) / (float)(9000 - roll_limit_margin);
+        desired_rate *= (1 - roll_prop);
+    }
+
+    return _get_rate_out(desired_rate, scaler, disable_integrator, aspeed, ground_mode);
+}
+
+void AP_PitchController::reset_I()
+{
+    rate_pid.reset_I();
+}
+
+/*
+  convert from old to new PIDs
+  this is a temporary conversion function during development
+ */
+void AP_PitchController::convert_pid()
+{
+    AP_Float &ff = rate_pid.ff();
+    if (ff.configured()) {
+        return;
+    }
+
+    float old_ff=0, old_p=1.0, old_i=0.3, old_d=0.08;
+    int16_t old_imax = 3000;
+    bool have_old = AP_Param::get_param_by_index(this, 1, AP_PARAM_FLOAT, &old_p);
+    have_old |= AP_Param::get_param_by_index(this, 3, AP_PARAM_FLOAT, &old_i);
+    have_old |= AP_Param::get_param_by_index(this, 2, AP_PARAM_FLOAT, &old_d);
+    have_old |= AP_Param::get_param_by_index(this, 8, AP_PARAM_FLOAT, &old_ff);
+    have_old |= AP_Param::get_param_by_index(this, 7, AP_PARAM_FLOAT, &old_imax);
+    if (!have_old) {
+        // none of the old gains were set
+        return;
+    }
+
+    const float kp_ff = MAX((old_p - old_i * gains.tau) * gains.tau  - old_d, 0);
+    rate_pid.ff().set_and_save(old_ff + kp_ff);
+    rate_pid.kI().set_and_save_ifchanged(old_i * gains.tau);
+    rate_pid.kP().set_and_save_ifchanged(old_d);
+    rate_pid.kD().set_and_save_ifchanged(0);
+    rate_pid.kIMAX().set_and_save_ifchanged(old_imax/4500.0);
+}
+
+/*
+  start an autotune
+ */
+void AP_PitchController::autotune_start(void)
+{
+    if (autotune == nullptr) {
+        autotune = NEW_NOTHROW AP_AutoTune(gains, AP_AutoTune::AUTOTUNE_PITCH, aparm, rate_pid);
+        if (autotune == nullptr) {
+            if (!failed_autotune_alloc) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "AutoTune: failed pitch allocation");
+            }
+            failed_autotune_alloc = true;
+        }
+    }
+    if (autotune != nullptr) {
+        autotune->start();
+    }
+}
+
+/*
+  restore autotune gains
+ */
+void AP_PitchController::autotune_restore(void)
+{
+    if (autotune != nullptr) {
+        autotune->stop();
+    }
+}
+                                                                                                                                                                                                                                                                  #pragma once
+
+#include <AP_Common/AP_Common.h>
+#include "AP_AutoTune.h"
+#include <AP_Math/AP_Math.h>
+#include <AC_PID/AC_PID.h>
+
+class AP_PitchController
+{
+public:
+    AP_PitchController(const AP_FixedWing &parms);
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_PitchController);
+
+    float get_rate_out(float desired_rate, float scaler);
+    float get_servo_out(int32_t angle_err, float scaler, bool disable_integrator, bool ground_mode);
+
+    // setup a one loop FF scale multiplier. This replaces any previous scale applied
+    // so should only be used when only one source of scaling is needed
+    void set_ff_scale(float _ff_scale) { ff_scale = _ff_scale; }
+
+    void reset_I();
+
+    /*
+      reduce the integrator, used when we have a low scale factor in a quadplane hover
+    */
+    void decay_I()
+    {
+        // this reduces integrator by 95% over 2s
+        _pid_info.I *= 0.995f;
+        rate_pid.set_integrator(rate_pid.get_i() * 0.995);
+    }
+
+    void autotune_start(void);
+    void autotune_restore(void);
+
+    const AP_PIDInfo& get_pid_info(void) const
+    {
+        return _pid_info;
+    }
+
+    // set the PID notch sample rates
+    void set_notch_sample_rate(float sample_rate) { rate_pid.set_notch_sample_rate(sample_rate); }
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    AP_Float &kP(void) { return rate_pid.kP(); }
+    AP_Float &kI(void) { return rate_pid.kI(); }
+    AP_Float &kD(void) { return rate_pid.kD(); }
+    AP_Float &kFF(void) { return rate_pid.ff(); }
+    AP_Float &tau(void) { return gains.tau; }
+
+    void convert_pid();
+
+private:
+    const AP_FixedWing &aparm;
+    AP_AutoTune::ATGains gains;
+    AP_AutoTune *autotune;
+    bool failed_autotune_alloc;
+    AP_Int16 _max_rate_neg;
+    AP_Float _roll_ff;
+    float _last_out;
+    AC_PID rate_pid{0.04, 0.15, 0, 0.345, 0.666, 3, 0, 12, 150, 1};
+    float angle_err_deg;
+    float ff_scale = 1.0;
+
+    AP_PIDInfo _pid_info;
+
+    float _get_rate_out(float desired_rate, float scaler, bool disable_integrator, float aspeed, bool ground_mode);
+    float _get_coordination_rate_offset(float &aspeed, bool &inverted) const;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+//	Code by Jon Challinger
+//  Modified by Paul Riseborough
+//
+
+#include <AP_HAL/AP_HAL.h>
+#include "AP_RollController.h"
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Scheduler/AP_Scheduler.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
+
+const AP_Param::GroupInfo AP_RollController::var_info[] = {
+    // @Param: 2SRV_TCONST
+    // @DisplayName: Roll Time Constant
+    // @Description: Time constant in seconds from demanded to achieved roll angle. Most models respond well to 0.5. May be reduced for faster responses, but setting lower than a model can achieve will not help.
+    // @Range: 0.4 1.0
+    // @Units: s
+    // @Increment: 0.1
+    // @User: Advanced
+    AP_GROUPINFO("2SRV_TCONST",      0, AP_RollController, gains.tau,       0.5f),
+
+    // index 1 to 3 reserved for old PID values
+
+    // @Param: 2SRV_RMAX
+    // @DisplayName: Maximum Roll Rate
+    // @Description: This sets the maximum roll rate that the attitude controller will demand (degrees/sec) in angle stabilized modes. Setting it to zero disables this limit.
+    // @Range: 0 180
+    // @Units: deg/s
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("2SRV_RMAX",   4, AP_RollController, gains.rmax_pos,       0),
+
+    // index 5, 6 reserved for old IMAX, FF
+
+    // @Param: _RATE_P
+    // @DisplayName: Roll axis rate controller P gain
+    // @Description: Roll axis rate controller P gain. Corrects in proportion to the difference between the desired roll rate vs actual roll rate
+    // @Range: 0.08 0.35
+    // @Increment: 0.005
+    // @User: Standard
+
+    // @Param: _RATE_I
+    // @DisplayName: Roll axis rate controller I gain
+    // @Description: Roll axis rate controller I gain.  Corrects long-term difference in desired roll rate vs actual roll rate
+    // @Range: 0.01 0.6
+    // @Increment: 0.01
+    // @User: Standard
+
+    // @Param: _RATE_IMAX
+    // @DisplayName: Roll axis rate controller I gain maximum
+    // @Description: Roll axis rate controller I gain maximum.  Constrains the maximum that the I term will output
+    // @Range: 0 1
+    // @Increment: 0.01
+    // @User: Standard
+
+    // @Param: _RATE_D
+    // @DisplayName: Roll axis rate controller D gain
+    // @Description: Roll axis rate controller D gain.  Compensates for short-term change in desired roll rate vs actual roll rate
+    // @Range: 0.001 0.03
+    // @Increment: 0.001
+    // @User: Standard
+
+    // @Param: _RATE_FF
+    // @DisplayName: Roll axis rate controller feed forward
+    // @Description: Roll axis rate controller feed forward
+    // @Range: 0 3.0
+    // @Increment: 0.001
+    // @User: Standard
+
+    // @Param: _RATE_FLTT
+    // @DisplayName: Roll axis rate controller target frequency in Hz
+    // @Description: Roll axis rate controller target frequency in Hz
+    // @Range: 2 50
+    // @Increment: 1
+    // @Units: Hz
+    // @User: Standard
+
+    // @Param: _RATE_FLTE
+    // @DisplayName: Roll axis rate controller error frequency in Hz
+    // @Description: Roll axis rate controller error frequency in Hz
+    // @Range: 2 50
+    // @Increment: 1
+    // @Units: Hz
+    // @User: Standard
+
+    // @Param: _RATE_FLTD
+    // @DisplayName: Roll axis rate controller derivative frequency in Hz
+    // @Description: Roll axis rate controller derivative frequency in Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @Units: Hz
+    // @User: Standard
+
+    // @Param: _RATE_SMAX
+    // @DisplayName: Roll slew rate limit
+    // @Description: Sets an upper limit on the slew rate produced by the combined P and D gains. If the amplitude of the control action produced by the rate feedback exceeds this value, then the D+P gain is reduced to respect the limit. This limits the amplitude of high frequency oscillations caused by an excessive gain. The limit should be set to no more than 25% of the actuators maximum slew rate to allow for load effects. Note: The gain will not be reduced to less than 10% of the nominal value. A value of zero will disable this feature.
+    // @Range: 0 200
+    // @Increment: 0.5
+    // @User: Advanced
+
+    // @Param: _RATE_PDMX
+    // @DisplayName: Roll axis rate controller PD sum maximum
+    // @Description: Roll axis rate controller PD sum maximum.  The maximum/minimum value that the sum of the P and D term can output
+    // @Range: 0 1
+    // @Increment: 0.01
+
+    // @Param: _RATE_D_FF
+    // @DisplayName: Roll Derivative FeedForward Gain
+    // @Description: FF D Gain which produces an output that is proportional to the rate of change of the target
+    // @Range: 0 0.03
+    // @Increment: 0.001
+    // @User: Advanced
+
+    // @Param: _RATE_NTF
+    // @DisplayName: Roll Target notch filter index
+    // @Description: Roll Target notch filter index
+    // @Range: 1 8
+    // @User: Advanced
+
+    // @Param: _RATE_NEF
+    // @DisplayName: Roll Error notch filter index
+    // @Description: Roll Error notch filter index
+    // @Range: 1 8
+    // @User: Advanced
+
+    AP_SUBGROUPINFO(rate_pid, "_RATE_", 9, AP_RollController, AC_PID),
+
+    AP_GROUPEND
+};
+
+// constructor
+AP_RollController::AP_RollController(const AP_FixedWing &parms)
+    : aparm(parms)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+    rate_pid.set_slew_limit_scale(45);
+}
+
+
+/*
+  AC_PID based rate controller
+*/
+float AP_RollController::_get_rate_out(float desired_rate, float scaler, bool disable_integrator, bool ground_mode)
+{
+    const AP_AHRS &_ahrs = AP::ahrs();
+
+    const float dt = AP::scheduler().get_loop_period_s();
+    const float eas2tas = _ahrs.get_EAS2TAS();
+    bool limit_I = fabsf(_last_out) >= 45;
+    float rate_x = _ahrs.get_gyro().x;
+    float aspeed;
+    float old_I = rate_pid.get_i();
+
+    if (!_ahrs.airspeed_estimate(aspeed)) {
+        aspeed = 0;
+    }
+    bool underspeed = aspeed <= float(aparm.airspeed_min);
+    if (underspeed) {
+        limit_I = true;
+    }
+
+    // the P and I elements are scaled by sq(scaler). To use an
+    // unmodified AC_PID object we scale the inputs and calculate FF separately
+    //
+    // note that we run AC_PID in radians so that the normal scaling
+    // range for IMAX in AC_PID applies (usually an IMAX value less than 1.0)
+    rate_pid.update_all(radians(desired_rate) * scaler * scaler, rate_x * scaler * scaler, dt, limit_I);
+
+    if (underspeed) {
+        // when underspeed we lock the integrator
+        rate_pid.set_integrator(old_I);
+    }
+
+    // FF should be scaled by scaler/eas2tas, but since we have scaled
+    // the AC_PID target above by scaler*scaler we need to instead
+    // divide by scaler*eas2tas to get the right scaling
+    const float ff = degrees(ff_scale * rate_pid.get_ff() / (scaler * eas2tas));
+    ff_scale = 1.0;
+
+    if (disable_integrator) {
+        rate_pid.reset_I();
+    }
+
+    // convert AC_PID info object to same scale as old controller
+    _pid_info = rate_pid.get_pid_info();
+    auto &pinfo = _pid_info;
+
+    const float deg_scale = degrees(1);
+    pinfo.FF = ff;
+    pinfo.P *= deg_scale;
+    pinfo.I *= deg_scale;
+    pinfo.D *= deg_scale;
+    pinfo.DFF *= deg_scale;
+
+    // fix the logged target and actual values to not have the scalers applied
+    pinfo.target = desired_rate;
+    pinfo.actual = degrees(rate_x);
+
+    // sum components
+    float out = pinfo.FF + pinfo.P + pinfo.I + pinfo.D + pinfo.DFF;
+    if (ground_mode) {
+        // when on ground suppress D term to prevent oscillations
+        out -= pinfo.D + 0.5*pinfo.P;
+    }
+
+    // remember the last output to trigger the I limit
+    _last_out = out;
+
+    if (autotune != nullptr && autotune->running && aspeed > aparm.airspeed_min) {
+      

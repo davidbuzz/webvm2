@@ -1,0 +1,2763 @@
+        case TrampStatus::TRAMP_STATUS_OFFLINE:
+            debug("status: OFFLINE");
+            break;
+        case TrampStatus::TRAMP_STATUS_INIT:
+            debug("status: INIT");
+            break;
+        case TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT:
+            debug("status: ONLINE_MONITOR_FREQPWRPIT");
+            break;
+        case TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_TEMP:
+            debug("status: ONLINE_MONITOR_TEMP");
+            break;
+        case TrampStatus::TRAMP_STATUS_ONLINE_CONFIG:
+            debug("status: ONLINE_CONFIG");
+            break;
+    }
+#endif
+}
+
+void AP_Tramp::process_requests()
+{
+    if (port == nullptr) {
+        return;
+    }
+
+    bool configUpdateRequired = false;
+
+    // Read response from device
+    const char replyCode = receive_response();
+    const uint32_t now = AP_HAL::micros();
+
+#ifdef TRAMP_DEBUG
+    if (replyCode != 0) {
+        debug("receive response '%c'", replyCode);
+    }
+#endif
+
+    // Act on state
+    switch (status) {
+    case TrampStatus::TRAMP_STATUS_OFFLINE: {
+        // Offline, check for response
+        if (replyCode == 'r') {
+            // Device replied to reset? request, enter init
+            set_status(TrampStatus::TRAMP_STATUS_INIT);
+        } else if ((now - last_time_us) >= TRAMP_MIN_REQUEST_PERIOD_US) {
+            // Min request period exceeded, issue another reset?
+            send_query('r');
+
+            // Update last time
+            last_time_us = now;
+        }
+        break;
+    }
+    case TrampStatus::TRAMP_STATUS_INIT: {
+        // Initializing, check for response
+        if (replyCode == 'v') {
+            // Device replied to freq / power / pit query, enter online
+            set_status(TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT);
+        } else if ((now - last_time_us) >= TRAMP_MIN_REQUEST_PERIOD_US) {
+
+            update_baud_rate();
+
+            // Min request period exceeded, issue another query
+            send_query('v');
+
+            // Update last time
+            last_time_us = now;
+        }
+        break;
+    }
+    case TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT: {
+        // Note after config a status update request is made, a new status
+        // request is made, this request is handled above and should prevent
+        // subsequent config updates if the config is now correct
+        if (retry_count > 0 && ((now - last_time_us) >= TRAMP_MIN_REQUEST_PERIOD_US)) {
+            AP_VideoTX& vtx = AP::vtx();
+            // Config retries remain and min request period exceeded, check freq
+            if (!is_race_lock_enabled() && vtx.update_frequency()) {
+                debug("Updating frequency to %uMhz", vtx.get_configured_frequency_mhz());
+                // Freq can be and needs to be updated, issue request
+                send_command('F', vtx.get_configured_frequency_mhz());
+
+                // Set flag
+                configUpdateRequired = true;
+            } else if (!is_race_lock_enabled() && vtx.update_power()) {
+                debug("Updating power to %umw\n", vtx.get_configured_power_mw());
+                // Power can be and needs to be updated, issue request
+                send_command('P', vtx.get_configured_power_mw());
+
+                // Set flag
+                configUpdateRequired = true;
+            } else if (vtx.update_options()) {
+                // Pit mode needs to be updated, issue request
+                send_command('I', vtx.has_option(AP_VideoTX::VideoOptions::VTX_PITMODE) ? 0 : 1);
+
+                // Set flag
+                configUpdateRequired = true;
+            }
+
+            if (configUpdateRequired) {
+                // Update required, decrement retry count
+                retry_count--;
+
+                // Update last time
+                last_time_us = now;
+
+                // Advance state
+                set_status(TrampStatus::TRAMP_STATUS_ONLINE_CONFIG);
+            } else {
+                // No update required, reset retry count
+                retry_count = 0;
+            }
+        }
+
+        /* Was a config update made? */
+        if (!configUpdateRequired) {
+            /* No, look to continue monitoring */
+            if ((now - last_time_us) >= TRAMP_STATUS_REQUEST_PERIOD_US) {
+                // Request period exceeded, issue freq/power/pit query
+                send_query('v');
+
+                // Update last time
+                last_time_us = now;
+            } else if (replyCode == 'v') {
+                // Got reply, issue temp query
+                send_query('s');
+
+                // Wait for reply
+                set_status(TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_TEMP);
+
+                // Update last time
+                last_time_us = now;
+            }
+        }
+
+        break;
+    }
+    case TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_TEMP: {
+        // Check request time
+        if (replyCode == 's') {
+            // Got reply, return to request freq/power/pit
+            set_status(TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_TEMP);
+        } else if ((now - last_time_us) >= TRAMP_MIN_REQUEST_PERIOD_US) {
+            // Timed out after min request period, return to request freq/power/pit query
+            set_status(TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT);
+        }
+        break;
+    }
+    case TrampStatus::TRAMP_STATUS_ONLINE_CONFIG: {
+        // Param should now be set, check time
+        if ((now - last_time_us) >= TRAMP_MIN_REQUEST_PERIOD_US) {
+            // Min request period exceeded, re-query
+            send_query('v');
+
+            // Advance state
+            set_status(TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT);
+
+            // Update last time
+            last_time_us = now;
+        }
+        break;
+    }
+    default:
+        // Invalid state, reset
+        set_status(TrampStatus::TRAMP_STATUS_OFFLINE);
+        break;
+    }
+}
+
+bool AP_Tramp::is_device_ready()
+{
+    return status >= TrampStatus::TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT;
+}
+
+void AP_Tramp::set_frequency(uint16_t freq)
+{
+    uint8_t freqValid;
+
+    // Check frequency valid
+    if (device_limits.rf_freq_min != 0 && device_limits.rf_freq_max != 0) {
+        freqValid = (freq >= device_limits.rf_freq_min && freq <= device_limits.rf_freq_max);
+    } else {
+        freqValid = (freq >= VTX_TRAMP_MIN_FREQUENCY_MHZ && freq <= VTX_TRAMP_MAX_FREQUENCY_MHZ);
+    }
+
+    // Is frequency valid?
+    if (freqValid) {
+        // Requested freq changed, reset retry count
+        retry_count = VTX_TRAMP_MAX_RETRIES;
+    } else {
+        debug("requested frequency %u is invalid", freq);
+        // not valid reset to default
+        AP::vtx().set_configured_frequency_mhz(AP::vtx().get_frequency_mhz());
+    }
+}
+
+void AP_Tramp::update()
+{
+    if (port == nullptr) {
+        return;
+    }
+
+    AP_VideoTX& vtx = AP::vtx();
+
+    if (vtx.have_params_changed() && retry_count == 0) {
+        // check changes in the order they will be processed
+        if (vtx.update_frequency() || vtx.update_band() || vtx.update_channel()) {
+            if (vtx.update_frequency()) {
+                vtx.update_configured_channel_and_band();
+            } else {
+                vtx.update_configured_frequency();
+            }
+            set_frequency(vtx.get_configured_frequency_mhz());
+        }
+        else if (vtx.update_power()) {
+            retry_count = VTX_TRAMP_MAX_RETRIES;
+        }
+        else if (vtx.update_options()) {
+            retry_count = VTX_TRAMP_MAX_RETRIES;
+        }
+    }
+
+    process_requests();
+}
+
+// we missed a response too many times - update the baud rate in case the temperature has increased
+void AP_Tramp::update_baud_rate()
+{
+    // on my Unify Pro32 the VTX will respond immediately on power up to a settings request, so 5 packets is easily more than enough
+    // we want to bias autobaud to only frequency hop when the current frequency is clearly exhausted, but after that hop quickly
+    // on a Foxeer Reaper Infinity the actual response baudrate is more like 9400, so auto-bauding down in the first instance.
+    if (_packets_sent - _packets_rcvd < 5) {
+        return;
+    }
+
+    if (_smartbaud_direction == AutobaudDirection::UP
+        && _smartbaud == VTX_TRAMP_SMARTBAUD_MAX) {
+        _smartbaud_direction = AutobaudDirection::DOWN;
+    } else if (_smartbaud_direction == AutobaudDirection::DOWN
+        && _smartbaud == VTX_TRAMP_SMARTBAUD_MIN) {
+        _smartbaud_direction = AutobaudDirection::UP;
+    }
+
+    _smartbaud += VTX_TRAMP_SMARTBAUD_STEP * int32_t(_smartbaud_direction);
+
+    debug("autobaud: %d", int(_smartbaud));
+
+    port->discard_input();
+    port->begin(_smartbaud);
+
+    _packets_sent = _packets_rcvd = 0;
+}
+
+
+bool AP_Tramp::init(void)
+{
+    if (AP::vtx().get_enabled() == 0) {
+        debug("protocol is not active");
+        return false;
+    }
+
+    // init uart
+    port = AP::serialmanager().find_serial(AP_SerialManager::SerialProtocol_Tramp, 0);
+    if (port != nullptr) {
+        port->configure_parity(0);
+        port->set_stop_bits(1);
+        port->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
+        port->set_options((port->get_options() & ~AP_HAL::UARTDriver::OPTION_RXINV));
+
+        port->begin(AP_TRAMP_UART_BAUD, AP_TRAMP_UART_BUFSIZE_RX, AP_TRAMP_UART_BUFSIZE_TX);
+        debug("port opened");
+
+        AP::vtx().set_provider_enabled(AP_VideoTX::VTXType::Tramp);
+
+        return true;
+    }
+    return false;
+}
+
+#endif // VTX_TRAMP
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+   Code by Andy Piper, ported from betaflight vtx_tramp
+*/
+
+#pragma once
+
+#include "AP_VideoTX_config.h"
+
+#if AP_TRAMP_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_OSD/AP_OSD.h>
+#include <AP_Param/AP_Param.h>
+#include <AP_HAL/utility/RingBuffer.h>
+#include "AP_VideoTX.h"
+
+#define VTX_TRAMP_POWER_COUNT 5
+
+#define VTX_TRAMP_MIN_FREQUENCY_MHZ 1000             //min freq in MHz
+#define VTX_TRAMP_MAX_FREQUENCY_MHZ 5999             //max freq in MHz
+// Maximum number of requests sent to try a config change
+// Some VTX fail to respond to every request (like Matek FCHUB-VTX) so
+// we sometimes need multiple retries to get the VTX to respond.
+#define VTX_TRAMP_MAX_RETRIES (20)
+// Race lock - settings can't be changed
+#define TRAMP_CONTROL_RACE_LOCK (0x01)
+
+#define VTX_TRAMP_UART_BAUD            9600
+#define VTX_TRAMP_SMARTBAUD_MIN        9120     // -5%
+#define VTX_TRAMP_SMARTBAUD_MAX        10080    // +5%
+#define VTX_TRAMP_SMARTBAUD_STEP       120
+
+class AP_Tramp
+{
+public:
+    AP_Tramp();
+    ~AP_Tramp() {}
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Tramp);
+
+    static AP_Tramp *get_singleton(void) {
+        return singleton;
+    }
+
+    bool init(void);
+    void update();
+
+    uint16_t get_current_actual_power();
+    uint16_t get_current_temp();
+
+private:
+    uint8_t checksum(uint8_t *buf);
+    // Check if race lock is enabled
+    bool is_race_lock_enabled(void) {
+        return cur_control_mode & TRAMP_CONTROL_RACE_LOCK;
+    }
+    void send_command(uint8_t cmd, uint16_t param);
+    char handle_response();
+    void reset_receiver();
+    char receive_response();
+    void send_query(uint8_t cmd);
+    void process_requests();
+    bool is_device_ready();
+    void set_frequency(uint16_t freq);
+    void set_power(uint16_t power);
+    void set_pit_mode(uint8_t onoff);
+    // change baud automatically when request-response fails many times
+    void update_baud_rate();
+
+    // serial interface
+    AP_HAL::UARTDriver *port;                  // UART used to send data to Tramp VTX
+
+    //Pointer to singleton
+    static AP_Tramp* singleton;
+
+    const static uint16_t TRAMP_BUF_SIZE = 16;
+
+    // Serial transmit and receive buffers
+    uint8_t request_buffer[TRAMP_BUF_SIZE];
+    uint8_t response_buffer[TRAMP_BUF_SIZE];
+
+    // Module state machine
+    enum class TrampStatus {
+        // Offline - device hasn't responded yet
+        TRAMP_STATUS_OFFLINE = 0,
+        // Init - fetching current settings from device
+        TRAMP_STATUS_INIT,
+        // Online - device is ready and being monitored - freq/power/pitmode
+        TRAMP_STATUS_ONLINE_MONITOR_FREQPWRPIT,
+        // Online - device is ready and being monitored - temperature
+        TRAMP_STATUS_ONLINE_MONITOR_TEMP,
+        // Online - device is ready and config has just been updated
+        TRAMP_STATUS_ONLINE_CONFIG
+    };
+
+    TrampStatus status = TrampStatus::TRAMP_STATUS_OFFLINE;
+
+    void set_status(TrampStatus stat);
+
+    // Device limits, read from device during init
+    struct {
+        uint32_t rf_freq_min;
+        uint32_t rf_freq_max;
+        uint32_t rf_power_max;
+    } device_limits;
+
+    uint16_t cur_act_power; // Actual power
+    int16_t cur_temp;
+    uint8_t cur_control_mode;
+
+    // statistics
+    uint16_t _packets_sent;
+    uint16_t _packets_rcvd;
+
+    // value for current baud adjust
+    int32_t _smartbaud = VTX_TRAMP_UART_BAUD;
+    enum class AutobaudDirection {
+        UP = 1,
+        DOWN = -1
+    } _smartbaud_direction = AutobaudDirection::DOWN;
+
+    // Retry count
+    uint8_t retry_count = VTX_TRAMP_MAX_RETRIES;
+
+    // Receive state machine
+    enum class ReceiveState {
+        S_WAIT_LEN = 0,   // Waiting for a packet len
+        S_WAIT_CODE,      // Waiting for a response code
+        S_DATA,           // Waiting for rest of the packet.
+    };
+
+    ReceiveState receive_state = ReceiveState::S_WAIT_LEN;
+
+    // Receive buffer index
+    int16_t receive_pos;
+
+    // Last action time
+    uint32_t last_time_us;
+};
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "AP_VideoTX.h"
+
+#if AP_VIDEOTX_ENABLED
+
+#include <AP_RCTelemetry/AP_CRSF_Telem.h>
+#include <GCS_MAVLink/GCS.h>
+
+#include <AP_HAL/AP_HAL.h>
+
+extern const AP_HAL::HAL& hal;
+
+AP_VideoTX *AP_VideoTX::singleton;
+
+const AP_Param::GroupInfo AP_VideoTX::var_info[] = {
+
+    // @Param: ENABLE
+    // @DisplayName: Is the Video Transmitter enabled or not
+    // @Description: Toggles the Video Transmitter on and off
+    // @Values: 0:Disable,1:Enable
+    AP_GROUPINFO_FLAGS("ENABLE", 1, AP_VideoTX, _enabled, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: POWER
+    // @DisplayName: Video Transmitter Power Level
+    // @Description: Video Transmitter Power Level. Different VTXs support different power levels, the power level chosen will be rounded down to the nearest supported power level
+    // @Range: 1 1000
+    AP_GROUPINFO("POWER",    2, AP_VideoTX, _power_mw, 0),
+
+    // @Param: CHANNEL
+    // @DisplayName: Video Transmitter Channel
+    // @Description: Video Transmitter Channel
+    // @User: Standard
+    // @Range: 0 7
+    AP_GROUPINFO("CHANNEL",  3, AP_VideoTX, _channel, 0),
+
+    // @Param: BAND
+    // @DisplayName: Video Transmitter Band
+    // @Description: Video Transmitter Band
+    // @User: Standard
+    // @Values: 0:Band A,1:Band B,2:Band E,3:Airwave,4:RaceBand,5:Low RaceBand,6:1G3 Band A,7:1G3 Band B,8:Band X,9:3G3 Band A,10:3G3 Band B
+    AP_GROUPINFO("BAND",  4, AP_VideoTX, _band, 0),
+
+    // @Param: FREQ
+    // @DisplayName: Video Transmitter Frequency
+    // @Description: Video Transmitter Frequency. The frequency is derived from the setting of BAND and CHANNEL
+    // @User: Standard
+    // @ReadOnly: True
+    // @Range: 1000 6000
+    AP_GROUPINFO("FREQ",  5, AP_VideoTX, _frequency_mhz, 0),
+
+    // @Param: OPTIONS
+    // @DisplayName: Video Transmitter Options
+    // @Description: Video Transmitter Options. Pitmode puts the VTX in a low power state. Unlocked enables certain restricted frequencies and power levels. Do not enable the Unlocked option unless you have appropriate permissions in your jurisdiction to transmit at high power levels. One stop-bit may be required for VTXs that erroneously mimic iNav behaviour.
+    // @User: Advanced
+    // @Bitmask: 0:Pitmode,1:Pitmode until armed,2:Pitmode when disarmed,3:Unlocked,4:Add leading zero byte to requests,5:Use 1 stop-bit in SmartAudio,6:Ignore CRC in SmartAudio,7:Ignore status updates in CRSF and blindly set VTX options
+    AP_GROUPINFO("OPTIONS",  6, AP_VideoTX, _options, 0),
+
+    // @Param: MAX_POWER
+    // @DisplayName: Video Transmitter Max Power Level
+    // @Description: Video Transmitter Maximum Power Level. Different VTXs support different power levels, this prevents the power aux switch from requesting too high a power level. The switch supports 6 power levels and the selected power will be a subdivision between 0 and this setting.
+    // @Range: 25 1000
+    AP_GROUPINFO("MAX_POWER", 7, AP_VideoTX, _max_power_mw, 800),
+
+    AP_GROUPEND
+};
+
+//#define VTX_DEBUG
+#ifdef VTX_DEBUG
+# define debug(fmt, args...)	hal.console->printf("VTX: " fmt "\n", ##args)
+#else
+# define debug(fmt, args...)	do {} while(0)
+#endif
+
+extern const AP_HAL::HAL& hal;
+
+const char * AP_VideoTX::band_names[] = {"A","B","E","F","R","L","1G3_A","1G3_B","X","3G3_A","3G3_B"};
+
+const uint16_t AP_VideoTX::VIDEO_CHANNELS[AP_VideoTX::MAX_BANDS][VTX_MAX_CHANNELS] =
+{
+    { 5865, 5845, 5825, 5805, 5785, 5765, 5745, 5725}, /* Band A */
+    { 5733, 5752, 5771, 5790, 5809, 5828, 5847, 5866}, /* Band B */
+    { 5705, 5685, 5665, 5645, 5885, 5905, 5925, 5945}, /* Band E */
+    { 5740, 5760, 5780, 5800, 5820, 5840, 5860, 5880}, /* Airwave */
+    { 5658, 5695, 5732, 5769, 5806, 5843, 5880, 5917}, /* Race */
+    { 5621, 5584, 5547, 5510, 5473, 5436, 5399, 5362}, /* LO Race */
+    { 1080, 1120, 1160, 1200, 1240, 1280, 1320, 1360}, /* Band 1G3_A */
+    { 1080, 1120, 1160, 1200, 1258, 1280, 1320, 1360}, /* Band 1G3_B */
+    { 4990, 5020, 5050, 5080, 5110, 5140, 5170, 5200}, /* Band X */
+    { 3330, 3350, 3370, 3390, 3410, 3430, 3450, 3470}, /* Band 3G3_A */
+    { 3170, 3190, 3210, 3230, 3250, 3270, 3290, 3310}  /* Band 3G3_B */
+};
+
+// mapping of power level to milliwatt to dbm
+// valid power levels from SmartAudio spec, the adjacent levels might be the actual values
+// so these are marked as level + 0x10 and will be switched if a dbm message proves it
+AP_VideoTX::PowerLevel AP_VideoTX::_power_levels[VTX_MAX_POWER_LEVELS] = {
+    // level, mw, dbm, dac
+    { 0xFF,  0,    0, 0    }, // only in SA 2.1
+    { 0,    25,   14, 7    },
+    { 0x11, 100,  20, 0xFF }, // only in SA 2.1
+    { 1,    200,  23, 16   },
+    { 0x12, 400,  26, 0xFF }, // only in SA 2.1
+    { 2,    500,  27, 25   },
+    { 0x12, 600,  28, 0xFF }, // Tramp lies above power levels and always returns 25/100/200/400/600
+    { 3,    800,  29, 40   },
+    { 0x13, 1000, 30, 0xFF }, // only in SA 2.1
+    { 0xFF, 0,    0,  0XFF, PowerActive::Inactive }  // slot reserved for a custom power level
+};
+
+AP_VideoTX::AP_VideoTX()
+{
+    if (singleton) {
+        AP_HAL::panic("Too many VTXs");
+        return;
+    }
+    singleton = this;
+
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+AP_VideoTX::~AP_VideoTX(void)
+{
+    singleton = nullptr;
+}
+
+bool AP_VideoTX::init(void)
+{
+    if (_initialized) {
+        return false;
+    }
+
+    // PARAMETER_CONVERSION - Added: Sept-2022
+    _options.convert_parameter_width(AP_PARAM_INT16);
+
+    // find the index into the power table
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (_power_mw <= _power_levels[i].mw) {
+            if (_power_mw != _power_levels[i].mw) {
+                if (i > 0) {
+                    _current_power = i - 1;
+                }
+                _power_mw.set_and_save(get_power_mw());
+            } else {
+                _current_power = i;
+            }
+            break;
+        }
+    }
+    _current_band = _band;
+    _current_channel = _channel;
+    _current_frequency = _frequency_mhz;
+    _current_options = _options;
+    _current_enabled = _enabled;
+    _initialized = true;
+
+    return true;
+}
+
+bool AP_VideoTX::get_band_and_channel(uint16_t freq, VideoBand& band, uint8_t& channel)
+{
+    for (uint8_t i = 0; i < AP_VideoTX::MAX_BANDS; i++) {
+        for (uint8_t j = 0; j < VTX_MAX_CHANNELS; j++) {
+            if (VIDEO_CHANNELS[i][j] == freq) {
+                band = VideoBand(i);
+                channel = j;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// set the current power
+void AP_VideoTX::set_configured_power_mw(uint16_t power)
+{
+    _power_mw.set_and_save_ifchanged(power);
+}
+
+uint8_t AP_VideoTX::find_current_power() const
+{
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (_power_mw == _power_levels[i].mw) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+// set the power in dbm, rounding appropriately
+void AP_VideoTX::set_power_dbm(uint8_t power, PowerActive active)
+{
+    if (power == _power_levels[_current_power].dbm
+        && _power_levels[_current_power].active == active) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (power == _power_levels[i].dbm) {
+            _current_power = i;
+            _power_levels[i].active = active;
+            debug("learned power %ddbm", power);
+            // now unlearn the "other" power level since we have no other way of guessing
+            // the supported levels
+            if ((_power_levels[i].level & 0xF0) == 0x10) {
+                _power_levels[i].level = _power_levels[i].level & 0xF;
+            }
+            if (i > 0 && _power_levels[i-1].level == _power_levels[i].level) {
+                debug("invalidated power %dwm, level %d is now %dmw", _power_levels[i-1].mw, _power_levels[i].level, _power_levels[i].mw);
+                _power_levels[i-1].level = 0xFF;
+                _power_levels[i-1].active = PowerActive::Inactive;
+            } else if (i < VTX_MAX_POWER_LEVELS-1 && _power_levels[i+1].level == _power_levels[i].level) {
+                debug("invalidated power %dwm, level %d is now %dmw", _power_levels[i+1].mw, _power_levels[i].level, _power_levels[i].mw);
+                _power_levels[i+1].level = 0xFF;
+                _power_levels[i+1].active = PowerActive::Inactive;
+            }
+            return;
+        }
+    }
+    // learn the non-standard power
+    _current_power = update_power_dbm(power, active);
+}
+
+// add an active power setting in dbm
+uint8_t AP_VideoTX::update_power_dbm(uint8_t power, PowerActive active)
+{
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (power == _power_levels[i].dbm) {
+            if (_power_levels[i].active != active) {
+                _power_levels[i].active = active;
+                debug("%s power %ddbm", active == PowerActive::Active ? "learned" : "invalidated", power);
+            }
+            return i;
+        }
+    }
+    // handed a non-standard value, use the last slot
+    _power_levels[VTX_MAX_POWER_LEVELS-1].dbm = power;
+    _power_levels[VTX_MAX_POWER_LEVELS-1].level = 255;
+    _power_levels[VTX_MAX_POWER_LEVELS-1].dac = 255;
+    _power_levels[VTX_MAX_POWER_LEVELS-1].mw = uint16_t(roundf(powf(10, power / 10.0f)));
+    _power_levels[VTX_MAX_POWER_LEVELS-1].active = active;
+    debug("non-standard power %ddbm -> %dmw", power, _power_levels[VTX_MAX_POWER_LEVELS-1].mw);
+    return VTX_MAX_POWER_LEVELS-1;
+}
+
+// add all active power setting in dbm
+void AP_VideoTX::update_all_power_dbm(uint8_t nlevels, const uint8_t power[])
+{
+    for (uint8_t i = 0; i < nlevels; i++) {
+        update_power_dbm(power[i], PowerActive::Active);
+    }
+    // invalidate the remaining ones
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (_power_levels[i].active == PowerActive::Unknown) {
+            _power_levels[i].active = PowerActive::Inactive;
+        }
+    }
+}
+
+// set the power in mw
+void AP_VideoTX::set_power_mw(uint16_t power)
+{
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (power == _power_levels[i].mw) {
+            _current_power = i;
+            break;
+        }
+    }
+}
+
+// set the power "level"
+void AP_VideoTX::set_power_level(uint8_t level, PowerActive active)
+{
+    if (level == _power_levels[_current_power].level
+        && _power_levels[_current_power].active == active) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (level == _power_levels[i].level) {
+            _current_power = i;
+            _power_levels[i].active = active;
+            debug("learned power level %d: %dmw", level, get_power_mw());
+            break;
+        }
+    }
+}
+
+// set the power dac
+void AP_VideoTX::set_power_dac(uint16_t power, PowerActive active)
+{
+    if (power == _power_levels[_current_power].dac
+        && _power_levels[_current_power].active == active) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (power == _power_levels[i].dac) {
+            _current_power = i;
+            _power_levels[i].active = active;
+            debug("learned power %dmw", get_power_mw());
+        }
+    }
+}
+
+// set the current channel
+void AP_VideoTX::set_enabled(bool enabled)
+{
+    _current_enabled = enabled;
+    if (!_enabled.configured()) {
+        _enabled.set_and_save(enabled);
+    }
+}
+
+void AP_VideoTX::set_power_is_current()
+{
+    set_power_dbm(get_configured_power_dbm());
+}
+
+void AP_VideoTX::set_freq_is_current()
+{
+    _current_frequency = _frequency_mhz;
+    _current_band = _band;
+    _current_channel = _channel;
+}
+
+// periodic update
+void AP_VideoTX::update(void)
+{
+    if (!_enabled) {
+        return;
+    }
+
+    // manipulate pitmode if pitmode-on-disarm or power-on-arm is set
+    if (has_option(VideoOptions::VTX_PITMODE_ON_DISARM) || has_option(VideoOptions::VTX_PITMODE_UNTIL_ARM)) {
+        if (hal.util->get_soft_armed() && has_option(VideoOptions::VTX_PITMODE)) {
+            _options.set(_options & ~uint8_t(VideoOptions::VTX_PITMODE));
+        } else if (!hal.util->get_soft_armed() && !has_option(VideoOptions::VTX_PITMODE)
+            && has_option(VideoOptions::VTX_PITMODE_ON_DISARM)) {
+            _options.set(_options | uint8_t(VideoOptions::VTX_PITMODE));
+        }
+    }
+    // check that the requested power is actually allowed
+    // reset if not
+    if (_power_mw != get_power_mw()) {
+        if (_power_levels[find_current_power()].active == PowerActive::Inactive) {
+            // reset to something we know works
+            debug("power reset to %dmw from %dmw", get_power_mw(), _power_mw.get());
+            _power_mw.set_and_save(get_power_mw());
+        }
+    }
+}
+
+bool AP_VideoTX::update_options() const
+{
+    if (!_defaults_set) {
+        return false;
+    }
+    // check pitmode
+    if ((_options & uint8_t(VideoOptions::VTX_PITMODE))
+        != (_current_options & uint8_t(VideoOptions::VTX_PITMODE))) {
+        return true;
+    }
+
+#if HAL_CRSF_TELEM_ENABLED
+    // using CRSF so unlock is not an option
+    if (AP::crsf_telem() != nullptr) {
+        return false;
+    }
+#endif
+    // check unlock only
+    if ((_options & uint8_t(VideoOptions::VTX_UNLOCKED)) != 0
+        && (_current_options & uint8_t(VideoOptions::VTX_UNLOCKED)) == 0) {
+        return true;
+    }
+
+    // ignore everything else
+    return false;
+}
+
+bool AP_VideoTX::update_power() const {
+    if (!_defaults_set || _power_mw == get_power_mw() || get_pitmode()) {
+        return false;
+    }
+    // check that the requested power is actually allowed
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (_power_mw == _power_levels[i].mw
+            && _power_levels[i].active != PowerActive::Inactive) {
+            return true;
+        }
+    }
+    // asked for something unsupported - only SA2.1 allows this and will have already provided a list
+    return false;
+}
+
+bool AP_VideoTX::have_params_changed() const
+{
+    return _enabled
+        && (update_power()
+        || update_band()
+        || update_channel()
+        || update_frequency()
+        || update_options());
+}
+
+// update the configured frequency to match the channel and band
+void AP_VideoTX::update_configured_frequency()
+{
+    _frequency_mhz.set_and_save(get_frequency_mhz(_band, _channel));
+}
+
+// update the configured channel and band to match the frequency
+void AP_VideoTX::update_configured_channel_and_band()
+{
+    VideoBand band;
+    uint8_t channel;
+    if (get_band_and_channel(_frequency_mhz, band, channel)) {
+        _band.set_and_save(band);
+        _channel.set_and_save(channel);
+    } else {
+        update_configured_frequency();
+    }
+}
+
+// set the current configured values if not currently set in storage
+// this is necessary so that the current settings can be seen
+bool AP_VideoTX::set_defaults()
+{
+    if (_defaults_set) {
+        return false;
+    }
+
+    // check that our current view of frequency matches band/channel
+    // if not then force one to be correct
+    uint16_t calced_freq = get_frequency_mhz(_current_band, _current_channel);
+    if (_current_frequency != calced_freq) {
+        if (_current_frequency > 0) {
+            VideoBand band;
+            uint8_t channel;
+            if (get_band_and_channel(_current_frequency, band, channel)) {
+                _current_band = band;
+                _current_channel = channel;
+            } else {
+                _current_frequency = calced_freq;
+            }
+        } else {
+            _current_frequency = calced_freq;
+        }
+    }
+
+    if (!_options.configured()) {
+        _options.set_and_save(_current_options);
+    }
+    if (!_channel.configured()) {
+        _channel.set_and_save(_current_channel);
+    }
+    if (!_band.configured()) {
+        _band.set_and_save(_current_band);
+    }
+    if (!_power_mw.configured()) {
+        _power_mw.set_and_save(get_power_mw());
+    }
+    if (!_frequency_mhz.configured()) {
+        _frequency_mhz.set_and_save(_current_frequency);
+    }
+
+    // Now check that the user didn't screw up by selecting incompatible options
+    if (_frequency_mhz != get_frequency_mhz(_band, _channel)) {
+        if (_frequency_mhz > 0) {
+            update_configured_channel_and_band();
+        } else {
+            update_configured_frequency();
+        }
+    }
+
+    _defaults_set = true;
+
+    announce_vtx_settings();
+
+    return true;
+}
+
+void AP_VideoTX::announce_vtx_settings() const
+{
+    // Output a friendly message so the user knows the VTX has been detected
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "VTX: %s%d %dMHz, PWR: %dmW",
+        band_names[_band.get()], _channel.get() + 1, _frequency_mhz.get(),
+        has_option(VideoOptions::VTX_PITMODE) ? 0 : _power_mw.get());
+}
+
+// change the video power based on switch input
+// 6-pos range is in the middle of the available range
+void AP_VideoTX::change_power(int8_t position)
+{
+    if (!_enabled || position < 0 || position > 5) {
+        return;
+    }
+    // first find out how many possible levels there are
+    uint8_t num_active_levels = 0;
+    for (uint8_t i = 0; i < VTX_MAX_POWER_LEVELS; i++) {
+        if (_power_levels[i].active != PowerActive::Inactive && _power_levels[i].mw <= _max_power_mw) {
+            num_active_levels++;
+        }
+    }
+    // iterate through to find the level
+    uint16_t level = constrain_int16(roundf((num_active_levels * (position + 1)/ 6.0f) - 1), 0, num_active_levels - 1);
+    debug("looking for pos %d power level %d from %d", position, level, num_active_levels);
+    uint16_t power = 0;
+    for (uint8_t i = 0, j = 0; i < num_active_levels; i++, j++) {
+        while (j < VTX_MAX_POWER_LEVELS-1 && _power_levels[j].active == PowerActive::Inactive) {
+            j++;
+        }
+        if (i == level) {
+            power = _power_levels[j].mw;
+            debug("selected power %dmw", power);
+            break;
+        }
+    }
+
+    if (power == 0) {
+        if (!hal.util->get_soft_armed()) {    // don't allow pitmode to be entered if already armed
+            set_configured_options(get_configured_options() | uint8_t(VideoOptions::VTX_PITMODE));
+        }
+    } else {
+        if (has_option(VideoOptions::VTX_PITMODE)) {
+            set_configured_options(get_configured_options() & ~uint8_t(VideoOptions::VTX_PITMODE));
+        }
+        set_configured_power_mw(power);
+    }
+}
+
+namespace AP {
+    AP_VideoTX& vtx() {
+        return *AP_VideoTX::get_singleton();
+    }
+};
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#pragma once
+
+#include "AP_VideoTX_config.h"
+
+#if AP_VIDEOTX_ENABLED
+
+#include <AP_Param/AP_Param.h>
+
+#define VTX_MAX_CHANNELS 8
+#define VTX_MAX_POWER_LEVELS 10
+
+class AP_VideoTX {
+public:
+    AP_VideoTX();
+    ~AP_VideoTX();
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_VideoTX);
+
+    // init - perform required initialisation
+    bool init();
+
+    // run any required updates
+    void update();
+
+    static AP_VideoTX *get_singleton(void) {
+        return singleton;
+    }
+    static const struct AP_Param::GroupInfo var_info[];
+
+    enum class VideoOptions {
+        VTX_PITMODE           = (1 << 0),
+        VTX_PITMODE_UNTIL_ARM = (1 << 1),
+        VTX_PITMODE_ON_DISARM = (1 << 2),
+        VTX_UNLOCKED          = (1 << 3),
+        VTX_PULLDOWN          = (1 << 4),
+        VTX_SA_ONE_STOP_BIT   = (1 << 5),
+        VTX_SA_IGNORE_CRC     = (1 << 6),
+        VTX_CRSF_IGNORE_STAT  = (1 << 7),
+    };
+
+    static const char *band_names[];
+
+    enum VideoBand {
+        BAND_A,
+        BAND_B,
+        BAND_E,
+        FATSHARK,
+        RACEBAND,
+        LOW_RACEBAND,
+        BAND_1G3_A,
+        BAND_1G3_B,
+        BAND_X,
+        BAND_3G3_A,
+        BAND_3G3_B,
+        MAX_BANDS
+    };
+
+    enum class PowerActive {
+        Unknown,
+        Active,
+        Inactive
+    };
+
+    enum VTXType {
+        CRSF = 1U<<0,
+        SmartAudio = 1U<<1,
+        Tramp = 1U<<2
+    };
+
+    struct PowerLevel {
+        uint8_t level;
+        uint16_t mw;
+        uint8_t dbm;
+        uint8_t dac; // SmartAudio v1 dac value
+        PowerActive active;
+    };
+
+    static PowerLevel _power_levels[VTX_MAX_POWER_LEVELS];
+
+    static const uint16_t VIDEO_CHANNELS[MAX_BANDS][VTX_MAX_CHANNELS];
+
+    static uint16_t get_frequency_mhz(uint8_t band, uint8_t channel) { return VIDEO_CHANNELS[band][channel]; }
+    static bool get_band_and_channel(uint16_t freq, VideoBand& band, uint8_t& channel);
+
+    void set_frequency_mhz(uint16_t freq) { _current_frequency = freq; }
+    void set_configured_frequency_mhz(uint16_t freq) { _frequency_mhz.set_and_save_ifchanged(freq); }
+    uint16_t get_frequency_mhz() const { return _current_frequency; }
+    uint16_t get_configured_frequency_mhz() const { return _frequency_mhz; }
+    bool update_frequency() const { return _defaults_set && _frequency_mhz != _current_frequency; }
+    void update_configured_frequency();
+    // get / set power level
+    void set_power_mw(uint16_t power);
+    void set_power_level(uint8_t level, PowerActive active=PowerActive::Active);
+    void set_power_dbm(uint8_t power, PowerActive active=PowerActive::Active);
+    void set_power_dac(uint16_t power, PowerActive active=PowerActive::Active);
+    // add a new dbm setting to those supported
+    uint8_t update_power_dbm(uint8_t power, PowerActive active=PowerActive::Active);
+    void update_all_power_dbm(uint8_t nlevels, const uint8_t levels[]);
+    void set_configured_power_mw(uint16_t power);
+    uint16_t get_configured_power_mw() const { return _power_mw; }
+    uint16_t get_power_mw() const { return _power_levels[_current_power].mw; }
+
+    // get the power in dbm, rounding appropriately
+    uint8_t get_configured_power_dbm() const {
+        return _power_levels[find_current_power()].dbm;
+    }
+    // get the power "level"
+    uint8_t get_configured_power_level() const {
+        return _power_levels[find_current_power()].level & 0xF;
+    }
+    // get the power "dac"
+    uint8_t get_configured_power_dac() const {
+        return _power_levels[find_current_power()].dac;
+    }
+
+    bool update_power() const;
+    // change the video power based on switch input
+    void change_power(int8_t position);
+    // get / set the frequency band
+    void set_band(uint8_t band) { _current_band = band; }
+    void set_configured_band(uint8_t band) { _band.set_and_save_ifchanged(band); }
+    uint8_t get_configured_band() const { return _band; }
+    uint8_t get_band() const { return _current_band; }
+    bool update_band() const { return _defaults_set && _band != _current_band; }
+    // get / set the frequency channel
+    void set_channel(uint8_t channel) { _current_channel = channel; }
+    void set_configured_channel(uint8_t channel) { _channel.set_and_save_ifchanged(channel); }
+    uint8_t get_configured_channel() const { return _channel; }
+    uint8_t get_channel() const { return _current_channel; }
+    bool update_channel() const { return _defaults_set && _channel != _current_channel; }
+    void update_configured_channel_and_band();
+    // get / set vtx option
+    void set_options(uint16_t options) { _current_options = options; }
+    void set_configured_options(uint16_t options) { _options.set_and_save_ifchanged(options); }
+    uint16_t get_configured_options() const { return _options; }
+    uint16_t get_options() const { return _current_options; }
+    bool has_option(VideoOptions option) const { return _options.get() & uint16_t(option); }
+    bool get_configured_pitmode() const { return _options.get() & uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE); }
+    bool get_pitmode() const { return _current_options & uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE); }
+    bool update_options() const;
+    // get / set whether the vtx is enabled
+    void set_enabled(bool enabled);
+    bool get_enabled() const { return _enabled; }
+    bool update_enabled() const { return _defaults_set && _enabled != _current_enabled; }
+
+    // have the parameters been updated
+    bool have_params_changed() const;
+    // set configured defaults from current settings, return true if defaults were set
+    bool set_defaults();
+    // display the current VTX settings in the GCS
+    void announce_vtx_settings() const;
+    // force the current values to reflect the configured values
+    void set_power_is_current();
+    void set_freq_is_current();
+    void set_options_are_current() {  _current_options = _options; }
+
+    void set_configuration_finished(bool configuration_finished) { _configuration_finished = configuration_finished; }
+    bool is_configuration_finished() { return _configuration_finished; }
+
+    // manage VTX backends
+    bool is_provider_enabled(VTXType type) const { return (_types & type) != 0; }
+    void set_provider_enabled(VTXType type) { _types |= type; }
+
+    static AP_VideoTX *singleton;
+
+private:
+    uint8_t find_current_power() const;
+    // channel frequency
+    AP_Int16 _frequency_mhz;
+    uint16_t _current_frequency;
+
+    // power output in mw
+    AP_Int16 _power_mw;
+    uint16_t _current_power;
+    AP_Int16 _max_power_mw;
+
+    // frequency band
+    AP_Int8 _band;
+    uint16_t _current_band;
+
+    // frequency channel
+    AP_Int8 _channel;
+    uint8_t _current_channel;
+
+    // vtx options
+    AP_Int16 _options;
+    uint16_t _current_options;
+
+    AP_Int8 _enabled;
+    bool _current_enabled;
+
+    bool _initialized;
+    // when defaults have been configured
+    bool _defaults_set;
+    // true when configuration have been applied successfully to the VTX
+    bool _configuration_finished;
+
+    // types of VTX providers
+    uint8_t _types;
+};
+
+namespace AP {
+    AP_VideoTX& vtx();
+};
+
+#endif  // AP_VIDEOTX_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+#include <AP_OSD/AP_OSD_config.h>
+
+#ifndef AP_VIDEOTX_ENABLED
+#define AP_VIDEOTX_ENABLED 1
+#endif
+
+#ifndef AP_TRAMP_ENABLED
+#define AP_TRAMP_ENABLED AP_VIDEOTX_ENABLED && OSD_ENABLED && BOARD_FLASH_SIZE>1024
+#endif
+
+#ifndef AP_SMARTAUDIO_ENABLED
+#define AP_SMARTAUDIO_ENABLED AP_VIDEOTX_ENABLED
+#endif
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_VisualOdom_config.h"
+
+#if HAL_VISUALODOM_ENABLED
+
+#include "AP_VisualOdom.h"
+#include "AP_VisualOdom_Backend.h"
+#include "AP_VisualOdom_MAV.h"
+#include "AP_VisualOdom_IntelT265.h"
+#include <AP_AHRS/AP_AHRS.h>
+
+extern const AP_HAL::HAL &hal;
+
+// table of user settable parameters
+const AP_Param::GroupInfo AP_VisualOdom::var_info[] = {
+
+    // @Param: _TYPE
+    // @DisplayName: Visual odometry camera connection type
+    // @Description: Visual odometry camera connection type
+    // @Values: 0:None,1:MAVLink,2:IntelT265,3:VOXL(ModalAI)
+    // @User: Advanced
+    // @RebootRequired: True
+    AP_GROUPINFO_FLAGS("_TYPE", 0, AP_VisualOdom, _type, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: _POS_X
+    // @DisplayName: Visual odometry camera X position offset
+    // @Description: X position of the camera in body frame. Positive X is forward of the origin.
+    // @Units: m
+    // @Range: -5 5
+    // @Increment: 0.01
+    // @User: Advanced
+
+    // @Param: _POS_Y
+    // @DisplayName: Visual odometry camera Y position offset
+    // @Description: Y position of the camera in body frame. Positive Y is to the right of the origin.
+    // @Units: m
+    // @Range: -5 5
+    // @Increment: 0.01
+    // @User: Advanced
+
+    // @Param: _POS_Z
+    // @DisplayName: Visual odometry camera Z position offset
+    // @Description: Z position of the camera in body frame. Positive Z is down from the origin.
+    // @Units: m
+    // @Range: -5 5
+    // @Increment: 0.01
+    // @User: Advanced
+    AP_GROUPINFO("_POS", 1, AP_VisualOdom, _pos_offset, 0.0f),
+
+    // @Param: _ORIENT
+    // @DisplayName: Visual odometery camera orientation
+    // @Description: Visual odometery camera orientation
+    // @Values: 0:Forward, 2:Right, 4:Back, 6:Left, 24:Up, 25:Down
+    // @User: Advanced
+    AP_GROUPINFO("_ORIENT", 2, AP_VisualOdom, _orientation, ROTATION_NONE),
+
+    // @Param: _SCALE
+    // @DisplayName: Visual odometry scaling factor
+    // @Description: Visual odometry scaling factor applied to position estimates from sensor
+    // @User: Advanced
+    AP_GROUPINFO("_SCALE", 3, AP_VisualOdom, _pos_scale, 1.0f),
+
+    // @Param: _DELAY_MS
+    // @DisplayName: Visual odometry sensor delay
+    // @Description: Visual odometry sensor delay relative to inertial measurements
+    // @Units: ms
+    // @Range: 0 250
+    // @User: Advanced
+    AP_GROUPINFO("_DELAY_MS", 4, AP_VisualOdom, _delay_ms, 10),
+
+    // @Param: _VEL_M_NSE
+    // @DisplayName: Visual odometry velocity measurement noise
+    // @Description: Visual odometry velocity measurement noise in m/s
+    // @Units: m/s
+    // @Range: 0.05 5.0
+    // @User: Advanced
+    AP_GROUPINFO("_VEL_M_NSE", 5, AP_VisualOdom, _vel_noise, 0.1),
+
+    // @Param: _POS_M_NSE
+    // @DisplayName: Visual odometry position measurement noise 
+    // @Description: Visual odometry position measurement noise minimum (meters). This value will be used if the sensor provides a lower noise value (or no noise value)
+    // @Units: m
+    // @Range: 0.1 10.0
+    // @User: Advanced
+    AP_GROUPINFO("_POS_M_NSE", 6, AP_VisualOdom, _pos_noise, 0.2f),
+
+    // @Param: _YAW_M_NSE
+    // @DisplayName: Visual odometry yaw measurement noise
+    // @Description: Visual odometry yaw measurement noise minimum (radians), This value will be used if the sensor provides a lower noise value (or no noise value)
+    // @Units: rad
+    // @Range: 0.05 1.0
+    // @User: Advanced
+    AP_GROUPINFO("_YAW_M_NSE", 7, AP_VisualOdom, _yaw_noise, 0.2f),
+
+    // @Param: _QUAL_MIN
+    // @DisplayName: Visual odometry minimum quality
+    // @Description: Visual odometry will only be sent to EKF if over this value. -1 to always send (even bad values), 0 to send if good or unknown
+    // @Units: %
+    // @Range: -1 100
+    // @User: Advanced
+    AP_GROUPINFO("_QUAL_MIN", 8, AP_VisualOdom, _quality_min, 0),
+
+    AP_GROUPEND
+};
+
+AP_VisualOdom::AP_VisualOdom()
+{
+    AP_Param::setup_object_defaults(this, var_info);
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    if (_singleton != nullptr) {
+        AP_HAL::panic("must be singleton");
+    }
+#endif
+    _singleton = this;
+}
+
+// detect and initialise any sensors
+void AP_VisualOdom::init()
+{
+    // create backend
+    switch (VisualOdom_Type(_type.get())) {
+    case VisualOdom_Type::None:
+        // do nothing
+        break;
+#if AP_VISUALODOM_MAV_ENABLED
+    case VisualOdom_Type::MAV:
+        _driver = NEW_NOTHROW AP_VisualOdom_MAV(*this);
+        break;
+#endif
+#if AP_VISUALODOM_INTELT265_ENABLED
+    case VisualOdom_Type::IntelT265:
+    case VisualOdom_Type::VOXL:
+        _driver = NEW_NOTHROW AP_VisualOdom_IntelT265(*this);
+        break;
+#endif
+    }
+}
+
+// return true if sensor is enabled
+bool AP_VisualOdom::enabled() const
+{
+    return ((_type != VisualOdom_Type::None));
+}
+
+// return true if sensor is basically healthy (we are receiving data)
+bool AP_VisualOdom::healthy() const
+{
+    if (!enabled()) {
+        return false;
+    }
+
+    if (_driver == nullptr) {
+        return false;
+    }
+    return _driver->healthy();
+}
+
+// return quality as a measure from 0 ~ 100
+// -1 means failed, 0 means unknown, 1 is worst, 100 is best
+int8_t AP_VisualOdom::quality() const
+{
+    if (_driver == nullptr) {
+        return 0;
+    }
+    return _driver->quality();
+}
+
+#if HAL_GCS_ENABLED
+// consume vision_position_delta mavlink messages
+void AP_VisualOdom::handle_vision_position_delta_msg(const mavlink_message_t &msg)
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return;
+    }
+
+    // call backend
+    if (_driver != nullptr) {
+        _driver->handle_vision_position_delta_msg(msg);
+    }
+}
+#endif
+
+// general purpose method to consume position estimate data and send to EKF
+// distances in meters, roll, pitch and yaw are in radians
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom::handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, float roll, float pitch, float yaw, float posErr, float angErr, uint8_t reset_counter, int8_t quality)
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return;
+    }
+
+    // call backend
+    if (_driver != nullptr) {
+        // convert attitude to quaternion and call backend
+        Quaternion attitude;
+        attitude.from_euler(roll, pitch, yaw);
+        _driver->handle_pose_estimate(remote_time_us, time_ms, x, y, z, attitude, posErr, angErr, reset_counter, quality);
+    }
+}
+
+// general purpose method to consume position estimate data and send to EKF
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom::handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality)
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return;
+    }
+
+    // call backend
+    if (_driver != nullptr) {
+        _driver->handle_pose_estimate(remote_time_us, time_ms, x, y, z, attitude, posErr, angErr, reset_counter, quality);
+    }
+}
+
+// general purpose methods to consume velocity estimate data and send to EKF
+// velocity in NED meters per second
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom::handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality)
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return;
+    }
+
+    // call backend
+    if (_driver != nullptr) {
+        _driver->handle_vision_speed_estimate(remote_time_us, time_ms, vel, reset_counter, quality);
+    }
+}
+
+// request sensor's yaw be aligned with vehicle's AHRS/EKF attitude
+void AP_VisualOdom::request_align_yaw_to_ahrs()
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return;
+    }
+
+    // call backend
+    if (_driver != nullptr) {
+        _driver->request_align_yaw_to_ahrs();
+    }
+}
+
+// update position offsets to align to AHRS position.  Should only be called when this library is not being used as the position source
+void AP_VisualOdom::align_position_to_ahrs(bool align_xy, bool align_z)
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return;
+    }
+
+    // call backend
+    if (_driver != nullptr) {
+        _driver->align_position_to_ahrs(align_xy, align_z);
+    }
+}
+
+// returns false if we fail arming checks, in which case the buffer will be populated with a failure message
+bool AP_VisualOdom::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const
+{
+    // exit immediately if not enabled
+    if (!enabled()) {
+        return true;
+    }
+
+    // if no backend we must have failed to create because out of memory
+    if (_driver == nullptr) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "out of memory");
+        return false;
+    }
+
+    // check healthy
+    if (!healthy()) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "not healthy");
+        return false;
+    }
+
+    // call backend specific arming check
+    return _driver->pre_arm_check(failure_msg, failure_msg_len);
+}
+
+// singleton instance
+AP_VisualOdom *AP_VisualOdom::_singleton;
+
+namespace AP {
+
+AP_VisualOdom *visualodom()
+{
+    return AP_VisualOdom::get_singleton();
+}
+
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_VisualOdom_config.h"
+
+#if HAL_VISUALODOM_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_Param/AP_Param.h>
+#include <GCS_MAVLink/GCS_config.h>
+#if HAL_GCS_ENABLED
+#include <GCS_MAVLink/GCS_MAVLink.h>
+#endif
+#include <AP_Math/AP_Math.h>
+
+class AP_VisualOdom_Backend;
+
+#define AP_VISUALODOM_TIMEOUT_MS 300
+
+class AP_VisualOdom
+{
+public:
+
+    AP_VisualOdom();
+
+    // get singleton instance
+    static AP_VisualOdom *get_singleton() {
+        return _singleton;
+    }
+
+    // external position backend types (used by _TYPE parameter)
+    enum class VisualOdom_Type {
+        None         = 0,
+#if AP_VISUALODOM_MAV_ENABLED
+        MAV          = 1,
+#endif
+#if AP_VISUALODOM_INTELT265_ENABLED
+        IntelT265    = 2,
+        VOXL         = 3,
+#endif
+    };
+
+    // detect and initialise any sensors
+    void init();
+
+    // return true if sensor is enabled
+    bool enabled() const;
+
+    // return true if sensor is basically healthy (we are receiving data)
+    bool healthy() const;
+
+    // get user defined orientation
+    enum Rotation get_orientation() const { return (enum Rotation)_orientation.get(); }
+
+    // get user defined scaling applied to position estimates
+    float get_pos_scale() const { return _pos_scale; }
+
+    // return a 3D vector defining the position offset of the camera in meters relative to the body frame origin
+    const Vector3f &get_pos_offset(void) const { return _pos_offset; }
+
+    // return the sensor delay in milliseconds (see _DELAY_MS parameter)
+    uint16_t get_delay_ms() const { return MAX(0, _delay_ms); }
+
+    // return velocity measurement noise in m/s
+    float get_vel_noise() const { return _vel_noise; }
+    
+    // return position measurement noise in m
+    float get_pos_noise() const { return _pos_noise; }
+
+    // return yaw measurement noise in rad
+    float get_yaw_noise() const { return _yaw_noise; }
+
+    // return quality threshold
+    int8_t get_quality_min() const { return _quality_min; }
+
+    // return quality as a measure from -1 ~ 100
+    // -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    int8_t quality() const;
+
+#if HAL_GCS_ENABLED
+    // consume vision_position_delta mavlink messages
+    void handle_vision_position_delta_msg(const mavlink_message_t &msg);
+#endif
+
+    // general purpose methods to consume position estimate data and send to EKF
+    // distances in meters, roll, pitch and yaw are in radians
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    void handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, float roll, float pitch, float yaw, float posErr, float angErr, uint8_t reset_counter, int8_t quality);
+    void handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality);
+    
+    // general purpose methods to consume velocity estimate data and send to EKF
+    // velocity in NED meters per second
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    void handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality);
+
+    // request sensor's yaw be aligned with vehicle's AHRS/EKF attitude
+    void request_align_yaw_to_ahrs();
+
+    // update position offsets to align to AHRS position
+    // should only be called when this library is not being used as the position source
+    void align_position_to_ahrs(bool align_xy, bool align_z);
+
+    // returns false if we fail arming checks, in which case the buffer will be populated with a failure message
+    bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const;
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    VisualOdom_Type get_type(void) const {
+        return _type;
+    }
+
+private:
+
+    static AP_VisualOdom *_singleton;
+
+    // parameters
+    AP_Enum<VisualOdom_Type> _type; // sensor type
+    AP_Vector3f _pos_offset;    // position offset of the camera in the body frame
+    AP_Int8 _orientation;       // camera orientation on vehicle frame
+    AP_Float _pos_scale;        // position scale factor applied to sensor values
+    AP_Int16 _delay_ms;         // average delay relative to inertial measurements
+    AP_Float _vel_noise;        // velocity measurement noise in m/s
+    AP_Float _pos_noise;        // position measurement noise in meters
+    AP_Float _yaw_noise;        // yaw measurement noise in radians
+    AP_Int8 _quality_min;       // positions and velocities will only be sent to EKF if over this value.  if 0 all values sent to EKF
+
+    // reference to backends
+    AP_VisualOdom_Backend *_driver;
+};
+
+namespace AP {
+    AP_VisualOdom *visualodom();
+};
+
+#endif // HAL_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_VisualOdom_Backend.h"
+
+#if HAL_VISUALODOM_ENABLED
+
+#include <AP_AHRS/AP_AHRS.h>
+#include <GCS_MAVLink/GCS.h>
+
+/*
+  base class constructor. 
+  This incorporates initialisation as well.
+*/
+AP_VisualOdom_Backend::AP_VisualOdom_Backend(AP_VisualOdom &frontend) :
+    _frontend(frontend)
+{
+}
+
+// return true if sensor is basically healthy (we are receiving data)
+bool AP_VisualOdom_Backend::healthy() const
+{
+    // healthy if we have received sensor messages within the past 300ms
+    return ((AP_HAL::millis() - _last_update_ms) < AP_VISUALODOM_TIMEOUT_MS);
+}
+
+#if HAL_GCS_ENABLED
+// consume vision_position_delta mavlink messages
+void AP_VisualOdom_Backend::handle_vision_position_delta_msg(const mavlink_message_t &msg)
+{
+    // decode message
+    mavlink_vision_position_delta_t packet;
+    mavlink_msg_vision_position_delta_decode(&msg, &packet);
+
+    // apply rotation to angle and position delta
+    const enum Rotation rot = _frontend.get_orientation();
+    Vector3f angle_delta = Vector3f(packet.angle_delta[0], packet.angle_delta[1], packet.angle_delta[2]);
+    angle_delta.rotate(rot);
+    Vector3f position_delta = Vector3f(packet.position_delta[0], packet.position_delta[1], packet.position_delta[2]);
+    position_delta.rotate(rot);
+
+    const uint32_t now_ms = AP_HAL::millis();
+    _last_update_ms = now_ms;
+
+    // send to EKF
+#if AP_AHRS_ENABLED || HAL_LOGGING_ENABLED
+    const float time_delta_sec = packet.time_delta_usec * 1.0E-6;
+#endif
+#if AP_AHRS_ENABLED
+    AP::ahrs().writeBodyFrameOdom(packet.confidence,
+                                  position_delta,
+                                  angle_delta,
+                                  time_delta_sec,
+                                  now_ms,
+                                  _frontend.get_delay_ms(),
+                                  _frontend.get_pos_offset());
+#endif
+
+#if HAL_LOGGING_ENABLED
+    // log sensor data
+    Write_VisualOdom(time_delta_sec,
+                                  angle_delta,
+                                  position_delta,
+                                  packet.confidence);
+#endif
+}
+#endif  // HAL_GCS_ENABLED
+
+// returns the system time of the last reset if reset_counter has not changed
+// updates the reset timestamp to the current system time if the reset_counter has changed
+uint32_t AP_VisualOdom_Backend::get_reset_timestamp_ms(uint8_t reset_counter)
+{
+    // update reset counter and timestamp if reset_counter has changed
+    if (reset_counter != _last_reset_counter) {
+        _last_reset_counter = reset_counter;
+        _reset_timestamp_ms = AP_HAL::millis();
+    }
+    return _reset_timestamp_ms;
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_VisualOdom.h"
+
+#if HAL_VISUALODOM_ENABLED
+
+#include <AP_Logger/AP_Logger_config.h>
+
+class AP_VisualOdom_Backend
+{
+public:
+    // constructor. This incorporates initialisation as well.
+    AP_VisualOdom_Backend(AP_VisualOdom &frontend);
+
+    // return true if sensor is basically healthy (we are receiving data)
+    bool healthy() const;
+
+    // return quality as a measure from -1 ~ 100
+    // -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    int8_t quality() const { return _quality; }
+
+#if HAL_GCS_ENABLED
+    // consume vision_position_delta mavlink messages
+    void handle_vision_position_delta_msg(const mavlink_message_t &msg);
+#endif
+
+    // consume vision pose estimate data and send to EKF. distances in meters
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    virtual void handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality) = 0;
+
+    // consume vision velocity estimate data and send to EKF, velocity in NED meters per second
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    virtual void handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality) = 0;
+
+    // request sensor's yaw be aligned with vehicle's AHRS/EKF attitude
+    virtual void request_align_yaw_to_ahrs() {}
+
+    // handle request to align position with AHRS
+    virtual void align_position_to_ahrs(bool align_xy, bool align_z) {}
+
+    // arming check - by default no checks performed
+    virtual bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const { return true; }
+
+protected:
+
+    // returns the system time of the last reset if reset_counter has not changed
+    // updates the reset timestamp to the current system time if the reset_counter has changed
+    uint32_t get_reset_timestamp_ms(uint8_t reset_counter);
+
+    AP_VisualOdom::VisualOdom_Type get_type(void) const {
+        return _frontend.get_type();
+    }
+
+#if HAL_LOGGING_ENABLED
+    // Logging Functions
+    void Write_VisualOdom(float time_delta, const Vector3f &angle_delta, const Vector3f &position_delta, float confidence);
+    void Write_VisualPosition(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, float roll, float pitch, float yaw, float pos_err, float ang_err, uint8_t reset_counter, bool ignored, int8_t quality);
+    void Write_VisualVelocity(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, bool ignored, int8_t quality);
+#endif
+
+    AP_VisualOdom &_frontend;   // reference to frontend
+    uint32_t _last_update_ms;   // system time of last update from sensor (used by health checks)
+
+    // reset counter handling
+    uint8_t _last_reset_counter;    // last sensor reset counter received
+    uint32_t _reset_timestamp_ms;   // time reset counter was received
+
+    // quality
+    int8_t _quality;                // last recorded quality
+};
+
+#endif  // HAL_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_VisualOdom_config.h"
+
+#if AP_VISUALODOM_INTELT265_ENABLED
+
+#include "AP_VisualOdom_IntelT265.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <GCS_MAVLink/GCS.h>
+
+#define VISUALODOM_RESET_IGNORE_DURATION_MS 1000    // sensor data is ignored for 1sec after a position reset
+
+extern const AP_HAL::HAL& hal;
+
+// consume vision pose estimate data and send to EKF. distances in meters
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom_IntelT265::handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality)
+{
+    const float scale_factor = _frontend.get_pos_scale();
+    Vector3f pos{x * scale_factor, y * scale_factor, z * scale_factor};
+    Quaternion att = attitude;
+
+    // handle voxl camera reset jumps in attitude and position
+    handle_voxl_camera_reset_jump(pos, att, reset_counter);
+
+    // handle request to align sensor's yaw with vehicle's AHRS/EKF attitude
+    if (_align_yaw) {
+        if (align_yaw_to_ahrs(pos, attitude)) {
+            _align_yaw = false;
+        }
+    }
+    if (_align_posxy || _align_posz) {
+        if (align_position_to_ahrs(pos, _align_posxy, _align_posz)) {
+            _align_posxy = _align_posz = false;
+        }
+    }
+
+    // rotate position and attitude to align with vehicle
+    rotate_and_correct_position(pos);
+    rotate_attitude(att);
+
+    // record position for voxl reset jump handling
+    record_voxl_position_and_reset_count(pos, reset_counter);
+
+    posErr = constrain_float(posErr, _frontend.get_pos_noise(), 100.0f);
+    angErr = constrain_float(angErr, _frontend.get_yaw_noise(), 1.5f);
+
+    // record quality
+    _quality = quality;
+
+    // check for recent position reset
+    bool consume = should_consume_sensor_data(true, reset_counter) && (_quality >= _frontend.get_quality_min());
+    if (consume) {
+        // send attitude and position to EKF
+        AP::ahrs().writeExtNavData(pos, att, posErr, angErr, time_ms, _frontend.get_delay_ms(), get_reset_timestamp_ms(reset_counter));
+    }
+
+    // calculate euler orientation for logging
+    float roll;
+    float pitch;
+    float yaw;
+    att.to_euler(roll, pitch, yaw);
+
+#if HAL_LOGGING_ENABLED
+    // log sensor data
+    Write_VisualPosition(remote_time_us, time_ms, pos.x, pos.y, pos.z, degrees(roll), degrees(pitch), wrap_360(degrees(yaw)), posErr, angErr, reset_counter, !consume, _quality);
+#endif
+
+    // store corrected attitude for use in pre-arm checks
+    _attitude_last = att;
+
+    // record time for health monitoring
+    _last_update_ms = AP_HAL::millis();
+}
+
+// consume vision velocity estimate data and send to EKF, velocity in NED meters per second
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom_IntelT265::handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality)
+{
+    // rotate velocity to align with vehicle
+    Vector3f vel_corrected = vel;
+    rotate_velocity(vel_corrected);
+
+    // record quality
+    _quality = quality;
+
+    // check for recent position reset
+    bool consume = should_consume_sensor_data(false, reset_counter) && (_quality >= _frontend.get_quality_min());
+    if (consume) {
+        // send velocity to EKF
+        AP::ahrs().writeExtNavVelData(vel_corrected, _frontend.get_vel_noise(), time_ms, _frontend.get_delay_ms());
+    }
+
+    // record time for health monitoring
+    _last_update_ms = AP_HAL::millis();
+
+#if HAL_LOGGING_ENABLED
+    Write_VisualVelocity(remote_time_us, time_ms, vel_corrected, reset_counter, !consume, _quality);
+#endif
+}
+
+// apply rotation and correction to position
+void AP_VisualOdom_IntelT265::rotate_and_correct_position(Vector3f &position) const
+{
+    if (_use_posvel_rotation) {
+        position = _posvel_rotation * position;
+    }
+    position += _pos_correction;
+}
+
+// apply rotation to velocity
+void AP_VisualOdom_IntelT265::rotate_velocity(Vector3f &velocity) const
+{
+    if (_use_posvel_rotation) {
+        velocity = _posvel_rotation * velocity;
+    }
+}
+
+// rotate attitude using _yaw_trim
+void AP_VisualOdom_IntelT265::rotate_attitude(Quaternion &attitude) const
+{
+    // apply orientation rotation
+    if (_use_att_rotation) {
+        attitude *= _att_rotation;
+    }
+
+    // apply earth-frame yaw rotation
+    if (!is_zero(_yaw_trim)) {
+        attitude = _yaw_rotation * attitude;
+    }
+    return;
+}
+
+// use sensor provided attitude to calculate rotation to align sensor with AHRS/EKF attitude
+bool AP_VisualOdom_IntelT265::align_yaw_to_ahrs(const Vector3f &position, const Quaternion &attitude)
+{
+    // do not align to ahrs if we are its yaw source
+    if (AP::ahrs().using_extnav_for_yaw()) {
+        return false;
+    }
+
+    // do not align until ahrs yaw initialised
+    if (!AP::ahrs().initialised()
+#if AP_AHRS_DCM_ENABLED
+        || !AP::ahrs().dcm_yaw_initialised()
+#endif
+        ) {
+        return false;
+    }
+
+    align_yaw(position, attitude, AP::ahrs().get_yaw());
+    return true;
+}
+
+// align sensor yaw with any new yaw (in radians)
+void AP_VisualOdom_IntelT265::align_yaw(const Vector3f &position, const Quaternion &attitude, float yaw_rad)
+{
+    // clear any existing errors
+    _error_orientation = false;
+
+    // create rotation quaternion to correct for orientation
+    const Rotation rot = _frontend.get_orientation();
+    _att_rotation.initialise();
+    _use_att_rotation = false;
+    if (rot != Rotation::ROTATION_NONE) {
+        _att_rotation.rotate(rot);
+        _att_rotation.invert();
+        _use_att_rotation = true;
+    }
+
+    Quaternion att_corrected = attitude;
+    att_corrected *= _att_rotation;
+
+    // extract sensor's corrected yaw
+    const float sens_yaw = att_corrected.get_euler_yaw();
+
+    // trim yaw by difference between ahrs and sensor yaw
+    const float yaw_trim_orig = _yaw_trim;
+    _yaw_trim = wrap_2PI(yaw_rad - sens_yaw);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "VisOdom: yaw shifted %d to %d deg",
+                    (int)degrees(_yaw_trim - yaw_trim_orig),
+                    (int)wrap_360(degrees(sens_yaw + _yaw_trim)));
+
+    // convert _yaw_trim to _yaw_rotation to speed up processing later
+    _yaw_rotation.from_euler(0.0f, 0.0f, _yaw_trim);
+
+    // calculate position with current rotation and correction
+    Vector3f pos_orig = position;
+    rotate_and_correct_position(pos_orig);
+
+    // create position and velocity rotation from yaw trim
+    _use_posvel_rotation = false;
+    if (!is_zero(_yaw_trim)) {
+        _posvel_rotation.from_euler(0.0f, 0.0f, _yaw_trim);
+        _use_posvel_rotation = true;
+    }
+
+    // recalculate position with new rotation
+    Vector3f pos_new = position;
+    rotate_and_correct_position(pos_new);
+
+    // update position correction to remove change due to rotation
+    _pos_correction += (pos_orig - pos_new);
+}
+
+// align position with ahrs position by updating _pos_correction
+// sensor_pos should be the position directly from the sensor with only scaling applied (i.e. no yaw or position corrections)
+bool AP_VisualOdom_IntelT265::align_position_to_ahrs(const Vector3f &sensor_pos, bool align_xy, bool align_z)
+{
+    // fail immediately if ahrs cannot provide position
+    Vector3f ahrs_pos_ned;
+    if (!AP::ahrs().get_relative_position_NED_origin(ahrs_pos_ned)) {
+        return false;
+    }
+
+    align_position(sensor_pos, ahrs_pos_ned, align_xy, align_z);
+    return true;
+}
+
+// align position with a new position by updating _pos_correction
+// sensor_pos should be the position directly from the sensor with only scaling applied (i.e. no yaw or position corrections)
+// new_pos should be a NED position offset from the EKF origin
+void AP_VisualOdom_IntelT265::align_position(const Vector3f &sensor_pos, const Vector3f &new_pos, bool align_xy, bool align_z)
+{
+    // calculate position with current rotation and correction
+    Vector3f pos_orig = sensor_pos;
+    rotate_and_correct_position(pos_orig);
+
+    // update position correction
+    if (align_xy) {
+        _pos_correction.x += (new_pos.x - pos_orig.x);
+        _pos_correction.y += (new_pos.y - pos_orig.y);
+    }
+    if (align_z) {
+        _pos_correction.z += (new_pos.z - pos_orig.z);
+    }
+}
+
+// returns false if we fail arming checks, in which case the buffer will be populated with a failure message
+bool AP_VisualOdom_IntelT265::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const
+{
+    // exit immediately if not healthy
+    if (!healthy()) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "not healthy");
+        return false;
+    }
+
+    // check for unsupported orientation
+    if (_error_orientation) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "check VISO_ORIENT parameter");
+        return false;
+    }
+
+    // get ahrs attitude
+    Quaternion ahrs_quat;
+    if (!AP::ahrs().get_quaternion(ahrs_quat)) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "waiting for AHRS attitude");
+        return false;
+    }
+
+    // check if roll and pitch is different by > 10deg (using NED so cannot determine whether roll or pitch specifically)
+    const float rp_diff_deg = degrees(ahrs_quat.roll_pitch_difference(_attitude_last));
+    if (rp_diff_deg > 10.0f) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "roll/pitch diff %4.1f deg (>10)",(double)rp_diff_deg);
+        return false;
+    }
+
+    // check if yaw is different by > 10deg
+    Vector3f angle_diff;
+    ahrs_quat.angular_difference(_attitude_last).to_axis_angle(angle_diff);
+    const float yaw_diff_deg = degrees(fabsf(angle_diff.z));
+    if (yaw_diff_deg > 10.0f) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "yaw diff %4.1f deg (>10)",(double)yaw_diff_deg);
+        return false;
+    }
+
+    return true;
+}
+
+// returns true if sensor data should be consumed, false if it should be ignored
+// set vision_position_estimate to true if reset_counter is from the VISION_POSITION_ESTIMATE source, false otherwise
+// only the VISION_POSITION_ESTIMATE message's reset_counter is used to determine if sensor data should be ignored
+bool AP_VisualOdom_IntelT265::should_consume_sensor_data(bool vision_position_estimate, uint8_t reset_counter)
+{
+    if (get_type() == AP_VisualOdom::VisualOdom_Type::VOXL) {
+        // we don't discard data after a reset for VOXL
+        return true;
+    }
+
+    uint32_t now_ms = AP_HAL::millis();
+
+    // set ignore start time if reset counter has changed
+    if (vision_position_estimate) {
+        if (reset_counter != _pos_reset_counter_last) {
+            _pos_reset_counter_last = reset_counter;
+            _pos_reset_ignore_start_ms = now_ms;
+        }
+    }
+
+    // check if 1 second has passed since the last reset
+    if ((now_ms - _pos_reset_ignore_start_ms) > VISUALODOM_RESET_IGNORE_DURATION_MS) {
+        _pos_reset_ignore_start_ms = 0;
+    }
+
+    return (_pos_reset_ignore_start_ms == 0);
+}
+
+// record voxl camera's position and reset counter for reset jump handling
+// position is post scaling, offset and orientation corrections
+void AP_VisualOdom_IntelT265::record_voxl_position_and_reset_count(const Vector3f &position, uint8_t reset_counter)
+{
+    // return immediately if not using VOXL camera
+    if (get_type() != AP_VisualOdom::VisualOdom_Type::VOXL) {
+        return;
+    }
+
+    _voxl_position_last = position;
+    _voxl_reset_counter_last = reset_counter;
+}
+
+// handle voxl camera reset jumps in attitude and position
+// sensor_pos should be the position directly from the sensor with only scaling applied (i.e. no yaw or position corrections)
+// sensor_att is similarly the attitude directly from the sensor
+void AP_VisualOdom_IntelT265::handle_voxl_camera_reset_jump(const Vector3f &sensor_pos, const Quaternion &sensor_att, uint8_t reset_counter)
+{
+    // return immediately if not using VOXL camera
+    if (get_type() != AP_VisualOdom::VisualOdom_Type::VOXL) {
+        return;
+    }
+
+    // return immediately if no change in reset counter
+    if (reset_counter == _voxl_reset_counter_last) {
+        return;
+    }
+
+    // warng user of reset
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "VisOdom: reset");
+
+    // align sensor yaw to match current yaw estimate
+    align_yaw_to_ahrs(sensor_pos, sensor_att);
+
+    // align psoition to match last recorded position
+    align_position(sensor_pos, _voxl_position_last, true, true);
+
+    // record change in reset counter
+    _voxl_reset_counter_last = reset_counter;
+}
+
+#endif  // AP_VISUALODOM_INTELT265_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #pragma once
+
+#include "AP_VisualOdom_config.h"
+
+#if AP_VISUALODOM_INTELT265_ENABLED
+
+#include "AP_VisualOdom_Backend.h"
+
+class AP_VisualOdom_IntelT265 : public AP_VisualOdom_Backend
+{
+
+public:
+
+    using AP_VisualOdom_Backend::AP_VisualOdom_Backend;
+
+    // consume vision pose estimate data and send to EKF. distances in meters
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    void handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality) override;
+
+    // consume vision velocity estimate data and send to EKF, velocity in NED meters per second
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    void handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality) override;
+
+    // request sensor's yaw be aligned with vehicle's AHRS/EKF attitude
+    void request_align_yaw_to_ahrs() override { _align_yaw = true; }
+
+    // update position offsets to align to AHRS position
+    // should only be called when this library is not being used as the position source
+    void align_position_to_ahrs(bool align_xy, bool align_z) override { _align_posxy = align_xy; _align_posz = align_z; }
+
+    // arming check
+    bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const override;
+
+protected:
+
+    // apply rotation and correction to position
+    void rotate_and_correct_position(Vector3f &position) const;
+
+    // apply rotation to velocity
+    void rotate_velocity(Vector3f &velocity) const;
+
+    // rotate attitude using _yaw_trim
+    void rotate_attitude(Quaternion &attitude) const;
+
+    // use sensor provided position and attitude to calculate rotation to align sensor yaw with AHRS/EKF attitude
+    // calls align_yaw (see below)
+    bool align_yaw_to_ahrs(const Vector3f &position, const Quaternion &attitude);
+
+    // align sensor yaw with any new yaw (in radians)
+    void align_yaw(const Vector3f &position, const Quaternion &attitude, float yaw_rad);
+
+    // returns true if sensor data should be consumed, false if it should be ignored
+    // set vision_position_estimate to true if reset_counter is from the VISION_POSITION_ESTIMATE source, false otherwise
+    // only the VISION_POSITION_ESTIMATE message's reset_counter is used to determine if sensor data should be ignored
+    bool should_consume_sensor_data(bool vision_position_estimate, uint8_t reset_counter);
+
+    // align position with ahrs position by updating _pos_correction
+    // sensor_pos should be the position directly from the sensor with only scaling applied (i.e. no yaw or position corrections)
+    bool align_position_to_ahrs(const Vector3f &sensor_pos, bool align_xy, bool align_z);
+
+    // align position with a new position by updating _pos_correction
+    // sensor_pos should be the position directly from the sensor with only scaling applied (i.e. no yaw or position corrections)
+    // new_pos should be a NED position offset from the EKF origin
+    void align_position(const Vector3f &sensor_pos, const Vector3f &new_pos, bool align_xy, bool align_z);
+
+    // record voxl camera's position and reset counter for reset jump handling
+    // position is post scaling, offset and orientation corrections
+    void record_voxl_position_and_reset_count(const Vector3f &position, uint8_t reset_counter);
+
+    // handle voxl camera reset jumps in attitude and position
+    // sensor_pos should be the position directly from the sensor with only scaling applied (i.e. no yaw or position corrections)
+    // sensor_att is similarly the attitude directly from the sensor
+    void handle_voxl_camera_reset_jump(const Vector3f &sensor_pos, const Quaternion &sensor_att, uint8_t reset_counter);
+
+    float _yaw_trim;                            // yaw angle trim (in radians) to align camera's yaw to ahrs/EKF's
+    Quaternion _yaw_rotation;                   // earth-frame yaw rotation to align heading of sensor with vehicle.  use when _yaw_trim is non-zero
+    Quaternion _att_rotation;                   // body-frame rotation corresponding to ORIENT parameter.  use when get_orientation != NONE
+    Matrix3f _posvel_rotation;                  // rotation to align position and/or velocity from sensor to earth frame.  use when _use_posvel_rotation is true
+    Vector3f _pos_correction;                   // position correction that should be added to position reported from sensor
+    bool _use_att_rotation;                     // true if _att_rotation should be applied to sensor's attitude data
+    bool _use_posvel_rotation;                  // true if _posvel_rotation should be applied to sensor's position and/or velocity data
+    bool _align_yaw = true;                     // true if sensor yaw should be aligned to AHRS/EKF
+    bool _align_posxy;                          // true if sensor xy position should be aligned to AHRS
+    bool _align_posz;                           // true if sensor z position should be aligned to AHRS
+    bool _error_orientation;                    // true if the orientation is not supported
+    Quaternion _attitude_last;                  // last attitude received from camera (used for arming checks)
+    uint8_t _pos_reset_counter_last;            // last vision-position-estimate reset counter value
+    uint32_t _pos_reset_ignore_start_ms;        // system time we start ignoring sensor information, 0 if sensor data is not being ignored
+
+    // voxl reset jump handling variables
+    uint8_t _voxl_reset_counter_last;           // last reset counter from voxl camera (only used for origin jump handling)
+    Vector3f _voxl_position_last;               // last recorded position (post scaling, offset and orientation corrections)
+};
+
+#endif  // AP_VISUALODOM_INTELT265_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #include "AP_VisualOdom_Backend.h"
+#include <AP_Logger/AP_Logger_config.h>
+
+#if HAL_VISUALODOM_ENABLED && HAL_LOGGING_ENABLED
+
+#include <AP_Logger/AP_Logger.h>
+
+// Write visual odometry sensor data
+void AP_VisualOdom_Backend::Write_VisualOdom(float time_delta, const Vector3f &angle_delta, const Vector3f &position_delta, float confidence)
+{
+    const struct log_VisualOdom pkt_visualodom {
+        LOG_PACKET_HEADER_INIT(LOG_VISUALODOM_MSG),
+        time_us             : AP_HAL::micros64(),
+        time_delta          : time_delta,
+        angle_delta_x       : angle_delta.x,
+        angle_delta_y       : angle_delta.y,
+        angle_delta_z       : angle_delta.z,
+        position_delta_x    : position_delta.x,
+        position_delta_y    : position_delta.y,
+        position_delta_z    : position_delta.z,
+        confidence          : confidence
+    };
+    AP::logger().WriteBlock(&pkt_visualodom, sizeof(log_VisualOdom));
+}
+
+// Write visual position sensor data.  x,y,z are in meters, angles are in degrees
+void AP_VisualOdom_Backend::Write_VisualPosition(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, float roll, float pitch, float yaw, float pos_err, float ang_err, uint8_t reset_counter, bool ignored, int8_t quality)
+{
+    const struct log_VisualPosition pkt_visualpos {
+        LOG_PACKET_HEADER_INIT(LOG_VISUALPOS_MSG),
+        time_us         : AP_HAL::micros64(),
+        remote_time_us  : remote_time_us,
+        time_ms         : time_ms,
+        pos_x           : x,
+        pos_y           : y,
+        pos_z           : z,
+        roll            : roll,
+        pitch           : pitch,
+        yaw             : yaw,
+        pos_err         : pos_err,
+        ang_err         : ang_err,
+        reset_counter   : reset_counter,
+        ignored         : (uint8_t)ignored,
+        quality         : quality
+    };
+    AP::logger().WriteBlock(&pkt_visualpos, sizeof(log_VisualPosition));
+}
+
+// Write visual velocity sensor data, velocity in NED meters per second
+void AP_VisualOdom_Backend::Write_VisualVelocity(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, bool ignored, int8_t quality)
+{
+    const struct log_VisualVelocity pkt_visualvel {
+        LOG_PACKET_HEADER_INIT(LOG_VISUALVEL_MSG),
+        time_us         : AP_HAL::micros64(),
+        remote_time_us  : remote_time_us,
+        time_ms         : time_ms,
+        vel_x           : vel.x,
+        vel_y           : vel.y,
+        vel_z           : vel.z,
+        vel_err         : _frontend.get_vel_noise(),
+        reset_counter   : reset_counter,
+        ignored         : (uint8_t)ignored,
+        quality         : quality
+    };
+    AP::logger().WriteBlock(&pkt_visualvel, sizeof(log_VisualVelocity));
+}
+
+#endif // HAL_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_VisualOdom_config.h"
+
+#if AP_VISUALODOM_MAV_ENABLED
+
+#include "AP_VisualOdom_MAV.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Logger/AP_Logger.h>
+
+// consume vision pose estimate data and send to EKF. distances in meters
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom_MAV::handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality)
+{
+    const float scale_factor =  _frontend.get_pos_scale();
+    Vector3f pos{x * scale_factor, y * scale_factor, z * scale_factor};
+
+    posErr = constrain_float(posErr, _frontend.get_pos_noise(), 100.0f);
+    angErr = constrain_float(angErr, _frontend.get_yaw_noise(), 1.5f);
+
+    // record quality
+    _quality = quality;
+
+    // send attitude and position to EKF if quality OK
+    bool consume = (_quality >= _frontend.get_quality_min());
+    if (consume) {
+        AP::ahrs().writeExtNavData(pos, attitude, posErr, angErr, time_ms, _frontend.get_delay_ms(), get_reset_timestamp_ms(reset_counter));
+    }
+
+    // calculate euler orientation for logging
+    float roll;
+    float pitch;
+    float yaw;
+    attitude.to_euler(roll, pitch, yaw);
+
+#if HAL_LOGGING_ENABLED
+    // log sensor data
+    Write_VisualPosition(remote_time_us, time_ms, pos.x, pos.y, pos.z, degrees(roll), degrees(pitch), degrees(yaw), posErr, angErr, reset_counter, !consume, _quality);
+#endif
+
+    // record time for health monitoring
+    _last_update_ms = AP_HAL::millis();
+}
+
+// consume vision velocity estimate data and send to EKF, velocity in NED meters per second
+// quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+void AP_VisualOdom_MAV::handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality)
+{
+    // record quality
+    _quality = quality;
+
+    // send velocity to EKF if quality OK
+    bool consume = (_quality >= _frontend.get_quality_min());
+    if (consume) {
+        AP::ahrs().writeExtNavVelData(vel, _frontend.get_vel_noise(), time_ms, _frontend.get_delay_ms());
+    }
+
+    // record time for health monitoring
+    _last_update_ms = AP_HAL::millis();
+
+#if HAL_LOGGING_ENABLED
+    Write_VisualVelocity(remote_time_us, time_ms, vel, reset_counter, !consume, _quality);
+#endif
+}
+
+#endif  // AP_VISUALODOM_MAV_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include "AP_VisualOdom_config.h"
+
+#if AP_VISUALODOM_MAV_ENABLED
+
+#include "AP_VisualOdom_Backend.h"
+
+class AP_VisualOdom_MAV : public AP_VisualOdom_Backend
+{
+
+public:
+    // constructor
+    using AP_VisualOdom_Backend::AP_VisualOdom_Backend;
+
+    // consume vision pose estimate data and send to EKF. distances in meters
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    void handle_pose_estimate(uint64_t remote_time_us, uint32_t time_ms, float x, float y, float z, const Quaternion &attitude, float posErr, float angErr, uint8_t reset_counter, int8_t quality) override;
+
+    // consume vision velocity estimate data and send to EKF, velocity in NED meters per second
+    // quality of -1 means failed, 0 means unknown, 1 is worst, 100 is best
+    void handle_vision_speed_estimate(uint64_t remote_time_us, uint32_t time_ms, const Vector3f &vel, uint8_t reset_counter, int8_t quality) override;
+};
+
+#endif  // AP_VISUALODOM_MAV_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+#include <GCS_MAVLink/GCS_config.h>
+
+#ifndef HAL_VISUALODOM_ENABLED
+#define HAL_VISUALODOM_ENABLED BOARD_FLASH_SIZE > 1024
+#endif
+
+#ifndef AP_VISUALODOM_BACKEND_DEFAULT_ENABLED
+#define AP_VISUALODOM_BACKEND_DEFAULT_ENABLED HAL_VISUALODOM_ENABLED
+#endif
+
+#ifndef AP_VISUALODOM_INTELT265_ENABLED
+#define AP_VISUALODOM_INTELT265_ENABLED AP_VISUALODOM_BACKEND_DEFAULT_ENABLED && HAL_GCS_ENABLED
+#endif
+
+#ifndef AP_VISUALODOM_MAV_ENABLED
+#define AP_VISUALODOM_MAV_ENABLED AP_VISUALODOM_BACKEND_DEFAULT_ENABLED && HAL_GCS_ENABLED
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #include "GCS_config.h"
+#include <AC_Fence/AC_Fence_config.h>
+
+#if HAL_GCS_ENABLED && AP_FENCE_ENABLED
+
+#include "MissionItemProtocol_Fence.h"
+
+#include <AC_Fence/AC_Fence.h>
+#include <AP_InternalError/AP_InternalError.h>
+#include <GCS_MAVLink/GCS.h>
+
+/*
+  public function to format mission item as mavlink_mission_item_int_t
+ */
+bool MissionItemProtocol_Fence::get_item_as_mission_item(uint16_t seq,
+                                                         mavlink_mission_item_int_t &ret_packet)
+{
+    AC_Fence *fence = AP::fence();
+    if (fence == nullptr) {
+        return false;
+    }
+    const uint8_t num_stored_items = fence->polyfence().num_stored_items();
+    if (seq > num_stored_items) {
+        return false;
+    }
+
+    AC_PolyFenceItem fenceitem;
+
+    if (!fence->polyfence().get_item(seq, fenceitem)) {
+        return false;
+    }
+
+    MAV_CMD ret_cmd = MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION; // initialised to avoid compiler warning
+    float p1 = 0;
+    switch (fenceitem.type) {
+    case AC_PolyFenceType::POLYGON_INCLUSION:
+        ret_cmd = MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION;
+        p1 = fenceitem.vertex_count;
+        break;
+    case AC_PolyFenceType::POLYGON_EXCLUSION:
+        ret_cmd = MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION;
+        p1 = fenceitem.vertex_count;
+        break;
+    case AC_PolyFenceType::RETURN_POINT:
+        ret_cmd = MAV_CMD_NAV_FENCE_RETURN_POINT;
+        break;
+    case AC_PolyFenceType::CIRCLE_EXCLUSION:
+        ret_cmd = MAV_CMD_NAV_FENCE_CIRCLE_EXCLUSION;
+        p1 = fenceitem.radius;
+        break;
+    case AC_PolyFenceType::CIRCLE_INCLUSION:
+        ret_cmd = MAV_CMD_NAV_FENCE_CIRCLE_INCLUSION;
+        p1 = fenceitem.radius;
+        break;
+    case AC_PolyFenceType::CIRCLE_EXCLUSION_INT:
+    case AC_PolyFenceType::CIRCLE_INCLUSION_INT:
+        // should never have an AC_PolyFenceItem with these types
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        FALLTHROUGH;
+    case AC_PolyFenceType::END_OF_STORAGE:
+        return false;
+    }
+
+    ret_packet.command = ret_cmd;
+    ret_packet.param1 = p1;
+    ret_packet.x = fenceitem.loc.x;
+    ret_packet.y = fenceitem.loc.y;
+    ret_packet.z = 0;
+
+    return true;
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::get_item(const GCS_MAVLINK &_link,
+                                                       const mavlink_message_t &msg,
+                                                       const mavlink_mission_request_int_t &packet,
+                                                       mavlink_mission_item_int_t &ret_packet)
+{
+    const uint8_t num_stored_items = _fence.polyfence().num_stored_items();
+    if (packet.seq > num_stored_items) {
+        return MAV_MISSION_INVALID_SEQUENCE;
+    }
+
+    if (!get_item_as_mission_item(packet.seq, ret_packet)) {
+        return MAV_MISSION_ERROR;
+    }
+
+    return MAV_MISSION_ACCEPTED;
+}
+
+uint16_t MissionItemProtocol_Fence::item_count() const
+{
+    if (receiving) {
+        return _new_items_count;
+    }
+    return _fence.polyfence().num_stored_items();
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::convert_MISSION_ITEM_INT_to_AC_PolyFenceItem(const mavlink_mission_item_int_t &mission_item_int, AC_PolyFenceItem &ret)
+{
+    if (mission_item_int.frame != MAV_FRAME_GLOBAL &&
+        mission_item_int.frame != MAV_FRAME_GLOBAL_INT &&
+        mission_item_int.frame != MAV_FRAME_GLOBAL_RELATIVE_ALT &&
+        mission_item_int.frame != MAV_FRAME_GLOBAL_RELATIVE_ALT_INT &&
+        mission_item_int.frame != MAV_FRAME_GLOBAL_TERRAIN_ALT &&
+        mission_item_int.frame != MAV_FRAME_GLOBAL_TERRAIN_ALT_INT) {
+        return MAV_MISSION_UNSUPPORTED_FRAME;
+    }
+
+    switch (mission_item_int.command) {
+    case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION:
+        ret.type = AC_PolyFenceType::POLYGON_INCLUSION;
+        ret.vertex_count = mission_item_int.param1;
+        break;
+    case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION:
+        ret.type = AC_PolyFenceType::POLYGON_EXCLUSION;
+        ret.vertex_count = mission_item_int.param1;
+        break;
+    case MAV_CMD_NAV_FENCE_RETURN_POINT:
+        ret.type = AC_PolyFenceType::RETURN_POINT;
+        break;
+    case MAV_CMD_NAV_FENCE_CIRCLE_EXCLUSION:
+        ret.type = AC_PolyFenceType::CIRCLE_EXCLUSION;
+        ret.radius = mission_item_int.param1;
+        break;
+    case MAV_CMD_NAV_FENCE_CIRCLE_INCLUSION:
+        ret.type = AC_PolyFenceType::CIRCLE_INCLUSION;
+        ret.radius = mission_item_int.param1;
+        break;
+    default:
+        return MAV_MISSION_UNSUPPORTED;
+    }
+    ret.loc.x = mission_item_int.x;
+    ret.loc.y = mission_item_int.y;
+    return MAV_MISSION_ACCEPTED;
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::replace_item(const mavlink_mission_item_int_t &mission_item_int)
+{
+    if (_new_items == nullptr) {
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        return MAV_MISSION_ERROR;
+    }
+    if (mission_item_int.seq >= _new_items_count) {
+        return MAV_MISSION_INVALID_SEQUENCE;
+    }
+
+    const MAV_MISSION_RESULT ret = convert_MISSION_ITEM_INT_to_AC_PolyFenceItem(mission_item_int, _new_items[mission_item_int.seq]);
+    if (ret != MAV_MISSION_ACCEPTED) {
+        return ret;
+    }
+    if (_updated_mask != nullptr) {
+        _updated_mask[mission_item_int.seq/8] |= (1U<<(mission_item_int.seq%8));
+    }
+    return MAV_MISSION_ACCEPTED;
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::append_item(const mavlink_mission_item_int_t &mission_item_int)
+{
+    return replace_item(mission_item_int);
+}
+
+void MissionItemProtocol_Fence::free_upload_resources()
+{
+    free(_new_items);
+    _new_items = nullptr;
+    delete[] _updated_mask;
+    _updated_mask = nullptr;
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::complete(const GCS_MAVLINK &_link)
+{
+    if (_updated_mask != nullptr) {
+        // get any points that weren't filled in
+        for (uint16_t i=0; i<_new_items_count; i++) {
+            if (!(_updated_mask[i/8] & (1U<<(i%8)))) {
+                if (!_fence.polyfence().get_item(i, _new_items[i])) {
+                    _link.send_text(MAV_SEVERITY_INFO, "Error replacing item (%u)", i);
+                    return MAV_MISSION_ERROR;
+                }
+            }
+        }
+    }
+
+    bool success = _fence.polyfence().write_fence(_new_items, _new_items_count);
+    if (!success) {
+        return MAV_MISSION_ERROR;
+    }
+
+    // AP::logger().Write_Fence();
+    return MAV_MISSION_ACCEPTED;
+}
+void MissionItemProtocol_Fence::timeout()
+{
+    link->send_text(MAV_SEVERITY_WARNING, "Fence upload timeout");
+}
+
+uint16_t MissionItemProtocol_Fence::max_items() const
+{
+    return _fence.polyfence().max_items();
+}
+
+void MissionItemProtocol_Fence::truncate(const mavlink_mission_count_t &packet)
+{
+    // FIXME: validate packet.count is same as allocated number of items
+}
+
+bool MissionItemProtocol_Fence::clear_all_items()
+{
+    return _fence.polyfence().write_fence(nullptr, 0);
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::allocate_receive_resources(const uint16_t count)
+{
+    if (_new_items != nullptr) {
+        // this is an error - the base class should have called
+        // free_upload_resources first
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        return MAV_MISSION_ERROR;
+    }
+
+    const uint16_t allocation_size = count * sizeof(AC_PolyFenceItem);
+    if (allocation_size != 0) {
+        _new_items = (AC_PolyFenceItem*)malloc(allocation_size);
+        if (_new_items == nullptr) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Out of memory for upload");
+            return MAV_MISSION_ERROR;
+        }
+    }
+    _new_items_count = count;
+    return MAV_MISSION_ACCEPTED;
+}
+
+MAV_MISSION_RESULT MissionItemProtocol_Fence::allocate_update_resources()
+{
+    const uint16_t _item_count = _fence.polyfence().num_stored_items();
+    _updated_mask = NEW_NOTHROW uint8_t[(_item_count+7)/8];
+    if (_updated_mask == nullptr) {
+        return MAV_MISSION_ERROR;
+    }
+    MAV_MISSION_RESULT ret = allocate_receive_resources(_item_count);
+    if (ret != MAV_MISSION_ACCEPTED) {
+        delete[] _updated_mask;
+        _updated_mask = nullptr;
+        return ret;
+    }
+    _new_items_count = _item_count;
+    ret

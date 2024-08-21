@@ -1,0 +1,1153 @@
+ion and height measurement variances.
+        // Use different errors if operating without external aiding using an assumed position or velocity of zero
+        if (PV_AidingMode == AID_NONE) {
+            if (tiltAlignComplete && motorsArmed) {
+                // This is a compromise between corrections for gyro errors and reducing effect of manoeuvre accelerations on tilt estimate
+                R_OBS[0] = sq(constrain_ftype(frontend->_noaidHorizNoise, 0.5f, 50.0f));
+            } else {
+                // Use a smaller value to give faster initial alignment
+                R_OBS[0] = sq(0.5f);
+            }
+            R_OBS[1] = R_OBS[0];
+            R_OBS[2] = R_OBS[0];
+            R_OBS[3] = R_OBS[0];
+            R_OBS[4] = R_OBS[0];
+            for (uint8_t i=0; i<=2; i++) R_OBS_DATA_CHECKS[i] = R_OBS[i];
+        } else {
+            if (gpsSpdAccuracy > 0.0f) {
+                // use GPS receivers reported speed accuracy if available and floor at value set by GPS velocity noise parameter
+                R_OBS[0] = sq(constrain_ftype(gpsSpdAccuracy, frontend->_gpsHorizVelNoise, 50.0f));
+                R_OBS[2] = sq(constrain_ftype(gpsSpdAccuracy, frontend->_gpsVertVelNoise, 50.0f));
+#if EK3_FEATURE_EXTERNAL_NAV
+            } else if (extNavVelToFuse) {
+                R_OBS[2] = R_OBS[0] = sq(constrain_ftype(extNavVelDelayed.err, 0.05f, 5.0f));
+#endif
+            } else {
+                // calculate additional error in GPS velocity caused by manoeuvring
+                R_OBS[0] = sq(constrain_ftype(frontend->_gpsHorizVelNoise, 0.05f, 5.0f)) + sq(frontend->gpsNEVelVarAccScale * accNavMag);
+                R_OBS[2] = sq(constrain_ftype(frontend->_gpsVertVelNoise,  0.05f, 5.0f)) + sq(frontend->gpsDVelVarAccScale  * accNavMag);
+            }
+            R_OBS[1] = R_OBS[0];
+            // Use GPS reported position accuracy if available and floor at value set by GPS position noise parameter
+            if (gpsPosAccuracy > 0.0f) {
+                R_OBS[3] = sq(constrain_ftype(gpsPosAccuracy, frontend->_gpsHorizPosNoise, 100.0f));
+#if EK3_FEATURE_EXTERNAL_NAV
+            } else if (extNavUsedForPos) {
+                R_OBS[3] = sq(constrain_ftype(extNavDataDelayed.posErr, 0.01f, 10.0f));
+#endif
+            } else {
+                R_OBS[3] = sq(constrain_ftype(frontend->_gpsHorizPosNoise, 0.1f, 10.0f)) + sq(posErr);
+            }
+            R_OBS[4] = R_OBS[3];
+            // For data integrity checks we use the same measurement variances as used to calculate the Kalman gains for all measurements except GPS horizontal velocity
+            // For horizontal GPS velocity we don't want the acceptance radius to increase with reported GPS accuracy so we use a value based on best GPS performance
+            // plus a margin for manoeuvres. It is better to reject GPS horizontal velocity errors early
+            ftype obs_data_chk;
+#if EK3_FEATURE_EXTERNAL_NAV
+            if (extNavVelToFuse) {
+                obs_data_chk = sq(constrain_ftype(extNavVelDelayed.err, 0.05f, 5.0f)) + sq(frontend->extNavVelVarAccScale * accNavMag);
+            } else
+#endif
+            {
+                obs_data_chk = sq(constrain_ftype(frontend->_gpsHorizVelNoise, 0.05f, 5.0f)) + sq(frontend->gpsNEVelVarAccScale * accNavMag);
+            }
+            R_OBS_DATA_CHECKS[0] = R_OBS_DATA_CHECKS[1] = R_OBS_DATA_CHECKS[2] = obs_data_chk;
+        }
+        R_OBS[5] = posDownObsNoise;
+        for (uint8_t i=3; i<=5; i++) R_OBS_DATA_CHECKS[i] = R_OBS[i];
+
+        // if vertical GPS velocity data and an independent height source is being used, check to see if the GPS vertical velocity and altimeter
+        // innovations have the same sign and are outside limits. If so, then it is likely aliasing is affecting
+        // the accelerometers and we should disable the GPS and barometer innovation consistency checks.
+        if (gpsDataDelayed.have_vz && fuseVelData && (frontend->sources.getPosZSource() != AP_NavEKF_Source::SourceZ::GPS)) {
+            // calculate innovations for height and vertical GPS vel measurements
+            const ftype hgtErr  = stateStruct.position.z - velPosObs[5];
+            const ftype velDErr = stateStruct.velocity.z - velPosObs[2];
+            // Check if they are the same sign and both more than 3-sigma out of bounds
+            // Step the test threshold up in stages from 1 to 2 to 3 sigma after exiting
+            // from a previous bad IMU event so that a subsequent error is caught more quickly.
+            const uint32_t timeSinceLastBadIMU_ms = imuSampleTime_ms - badIMUdata_ms;
+            float R_gain;
+            if (timeSinceLastBadIMU_ms > (BAD_IMU_DATA_HOLD_MS * 2)) {
+                R_gain = 9.0F;
+            } else if  (timeSinceLastBadIMU_ms > ((BAD_IMU_DATA_HOLD_MS * 3) / 2)) {
+                R_gain = 4.0F;
+            } else {
+                R_gain = 1.0F;
+            }
+            if ((hgtErr*velDErr > 0.0f) && (sq(hgtErr) > R_gain * R_OBS[5]) && (sq(velDErr) >R_gain * R_OBS[2])) {
+                badIMUdata_ms = imuSampleTime_ms;
+            } else {
+                goodIMUdata_ms = imuSampleTime_ms;
+            }
+            if (timeSinceLastBadIMU_ms < BAD_IMU_DATA_HOLD_MS) {
+                badIMUdata = true;
+                stateStruct.velocity.z = gpsDataDelayed.vel.z;
+            } else {
+                badIMUdata = false;
+            }
+        }
+
+        // Test horizontal position measurements
+        if (fusePosData) {
+            innovVelPos[3] = stateStruct.position.x - velPosObs[3];
+            innovVelPos[4] = stateStruct.position.y - velPosObs[4];
+            varInnovVelPos[3] = P[7][7] + R_OBS_DATA_CHECKS[3];
+            varInnovVelPos[4] = P[8][8] + R_OBS_DATA_CHECKS[4];
+
+            // Apply an innovation consistency threshold test
+            // Don't allow test to fail if not navigating and using a constant position
+            // assumption to constrain tilt errors because innovations can become large
+            // due to vehicle motion.
+            ftype maxPosInnov2 = sq(MAX(0.01 * (ftype)frontend->_gpsPosInnovGate, 1.0))*(varInnovVelPos[3] + varInnovVelPos[4]);
+
+            posTestRatio = (sq(innovVelPos[3]) + sq(innovVelPos[4])) / maxPosInnov2;
+            if (posTestRatio < 1.0f || (PV_AidingMode == AID_NONE)) {
+                posCheckPassed = true;
+                lastPosPassTime_ms = imuSampleTime_ms;
+            } else if ((frontend->_gpsGlitchRadiusMax <= 0) && (PV_AidingMode != AID_NONE)) {
+                // Handle the special case where the glitch radius parameter has been set to a non-positive number.
+                // The innovation variance is increased to limit the state update to an amount corresponding
+                // to a test ratio of 1.
+                posCheckPassed = true;
+                lastPosPassTime_ms = imuSampleTime_ms;
+                varInnovVelPos[3] *= posTestRatio;
+                varInnovVelPos[4] *= posTestRatio;
+                posCheckPassed = true;
+                lastPosPassTime_ms = imuSampleTime_ms;
+            }
+
+            // Use position data if healthy or timed out or bad IMU data
+            // Always fuse data if bad IMU to prevent aliasing and clipping pulling the state estimate away
+            // from the measurement un-opposed if test threshold is exceeded.
+            if (posCheckPassed || posTimeout || badIMUdata) {
+                // if timed out or outside the specified uncertainty radius, reset to the external sensor
+                // if velocity drift is being constrained, dont reset until gps passes quality checks
+                const bool posVarianceIsTooLarge = (frontend->_gpsGlitchRadiusMax > 0) && (P[8][8] + P[7][7]) > sq(ftype(frontend->_gpsGlitchRadiusMax));
+                if ((posTimeout || posVarianceIsTooLarge) && (!velAiding || gpsGoodToAlign)) {
+                    // reset the position to the current external sensor position
+                    ResetPosition(resetDataSource::DEFAULT);
+
+                    // Don't fuse the same data we have used to reset states.
+                    fusePosData = false;
+
+                    // Reset the position variances and corresponding covariances to a value that will pass the checks
+                    zeroRows(P,7,8);
+                    zeroCols(P,7,8);
+                    P[7][7] = sq(ftype(0.5f*frontend->_gpsGlitchRadiusMax));
+                    P[8][8] = P[7][7];
+
+                    // Reset the normalised innovation to avoid failing the bad fusion tests
+                    posTestRatio = 0.0f;
+
+                    // Reset velocity if it has timed out
+                    if (velTimeout) {
+                        ResetVelocity(resetDataSource::DEFAULT);
+
+                        // Don't fuse the same data we have used to reset states.
+                        fuseVelData = false;
+
+                        // Reset the normalised innovation to avoid failing the bad fusion tests
+                        velTestRatio = 0.0f;
+                    }
+                }
+            } else {
+                fusePosData = false;
+            }
+        }
+
+        // Test velocity measurements
+        if (fuseVelData) {
+            uint8_t imax = 2;
+            // Don't fuse vertical velocity observations if disabled in sources or not available
+            if ((!frontend->sources.haveVelZSource() || PV_AidingMode != AID_ABSOLUTE ||
+                 !gpsDataDelayed.have_vz) && !useExtNavVel) {
+                imax = 1;
+            }
+
+            // Apply an innovation consistency threshold test
+            ftype innovVelSumSq = 0; // sum of squares of velocity innovations
+            ftype varVelSum = 0; // sum of velocity innovation variances
+
+            for (uint8_t i = 0; i<=imax; i++) {
+                stateIndex   = i + 4;
+                const float innovation = stateStruct.velocity[i] - velPosObs[i];
+                innovVelSumSq += sq(innovation);
+                varInnovVelPos[i] = P[stateIndex][stateIndex] + R_OBS_DATA_CHECKS[i];
+                varVelSum += varInnovVelPos[i];
+            }
+            velTestRatio = innovVelSumSq / (varVelSum * sq(MAX(0.01 * (ftype)frontend->_gpsVelInnovGate, 1.0)));
+            if (velTestRatio < 1.0) {
+                velCheckPassed = true;
+                lastVelPassTime_ms = imuSampleTime_ms;
+            } else if (frontend->_gpsGlitchRadiusMax <= 0) {
+                // Handle the special case where the glitch radius parameter has been set to a non-positive number.
+                // The innovation variance is increased to limit the state update to an amount corresponding
+                // to a test ratio of 1.
+                posCheckPassed = true;
+                lastPosPassTime_ms = imuSampleTime_ms;
+                for (uint8_t i = 0; i<=imax; i++) {
+                    varInnovVelPos[i] *= velTestRatio;
+                }
+                velCheckPassed = true;
+                lastVelPassTime_ms = imuSampleTime_ms;
+            }
+
+            // Use velocity data if healthy, timed out or when IMU fault has been detected
+            // Always fuse data if bad IMU to prevent aliasing and clipping pulling the state estimate away
+            // from the measurement un-opposed if test threshold is exceeded.
+            if (velCheckPassed || velTimeout || badIMUdata) {
+                // If we are doing full aiding and velocity fusion times out, reset to the external sensor velocity
+                if (PV_AidingMode == AID_ABSOLUTE && velTimeout) {
+                    ResetVelocity(resetDataSource::DEFAULT);
+
+                    // Don't fuse the same data we have used to reset states.
+                    fuseVelData = false;
+
+                    // Reset the normalised innovation to avoid failing the bad fusion tests
+                    velTestRatio = 0.0f;
+                }
+            } else {
+                fuseVelData = false;
+            }
+        }
+
+        // Test height measurements
+        if (fuseHgtData) {
+            // Calculate height innovations
+            innovVelPos[5] = stateStruct.position.z - velPosObs[5];
+            varInnovVelPos[5] = P[9][9] + R_OBS_DATA_CHECKS[5];
+
+            // Calculate the innovation consistency test ratio
+            hgtTestRatio = sq(innovVelPos[5]) / (sq(MAX(0.01 * (ftype)frontend->_hgtInnovGate, 1.0)) * varInnovVelPos[5]);
+
+            // When on ground we accept a larger test ratio to allow the filter to handle large switch on IMU
+            // bias errors without rejecting the height sensor.
+            const bool onGroundNotNavigating = (PV_AidingMode == AID_NONE) && onGround;
+            const float maxTestRatio = onGroundNotNavigating ? 3.0f : 1.0f;
+            if (hgtTestRatio < maxTestRatio) {
+                hgtCheckPassed = true;
+                lastHgtPassTime_ms = imuSampleTime_ms;
+            } else if ((frontend->_gpsGlitchRadiusMax <= 0) && !onGroundNotNavigating && (activeHgtSource == AP_NavEKF_Source::SourceZ::GPS)) {
+                // Handle the special case where the glitch radius parameter has been set to a non-positive number.
+                // The innovation variance is increased to limit the state update to an amount corresponding
+                // to a test ratio of 1.
+                posCheckPassed = true;
+                lastPosPassTime_ms = imuSampleTime_ms;
+                varInnovVelPos[5] *= hgtTestRatio;
+                hgtCheckPassed = true;
+                lastHgtPassTime_ms = imuSampleTime_ms;
+            }
+
+            // Use height data if innovation check passed or timed out or if bad IMU data
+            // Always fuse data if bad IMU to prevent aliasing and clipping pulling the state estimate away
+            // from the measurement un-opposed if test threshold is exceeded.
+            if (hgtCheckPassed || hgtTimeout || badIMUdata) {
+                // Calculate a filtered value to be used by pre-flight health checks
+                // We need to filter because wind gusts can generate significant baro noise and we want to be able to detect bias errors in the inertial solution
+                if (onGround) {
+                    ftype dtBaro = (imuSampleTime_ms - lastHgtPassTime_ms) * 1.0e-3;
+                    const ftype hgtInnovFiltTC = 2.0;
+                    ftype alpha = constrain_ftype(dtBaro/(dtBaro+hgtInnovFiltTC), 0.0, 1.0);
+                    hgtInnovFiltState += (innovVelPos[5] - hgtInnovFiltState)*alpha;
+                } else {
+                    hgtInnovFiltState = 0.0f;
+                }
+
+                if (hgtTimeout) {
+                    ResetHeight();
+
+                    // Don't fuse the same data we have used to reset states.
+                    fuseHgtData = false;
+                }
+
+            } else {
+                fuseHgtData = false;
+            }
+        }
+
+        // set range for sequential fusion of velocity and position measurements depending on which data is available and its health
+        if (fuseVelData) {
+            fuseData[0] = true;
+            fuseData[1] = true;
+            if (useGpsVertVel || useExtNavVel) {
+                fuseData[2] = true;
+            }
+        }
+        if (fusePosData) {
+            fuseData[3] = true;
+            fuseData[4] = true;
+        }
+        if (fuseHgtData) {
+            fuseData[5] = true;
+        }
+
+        // fuse measurements sequentially
+        for (obsIndex=0; obsIndex<=5; obsIndex++) {
+            if (fuseData[obsIndex]) {
+                stateIndex = 4 + obsIndex;
+                // calculate the measurement innovation, using states from a different time coordinate if fusing height data
+                // adjust scaling on GPS measurement noise variances if not enough satellites
+                if (obsIndex <= 2) {
+                    innovVelPos[obsIndex] = stateStruct.velocity[obsIndex] - velPosObs[obsIndex];
+                    R_OBS[obsIndex] *= sq(gpsNoiseScaler);
+                } else if (obsIndex == 3 || obsIndex == 4) {
+                    innovVelPos[obsIndex] = stateStruct.position[obsIndex-3] - velPosObs[obsIndex];
+                    R_OBS[obsIndex] *= sq(gpsNoiseScaler);
+                } else if (obsIndex == 5) {
+                    innovVelPos[obsIndex] = stateStruct.position[obsIndex-3] - velPosObs[obsIndex];
+                    const ftype gndMaxBaroErr = MAX(frontend->_baroGndEffectDeadZone, 0.0);
+                    const ftype gndBaroInnovFloor = -0.5;
+
+                    if ((dal.get_touchdown_expected() || dal.get_takeoff_expected()) && activeHgtSource == AP_NavEKF_Source::SourceZ::BARO) {
+                        // when baro positive pressure error due to ground effect is expected,
+                        // floor the barometer innovation at gndBaroInnovFloor
+                        // constrain the correction between 0 and gndBaroInnovFloor+gndMaxBaroErr
+                        // this function looks like this:
+                        //         |/
+                        //---------|---------
+                        //    ____/|
+                        //   /     |
+                        //  /      |
+                        innovVelPos[5] += constrain_ftype(-innovVelPos[5]+gndBaroInnovFloor, 0.0f, gndBaroInnovFloor+gndMaxBaroErr);
+                    }
+                }
+
+                // calculate the Kalman gain and calculate innovation variances
+                varInnovVelPos[obsIndex] = P[stateIndex][stateIndex] + R_OBS[obsIndex];
+                SK = 1.0f/varInnovVelPos[obsIndex];
+                for (uint8_t i= 0; i<=9; i++) {
+                    Kfusion[i] = P[i][stateIndex]*SK;
+                }
+
+                // inhibit delta angle bias state estimation by setting Kalman gains to zero
+                if (!inhibitDelAngBiasStates) {
+                    for (uint8_t i = 10; i<=12; i++) {
+                        // Don't try to learn gyro bias if not aiding and the axis is
+                        // less than 45 degrees from vertical because the bias is poorly observable
+                        bool poorObservability = false;
+                        if (PV_AidingMode == AID_NONE) {
+                            const uint8_t axisIndex = i - 10;
+                            if (axisIndex == 0) {
+                                poorObservability = fabsF(prevTnb.a.z) > M_SQRT1_2;
+                            } else if (axisIndex == 1) {
+                                poorObservability = fabsF(prevTnb.b.z) > M_SQRT1_2;
+                            } else {
+                                poorObservability = fabsF(prevTnb.c.z) > M_SQRT1_2;
+                            }
+                        }
+                        if (poorObservability) {
+                            Kfusion[i] = 0.0;
+                        } else {
+                            Kfusion[i] = P[i][stateIndex]*SK;
+                        }
+                    }
+                } else {
+                    // zero indexes 10 to 12
+                    zero_range(&Kfusion[0], 10, 12);
+                }
+
+                // Inhibit delta velocity bias state estimation by setting Kalman gains to zero
+                // Don't use 'fake' horizontal measurements used to constrain attitude drift during
+                // periods of non-aiding to learn bias as these can give incorrect esitmates.
+                const bool horizInhibit = PV_AidingMode == AID_NONE && obsIndex != 2 && obsIndex != 5;
+                if (!horizInhibit && !inhibitDelVelBiasStates && !badIMUdata) {
+                    for (uint8_t i = 13; i<=15; i++) {
+                        if (!dvelBiasAxisInhibit[i-13]) {
+                            Kfusion[i] = P[i][stateIndex]*SK;
+                        } else {
+                            Kfusion[i] = 0.0f;
+                        }
+                    }
+                } else {
+                    // zero indexes 13 to 15
+                    zero_range(&Kfusion[0], 13, 15);
+                }
+
+                // inhibit magnetic field state estimation by setting Kalman gains to zero
+                if (!inhibitMagStates) {
+                    for (uint8_t i = 16; i<=21; i++) {
+                        Kfusion[i] = P[i][stateIndex]*SK;
+                    }
+                } else {
+                    // zero indexes 16 to 21
+                    zero_range(&Kfusion[0], 16, 21);
+                }
+
+                // inhibit wind state estimation by setting Kalman gains to zero
+                if (!inhibitWindStates && !treatWindStatesAsTruth) {
+                    Kfusion[22] = P[22][stateIndex]*SK;
+                    Kfusion[23] = P[23][stateIndex]*SK;
+                } else {
+                    // zero indexes 22 to 23
+                    zero_range(&Kfusion[0], 22, 23);
+                }
+
+                // update the covariance - take advantage of direct observation of a single state at index = stateIndex to reduce computations
+                // this is a numerically optimised implementation of standard equation P = (I - K*H)*P;
+                for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                    for (uint8_t j= 0; j<=stateIndexLim; j++) {
+                        KHP[i][j] = Kfusion[i] * P[stateIndex][j];
+                    }
+                }
+                // Check that we are not going to drive any variances negative and skip the update if so
+                bool healthyFusion = true;
+                for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                    if (KHP[i][i] > P[i][i]) {
+                        healthyFusion = false;
+                    }
+                }
+                if (healthyFusion) {
+                    // update the covariance matrix
+                    for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                        for (uint8_t j= 0; j<=stateIndexLim; j++) {
+                            P[i][j] = P[i][j] - KHP[i][j];
+                        }
+                    }
+
+                    // force the covariance matrix to be symmetrical and limit the variances to prevent ill-conditioning.
+                    ForceSymmetry();
+                    ConstrainVariances();
+
+                    // update states and renormalise the quaternions
+                    for (uint8_t i = 0; i<=stateIndexLim; i++) {
+                        statesArray[i] = statesArray[i] - Kfusion[i] * innovVelPos[obsIndex];
+                    }
+                    stateStruct.quat.normalize();
+
+                    // record good fusion status
+                    if (obsIndex == 0) {
+                        faultStatus.bad_nvel = false;
+                    } else if (obsIndex == 1) {
+                        faultStatus.bad_evel = false;
+                    } else if (obsIndex == 2) {
+                        faultStatus.bad_dvel = false;
+                    } else if (obsIndex == 3) {
+                        faultStatus.bad_npos = false;
+                    } else if (obsIndex == 4) {
+                        faultStatus.bad_epos = false;
+                    } else if (obsIndex == 5) {
+                        faultStatus.bad_dpos = false;
+                    }
+                } else {
+                    // record bad fusion status
+                    if (obsIndex == 0) {
+                        faultStatus.bad_nvel = true;
+                    } else if (obsIndex == 1) {
+                        faultStatus.bad_evel = true;
+                    } else if (obsIndex == 2) {
+                        faultStatus.bad_dvel = true;
+                    } else if (obsIndex == 3) {
+                        faultStatus.bad_npos = true;
+                    } else if (obsIndex == 4) {
+                        faultStatus.bad_epos = true;
+                    } else if (obsIndex == 5) {
+                        faultStatus.bad_dpos = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/********************************************************
+*                   MISC FUNCTIONS                      *
+********************************************************/
+
+// select the height measurement to be fused from the available baro, range finder and GPS sources
+void NavEKF3_core::selectHeightForFusion()
+{
+#if AP_RANGEFINDER_ENABLED
+    // Read range finder data and check for new data in the buffer
+    // This data is used by both height and optical flow fusion processing
+    readRangeFinder();
+    rangeDataToFuse = storedRange.recall(rangeDataDelayed,imuDataDelayed.time_ms);
+
+    // correct range data for the body frame position offset relative to the IMU
+    // the corrected reading is the reading that would have been taken if the sensor was
+    // co-located with the IMU
+    const auto *_rng = dal.rangefinder();
+    if (_rng && rangeDataToFuse) {
+        auto *sensor = _rng->get_backend(rangeDataDelayed.sensor_idx);
+        if (sensor != nullptr) {
+            Vector3F posOffsetBody = sensor->get_pos_offset().toftype() - accelPosOffset;
+            if (!posOffsetBody.is_zero()) {
+                Vector3F posOffsetEarth = prevTnb.mul_transpose(posOffsetBody);
+                rangeDataDelayed.rng += posOffsetEarth.z / prevTnb.c.z;
+            }
+        }
+    }
+#endif  // AP_RANGEFINDER_ENABLED
+
+    // read baro height data from the sensor and check for new data in the buffer
+    readBaroData();
+    baroDataToFuse = storedBaro.recall(baroDataDelayed, imuDataDelayed.time_ms);
+
+    bool rangeFinderDataIsFresh = (imuSampleTime_ms - rngValidMeaTime_ms < 500);
+#if EK3_FEATURE_EXTERNAL_NAV
+    const bool extNavDataIsFresh = (imuSampleTime_ms - extNavMeasTime_ms < 500);
+#endif
+    // select height source
+    if ((frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::NONE)) {
+        // user has specified no height sensor
+        activeHgtSource = AP_NavEKF_Source::SourceZ::NONE;
+#if AP_RANGEFINDER_ENABLED
+    } else if ((frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::RANGEFINDER) && _rng && rangeFinderDataIsFresh) {
+        // user has specified the range finder as a primary height source
+        activeHgtSource = AP_NavEKF_Source::SourceZ::RANGEFINDER;
+    } else if ((frontend->_useRngSwHgt > 0) && ((frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::BARO) || (frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::GPS)) && _rng && rangeFinderDataIsFresh) {
+        // determine if we are above or below the height switch region
+        ftype rangeMaxUse = 1e-4 * (ftype)_rng->max_distance_cm_orient(ROTATION_PITCH_270) * (ftype)frontend->_useRngSwHgt;
+        bool aboveUpperSwHgt = (terrainState - stateStruct.position.z) > rangeMaxUse;
+        bool belowLowerSwHgt = ((terrainState - stateStruct.position.z) < 0.7f * rangeMaxUse) && (imuSampleTime_ms - gndHgtValidTime_ms < 1000);
+
+        // If the terrain height is consistent and we are moving slowly, then it can be
+        // used as a height reference in combination with a range finder
+        // apply a hysteresis to the speed check to prevent rapid switching
+        bool dontTrustTerrain, trustTerrain;
+        if (filterStatus.flags.horiz_vel) {
+            // We can use the velocity estimate
+            ftype horizSpeed = stateStruct.velocity.xy().length();
+            dontTrustTerrain = (horizSpeed > frontend->_useRngSwSpd) || !terrainHgtStable;
+            ftype trust_spd_trigger = MAX((frontend->_useRngSwSpd - 1.0f),(frontend->_useRngSwSpd * 0.5f));
+            trustTerrain = (horizSpeed < trust_spd_trigger) && terrainHgtStable;
+        } else {
+            // We can't use the velocity estimate
+            dontTrustTerrain = !terrainHgtStable;
+            trustTerrain = terrainHgtStable;
+        }
+
+        /*
+            * Switch between range finder and primary height source using height above ground and speed thresholds with
+            * hysteresis to avoid rapid switching. Using range finder for height requires a consistent terrain height
+            * which cannot be assumed if the vehicle is moving horizontally.
+        */
+        if ((aboveUpperSwHgt || dontTrustTerrain) && (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER)) {
+            // cannot trust terrain or range finder so stop using range finder height
+            if (frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::BARO) {
+                activeHgtSource = AP_NavEKF_Source::SourceZ::BARO;
+            } else if (frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::GPS) {
+                activeHgtSource = AP_NavEKF_Source::SourceZ::GPS;
+            }
+        } else if (belowLowerSwHgt && trustTerrain && (prevTnb.c.z >= 0.7f)) {
+            // reliable terrain and range finder so start using range finder height
+            activeHgtSource = AP_NavEKF_Source::SourceZ::RANGEFINDER;
+        }
+#endif
+    } else if (frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::BARO) {
+        activeHgtSource = AP_NavEKF_Source::SourceZ::BARO;
+    } else if ((frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::GPS) && ((imuSampleTime_ms - lastTimeGpsReceived_ms) < 500) && validOrigin && gpsAccuracyGood) {
+        activeHgtSource = AP_NavEKF_Source::SourceZ::GPS;
+#if EK3_FEATURE_BEACON_FUSION
+    } else if ((frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::BEACON) && validOrigin && rngBcn.goodToAlign) {
+        activeHgtSource = AP_NavEKF_Source::SourceZ::BEACON;
+#endif
+#if EK3_FEATURE_EXTERNAL_NAV
+    } else if ((frontend->sources.getPosZSource() == AP_NavEKF_Source::SourceZ::EXTNAV) && extNavDataIsFresh) {
+        activeHgtSource = AP_NavEKF_Source::SourceZ::EXTNAV;
+#endif
+    }
+
+    // Use Baro alt as a fallback if we lose range finder, GPS, external nav or Beacon
+    bool lostRngHgt = ((activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER) && !rangeFinderDataIsFresh);
+    bool lostGpsHgt = ((activeHgtSource == AP_NavEKF_Source::SourceZ::GPS) && ((imuSampleTime_ms - lastTimeGpsReceived_ms) > 2000 || !gpsAccuracyGoodForAltitude));
+#if EK3_FEATURE_BEACON_FUSION
+    bool lostRngBcnHgt = ((activeHgtSource == AP_NavEKF_Source::SourceZ::BEACON) && ((imuSampleTime_ms - rngBcn.dataDelayed.time_ms) > 2000));
+#endif
+    bool fallback_to_baro =
+        lostRngHgt
+        || lostGpsHgt
+#if EK3_FEATURE_BEACON_FUSION
+        || lostRngBcnHgt
+#endif
+        ;
+#if EK3_FEATURE_EXTERNAL_NAV
+    bool lostExtNavHgt = ((activeHgtSource == AP_NavEKF_Source::SourceZ::EXTNAV) && !extNavDataIsFresh);
+    fallback_to_baro |= lostExtNavHgt;
+#endif
+    if (fallback_to_baro) {
+        activeHgtSource = AP_NavEKF_Source::SourceZ::BARO;
+    }
+
+    // if there is new baro data to fuse, calculate filtered baro data required by other processes
+    if (baroDataToFuse) {
+        // calculate offset to baro data that enables us to switch to Baro height use during operation
+        if (activeHgtSource != AP_NavEKF_Source::SourceZ::BARO) {
+            calcFiltBaroOffset();
+        }
+        // filtered baro data used to provide a reference for takeoff
+        // it is is reset to last height measurement on disarming in performArmingChecks()
+        if (!dal.get_takeoff_expected()) {
+            const ftype gndHgtFiltTC = 0.5;
+            const ftype dtBaro = frontend->hgtAvg_ms*1.0e-3;
+            ftype alpha = constrain_ftype(dtBaro / (dtBaro+gndHgtFiltTC),0.0,1.0);
+            meaHgtAtTakeOff += (baroDataDelayed.hgt-meaHgtAtTakeOff)*alpha;
+        }
+    }
+
+    // If we are not using GPS as the primary height sensor, correct EKF origin height so that
+    // combined local NED position height and origin height remains consistent with the GPS altitude
+    // This also enables the GPS height to be used as a backup height source
+    if (gpsDataToFuse &&
+            (((frontend->_originHgtMode & (1 << 0)) && (activeHgtSource == AP_NavEKF_Source::SourceZ::BARO)) ||
+            ((frontend->_originHgtMode & (1 << 1)) && (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER)))
+            ) {
+            correctEkfOriginHeight();
+    }
+
+    // Select the height measurement source
+#if EK3_FEATURE_EXTERNAL_NAV
+    if (extNavDataToFuse && (activeHgtSource == AP_NavEKF_Source::SourceZ::EXTNAV)) {
+        hgtMea = -extNavDataDelayed.pos.z;
+        velPosObs[5] = -hgtMea;
+        posDownObsNoise = sq(constrain_ftype(extNavDataDelayed.posErr, 0.1f, 10.0f));
+        fuseHgtData = true;
+    } else
+#endif // EK3_FEATURE_EXTERNAL_NAV
+        if (rangeDataToFuse && (activeHgtSource == AP_NavEKF_Source::SourceZ::RANGEFINDER)) {
+        // using range finder data
+        // correct for tilt using a flat earth model
+        if (prevTnb.c.z >= 0.7) {
+            // calculate height above ground
+            hgtMea  = MAX(rangeDataDelayed.rng * prevTnb.c.z, rngOnGnd);
+            // correct for terrain position relative to datum
+            hgtMea -= terrainState;
+            // correct sensor so that local position height adjusts to match GPS
+            if (frontend->_originHgtMode & (1 << 1) && frontend->_originHgtMode & (1 << 2)) {
+                // offset has to be applied to the measurement, not the NED origin
+                hgtMea += (float)(ekfGpsRefHgt - 0.01 * (double)EKF_origin.alt);
+            }
+            velPosObs[5] = -hgtMea;
+            // enable fusion
+            fuseHgtData = true;
+            // set the observation noise
+            posDownObsNoise = sq(constrain_ftype(frontend->_rngNoise, 0.1f, 10.0f));
+            // add uncertainty created by terrain gradient and vehicle tilt
+            posDownObsNoise += sq(rangeDataDelayed.rng * frontend->_terrGradMax) * MAX(0.0f , (1.0f - sq(prevTnb.c.z)));
+        } else {
+            // disable fusion if tilted too far
+            fuseHgtData = false;
+        }
+    } else if (gpsDataToFuse && (activeHgtSource == AP_NavEKF_Source::SourceZ::GPS)) {
+        // using GPS data
+        hgtMea = gpsDataDelayed.hgt;
+        velPosObs[5] = -hgtMea;
+        // enable fusion
+        fuseHgtData = true;
+        // set the observation noise using receiver reported accuracy or the horizontal noise scaled for typical VDOP/HDOP ratio
+        if (gpsHgtAccuracy > 0.0f) {
+            posDownObsNoise = sq(constrain_ftype(gpsHgtAccuracy, 1.5f * frontend->_gpsHorizPosNoise, 100.0f));
+        } else {
+            posDownObsNoise = sq(constrain_ftype(1.5f * frontend->_gpsHorizPosNoise, 0.1f, 10.0f));
+        }
+    } else if (baroDataToFuse && (activeHgtSource == AP_NavEKF_Source::SourceZ::BARO)) {
+        // using Baro data
+        hgtMea = baroDataDelayed.hgt - baroHgtOffset;
+        // correct sensor so that local position height adjusts to match GPS
+        if (frontend->_originHgtMode & (1 << 0) && frontend->_originHgtMode & (1 << 2)) {
+            hgtMea += (float)(ekfGpsRefHgt - 0.01 * (double)EKF_origin.alt);
+        }
+        // enable fusion
+        fuseHgtData = true;
+        // set the observation noise
+        posDownObsNoise = sq(constrain_ftype(frontend->_baroAltNoise, 0.1f, 100.0f));
+        // reduce weighting (increase observation noise) on baro if we are likely to be experiencing rotor wash ground interaction
+        if (dal.get_takeoff_expected() || dal.get_touchdown_expected()) {
+            posDownObsNoise *= frontend->gndEffectBaroScaler;
+        }
+        velPosObs[5] = -hgtMea;
+    } else if ((activeHgtSource == AP_NavEKF_Source::SourceZ::NONE && imuSampleTime_ms - lastHgtPassTime_ms > 70)) {
+        // fuse a constant height of 0 at 14 Hz
+        hgtMea = 0.0f;
+        fuseHgtData = true;
+        velPosObs[5] = -hgtMea;
+        if (onGround) {
+            // use a typical vertical positoin observation noise when not flying for faster IMU delta velocity bias estimation
+            posDownObsNoise = sq(2.0f);
+        } else {
+            // alow a larger value when flying to accomodate vertical maneouvres
+            posDownObsNoise = sq(constrain_ftype(frontend->_baroAltNoise, 2.0f, 100.0f));
+        }
+    } else {
+        fuseHgtData = false;
+    }
+
+    // detect changes in source and reset height
+    if ((activeHgtSource != prevHgtSource) && fuseHgtData) {
+        prevHgtSource = activeHgtSource;
+        ResetPositionD(-hgtMea);
+    }
+
+    // If we haven't fused height data for a while or have bad IMU data, then declare the height data as being timed out
+    // set height timeout period based on whether we have vertical GPS velocity available to constrain drift
+    hgtRetryTime_ms = ((useGpsVertVel || useExtNavVel) && !velTimeout) ? frontend->hgtRetryTimeMode0_ms : frontend->hgtRetryTimeMode12_ms;
+    if (imuSampleTime_ms - lastHgtPassTime_ms > hgtRetryTime_ms ||
+        (badIMUdata &&
+        (imuSampleTime_ms - goodIMUdata_ms > BAD_IMU_DATA_TIMEOUT_MS))) {
+        hgtTimeout = true;
+    } else {
+        hgtTimeout = false;
+    }
+}
+
+#if EK3_FEATURE_BODY_ODOM
+/*
+ * Fuse body frame velocity measurements using explicit algebraic equations generated with Matlab symbolic toolbox.
+ * The script file used to generate these and other equations in this filter can be found here:
+ * https://github.com/PX4/ecl/blob/master/matlab/script#include "AP_NavEKF3.h"
+#include "AP_NavEKF3_core.h"
+
+#if EK3_FEATURE_BEACON_FUSION
+
+// initialise state:
+void NavEKF3_core::BeaconFusion::InitialiseVariables()
+{
+    memset((void *)&dataDelayed, 0, sizeof(dataDelayed));
+    lastPassTime_ms = 0;
+    testRatio = 0.0f;
+    health = false;
+    varInnov = 0.0f;
+    innov = 0.0f;
+    memset(&lastTime_ms, 0, sizeof(lastTime_ms));
+    dataToFuse = false;
+    vehiclePosNED.zero();
+    vehiclePosErr = 1.0f;
+    last3DmeasTime_ms = 0;
+    goodToAlign = false;
+    lastChecked = 0;
+    receiverPos.zero();
+    memset(&receiverPosCov, 0, sizeof(receiverPosCov));
+    alignmentStarted =  false;
+    alignmentCompleted = false;
+    lastIndex = 0;
+    posSum.zero();
+    numMeas = 0;
+    sum = 0.0f;
+    N = 0;
+    maxPosD = 0.0f;
+    minPosD = 0.0f;
+    posDownOffsetMax = 0.0f;
+    posOffsetMaxVar = 0.0f;
+    maxOffsetStateChangeFilt = 0.0f;
+    posDownOffsetMin = 0.0f;
+    posOffsetMinVar = 0.0f;
+    minOffsetStateChangeFilt = 0.0f;
+    fuseDataReportIndex = 0;
+    delete[] fusionReport;
+    fusionReport = nullptr;
+    numFusionReports = 0;
+    auto *beacon = AP::dal().beacon();
+    if (beacon != nullptr) {
+        const uint8_t count = beacon->count();
+        fusionReport = NEW_NOTHROW BeaconFusion::FusionReport[count];
+        if (fusionReport != nullptr) {
+            numFusionReports = count;
+        }
+    }
+    posOffsetNED.zero();
+    originEstInit = false;
+}
+
+/********************************************************
+*                   FUSE MEASURED_DATA                  *
+********************************************************/
+
+// select fusion of range beacon measurements
+void NavEKF3_core::SelectRngBcnFusion()
+{
+    // read range data from the sensor and check for new data in the buffer
+    readRngBcnData();
+
+    // Determine if we need to fuse range beacon data on this time step
+    if (rngBcn.dataToFuse) {
+        if (PV_AidingMode == AID_ABSOLUTE) {
+            if ((frontend->sources.getPosXYSource() == AP_NavEKF_Source::SourceXY::BEACON) && rngBcn.alignmentCompleted) {
+                if (!rngBcn.originEstInit) {
+                    rngBcn.originEstInit = true;
+                    rngBcn.posOffsetNED.x = rngBcn.receiverPos.x - stateStruct.position.x;
+                    rngBcn.posOffsetNED.y = rngBcn.receiverPos.y - stateStruct.position.y;
+                }
+                // beacons are used as the primary means of position reference
+                FuseRngBcn();
+            } else {
+                // If another source (i.e. GPS, ExtNav) is the primary reference, we continue to use the beacon data
+                // to calculate an independent position that is used to update the beacon position offset if we need to
+                // start using beacon data as the primary reference.
+                FuseRngBcnStatic();
+                // record that the beacon origin needs to be initialised
+                rngBcn.originEstInit = false;
+            }
+        } else {
+            // If we aren't able to use the data in the main filter, use a simple 3-state filter to estimate position only
+            FuseRngBcnStatic();
+            // record that the beacon origin needs to be initialised
+            rngBcn.originEstInit = false;
+        }
+    }
+}
+
+void NavEKF3_core::FuseRngBcn()
+{
+    // declarations
+    ftype pn;
+    ftype pe;
+    ftype pd;
+    ftype bcn_pn;
+    ftype bcn_pe;
+    ftype bcn_pd;
+    const ftype R_BCN = sq(MAX(rngBcn.dataDelayed.rngErr , 0.1f));
+    ftype rngPred;
+
+    // health is set bad until test passed
+    rngBcn.health = false;
+
+    if (activeHgtSource != AP_NavEKF_Source::SourceZ::BEACON) {
+        // calculate the vertical offset from EKF datum to beacon datum
+        CalcRangeBeaconPosDownOffset(R_BCN, stateStruct.position, false);
+    } else {
+        rngBcn.posOffsetNED.z = 0.0f;
+    }
+
+    // copy required states to local variable names
+    pn = stateStruct.position.x;
+    pe = stateStruct.position.y;
+    pd = stateStruct.position.z;
+    bcn_pn = rngBcn.dataDelayed.beacon_posNED.x;
+    bcn_pe = rngBcn.dataDelayed.beacon_posNED.y;
+    bcn_pd = rngBcn.dataDelayed.beacon_posNED.z + rngBcn.posOffsetNED.z;
+
+    // predicted range
+    Vector3F deltaPosNED = stateStruct.position - rngBcn.dataDelayed.beacon_posNED;
+    rngPred = deltaPosNED.length();
+
+    // calculate measurement innovation
+    rngBcn.innov = rngPred - rngBcn.dataDelayed.rng;
+
+    // perform fusion of range measurement
+    if (rngPred > 0.1f)
+    {
+        // calculate observation jacobians
+        ftype H_BCN[24];
+        memset(H_BCN, 0, sizeof(H_BCN));
+        ftype t2 = bcn_pd-pd;
+        ftype t3 = bcn_pe-pe;
+        ftype t4 = bcn_pn-pn;
+        ftype t5 = t2*t2;
+        ftype t6 = t3*t3;
+        ftype t7 = t4*t4;
+        ftype t8 = t5+t6+t7;
+        ftype t9 = 1.0f/sqrtF(t8);
+        H_BCN[7] = -t4*t9;
+        H_BCN[8] = -t3*t9;
+        // If we are not using the beacons as a height reference, we pretend that the beacons
+        // are at the same height as the flight vehicle when calculating the observation derivatives
+        // and Kalman gains
+        // TODO  - less hacky way of achieving this, preferably using an alternative derivation
+        if (activeHgtSource != AP_NavEKF_Source::SourceZ::BEACON) {
+            t2 = 0.0f;
+        }
+        H_BCN[9] = -t2*t9;
+
+        // calculate Kalman gains
+        ftype t10 = P[9][9]*t2*t9;
+        ftype t11 = P[8][9]*t3*t9;
+        ftype t12 = P[7][9]*t4*t9;
+        ftype t13 = t10+t11+t12;
+        ftype t14 = t2*t9*t13;
+        ftype t15 = P[9][8]*t2*t9;
+        ftype t16 = P[8][8]*t3*t9;
+        ftype t17 = P[7][8]*t4*t9;
+        ftype t18 = t15+t16+t17;
+        ftype t19 = t3*t9*t18;
+        ftype t20 = P[9][7]*t2*t9;
+        ftype t21 = P[8][7]*t3*t9;
+        ftype t22 = P[7][7]*t4*t9;
+        ftype t23 = t20+t21+t22;
+        ftype t24 = t4*t9*t23;
+        rngBcn.varInnov = R_BCN+t14+t19+t24;
+        ftype t26;
+        if (rngBcn.varInnov >= R_BCN) {
+            t26 = 1.0f/rngBcn.varInnov;
+            faultStatus.bad_rngbcn = false;
+        } else {
+            // the calculation is badly conditioned, so we cannot perform fusion on this step
+            // we reset the covariance matrix and try again next measurement
+            CovarianceInit();
+            faultStatus.bad_rngbcn = true;
+            return;
+        }
+
+        Kfusion[0] = -t26*(P[0][7]*t4*t9+P[0][8]*t3*t9+P[0][9]*t2*t9);
+        Kfusion[1] = -t26*(P[1][7]*t4*t9+P[1][8]*t3*t9+P[1][9]*t2*t9);
+        Kfusion[2] = -t26*(P[2][7]*t4*t9+P[2][8]*t3*t9+P[2][9]*t2*t9);
+        Kfusion[3] = -t26*(P[3][7]*t4*t9+P[3][8]*t3*t9+P[3][9]*t2*t9);
+        Kfusion[4] = -t26*(P[4][7]*t4*t9+P[4][8]*t3*t9+P[4][9]*t2*t9);
+        Kfusion[5] = -t26*(P[5][7]*t4*t9+P[5][8]*t3*t9+P[5][9]*t2*t9);
+        Kfusion[7] = -t26*(t22+P[7][8]*t3*t9+P[7][9]*t2*t9);
+        Kfusion[8] = -t26*(t16+P[8][7]*t4*t9+P[8][9]*t2*t9);
+
+        if (!inhibitDelAngBiasStates) {
+            Kfusion[10] = -t26*(P[10][7]*t4*t9+P[10][8]*t3*t9+P[10][9]*t2*t9);
+            Kfusion[11] = -t26*(P[11][7]*t4*t9+P[11][8]*t3*t9+P[11][9]*t2*t9);
+            Kfusion[12] = -t26*(P[12][7]*t4*t9+P[12][8]*t3*t9+P[12][9]*t2*t9);
+        } else {
+            // zero indexes 10 to 12
+            zero_range(&Kfusion[0], 10, 12);
+        }
+
+        if (!inhibitDelVelBiasStates && !badIMUdata) {
+            for (uint8_t index = 0; index < 3; index++) {
+                const uint8_t stateIndex = index + 13;
+                if (!dvelBiasAxisInhibit[index]) {
+                    Kfusion[stateIndex] = -t26*(P[stateIndex][7]*t4*t9+P[stateIndex][8]*t3*t9+P[stateIndex][9]*t2*t9);
+                } else {
+                    Kfusion[stateIndex] = 0.0f;
+                }
+            }
+        } else {
+            // zero indexes 13 to 15
+            zero_range(&Kfusion[0], 13, 15);
+        }
+
+        // only allow the range observations to modify the vertical states if we are using it as a height reference
+        if (activeHgtSource == AP_NavEKF_Source::SourceZ::BEACON) {
+            Kfusion[6] = -t26*(P[6][7]*t4*t9+P[6][8]*t3*t9+P[6][9]*t2*t9);
+            Kfusion[9] = -t26*(t10+P[9][7]*t4*t9+P[9][8]*t3*t9);
+        } else {
+            Kfusion[6] = 0.0f;
+            Kfusion[9] = 0.0f;
+        }
+
+        if (!inhibitMagStates) {
+            Kfusion[16] = -t26*(P[16][7]*t4*t9+P[16][8]*t3*t9+P[16][9]*t2*t9);
+            Kfusion[17] = -t26*(P[17][7]*t4*t9+P[17][8]*t3*t9+P[17][9]*t2*t9);
+            Kfusion[18] = -t26*(P[18][7]*t4*t9+P[18][8]*t3*t9+P[18][9]*t2*t9);
+            Kfusion[19] = -t26*(P[19][7]*t4*t9+P[19][8]*t3*t9+P[19][9]*t2*t9);
+            Kfusion[20] = -t26*(P[20][7]*t4*t9+P[20][8]*t3*t9+P[20][9]*t2*t9);
+            Kfusion[21] = -t26*(P[21][7]*t4*t9+P[21][8]*t3*t9+P[21][9]*t2*t9);
+        } else {
+            // zero indexes 16 to 21
+            zero_range(&Kfusion[0], 16, 21);
+        }
+
+        if (!inhibitWindStates && !treatWindStatesAsTruth) {
+            Kfusion[22] = -t26*(P[22][7]*t4*t9+P[22][8]*t3*t9+P[22][9]*t2*t9);
+            Kfusion[23] = -t26*(P[23][7]*t4*t9+P[23][8]*t3*t9+P[23][9]*t2*t9);
+        } else {
+            // zero indexes 22 to 23
+            zero_range(&Kfusion[0], 22, 23);
+        }
+
+        // Calculate innovation using the selected offset value
+        Vector3F delta = stateStruct.position - rngBcn.dataDelayed.beacon_posNED;
+        rngBcn.innov = delta.length() - rngBcn.dataDelayed.rng;
+
+        // calculate the innovation consistency test ratio
+        rngBcn.testRatio = sq(rngBcn.innov) / (sq(MAX(0.01f * (ftype)frontend->_rngBcnInnovGate, 1.0f)) * rngBcn.varInnov);
+
+        // fail if the ratio is > 1, but don't fail if bad IMU data
+        rngBcn.health = ((rngBcn.testRatio < 1.0f) || badIMUdata);
+
+        // test the ratio before fusing data
+        if (rngBcn.health) {
+
+            // restart the counter
+            rngBcn.lastPassTime_ms = imuSampleTime_ms;
+
+            // correct the covariance P = (I - K*H)*P
+            // take advantage of the empty columns in KH to reduce the
+            // number of operations
+            for (unsigned i = 0; i<=stateIndexLim; i++) {
+                for (unsigned j = 0; j<=6; j++) {
+                    KH[i][j] = 0.0f;
+                }
+                for (unsigned j = 7; j<=9; j++) {
+                    KH[i][j] = Kfusion[i] * H_BCN[j];
+                }
+                for (unsigned j = 10; j<=23; j++) {
+                    KH[i][j] = 0.0f;
+                }
+            }
+            for (unsigned j = 0; j<=stateIndexLim; j++) {
+                for (unsigned i = 0; i<=stateIndexLim; i++) {
+                    ftype res = 0;
+                    res += KH[i][7] * P[7][j];
+                    res += KH[i][8] * P[8][j];
+                    res += KH[i][9] * P[9][j];
+                    KHP[i][j] = res;
+                }
+            }
+            // Check that we are not going to drive any variances negative and skip the update if so
+            bool healthyFusion = true;
+            for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                if (KHP[i][i] > P[i][i]) {
+                    healthyFusion = false;
+                }
+            }
+            if (healthyFusion) {
+                // update the covariance matrix
+                for (uint8_t i= 0; i<=stateIndexLim; i++) {
+                    for (uint8_t j= 0; j<=stateIndexLim; j++) {
+                        P[i][j] = P[i][j] - KHP[i][j];
+                    }
+                }
+
+                // force the covariance matrix to be symmetrical and limit the variances to prevent ill-conditioning.
+                ForceSymmetry();
+                ConstrainVariances();
+
+                // correct the state vector
+                for (uint8_t j= 0; j<=stateIndexLim; j++) {
+                    statesArray[j] = statesArray[j] - Kfusion[j] * rngBcn.innov;
+                }
+
+                // record healthy fusion
+                faultStatus.bad_rngbcn = false;
+
+            } else {
+                // record bad fusion
+                faultStatus.bad_rngbcn = true;
+
+            }
+        }
+
+        // Update the fusion report
+        if (rngBcn.dataDelayed.beacon_ID < rngBcn.numFusionReports) {
+            auto &report = rngBcn.fusionReport[rngBcn.dataDelayed.beacon_ID];
+            report.beaconPosNED = rngBcn.dataDelayed.beacon_posNED;
+            report.innov = rngBcn.innov;
+            report.innovVar = rngBcn.varInnov;
+            report.rng = rngBcn.dataDelayed.rng;
+            report.testRatio = rngBcn.testRatio;
+        }
+    }
+}
+
+/*
+Use range beacon measurements to calculate a static position using a 3-state EKF algorithm.
+Algorithm based on the following:
+https://github.com/priseborough/InertialNav/blob/master/derivations/range_beacon.m
+*/
+void NavEKF3_core::FuseRngBcnStatic()
+{
+    // get the estimated range measurement variance
+    const ftype R_RNG = sq(MAX(rngBcn.dataDelayed.rngErr , 0.1f));
+
+    /*
+    The first thing to do is to check if we have started the alignment and if not, initialise the
+    states and covariance to a first guess. To do this iterate through the available beacons and then
+    initialise the initial position to the mean beacon position. The initial position uncertainty
+    is set to the mean range measurement.
+    */
+    if (!rngBcn.alignmentStarted) {
+        if (rngBcn.dataDelayed.beacon_ID != rngBcn.lastIndex) {
+            rngBcn.posSum += rngBcn.dataDelayed.beacon_posNED;
+            rngBcn.lastIndex = rngBcn.dataDelayed.beacon_ID;
+            rngBcn.sum += rngBcn.dataDelayed.rng;
+            rngBcn.numMeas++;
+
+            // capture the beacon vertical spread
+            if (rngBcn.dataDelayed.beacon_posNED.z > rngBcn.maxPosD) {
+                rngBcn.maxPosD = rngBcn.dataDelayed.beacon_posNED.z;
+            } else if(rngBcn.dataDelayed.beacon_posNED.z < rngBcn.minPosD) {
+                rngBcn.minPosD = rngBcn.dataDelayed.beacon_posNED.z;
+            }
+        }
+        if (rngBcn.numMeas >= 100) {
+            rngBcn.alignmentStarted = true;
+            ftype tempVar = 1.0f / (ftype)rngBcn.numMeas;
+            // initialise the receiver position to the centre of the beacons and at zero height
+            rngBcn.receiverPos.x = rngBcn.posSum.x * tempVar;
+            rngBcn.receiverPos.y = rngBcn.posSum.y * tempVar;
+            rngBcn.receiverPos.z = 0.0f;
+            rngBcn.receiverPosCov[2][2] = rngBcn.receiverPosCov[1][1] = rngBcn.receiverPosCov[0][0] = rngBcn.sum * tempVar;
+            rngBcn.lastIndex  = 0;
+            rngBcn.numMeas = 0;
+            rngBcn.posSum.zero();
+            rngBcn.sum = 0.0f;
+        }
+    }
+
+    if (rngBcn.alignmentStarted) {
+        rngBcn.numMeas++;
+
+        if (rngBcn.numMeas >= 100) {
+            // 100 observations is enough for a stable estimate under most conditions
+            // TODO monitor stability of the position estimate
+            rngBcn.alignmentCompleted = true;
+
+        }
+
+        if (rngBcn.alignmentCompleted) {
+            if (activeHgtSource != AP_NavEKF_Source::SourceZ::BEACON) {
+                // We are using a different height reference for the main EKF so need to estimate a vertical
+                // position offset to be applied to the beacon system that minimises the range innovations
+                // The position estimate should be stable after 100 iterations so we use a simple dual
+                // hypothesis 1-state EKF to estimate the offset
+                Vector3F refPosNED;
+                refPosNED.x = rngBcn.receiverPos.x;
+                refPosNED.y = rngBcn.receiverPos.y;
+                refPosNED.z = stateStruct.position.z;
+                CalcRangeBeaconPosDownOffset(R_RNG, refPosNED, true);
+
+            } else {
+                // we are using the beacons as the primary height source, so don't modify their vertical position
+                rngBcn.posOffsetNED.z = 0.0f;
+
+            }
+        } else {
+            if (activeHgtSource != AP_NavEKF_Source::SourceZ::BEACON) {
+                // The position estimate is not yet stable so we cannot run the 1-state EKF to estimate
+                // beacon system vertical position offset. Instead we initialise the dual hypothesis offset states
+                // using the beacon vertical position, vertical position estimate relative to the beacon origin
+                // and the main EKF vertical position
+
+                // Calculate the mid vertical position of all beacons
+               яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322C322ѓ322°322У322л322н322в322Г322ћ322f322$322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322%322Ћ322я322я322я322я322я322я322я322я322я322я322я322я322Д322[322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322"322‹322я322я322яihhяњ››яАїїяЬЬЬяпппясссяииияПППя±±±я…„„я322я322я322я322Е322\322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322h322я322я322яЎЎЎязззяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяящщщяНННяyyyя322я322я322“322'яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322‘322я322я‘‘‘ятттяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяЅЅЅя322я322я322я322[яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322–322я322яЅЅЅяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяъъъяЏЋЋя322я322я322oяяя яяя яяя яяя яяя яяя яяя 322322–322я‡††яЭЭЭяяяяяяяяяяяяяяяяяяяяяяяяядддяј»»яќњњя”““я‡††я™™™я©©©яПППячччяяяяяяяяяяяяяяяяяяяяяяяяяћћћя322я322я322sяяя яяя яяя яяя яяя яяя 322–322я‡††яннняяяяяяяяяяяяяяяяяэээяєєєяpooя322я322я322я322я322я322я322я322я322я’’’ядддяяяяяяяяяяяяяяяяяяяяяҐ¤¤я322я322я322aяяя яяя яяя яяя 322‚322яѓ‚‚яллляяяяяяяяяяяяяяяяя№№№я322я322я322я322я"v-я•+яћ+я«*я+я€,я'b/я322я322я322я•””яхххяяяяяяяяяяяяяяяяяњ››я322я322я322%яяя яяя яяя 322л322яЦЦЦяяяяяяяяяяяяящщщя‹ЉЉя322я322я"w-яВ(яж&яІ)я‘,я€,я€,я‰,я *яЛ(яг&яџ+я322я322я322я№№№яяяяяяяяяяяяяяяяяЎЎЎя322я322Љяяя яяя яяя 322‚322я‚‚‚яяяяяяяяянння‡††я322я322яґ)яУ'я ~-я322я322я322я322я322я322я322я322я322я«*яд&яЊ,я322я322яЎЎЎяяяяяяяяя­¬¬я322я322я322$яяя яяя яяя яяя 322Ў322яЌЌЌяуууя‡††я322я†,яа&яЉ,я322я322я322яЂяЎ  я©©©я©©©я©ЁЁя‘‘‘яgffя322я322я322я°)яў*я322я322яЎЎЎяТТТя322я322я322kяяя яяя яяя яяя яяя 322Є322я322я‡††я322я†,яД(я322я322я322яЇЇЇятттяяяяяяяяяяяяяяяяяяяяяяяяяяяяяЩЩЩя………я322я322яЋ,я§*я322я322я~~~я322я322я322aяяя яяя яяя яяя 322‚322я'c/я322я322я†,яё)я322я322я‰€€яллляяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяя±±±я322я322я†,яћ+я322я322я(]/я322я322я322%яяя яяя яяя 322л322я
+Ц'я	Ь&я‘,яЛ(я322я322я•””яяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяРРРя{zzя322я‰,яС'яџ+яу%яЎ*я322я322Љяяя яяя яяя 322‚322я‚-я я$яэ$я322я322яЋЋЋяяяяяяяяяяяяяяяяяяяяяннняЕЕЕя—––яЋЋЋя¦¦¦яЩШШяюююяяяяяяяяяяяяяяяяяПППя322я322яЛ(я я$я¬*я322я322я322$яяя яяя яяя яяя 322™322яЌ,яр%я322я322яљљљяяяяяяяяяяяяявввяЋЋЋя322я322я322я322я322я322я322яё··яяяяяяяяяяяяяпппя322я322яЃ,яТ'я322я322я322kяяя яяя яяя яяя яяя 3220322я322я†,я322я322я322яєєєяяяяя±±±я322я322я322я%l.я›+яЈ*я‹,я322я322я322я€‡‡ясссяяяяя‰€€я322я322я322я ~-я322я322€яяя яяя яяя яяя яяя яяя яяя 322d322я322я322–322§322я322яўўўя322я322яЏ,яо%я я$я	Щ'яН'яс%я ю$яЅ)я322я322я‡††я›››я322я322я322†322я322я322–яяя яяя яяя яяя яяя яяя яяя яяя яяя 322+322‰322A322я322я322я322я322яЈ*я я$яі)я(_/я322я322я322яЋ,яв&яй%я†,я322я322я322я322я322“3229322x322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322я322я‡,я322я322яћ+я ю$я‹,я322я322я322яeddя322я322я322я»)яж&я322я322я†,я322я322я322Aяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322я322яљ+яэ$яи&я ю$я322я322я322яБББяэээяяяяякккяЋЋЋя322я322як%я ю$яи&яп%я322я322я322Iяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322O322я322яє)я я$яЇ)я322я322я¶¶¶яяяяяяяяяяяяяяяяяяяяя~~~я322я&h.яс%я я$я€,я322я322•яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я322яў*я322я322я322я322яЬЬЬяяяяяяяяяяяяя–––я322я322я322я†,я›+я322я322я322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322“322я322я322я322r322Ќ322я‡††яяяяяяяяяµґґя322я322я322Z322–322я322я322я322Q322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322я322я322y322322ђ322я322яЏЋЋяНННя322я322я322я322U322322я322я322v322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322322322я322я322я322я322я322я322я)[/я322я322я322322322322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322я322я¶)яј)я&h.я/B1я–+я я$я ~-я322я322^322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322j322я322я	Ь&я я$я я$я я$я–+я322я322я322322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322Ќ322я†,я я$я я$яґ)я322я322я322F322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322322њ322яЋ,яН'я322я322я322u322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 3223322я322я322я322я322Њ322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322S322ј322л322‚322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322*322322ј322322
+яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322n322ь322я322я322я322Ўяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322322І322я322я„„„яИИИя322я322Юяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322n322л322яA@@яєєєяюююяИИИя322я322яяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322
+322§322я322яwvvяррряюююяюююяИИИя322я322яяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322]322Ъ322яA@@яєєєяюююяюююяюююяюююяИИИя322я322яяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322
+322Ў322я322яihhягггяюююяюююяюююяюююяџџџя322я322я322Гяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322;322Й322я322я­¬¬яюююяюююяюююяюююяХХХя\[[я322я322я322322,яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322ђ322я322я\[[ягггяюююяюююяюююяюююя„„„я322я322я322Й322Lююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322;322Й322я322я’‘‘яюююяюююяюююяюююяєєєяNMMя322я322ь322ђююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322я322я\[[яХХХяюююяюююяюююяррряwvvя322я322я322Г322,322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322я’‘‘яюююяюююяюююяюююя­¬¬яA@@я322я322л322n322 322 322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322я322яюююяюююяюююягггяihhя322я322я322І322322 322 322 322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322я322яюююяюююягггя322я322я322Ъ322]322 322 322 322 322 322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322я322яюююяюююяюююягггяihhя322я322я322І322322 322 322 322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322я’‘‘яюююяюююяюююяюююя­¬¬яA@@я322я322л322n322 322 322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322я322я\[[яХХХяюююяюююяюююяррряwvvя322я322я322Г322,322 ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322;322Й322я322я’‘‘яюююяюююяюююяюююяєєєяNMMя322я322ь322ђююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322ђ322я322я\[[ягггяюююяюююяюююяюююя„„„я322я322я322Й322Lююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322;322Й322я322я­¬¬яюююяюююяюююяюююяХХХя\[[я322я322я322322,яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322
+322Ў322я322яihhягггяюююяюююяюююяюююяџџџя322я322я322Гяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322]322Ъ322яA@@яєєєяюююяюююяюююяюююяИИИя322я322яяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322
+322§322я322яwvvяррряюююяюююяИИИя322я322яяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322n322л322яA@@яєєєяюююяИИИя322я322яяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322322І322я322я„„„яИИИя322я322Юяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322n322ь322я322я322я322Ўяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322*322322ј322322
+яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322§322я322§322
+322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яA@@я322я322Ъ322]ююю ююю ююю ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322ягггяihhя322я322я322Ў322
+ююю ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яюююяюююя­¬¬я322я322я322Й322;ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яюююяюююяюююягггя\[[я322я322я322ђююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яюююяюююяюююяюююяюююя’‘‘я322я322я322Й322,ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яA@@яєєєяюююяюююяюююяюююяХХХя\[[я322я322ь322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322я322яwvvягггяюююяюююяюююяюююя„„„я322я322я322Г322,яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю 322n322л322я322я­¬¬яюююяюююяюююяюююяИИИяNMMя322я322ь322nяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю 322322Ў322я322я\[[яХХХяюююяюююяюююяюююя„„„я322я322я322І322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю 322]322Й322я322я’‘‘яюююяюююяюююяюююяєєєяA@@я322я322л322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю ююю ююю 322ђ322я322яNMMяИИИяюююяюююяюююяррряwvvя322я322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю ююю ююю ююю 322;322Г322я322яwvvяррряюююяюююяИИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю ююю ююю ююю ююю ююю 322322л322яNMMяюююяюююяИИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю ююю ююю ююю 322;322Г322я322яwvvяррряюююяюююяИИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю ююю ююю 322ђ322я322яNMMяИИИяюююяюююяюююяррряwvvя322я322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю ююю ююю 322]322Й322я322я’‘‘яюююяюююяюююяюююяєєєяA@@я322я322л322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю ююю 322322Ў322я322я\[[яХХХяюююяюююяюююяюююя„„„я322я322я322І322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ююю 322n322л322я322я­¬¬яюююяюююяюююяюююяИИИяNMMя322я322ь322nяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322я322яwvvягггяюююяюююяюююяюююя„„„я322я322я322Г322,яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яA@@яєєєяюююяюююяюююяюююяХХХя\[[я322я322ь322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яюююяюююяюююяюююяюююя’‘‘я322я322я322Й322,ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яюююяюююяюююягггя\[[я322я322я322ђююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яюююяюююя­¬¬я322я322я322Й322;ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322ягггяihhя322я322я322Ў322
+ююю ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322яA@@я322я322Ъ322]ююю ююю ююю ююю ююю ююю ююю яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322§322я322§322
+322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322322B322e322ѓ322‡322t322N322'322322 322 322 322 322 322322?322c322&322 яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322322Ђ322Ѕ322я322я322я322я322я322я322я322я322я322џ322?322 322 322&322Ф322я322я322ш3229яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322322›322я322я322яDCCяhggяѓ‚‚я›››яћћћяЏЋЋяqqqяQQQя433я322я322я322є322N322С322я'WdяmЃя322я322я3229яяя яяя яяя 322 322 322 322 322 322 322 322_322е322я655яuttяЙЙЙящщщяяяяяуууяйййязззяпппяъъъяяяяявввя•••яIHHя322я322я322я'UaяИъя Мяяyђя322я322я3229яяя яяя 322 322 322 322 322 322 322ў322я322яrrrяЯЯЯяяяяяНННя‰€€яSRRя655я322я322я322яDCCяkjjяЁ§§ятттяшшшяЎЎЎя666я+MUяЖщя ДяЊЄя Мяяyђя322я322Аяяя яяя 322 322 322 322 322 322©322я=<<яЇЇЇяэээяВВВя\[[я322я322яA@@я]]]яpooяuttяhggяJIIя322я322я<;;я“’’яБББяC]eяЅняҐЛя179я322я­ФяЗъя322я322ьяяя яяя 322 322 322 322 322Ј322яBAAяЩШШясссяlkkя322я322яѓ‚‚яЧЧЧяъъъяэээяхххяпппяшшшяыыыявббя¦ҐҐяRQQя322я9RYяБхя¦Мя178я322я&XeяЛья"v‹я322я322Аяяя яяя 322 322 322 322g322я=<<яХХХяииияNMMя322яfeeяЭЭЭяэээяј»»я~~~яTSSяA@@я<;;яHGGяeeeя џџяйййяЇЇЇя9U]яБця§Ня19<я322я4:;яµЯя
+ЇШя333я322я322Aяяя яяя 322 322 322 322т322яµµµящщщяQQQя322яЉЉЉяяяяяКККяUUUя322я322я322я322я322я322я322я322я544я@^eяВхяЁПя0:<я322я322яђЇя Люя+KTя322я322яяя яяя яяя 322 322 322]322я}||яюююяpooя322яЌЊЊяяяяя–––я322я322яLKKяЉЉЉяЕДДяаааяжжжяСССяҐ¤¤яA@@я0LTяБфя¤Кя0:<я322я322я"duя Мяя p„я322я322Вяяя яяя яяя яяя 322 322!322у322яgffя€€€я322я}||яюююя‰€€я322я322яЋЋЋящщщяцццяѕѕѕя•••я‹ЉЉяЁ§§я±±±яBdmяАтя Дя267я322я322я.@DяЕхяЎЖя322я322ю322,яяя яяя яяя яяя 322 322]322я}}}я•••я322я322яћћћя«««я322я322яўўўяяяяяќќќяDCCя322я322я322я322я7MRяАуяЁРя179я322я322у322я—ёяВтя.AFя322я322| Мя яяя яяя яяя яяя 322 322H322яmllяЌЊЊя322я322я322я322я322я322я”““яvvvя322я322я322ё322Ю322я'TaяВхяЄСя0:=я322я322ё322я j}я Мяя#dtя322я322і Мя  Мя яяя яяя яяя яяя 322 322322Ю322я322я322я322J322‡322™322\322я322я322я322к322ў322я322я%]lяЕцяўИя0:=я322я322¤322я-ELяЕця–·я322я322и322 Мя  Мя яяя яяя яяя яяя 322 322 322322H322q3224322 322 322 322 322=322z322T322Ј322я19<яq†яЙыя¬Фя333я322я322я322я334яЄСяѕня/=Aя322я322j Мя  Мя  Мя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322322t322¶322я0:<я«Фя МяяЕцяГуя$_mя322я.@Dя lяЁРя Мяя%\jя322я322¬ Мя  Ля  Йя  Йя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322322±322я322я322я0<?яѓћяКья%]kя-CIяџДяјкяќАяЗшя Мяя	°Ъяoѓя322я322Ь322 Кя 
+Оя ZЮя cая яяя яяя яяя яяя 322 322 322 322 322 322 322 322322и322я0;>я#brяњїяДхя Мяя«Фя322я322я)hxя МяяґЯя|•я*NWя322я322я322ы322, Ия Пя Дуя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322і322я#dtяБся МяяєзяЂљя}–я Мяяя$brя	єжяЁПя333я322я322я322Т322•322):Чя SЫя Йфя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322~322я.BGяВтя«Уя&Zgя267я322я322я‚ќя Мяя Мяя	±Ья+IQя322я322›322?UЭя Оя ‚жя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322=322я322яўИяГуя.BGя322я322я322я333я‹ЁяИъя mЂя267я322я322ј322—322я322—рья яяя яяя яяя яяя 322-3228яяя яяя яяя яяя яяя 322 322 322 322 322 322Г322я{“я Мяя$^mя322я322ґ322я245я–·я Ляя$]mя322я322я322њ322У322я433я322я322ѕ322|322№322|322В322я322я322Няяя яяя яяя яяя 322 322 322 322 322322я,GMя МяяЋ­я322я322Я322я245я™»я Йюя']jя322я322Я322Х322я322яdccяЬЬЬяSRRя322я322я322я322я322яVUUя_^^я322я322jяяя яяя яяя 322 322 322 322>322я334я¦Мя·дя19;я322я322я322я—ёя Июя;cmя322я322я322я322яQPPяўўўяяяяяѕѕѕя=<<я322я………яЖЖЖя322я322яљљљяІІІя322я322§яяя яяя яяя 322 322 322	322С322я|”я Мяя'Vbя322я322я334яђЇяГщя;akяќ  яйййяНННяЙИИяЩЩЩяыыыяннняЏЋЋя322я322яsrrяяяяяћќќя322я[ZZяVUUя877я322я322jяяя яяя яяя 322 322 322ў322я'Vaя Мяя„џя322я322я334я—ёя Кяя2S\я322я[ZZя†††я«««яµґґяќќќяmllя;::я322я322яЉЉЉяяяяя°ЇЇя322яPOOяыыыя–––я322я322ќяяя яяя яяя яяя 322 322Z322я19<я·гяіЭя267я322я322я–·я Йяя=o|яghiя=<<я322я322я322я322я322я322я322я]]]яНННяяяяяќњњя322я@??явввяЪЪЪя>==я322я322@яяя яяя яяя яяя 322322н322яЌ«я Мяя)Q[я322я322я”µя Ияя/Zeя\]]яыыыяннняґіія………яmllяeddя|{{яўўўяЧЧЧяяяяяЩЩЩяfeeя322яEDDяЦЦЦяллляMLLя322я322¤яяя яяя яяя яяя яяя 322Z322я"fxя Мяяq†я322я334я—№яЕъя?hsя888я322яONNяЏЋЋяЛЛЛяйййячччяшшшяуууяЭЬЬя®®®яkjjя322я322яuttяннняЭЭЭяONNя322я322¶яяя яяя яяя яяя яяя яяя 322—322я‰¦я Мяя'Vbя322я“іяИэя9Yaя™љљяпппя‹ЉЉя988я322я322я322я>==яBAAя655я322я322я322яmmmяМММяяяяяµµµяA@@я322я322№322яяя яяя яяя яяя яяя яяя 322Z322я0:=яЎЖяЕцяџГя Мяя%[jя322яNMMяҐ¤¤ящщщясссяј»»я€‡‡яeeeяXWWяUUUя[ZZяyxxя§§§ябббяяяяяХХХяnmmя322я322я322§322яяя яяя яяя яяя яяя яяя яяя 322 322¤322я18:яҐЛя Мяя#dtя322я322Ь322я322яIIIяЋЋЋяРРРясссяъъъяьььяэээящщщящщщягггяЇЇЇяfeeя322я322я322а322gяяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322я322я322я322я322и322,322R322»322я322я322я322я322я322я322я322я322я322я322я322я322Ц322Џ322322 322 322 322 322 322 яяя яяя яяя яяя 322 322 322 322‚322Г322я322Г322,322 322 322 3226322€322Е322п322ъ322ь322ю322щ322ш322Э322 322_322322 322 322 322 322 322 322 322 яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322@322}322µ322~322A322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322›322я322я322я322я322я322њ322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ЧЧЧ 322322я655я‹‹‹яјјјяЊЊЊя766я322я322ЬЬЬ ЬЬЬ ЬЬЬ ЬЬЬ ЬЬЬ ЬЬЬ яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322ћ322я433я«««яяяяяяяяяяяяя«««я433я322я322ќЬЬЬ ЬЬЬ ЬЬЬ ЬЬЬ ЬЬЬ яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322џ322я877я©©©яяяяяяяяяяяяяяяяяяяяяЁ§§я877я322я322 ЬЬЬ ЬЬЬ ЬЬЬ ЬЬЬ яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322¦322я988яіііяяяяяяяяяяяяяяяяяяяяяяяяяяяяяіІІя:99я322я322ҐЬЬЬ ЬЬЬ ЬЬЬ яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322§322я=<<яё··яяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяя···я=<<я322я322§ЫЫЪ ЫЫЪ яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Ї322я>==яїїїяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяѕѕѕя>==я322я322­ЬЬЫ яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322і322яDCCяЙЙЙяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяИИИяBBBя322я322±322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322¶322яGFFяМММяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяЙЙЙяFEEя322я322µяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322ѕ322яHGGяЧЧЧяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяУУУяGFFя322я322є322
+яяя яяя яяя яяя яяя яяя яяя яяя яяя 322И322яNMMяЦЦЦяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяУУУяLKKя322я322Дяяя яяя яяя яяя яяя яяя яяя яяя 322_322яUTTяаааяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяЫЫЫяQPPя322я322Kяяя яяя яяя яяя яяя яяя яяя 322њ322яўўўясссяннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняннняссся—––я322я322‡яяя яяя яяя яяя яяя яяя яяя 322_322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322Kяяя яяя яяя яяя яяя яяя яяя яяя 322_322±322о322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322й322п322І322Kяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322,322Г322я322п322І322322 322 322 322 322 322 322;322Г322я322Г322322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322л322я322я322я322я322ё322 322 322 322 322 322;322я322я322я322я322я322322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322яwvvяяяяясссяNMMя322я322]322 322 322 322 322Г322я’’’яяяяяЙИИя322я322Ъ322322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322ј322яЙИИяяяяяяяяя­­­я322я322Г322 322 322 322;322яA@@яяяяяяяяяяяяяiiiя322я322E322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322я’’’яяяяяяяяяяяяяA@@я322я322*322 322 322ђ322я’’’яяяяяяяяясссяA@@я322я322322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322яNMMяяяяяяяяяяяяя…„„я322я322322 322 322М322яЦЦЦяяяяяяяяя­­­я322я322І322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322яЙИИяяяяяяяяяЙИИя322я322Г322 322;322я\[[яяяяяяяяяяяяя\[[я322я322]322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322яwvvяяяяяяяяяяяяяNMMя322я322;322Ў322я’’’яяяяяяяяяЙИИя322я322Й322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322л322ядддяяяяяяяяя’’’я322я322ђ322Ю322ядддяяяяяяяяя…„„я322я322322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Ў322я’’’яяяяяяяяяЦЦЦя322я322М322яiiiяяяяяяяяяссся322я322ь322*322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322яNMMяяяяяяяяяяяяя\[[я322я322я џџяяяяяяяяя’’’я322я322І322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322я»»»яяяяяяяяя џџя322я322ясссяяяяяяяяяNMMя322я322;322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322n322яiiiяяяяяяяяядддя322яwvvяяяяяяяяя»»»я322я322Г322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322322Ю322ядддяяяяяяяяяiiiя»»»яяяяяяяяяwvvя322я322n322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Ў322я’’’яяяяяяяяя»»»ясссяяяяядддя322я322л322322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322яA@@яяяяяяяяяяяяяяяяяяяяя’’’я322я322Ў322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Г322я­­­яяяяяяяяяяяяясссяA@@я322я322;322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322]322яA@@яЙИИяяяяясссяwvvя322я322І322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322§322я322я322я322я322я322л322322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322322Г322я322п322І322322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322 322,322Г322я322я322Ю322Ў322
+яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322 322 322 322 322 322 322 322 322 322 322322Ъ322я322я322я322я322я322Йяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322І322яiiiяяяяяяяяядддя\[[я322я322ђяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322*322ь322ясссяяяяяяяяяяяяяЦЦЦя322я322Ъ322яяя яяя яяя яяя яяя 322,322Г322я322я322Г322Г322я322я322я322Г322]322Г322я322я322я322Г322яяя яяя яяя 322322я…„„яяяяяяяяяяяяяяяяяяяяяiiiя322я322]яяя яяя яяя яяя 322322Ъ322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322я322Й322
+яяя 322Й322яЙИИяяяяяяяяядддяяяяяяяяя­­­я322я322Гяяя яяя яяя яяя 322E322яiiiяяяяяяяяя…„„я­­­яяяяяяяяяяяяя­­­яA@@я џџяяяяяяяяяяяяяЙИИя\[[я322я322§322]322я\[[яяяяяяяяясссяiiiяяяяяяяяяяяяяNMMя322я322;яяя яяя яяя 322x322я’’’яяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяядддяA@@я322я322І322я­­­яяяяяяяяя»»»я322яЦЦЦяяяяяяяяя’’’я322я322Іяяя яяя яяя 322x322я’’’яяяяяяяяяяяяядддя’’’ядддяяяяяяяяяяяяяяяяя­­­яЦЦЦяяяяяяяяяяяяяwvvя322я322яA@@ясссяяяяяяяяяwvvя322я’’’яяяяяяяяяссся322я322ь322*яяя яяя 322x322я’’’яяяяяяяяяяяяя\[[я322я’’’яяяяяяяяяяяяя’’’я322я\[[яяяяяяяяяяяяя…„„я322я322я’’’яяяяяяяяяссся322я322яNMMяяяяяяяяяяяяя…„„я322я322ђяяя яяя 322x322я’’’яяяяяяяяяссся322я322яiiiяяяяяяяяяяяяя\[[я322я322яяяяяяяяяяяяя…„„я322я322ядддяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяЦЦЦя322я322Ъ322яяя 322x322я’’’яяяяяяяяядддя322я322яiiiяяяяяяяяяяяяяNMMя322я322яяяяяяяяяяяяя…„„я322яiiiяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяiiiя322я322]яяя 322x322я’’’яяяяяяяяядддя322я322яiiiяяяяяяяяяяяяяNMMя322я322яяяяяяяяяяяяя…„„я322я»»»яяяяяяяяядддя’’’я’’’я’’’я’’’я’’’ясссяяяяяяяяя­­­я322я322Гяяя 322x322я’’’яяяяяяяяядддя322я322яiiiяяяяяяяяяяяяяNMMя322я322яяяяяяяяяяяяя…„„яNMMяяяяяяяяяяяяя’’’я322я322я322я322я322я­­­яяяяяяяяяяяяяA@@я322я322;322x322я’’’яяяяяяяяядддя322я322яiiiяяяяяяяяяяяяяNMMя322я322яяяяяяяяяяяяя…„„я’’’яяяяяяяяяяяяяNMMя322я322x322x322x322яiiiяяяяяяяяяяяяя’’’я322я322x322x322я’’’яяяяяяяяяЦЦЦя322я322я\[[яяяяяяяяяяяяяA@@я322я322ясссяяяяяяяяяwvvя’’’яяяяяяяяяЙИИя322я322Гяяя яяя 322322Ю322ядддяяяяяяяяя…„„я322я322f322;322я322я’’’я’’’яNMMя322я322Й322я…„„я’’’яiiiя322я322Г322яiiiя’’’я’’’я322я322я’’’я’’’я\[[я322я322яяя яяя яяя 322Ў322я\[[я’’’я’’’я322я322ь322*яяя 322;322я322я322я322я322ё322,322ь322я322я322я322Ъ322,322Ъ322я322я322я322я322я322я322я322я322Йяяя яяя яяя яяя 322
+322Й322я322я322я322я322;яяя яяя яяя 322;322x322x322;яяя яяя 322*322f322x322E322Г322я322я322Г322x322x322;322;322x322x322;яяя яяя яяя яяя яяя яяя яяя 322;322x322x322;яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322Й322я322я322я322я322я322Lяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322я\[[яяяяяяяяя џџя322я322Ўяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322Юяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322я322я322я322М322ђ322яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322я322я322я322я322я322Ъ322,яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя’’’яяяяяяяяяяяяяЦЦЦяiiiя322я322Гяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяяNMMя322я322Lяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяяяяяяяяяя џџя»»»яяяяяяяяяяяяя џџя322я322‰яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяяяяяяwvvя322я322яЦЦЦяяяяяяяяя»»»я322я322«яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяяссся322я322п322я­­­яяяяяяяяяЙИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322Ю322я­­­яяяяяяяяяЙИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322Ю322я­­­яяяяяяяяяЙИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322Ю322я­­­яяяяяяяяяЙИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяядддя322я322Ю322я­­­яяяяяяяяяЙИИя322я322јяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322x322я’’’яяяяяяяяяЦЦЦя322я322М322я џџяяяяяяяяя»»»я322я322«яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322я322я’’’я’’’я\[[я322я322ђ322яA@@я’’’я’’’яNMMя322я322nяяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322я322я322я322я322Й322 322§322я322я322я322я322ё322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя 322;322x322x322;322 322 322 322;322x322x322;322 322 322 322 322 яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяяDяяяяяяяяяяяяяяяяяяя»яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяяDяяяяяяяяяяяяяяяяяяя»яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя яяя ‰PNG
+
+   IHDR     $    4  Ѓ   IDATxњм}w|UЫцuffы¦“„„zЁЎ„Zи €ЂмЉЅЂў>D4(Љ]м{гA@¤I“Ю{	zH	йЙц™№ї?f&,!eS|ѕч}ЮЅ~мoГмМ№П9sЪЭ?ьрГ?ьрГ?ьрГ?ьш_VП{©1€у©©©<Зqаy‚ T|xћЗqHKKг рu¬(ёґґ4N+D#ААА@§э cЪ=ЧтѕАҐҐҐaЦ¬YІ,Л РАЂЋ;€€€h­Уй%Ir•——зњ9tиРЏЗу7ЂЊ1cІ,s дkjнUЫЃ-[¶\8uкФ‚eЛ–СйУ§Йfі‘7$IўммlЪІeЅък«rЇ^Ѕv x@Пу АyОФ&FїыФSOЙ№№№ZY"‰HЄжг!"r№\фХW_Q§Nќv и]№к РЇ[·nЗ7mЪ¤¬*{<);;›>LыцнЈ#GЋPNN‘¬ЭЈЭџ••E·Я~{clVRR’ З „Ћ=zЫЇїюљ`±X<І,л PNNЫєu+¶oЯЋ#GЋёіііуќNg™^ЇзЈЈЈГ:vмТЇ_?:бббІ(ЉLА=эфУ3gО$ЖШ Т«WЇџV­ZED$–””H‹-ўQЈF‰V«5АJ « lб8n'ЂЌ –шАтAѓеэюыпдv»ЙеrIK–,‘“““ <
+@Ї±ЁfНљ­^ґhЅяюыz	АК   ХwЮygй·Я~лШ¶mќ={–:Dїэц›з™gћ)оЪµлz 1Ж6Пњ9УЅdЙjУ¦ЌА§zЅѕ= ѓчк±ЎI“&» Мїн¶Ыт8@• «""КЙЙЎ—_~Y
+
+
+ъ…зщпгввNш@§У%°xO–љљЄM¦'ћyжТFЉ,ЛDD’Зг‘].WЕHEQ{ЙћЇїюљ ¬g4гЎLИkАsЅ^Я®gПћ[–-[FD$еззKkЦ¬Ў™3gТдЙ“Е3fРЪµkЙfі‘$IвўE‹())©њ1цVJJЉQ­uµK‡6'ZEFF.яьуПй‰'ћ ЂЂЂ3 ¶Ша/ &Mљdыж›oЁmЫ¶e >Уйtќ ,#WXћзI’¤VЃЃЃiеее!‚ GЌЧ·oЯ¦YYYЕK—.=љ™™™]\\јЭl6/¶Ын мрqҐeiiiњєZNќ3gОUozнЪµ°@txxxУЄjоґwТ>11qЅъN<K–,‘»vнZО›Уєuл@(лЋOЛµ¶¶уёІXiп¤mLLМъ3fPЗЋm жкtє® ¬ \ЅT_µG°Љ‚xFP
+1(эЙу:A’Мb0Кр8d”иtєЌЏзгY€@)е1Fа (яїЄimДЁз 8жх[W н њЏж n "Ђ.PцЌS vy•а  ЏVААЙ=.µьxµюb$…я«{ЂG pёН§х+кґвVЉ|-ЩЃf¦џ„p7]»1+ЩОвL? €ТbkиМv ч3­Ї Ѕm\hdV'§”yс‚Xъlt8{Єх» ¦6™ЮcFщmM‚3Цп+)h#vЂ»›<џфІvЅ°=Lиv7Ђ!,)¤nof0*°j?‰Џ[vя}QВмSAНCЪzє[змk‘мy’ьn†SОѓГЇ dgw“Бћ[qэtl	Ђ§Эi |0– H У{О|k!fО 6ьЂpэћ-ші4mпnIЗшИі#ГЮINаг-н ¬*}эАfIЇ^79ЃЏіДрp<GЊз ћ ^Ђ:¦ЬnњyNV0)ЬаxлрGОjXt«№ЅҐzyРfSО АxэWэ"‰ZЬ…зЋ¬ж”ю¦^ЏУХ/‚ё–“рфЎг0рv¬ЪЛ*†iЁ^–я<#;жџ—сtуІќИtц€xЇяkLД9сгSg±Уa,€3ё7тгЃЅa“уЕONќБ‡Ў Ц G`dд$ЌЂЦE’г\1ѕП>Ље<ЖFЏР»иМеѓҐ=-<єх±‡± щЅ“. §
+Џ\М,нe€ч,иЦЗЮ„Йпћt8jЛ/pњ*жђCК Ђ&°рџБВя`,ЂЦ­ђ 8,BWЛiи±@h`PҐл/h3{fn5ЂI ‚ЅжЂ@„ГЄю  Ry &ђ =,€`RОЧ\7Ёe™Р{ОбКдЅЂ)ї)я»jќЄжєw9uBu+fќѕ~шбЗяp*gSgЦЦ§ВЅЙF‡ РRжйхъзPi©®7RSSy•uыМ3П”\ѕ|™.\H<ПїЏFи&Aн–1У¦M+S™З‰'$ќN·@hЈФ|Ъґiезгt:Еoѕщ†8ЋЫ„+'ЕєЧ\-ь†зџѕL+ЬfіЙЯя=ЕДДxЪjµ6©WНХnыВ/TФЬn·K?ьрЕДД”xMЇЧ·Б•-ФghCqLељярГФ¬Yі і¬Vk{Фѓ)Сx…џ}цЩЉВKKKеџю™bbbКФВЫХ«pµП#GЋМ—$‰<Џ(I’ьгЏ?RPPPЂ™V«µCеВ}ћzjнБqзv»AD ЪґiCБББ ЛККЋCбк­‹n›<yІЛбpђ$I2ЙYYY”””t@µҐ|}‰h-™:yтd§Эn'I’$"’Nџ>MЭєuk8‘ґґ4Nнћ§ьq—Эn'ЏЗ#‘”™™YСµ"х^эq ћ¬ФсФ©SФіgПc єkп­^јZтФ”)Sј[вЩѕ};	‚°4%%EЁµ$ZВ <5yтdgyy9‘уиСЈўN§Ы	 ІЎH%т!cЊњNз[7Эt“aлЦ­E1^тХ†BkЙ}PDn‹Ь ¤1чMЖ#"2C‘v№Ш±|…04лJИ?ьргя&xMsфЏRQ·ЌѕЬљ8ЋыW@@А< Гјt“ЌЅ^явџюIщщщффУOЫ <Ау<TЅNГІDХжЩ‰€ћ{о9'ЂGФоjш;±X,Я=z”€ИЈj—иЩgџuxґБ-Qы»uRRТ‘эыч‰ЏGR‰8<R•†µЋ4 $vлЦн„FDkЙsП=зр(Зqj	§ЦІ[—.]Ћ«D$Q%пwТђГ, h|o·®]»ћTХЊІКdРУO?нр°z ­7%­%ќљ7o~xПћ=$Љў,I’$Л2хмЩі@‚zЏoVъїVіЛЗycаyІ,іC‡‘УйФohнc{чоЅзВ…DD’$IтЃд‘#GЂ_фz}B«Zя7нЩіз®S§NUh\8 _wЭu`ПуC ЅлfGЎЋЋШЮЅ{п>юј6иАЃtэхЧЂUѓaxPPPHќkЇЮ«W/­жў(ЉтюэыеQЈFЂѓaЂђєЦј‚ЂЙdъжД‰DDnЏЗCФєeeЅkоu±у‘cЯѕ}Ю5^пљ{Гd2Ньюыпiюьщ¤Ћ–e^5o”Н'
+А [ |$В (5oФн“¶Z­б@…§QчYсм‡~шбG%шјzЄ29н~bЊU6TbPUШ:ЦT0GDЧеґл^ЖАxр•§Ё\(Y‰Ё5%QШU7sјЦ‚лДў6±ІV81"є›€ю ў-Dґ‘€6СfQя"ўз‰(@џА–	Ющ™МГ&РM%rн+PeТ ў’$н%ўҐDt+ЕQґЭnЏЛИИ€!ўтёьтќЩgГoy¤8ь—ќ¤џэ‹Ќяq±!гЏи‚КљAЇљ?/IТa·ЫќBDЎD4ѓ€СjQWСOО‚~^И¬пЬж/ЦZu>ЗY–џvxpзУаQ,XАWUу§€и йХљџ ўЏЭnw•Xи]#‡|ЦwтуRдјќ¤|6XgаШћ€Џя…G^% k ЎвгЌZбLэо*IRzyyySQџ'ўэDФR1“€¤·ъ§ъЭ<e–[яе:BТ  ѕ6их[›~ІЊtOѕC VЂзhЂЧ^$#"3Ґ–——wсx<c%IЪCD"осxNСЏУџzbIЬњd|эg‚Й|АѓъЂ •‘/%бс7	АJЌk84FЮ«цQDфЁъw[хяL’¤OlNз @\»щЖџwI0 ёНh4эсОћ~Џ ¬в†APОUUKхХ®ајю_1МЊ@яИGgдсУ?sc]СфУe$L}‹ ,‡`LЃВэФО_yв@ДL‚Р'ёп°Н7d“рцBЏ!,<+вѓЯIxвM°B0ZS и-л¤Џ`)i `‰ЋЫ=aШН—u/|&…¬ѕ@ЬГ3	А*ВХ}оkбP»ЗАупЖ}№Вcэ+‹xѓ9Л4е5'fэL ¶сfуµжu,|БDМhµѕцюп¤d&бЋ'нЦ%'ЙрБRbСНKfу$ MЎj?јжQЌ+ґWНЩЫas~#ЭsЂM†ЁёmєПWovY ћЮРQ…ћ¦цВ,аbжррчC^я‰tOїз°АKкCe†wJ ѕuсвЕQDґЋ€љQ u Qou8­U‚Ь•ВUкFя~ШG‹Iчм`>ЂqQ1‡я{7йFЯIУџzbcVОҐUDt€€Ж Ђ$I‹ўш/"
+EсоK—.Ez·€A±Њeѓбµ[jНЯ».х`Ш/Ы	·<й¶Z­лїщтуY™ЩЩ#ХЪСN"ъ@ќх{‰(Е»ц€ ЖdѓБрћеµџ.ЙЛu€o?ѕДl6л‚&їъLY—юМ<я#Њ,8ќЧы™gюn•Р~Ot“&‘Dф=Ђ^ ЮdЊэHDш›1¶QЭйTc>Ж 7›_ЉћіђtПј_ =ґПа3M~ШBьїЮ'pВЎ¦™ї/[цfvvц·n·ыG"ъ€€оRWЧбjwЅўХЬыe ‚$#¦8Ў'дM«¤€ыџ‹’®ї+8яг4{—М='џяю]»nЭЈ›­ЊЋЋ>Еъ/ЉА|хпзc«Ф‚Ї:`$§эSы”СcШуE\К„фиuX^Цчен:/ЏЉмШ¶нЅ^? “e™8Ћгш”1¶D«9c¬КУSчП^°-р3Ђс€ЊlЃjLМ+ЈЄSЗ•ВЇ!(ёЃЃN”––рЁН®Ћ•««uх-№ъЂе‡~шб‡я}`PОяя€¶¶В–1¦йm[ХЊ'Ыs7АЌPcСt;·Џ3Ж№aГљ9s&с<??))ЙЬPeЄVш]гЗЏw•——Wш_ѕчЮ{`!Ђ ъШУ1/kШпёгr:ќDЉЁf~ищв‹/Иh4.­kK4}Ъ”{пЅWr№\’ЄO#""Y–IE""сЫoї%Ѕ^ї
+@S_€0НmАїћxв	R!k…W\ёBДулЇїR@@Аz Нj#ўэрЬїюх/""Q’$IE’e™$Iєжгсx€€ДЯяќ6€­nt1Ж‚‚‚юхЖo]нХ+ърqmШ°ЃZ·nЅЕl6G]Н(“H–e9fиРЎ/6,€ѕкЏeYж###1|шр~џющ­ЗНQ{DЦєАvWaaб8RЊскў7& ‚^Ї?йv»ї°Ђ«Кѕ‚вѕ‚:КT"n х#VEЂує№®®т2ХЄ.Vws]С(юы~шб‡~шб‡яЛP'щЄ&1ч>Ыs^Q7®-ќ1Bјl|8YЎxВC­Xх<tXXШРёёёчхzэх^4
+
+љЩєuлы 8ми jK]»vЭrЫm·еBсЅсЖµDМfуo;wо¤I“&•  ссс_Ї^Ѕљ&NњXh6›»ихzр<ќN QS§Nхdggcм«ХЪПd2ЅkµZыU6«жc°Ын?]јxQћ2eJ ЂЊFcь7ЬpcBB‚ґqгЖt»Эnu»ЭГ%Iк3}ъt.((ИйсxЬgПћ%"
+iЧ®Э‡Ы·oяW||ь‡І,wа8оК!Xeъ,Г†;^^^.<шЂџwоЬIУ¦M,єй¦›ц}ын·фцЫo;Zґh±@т“O>Y¶yуfЉЉЉКък«ЇК‰Иуй§џЉгЗЏ?ЄУйєk!7cЖЋ1fЫ°aГЧычпgwЬqG‹=zЬЌoѕщ&sвД‰ѕък«nЊ1Њ1ВёdЙ’±‹eЋЛев=…†††цпЯЯ’““ГwмШ‘kЩІeЏЗ3H’¤+Э¤·„Й“'_>uкнЪµKюиЈЏ$ зNњ8!}рБЂµ!!!ы
+
+Д[oЅUѕуО;е={цИ ЋЊ3жВ№sзЁcЗЋNЋг	‚РZh! І(ЉЂЊпѕыn‘Гб@LL}хХW№ Љ¬V++--e Ое•––r&“‰©ЇЂіЩ\L6›Н.ЛтъцнЫџ„W(	 `ZЈЗЬхЛ/їЂµ ћzб…Ё°°ђЮя}ыпїяоNOO§°°°ВG}Ф}мШ1АТ–-[юmіЩиП?яtЮyзќЩ‚ ¤Tј• ©}vxлЦ­;ѕшв‹RЋгжчЖoјяшгЏ‹M›65eggлnЅхЦь‚‚‚ЇOћ<йшцЫoy —Пњ9унэчЯo///7G‹ўШW{ЮУUcg{BQќпP¬^Ј~Ђ­zЅ~“Ынn ЂЅЎЎЎыЁ>уЂГЁК	ФKўҐSФЬV¬Vk“РРР@ zНўJРНЪЕб­F™Eе№*Ц¦КчqЌ-jуГ?ьрГ?ьh*3<к¦kЁЗqWЩУ5¬Б•юЯА8\	cSeKґSљBQы[k: <ПЏ7nЬБ6mЪјеh<zфиўпѕыЋ ј©>[u„пЈЎ·KћW—ДЬ~ынYDDУ§O' · hъфУOЫOћ<)XдUОоFҐ8†€n р
+Ђg$Iк Ќ16K–еЋЗЗqЧЭtУMНJKKќЈGЏ–-Л] 
+y нAшљ€BЌc 
+
+zцХW_Ґ/ѕшBJOO§еЛ—SjjЄtшрaЪіgхмЩу,Ђvэыч_uъфiєн¶Ы¤У§OУ¤I“Љ Ь=eК”ўВВBљ?>ежжТіП>[n±XоЁђDFF~љ‘‘A7nпЅч^свЕ‹Т®]»ић{осњ<yТуЫoїЂ№oЅхVБОќ;	Аеџ~ъЙхыпїЂ/&Oћ\XPP@“&M’?яьswii)uкФйЂж<Пѓ#"Сбpа·Я~їыо»Њ={цРЮЅ{е~шбфкХ«ҐРРPІX,7ЭxгЌAНљ5ГЇїюЬЅ{waраБd6›‡9уЙ“'сэчЯ›?ю%»ЭN<Пh*Љ"cДу<ПуER`` ЇУйJЌFЈ$IЖЋf4iцмЩ0™LВоЭ»сРCбЦ[omйr№Hвyѕ <<\fЊЕКІ,Aб2™А33Ж(Љ:I’фў(к%I‚Зг8ЋУЫнv6aВьхЧ_міП>ЫЕgЌ™L¦зnїэvnйТҐ $Iв‰H§ЋўЉёE,88xlbbв·YYYEgОњщЎяюЛЛЛ­ш±GЏcEQЊ5ИЙЙ)КЙЙ™•ђђ°Є¬¬Мe·ЫїOHH^RRR`±XBvмШсq«V­‚cccпЯ·oЯжТТТ'УТТТµсљ %,РEх;@ћ:ЊЈ р\екп—ЎрАV ­ХыЂPBАЖpB‰0ZЁLћjЂК««вoняЄлрUЃUµзґы‰€с<ЇЪцуj~ьЧАЛhѕ=­$ўµDфµSЇЧ8Юлє[k‘Њяз ®Ю\Ю-«ритГ?ЄЂ/­є{<Й|QcХj[WkV¬XaёpбВ5\Ы¶mЭѓ«z¦6,--ЌmШ°Бњџџ?іј¬мV"
+®t?	‚p*0(инМГБzнRSSщ…J			“Ъ·kчЭдЙ“
+НjMы>|ижОќ+¶НИИ8[‘jыђ€LzЅЮgSёкPm-[¶,АбpМґ•—§6jUFC_rMшПУоспf~шб#ю+с«‰иo•GшGш	К'ХvЈ~ьБ?лвКCCЭdjCЂАF'ў%шсИ‘#ч¦iS•Ж‰'^.))Ўѕ}ыжёЎЎЃЇ!0fМ‹D$feeQџ>}Љ ЊlpјqoгЖЌЛQѓщ‹§Oџ¦оЭ»зЪP"W "r№\2‰'Oћ¤Ћ;жиЧђоє†Ђ(ЉІжєtиР!jХЄХy =лK¤Jк7‘ёwп^ЉЏЏПР­>МKµј€xvоЬI±±±» D4к,ФжCЇ^ЅдAѓu0ІС4ls(Љ"­^ЅљнЬ№УE_'TЩEкp%QiХЄUr§NќАwj’…† Е#N^ї~ЅФµkW°Иl6'WP5€Ђ$IґeЛ©WЇ^`i@@@(JЌ:гљ™,ЉўґcЗ©яю`e@@@_(†®хЪ+*Њ;ц"СЮЅ{ЕЎC‡*!††AЁGhМЄnЅхЦьјј<2dШh0†BЩ#¶Лi‹Щ€#цЮ{пЅа/ѓБ0Х„i¬5Ml0@ќN·Егсd(DcуОЄ¶Й„h_цОрГ?ьЁюСU“г8®Бт‡rBRЇ5%НXѕЯ€#цхпЯяK ЖЪdCѕB‹“Р{аАЃЩ%%%tэхЧ—иШґВ“ъхл—›››Kў(ЉЭєu+0ј‚ЇХZJІДћ={ћ?sж‘XXXHIIIv #B@ВРѕK—.зOџ>­ЕJђ‹‹‹L@+јEЫ¶mO9rD=УЉDD' Ћ–Ц-Zґ8№oЯ>""ЏЗг!хМЯ(-0µhСbЭ®]»€€ЬjНЌ  ыќwЮ™ФіgOYEБЫ€Ї1Аё°uлЦ‚K—.q‚ HІм{xXџ ®3w2„.\ё “ВЈ1ЯЃ6№¦Њ9RКННйJ’F! \ЄПЋ?ћтууµњнЌFА›И‹·Эv‹D$5€Ђ7#N’$qD4›1f0Ќ/}ъй§І:OкНX\E JАAFDiЊ1ЈБ`xц•W^!ћз7‚=±ґґ4А{“&MўДДД ъ,рЋzлka5\'(’«» °I@±l4ЭГ-јr!76ьјянрy|·iСbL*°X,ЩGЏЭкЛs5.bљнnч.]ћЌ‰Џ_ЭЎS§_;wкфkHpрљДДД» ФљFЁ&№)›9s&аяшэч›¦¤°>}ъxЂПџoЪ¶eЛH ?ќ9s¦FЭ¦/–rRRТ ‡Эю…ЫнЋ іЩ|Ьj4>°mчоЪ=х%PЃ/їьRWZZЄ///§Ћ;є&NњШЁЩЄЮХ?І ъWV?юблf©©©\^^Ђ€€Zёpб?n[бSе|ћ•­Zµ,Лr($	іщв‘гЗ·ытњOыA·nЭћЏЏ‹[Я№S§Eќ»tYє!11сn сцѓ›Ђ>}ъxАжПџЇЯ¶eЛp ?ъчюэА? я~P+кµ‡…5ъ~0¶_яюHNNv2ЖрпyуЊЫ·o†ЖЪzvл6Фоt~лr»c0іЩ|Фl±ЬЅcЗЋ}Ёe?рГ?ьрГЏя.pЄR‚гyѕВPLыQ+/Ќ  \ЄГW0 uУ©S§ОхкХ«їЗгЎнЫ·/€ЌЌmЧ©S§aычпЯrйТҐч TлљWtэыч?°oЯ>Zјx1]єt‰._ѕL~ш!mЮј™DQ¤Ѕ{чRЫ¶mЧ«OуЁQЈ¶‘8{цlG§NќЉ¶mЫ&egg{®їюъТ[oЅµDEqТ¤I Х®у™Ђ Ђ<g·ЫщҐK—ЪЏ9І|Пћ=rssЌ+V¬8AзПџп  Qў(zeуЌ  е%љНf‘1vЉзy·Хj5rw)$$„ў( aжМ™<к ‰в HкL&“Иу<ЊF# ЄЄ_!((H2WlыФM 1777з­·ЮJ:{ц, wэъхЋќ;wZ d;ќNщќwЮбwпЮ-(Ь°aѓЊ:Њ$­­Ў¤-°@ ‰ 6И0
+J·l еHуZ€ х(.p§M4ѓ6›U5Јл±ОР–нбkb6Ц·`?ьрГ?T4љ0¶rЂ6–––Ж	‚ AкmP©=Еc¤ҐЗ’eD;bЂJј¤• Dё@*”8\є¦M›¦ЭqЗ—xаЃТЧЎџФнЊЄЩЩхнЫчШЉ+иЗ¤шшш<тУO?QII	-Zґ€љ6mєJш­є‚ЌFгЛлЧЇ§'ћx"я—_~qїуО;N“Йґ6//Oљ2eЉJ`з»Q%Д9c–АА@pЗJKK9ЈСЁkСўEЅ^ПtЎЎЎ0™LE lu% ЌЋnГ†Л_ёp!Ѕщж›ФўEOff&Щl6КЛЛяшгТлхЯГ+ь_}€фрЂчј?aВ„В.РЊ3ДfНљe†ЗбcЦ*iЁ/ЫФ№sзђ   ђжН›/ПЛЛЈ'ћx‚ |©¤y5ЦµаЉђаІ,sDд<zфhQIIIQ“&MмЊ1Тйt$BоАЃ/A	ВVч—¬Bцv‹—eЩ"Л2#"&Љ":tиР8ІjНpёYіf<ёPхп»-))©кxЌµ ¦ж2  Мк\‰cЧ8РЅ*OцЏyръб‡~шб‡~шпs‘v<!(
+иFс–®‰G«іј&ЂВЈ†rz[†kєх#V™Gыб‡(66ц Ц‡zH§E+†"х­/лНЈэьуП®9sжЗqЁлQП°@%Ќзy”––2Y–!ЛrY–џ1bД†±cЗnРлхУ„©ПщЮomБ‚фюыпS“&M¶4mЪфакХ«йВ…”ќќM?эфEEE}АPgЯ@/нs(<ЪЯ~ы-;vLjЧ®ќ=11±д–[n)яЪb±DЦ+€ЪЯЦ¤¤$ќ ssss%5ѕыЏ Жx@,®¤,«3ё””AЌк3eХЄU”ћћ.………‰ЋЋ^xЫm·­ХЎC‡yіh-	нЪµлЕффt:uк9r„ююыoЉЏЏ_ ёЎю™ЪГCўўўv§¦¦Љ7Я|іyJ7ЈЈЁZO"Е%Љ" Ѓ2ЛЏ8	Eaб¬oнЅБiі855Uџ’’bДяґ0И~шб‡~шб‡~шQT>]{лЙЌЫЇ(\3jМЁМл› рД]ХїгЉОFBZЈ%ИЋнЧЇЯЄwЮyЗюК+ЇШBBB>сКш\—––ЖµoЯю«ЊЊ:sжЊьТK/‘Б`аF cыфйcR+QwЮLлпБѓп.++“`рo 3^|сEљ3gx@ЅФо‚(Љ,66ццИИИЅ^Пйьщуp8Й©©©R“&MиуП?„1¦·Щls.\ёа¬k нИ›nє)чвЕ‹дсxД¬¬,љ1cЅюълdіЩ(''G:qв=тИ#`tќГЉЖЗЗїќ9s¦нВ…Т”)SДNќ:eхкХ+gЯѕ}фЧ_ЙC†quиРбЂЄКСчѕRkЬ·oЯГщщщФї;Ђ§МXІd	-]є” м 0Жb±D єtХ@ Ђ”””r“Йд ‹Е"у<њ€‰В.Ънцј:Хj_nЬёЗй‚ѓѓEЖ'I’ ЛrцоЭ»1hР yЮјy=ЖЋы%ЁIИ}7U4дњњњKіfНJ<ю| ЂЭпјуОҐҐҐ7uйТІ,ч‚"т9ЃzШ:@(Б s м„’Є¬	ЂЫ ф†Іt,U	Ф]y­-tЄё¦b¤ЁТ—аЦ­[BСйЧ[х[•Iѓwдї­ЈяџБ %пJ\llОўE‹$"r‘ЗЗЏkСўER\llОЉ+ЮezЏmЖЈvнЪ}ЬІyу)ќлTГГ‡бМ№sџ?~ьqoЭГU>ЃD„Nќ:=w`ЯѕsыцнK®Kу-Vлц°оЭ?ЈcЗкT±ЈЄйПRSS9Х[СgґlЩR^ёpaЈџэргї>»pWsЅQuќхєЗ§|ще—UЪ8>ьрГµЋЇ1\rrrDiiйч¶ІІY–	ЂЖПqМbµn
+љґ}ыvнМzM—UйВќ’’ВoЬёQ,ё|yFл6m®»пѕы`PВЯ c(/+ГwЯ}wЭйЊЊ ћРћс‰@yy9 »Э/Oёщf7®UIлЦ­У<p Шы™Єєў*p дцнЫ_hµ.пСі'ЊFЈbЙМ §ГЃ={ц ґј|ф±cЗVhПшJ@ыЌ:&$Њ).-Ѕќ dYЙНq`Ђ'80pЮС'юDNЫЌ_†)—””TҐlaпЮЅь.ф~шQ+j[*кџ—Љ†@ы–"‚1†—_~№N–ъЇѕъЄЭЛo¤J %%%uvШlп;Ћ>Кв|u%ј%!ЪоЖ 2Ќ;,VлУ{чо=ЇХх*D„„Ц­W6lДш›nФ.5Pч€?~ялЦЇ_ќ‘‘1J}ж?і|яЏў·Я~ЫиS­JKKЩsП=gуiхкХ«CqAБN·;љґ—1еe*Ф+Ћ/Ј€12кхЫѓћЬuа@:jE¬mлЦ«Ї»оєЎЧЯpC•ЈЁ2d•ШЉеЛ±rХЄu'OЋP·WсЙ ­\№Rпr№:6L9r¤ж‡мИйrq‹/ојrеJ™ѓ2G®ґЂ1FнЫ·я0>6ц‰;ъX6 "¤§§гь…;vljЌњ~Л–-_8qмXжБC‡’!ЛЂjћXq&‚Чdг8hчXМжн	нЫћћћо{Е~NЯ?юшБйЧ¶­6њУпЅчLV«хЄ{ЛЛЛй_яъ—Г—VыЫрбГНY™™oЩl¶;Б ©№и OЂХъstLМуkЦ¬±ЈљоЄЋУ6nЬ(ћ=}ъЃ¶mЫNѕпюыaµZЇ,УЊБV^ЋoѕщfrЖ‰'|Ё=гЌkw:ќIН[ґђ&Ь|іUpълЧЇЧ:x0Йы™kєЎЄ‹ржф–чHJ‚СdЄ8Й1Ж—У/--Ѕ]t$ЛКEЋззфэрГ?ьЁьњ>Ђєrъ]»v(¶Щ>p:ќњѕ7wYE­Њ‘AЇЯцд–]»jбфЫґY=jФЁЎЈUN_УTM§°|Щ2¬т‰Уw:;­§пr8|гф;$$|яDы*Nq5­t\ъ±c8џ™Y;§ЯўuлN;–yаРЎdVUћ.Ќ»ЧћЃў±НЫЫ·яњьњѕ~ьВПй7"§ЇШ?ЌЛй·iЫvтэ< pъљNЂНfkNїE‹Т„	ЄдфЧ­[§;Р`NЯj]ЮЈG…УWw/ЖњN'vпЮЌІЖФй“,ѓ©ІlЖqћ`«ХПйяCРRЕ4kцЭ#Џ<BDдЁВѕСсИГSLіfЯy?SХu@кШ®ЭЃЃцоУ&і$ЛКIЏ18мvмЬ±eҐҐcЋ?ѕL{ЖWЪoК(*)№]&RjЁћ‹8Ћу‡†О;zфЁщбЗ=ьњ>ЂъrъG2*џЬ4ЭѕЖЪ*#ЈСё="$¤њюиС­©
+uUkЅ|щrЯ8}§ЖйЏUgќю_uъq±±OtмШдѓU‚†фЈGл¦У?¤йф5xйпµлЮє}їNЯ?ю›с€У/--ЅкЮАААqъ zхк`//ГnіЭAЮњ>А8АcІX~1[­/мЪµ«L}О7лэФФTnбВ…RQAБЭ-[ґxмЃ‡BPPduчвCII	ѕћ;ч±SgПрIjj*яџHЊwюЌўV^d·+т"е (GO Етst\\-C&ЯЯ}°Ё–!Z­*,C22nrS5–!лЦЇЧ:tЁ,CzфёЦДйДћЭ»СD–uЮ]ДБмзфэргяьњ>ЂzXп|аr»“‰ЁВDХ| D•-И	 M¦нБKнЦыmЪґY}ќКй”3Pu  B+І|Щ2¬ълЇЪ9}·УЩyиРЎхвф/]кЈх~\Ь:tёZрQЋ=ЉМ:Yп<\ҐЕѕц·Є	Сґ"~NЯ?ьрГЏљазфОй_МКz«¬јьN(ъд
+yk$ђ„„ЙчЯїВй{E{°••б›oїmђжНҐ›Єіiґосsъ~шС@ш9} хсУ/*єКzї¦ВЙЛOЯрд_ьфG]w]…х~mС4­щЉeЛ°bХЄu'kµЮw»лeЅпt:№ЕK–ФСOїњ~Эtъ'Nd<t(Yуbј
+•¬чµk~NЯ?ю?ў®›JUПkџНЃЄ*Вгy<П{зпЄ8ћз!‚VЂ6»µмK РJњт@ ".pE…jм"Ћг ЛІJІ©BЋгH–e¦~hЯѕэ“cЗЋнhЬѕ}{жџю№А» Кj*Ч»_п>|шЃ‡zЁ¬[·n«\§ЦрЙx@.(( ффtЪ·oТЄU«ЁeЛ–4­*ш0@hЭєµбпїяL&УН/Ѕф•——У…(//Џ®»оє| пЅчЮQiК”)RPPР9ЈСё·oЯѕE—.]ўХ«W“Щlю<22ТRc‚ЄёёёЩлЦ­Ј|°@жЉ+ДХ«W»u:ЭйC‡Iџ|т‰%Рц] єёqШ°aYЏGNNN.Р…зщЉ¤даfѓБРЂ .]єл­·^(**u:]AqqqL@@ bcc›rлЦ­ѓ ЛЪµk·є¬¬¬$++kяЪµkЗњ9sжіЩ, h"Љ"'ЁЙпnћ3gОВnёҐҐҐр!"вAhЊ{о№З~щтееП=чЬИC‡XшрбќN'J’іЩЖ%
+>УjіЭ»w—8pАTXXИ«Q№9Ћгt `іЩhЫ¶mћ’’’?ьґ`Б‚ePТз3ЖBХччаЊ3nђe™222
+8.\ЁUФcЖФaГ†Н4yЏ нШ"…††:€€йt:—$I:Y–9Y–!FЋiкЯї?zи!,Zґи§   ™%%%з*6э.]є$Нћ=ЫlµZҐттrЮ«›*†Ї$IZl/“vQЛ6pиР!Њ9»wп^Нуь·%%%yPDЂйхъ¶ѓayЌ{¬нЈЭ—`9ЂgAиЇЊй Rе‹ем‚4mЪTтx<\MvЋZ`I’дµkЧbЦ¬Yзю€€€И:uк”ЮзўЌ7j'ВмҐK—ёЭо@"BҐ‰Вc2Зq6 ђeЩ*I№W^y%,,,м±©S§/))щМ;6UU ­ЪПЮїЛPLЂоRЇяе€ШvкФ©чїсЖж>}ъ:tЁ?ЗqЗеЄ\.Ў&]#"цРCйґOJJЉQ]U^іfЌшЦ[oI:ќоv"ТйхzиtєeeetгЌ7Љ n¬-‡]UGv^}ићЕ‹У±cЗА ­ ґќ0aВ‰ўў"№K—.e nX°`Aќч¦&мЫ·o~ii)­\№Rѕе–[.O™2Е–џџOsжМ!ЖШjќNЧ%55µ^Y2T+Ь6

@@ -1,0 +1,3038 @@
+R_SHOULDER]._bin, end_bin);
+    fft->_peak_data[LOWER_SHOULDER]._freq_hz = calc_frequency(fft, start_bin, fft->_peak_data[LOWER_SHOULDER]._bin, end_bin);
+
+    return fft->_peak_data[CENTER]._bin;
+}
+
+void DSP::update_average_from_sliding_window(FFTWindowState* fft)
+{
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#define ASSERT_MAX(v) assert((v)<(fft->_num_stored_freqs * fft->_sliding_window_size))
+#else
+#define ASSERT_MAX(v)
+#endif
+
+    // copy and scale the new slice
+    const uint16_t slice_index = fft->_current_slice * fft->_num_stored_freqs;
+    ASSERT_MAX(slice_index);
+    float* slice = &fft->_sliding_window[slice_index];
+
+    const uint16_t old_slice_index = ((fft->_current_slice + 1) % fft->_sliding_window_size) * fft->_num_stored_freqs;
+    ASSERT_MAX(old_slice_index);
+    float* old_slice = &fft->_sliding_window[old_slice_index];
+
+    const float inv_ssize = 1.0f / fft->_sliding_window_size;
+
+    for (uint16_t i = 0; i < fft->_bin_count; i++) {
+        slice[i] = fft->_freq_bins[i] * fft->_window_scale * inv_ssize;
+        fft->_avg_freq_bins[i] = fft->_avg_freq_bins[i] + slice[i] - old_slice[i];
+    }
+
+    // advance the current slice
+    fft->_current_slice = (fft->_current_slice + 1) % fft->_sliding_window_size;
+}
+
+// calculate a single frequency
+uint16_t DSP::calc_frequency(FFTWindowState* fft, uint16_t start_bin, uint16_t peak_bin, uint16_t end_bin)
+{
+    if (peak_bin == 0 || is_zero(fft->get_freq_bin(peak_bin))) {
+        return start_bin * fft->_bin_resolution;
+    }
+
+    peak_bin = constrain_int16(peak_bin, start_bin, end_bin);
+
+    // It turns out that Jain is pretty good and works with only magnitudes, but Candan is significantly better
+    // if you have access to the complex values and Quinn is a little better still. Quinn is computationally
+    // more expensive, but compared to the overall FFT cost seems worth it.
+    if (fft->_sliding_window != nullptr) {
+        return (peak_bin + calculate_jains_estimator(fft, fft->_avg_freq_bins, peak_bin)) * fft->_bin_resolution;
+    } else {
+        return (peak_bin + calculate_quinns_second_estimator(fft, fft->_rfft_data, peak_bin)) * fft->_bin_resolution;
+    }
+}
+
+// Interpolate center frequency using https://dspguru.com/dsp/howtos/how-to-interpolate-fft-peak/
+float DSP::calculate_quinns_second_estimator(const FFTWindowState* fft, const float* complex_fft, uint16_t k_max) const
+{
+    if (k_max <= 1 || k_max >= fft->_bin_count) {
+        return 0.0f;
+    }
+
+    const uint16_t k_m1 = (k_max - 1) * 2;
+    const uint16_t k_p1 = (k_max + 1) * 2;
+    const uint16_t k = k_max * 2;
+
+    const float divider = complex_fft[k] * complex_fft[k] + complex_fft[k+1] * complex_fft[k+1];
+    const float ap = (complex_fft[k_p1] * complex_fft[k] + complex_fft[k_p1 + 1] * complex_fft[k+1]) / divider;
+    const float am = (complex_fft[k_m1] * complex_fft[k] + complex_fft[k_m1 + 1] * complex_fft[k + 1]) / divider;
+
+    // sanity check
+    if (fabsf(1.0f - ap) < 0.01f || fabsf(1.0f - am) < 0.01f) {
+        return 0.0f;
+    }
+
+    const float dp = -ap / (1.0f - ap);
+    const float dm = am / (1.0f - am);
+
+    float d = (dp + dm) * 0.5f + tau(dp * dp) - tau(dm * dm);
+
+    // -0.5 < d < 0.5 which is the fraction of the sample spacing about the center element
+    return constrain_float(d, -0.5f, 0.5f);
+}
+
+static const float TAU_FACTOR = SQRT_6 / 24.0f;
+
+// Helper function used for Quinn's frequency estimation
+float DSP::tau(const float x) const
+{
+    float p1 = logf(3.0f * sq(x) + 6.0f * x + 1.0f);
+    float part1 = x + 1.0f - SQRT_2_3;
+    float part2 = x + 1.0f + SQRT_2_3;
+    float p2 = logf(part1 / part2);
+    return (0.25f * p1 - TAU_FACTOR * p2);
+}
+
+// from https://dspguru.com/dsp/howtos/how-to-interpolate-fft-peak/
+// Works on magnitudes only, which is useful when using averaged data
+float DSP::calculate_jains_estimator(const FFTWindowState* fft, const float* real_fft, uint16_t k_max)
+{
+    if (k_max <= 1 || k_max >= fft->_bin_count) {
+        return 0.0f;
+    }
+
+    float y1 = real_fft[k_max-1];
+    float y2 = real_fft[k_max];
+    float y3 = real_fft[k_max+1];
+    float d = 0.0f;
+
+    if (y1 > y3) {
+        float a = y2 / y1;
+        d = a / (1 + a) - 1;
+    } else {
+        float a = y3 / y2;
+        d = a  /  (1 + a);
+    }
+    return constrain_float(d, -0.5f, 0.5f);
+}
+
+// initialize averaging FFT windows as they are calculated
+bool DSP::fft_init_average(FFTWindowState* fft)
+{
+    if (fft->_avg_freq_bins == nullptr) {
+        fft->_avg_freq_bins = (float*)hal.util->malloc_type(sizeof(float) * fft->_num_stored_freqs, DSP_MEM_REGION);
+        if (fft->_avg_freq_bins == nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// start averaging FFT windows as they are calculated
+bool DSP::fft_start_average(FFTWindowState* fft)
+{
+    if (fft->_averaging) {
+        return false;
+    }
+
+    if (!fft_init_average(fft)) {
+        return false;
+    }
+
+    fft->_averaging_samples = 0;
+    fft->_averaging = true;
+    return true;
+}
+
+// start averaging FFT windows as they are calculated
+uint16_t DSP::fft_stop_average(FFTWindowState* fft, uint16_t start_bin, uint16_t end_bin, float* freqs)
+{
+    // ensure the window has been allocated even if we do nothing else
+    if (!fft_init_average(fft)) {
+        return 0;
+    }
+
+    if (!fft->_averaging) {
+        return 0;
+    }
+
+    fft->_averaging = false;
+
+    // scale by the number of samples
+    vector_scale_float(fft->_avg_freq_bins, fft->_averaging_samples, fft->_avg_freq_bins, fft->_bin_count);
+
+    const uint16_t smoothwidth = 1;
+    uint16_t bin_range = (MIN(end_bin + ((smoothwidth + 1) >> 1) + 2, fft->_bin_count) - start_bin) + 1;
+
+    // find the three highest peaks using a zero crossing algorithm
+    // allocate the scratch space locally as we are in a different thread to the regular FFT
+    float* scratch_space = (float*)hal.util->malloc_type(sizeof(float) * fft->_num_stored_freqs, DSP_MEM_REGION);
+    if (scratch_space == nullptr) {
+        return false;
+    }
+    uint16_t peaks[MAX_TRACKED_PEAKS] {};
+    uint16_t numpeaks = find_peaks(&fft->_avg_freq_bins[start_bin], bin_range,
+        scratch_space, peaks, MAX_TRACKED_PEAKS, 0.0f, -1.0f, smoothwidth, 2);
+    hal.util->free_type(scratch_space, sizeof(float) * fft->_num_stored_freqs, DSP_MEM_REGION);
+
+    numpeaks = MIN(numpeaks, uint16_t(MAX_TRACKED_PEAKS));
+
+    // now try and find the lowest harmonic
+    for (uint16_t i = 0; i < numpeaks; i++) {
+        const uint16_t bin = peaks[i] + start_bin;
+        float d = calculate_jains_estimator(fft, fft->_avg_freq_bins, bin);
+        freqs[i] = (bin + d) * fft->_bin_resolution;
+    }
+
+    fft->_averaging_samples = 0;
+    return numpeaks;
+}
+
+// find all the peaks in the fft window using https://terpconnect.umd.edu/~toh/spectrum/PeakFindingandMeasurement.htm
+// in general peakgrup > 2 is only good for very broad noisy peaks, <= 2 better for spikey peaks, although 1 will miss
+// a true spike 50% of the time
+uint16_t DSP::find_peaks(const float* input, uint16_t length, float* d, uint16_t* peaks, uint16_t peaklen,
+    float slopeThreshold, float ampThreshold, uint16_t smoothwidth, uint16_t peakgroup) const
+{
+    if (smoothwidth > 1) {
+        derivative(input, d, length);
+        fastsmooth(d, length, smoothwidth);
+    } else {
+        derivative(input, d, length);
+    }
+
+    uint16_t n = ((peakgroup + 1) >> 1) + 1;
+    uint16_t halfw = (smoothwidth + 1) >> 1;
+    uint16_t numpeaks = 0;
+    uint16_t peakX = 0;
+    float peakY = 0;
+    uint16_t pindex;
+    uint16_t xx[peakgroup];
+    float yy[peakgroup];
+    memset(xx, 0, peakgroup * sizeof(uint16_t));
+    memset(yy, 0, peakgroup * sizeof(float));
+
+    for (uint16_t j = (halfw << 1) - 2; j < length - smoothwidth - 1; j++) {
+        if (d[j] >= 0 && d[j + 1] <= 0 && !is_equal(d[j], d[j + 1])) { // detect zero crossing
+            if ((d[j] - d[j + 1]) > slopeThreshold) {
+                for (uint16_t k = 0; k < peakgroup; k++) {
+                    uint16_t groupIndex = j + k - n + 2;
+                    groupIndex = constrain_int16(groupIndex, 0, length - 1);
+                    xx[k] = groupIndex;
+                    yy[k] = input[groupIndex];
+                }
+                if (peakgroup < 3) {
+                    vector_max_float(yy, peakgroup, &peakY, &pindex);
+                } else {
+                    peakY = vector_mean_float(yy, peakgroup);
+                    pindex = val2index(yy, peakgroup, peakY);
+                }
+                peakX = xx[pindex];
+                //hal.console->printf("zero %d, gindex %d -> %d, index %d, val %f\n", j, j -n +2, j+peakgroup -1  - n +2, peakX, peakY);
+                // see if we have a valid peak
+                if (isfinite(peakY) && peakY >= ampThreshold) {
+                    // record in amplitude order
+                    for (int16_t i = 0; i < peaklen; i++) {
+                        if (i >= numpeaks) {
+                            peaks[i] = peakX;
+                            break;
+                        }
+                        if (peakY > input[peaks[i]]) {
+                            for (int16_t a = peaklen - 1; a > i; a--) {
+                                peaks[a] = peaks[a - 1];
+                            }
+                            peaks[i] = peakX;
+                            break;
+                        }
+                    }
+                    numpeaks++;
+                }
+            }
+        }
+    }
+
+    return numpeaks;
+}
+
+// Returns the index and the value of the element of a vector that is closest to val
+uint16_t DSP::val2index(const float* vector, uint16_t n, float val) const
+{
+    float minval = FLT_MAX;
+    uint16_t minidx = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        float dif = fabsf(vector[i] - val);
+        if (dif < minval) {
+            minval = dif;
+            minidx = i;
+        }
+    }
+    return minidx;
+}
+
+// First derivative of vector using 2-point central difference.
+void DSP::derivative(const float* input, float* output, uint16_t n) const
+{
+    output[0] = input[1] - input[0];
+    output[n - 1] = input[n - 1] - input[n - 2];
+    for (uint16_t i = 1; i < n - 1; i++) {
+        output[i] = (input[i + 1] - input[i - 1]) / 2.0f;
+    }
+}
+
+// smooth a vector in-place
+void DSP::fastsmooth(float* input, uint16_t n, uint16_t smoothwidth) const
+{
+    float window[smoothwidth];
+    memset(window, 0, smoothwidth * sizeof(float));
+    float sumpoints = 0.0f;
+    for (int i = 0; i < smoothwidth; i++) {
+        sumpoints += input[i];
+    }
+    uint16_t halfw = (smoothwidth + 1) >> 1;
+    for (int i = 0; i < n - smoothwidth; i++) {
+        window[i % smoothwidth] = sumpoints;
+        sumpoints -= input[i];
+        sumpoints += input[i + smoothwidth];
+        input[i] = window[(i + smoothwidth - 1) % smoothwidth] / smoothwidth;
+    }
+    uint16_t last = n - smoothwidth + halfw;
+    input[last] = 0.0f;
+    for (int i = last + 1; i < n; i++) {
+        input[last] += input[i];
+    }
+    input[n - smoothwidth + halfw] /= smoothwidth;
+    for (int i = last + 1; i < n; i++) {
+        input[i] = 0.0f;
+    }
+}
+
+#endif // HAL_WITH_DSP
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andy Piper
+ */
+/*
+  interface to DSP device
+ */
+#pragma once
+
+#include <stdint.h>
+#include "AP_HAL_Namespace.h"
+#include <AP_HAL/utility/RingBuffer.h>
+
+#define DSP_MEM_REGION AP_HAL::Util::MEM_FAST
+// Maximum tolerated number of cycles with missing signal
+#define FFT_MAX_MISSED_UPDATES 5
+
+class AP_HAL::DSP {
+#if HAL_WITH_DSP
+public:
+    enum FrequencyPeak : uint8_t {
+        CENTER = 0,
+        LOWER_SHOULDER = 1,
+        UPPER_SHOULDER = 2,
+        MAX_TRACKED_PEAKS = 3,
+        NONE = 4
+    };
+
+    struct FrequencyPeakData {
+        // estimate of FFT peak frequency
+        float _freq_hz;
+        // FFT bin with maximum energy
+        uint16_t _bin;
+        // width of the peak
+        float _noise_width_hz;
+    };
+
+    static const uint8_t MAX_SLIDING_WINDOW_SIZE = 8;
+
+    class FFTWindowState {
+    public:
+        // frequency width of a FFT bin
+        const float _bin_resolution;
+        // number of FFT bins
+        const uint16_t _bin_count;
+        // number of stored frequencies (_bin_count + DC)
+        const uint16_t _num_stored_freqs;
+        // size of the FFT window
+        const uint16_t _window_size;
+        // size of the FFT sliding window
+        const uint8_t _sliding_window_size;
+        // FFT data
+        float* _freq_bins;
+        // derivative real data scratch space
+        float* _derivative_freq_bins;
+        // intermediate real FFT data
+        float* _rfft_data;
+        // averaged frequency data via Welch's method
+        float* _avg_freq_bins;
+        // sliding window of _bin_count frames
+        float* _sliding_window;
+        // three highest peaks
+        FrequencyPeakData _peak_data[MAX_TRACKED_PEAKS];
+        // Hanning window for incoming samples, see https://en.wikipedia.org/wiki/Window_function#Hann_.28Hanning.29_window
+        float* _hanning_window;
+        // Use in calculating the PS of the signal [Heinz] equations (20) & (21)
+        float _window_scale;
+        // averaging is ongoing
+        bool _averaging;
+        // number of samples in the average
+        uint32_t _averaging_samples;
+        // current sliding window slice
+        uint8_t _current_slice;
+        // get a frequency bin from an arbitrary slice
+        float get_freq_bin(uint16_t idx) { return _sliding_window == nullptr ? _freq_bins[idx] : _avg_freq_bins[idx]; }
+
+        void free_data_structures();
+        virtual ~FFTWindowState();
+        FFTWindowState(uint16_t window_size, uint16_t sample_rate, uint8_t sliding_window_size);
+    };
+    // initialise an FFT instance
+    virtual FFTWindowState* fft_init(uint16_t window_size, uint16_t sample_rate, uint8_t sliding_window_size = 0) = 0;
+    // start an FFT analysis with an ObjectBuffer
+    virtual void fft_start(FFTWindowState* state, FloatBuffer& samples, uint16_t advance) = 0;
+    // perform remaining steps of an FFT analysis
+    virtual uint16_t fft_analyse(FFTWindowState* state, uint16_t start_bin, uint16_t end_bin, float noise_att_cutoff) = 0;
+    // start averaging FFT data
+    bool fft_start_average(FFTWindowState* fft);
+    // finish the averaging process
+    uint16_t fft_stop_average(FFTWindowState* fft, uint16_t start_bin, uint16_t end_bin, float* peaks);
+
+protected:
+    // step 3: find the magnitudes of the complex data
+    void step_cmplx_mag(FFTWindowState* fft, uint16_t start_bin, uint16_t end_bin, float noise_att_cutoff);
+    // calculate the noise width of a peak based on the input parameters
+    float find_noise_width(float* freq_bins, uint16_t start_bin, uint16_t end_bin, uint16_t max_energy_bin, float cutoff,
+        float bin_resolution, uint16_t& peak_top, uint16_t& peak_bottom) const;
+    // step 4: find the bin with the highest energy and interpolate the required frequency
+    uint16_t step_calc_frequencies(FFTWindowState* fft, uint16_t start_bin, uint16_t end_bin);
+    // calculate the final average output
+    void update_average_from_sliding_window(FFTWindowState* fft);
+    // calculate a single frequency
+    uint16_t calc_frequency(FFTWindowState* fft, uint16_t start_bin, uint16_t peak_bin, uint16_t end_bin);
+    // find the maximum value in an vector of floats
+    virtual void vector_max_float(const float* vin, uint16_t len, float* max_value, uint16_t* max_index) const = 0;
+    // find the mean value in an vector of floats
+    virtual float vector_mean_float(const float* vin, uint16_t len) const = 0;
+    // multiply an vector of floats by a scale factor
+    virtual void vector_scale_float(const float* vin, float scale, float* vout, uint16_t len) const = 0;
+    // add two vectors together
+    virtual void vector_add_float(const float* vin1, const float* vin2, float* vout, uint16_t len) const = 0;
+    // algorithm for finding peaks in noisy data as per https://terpconnect.umd.edu/~toh/spectrum/PeakFindingandMeasurement.htm
+    uint16_t find_peaks(const float* input, uint16_t length, float* output, uint16_t* peaks, uint16_t peaklen, 
+        float slopeThreshold, float ampThreshold, uint16_t smoothwidth, uint16_t peakgroup) const;
+    uint16_t val2index(const float* vector, uint16_t n, float val) const;
+    void derivative(const float* input, float* output, uint16_t n) const;
+    void fastsmooth(float* input, uint16_t n, uint16_t smoothwidth) const;
+
+    // Quinn's frequency interpolator
+    float calculate_quinns_second_estimator(const FFTWindowState* fft, const float* complex_fft, uint16_t k) const;
+    float tau(const float x) const;
+    // Jain's estimator
+    float calculate_jains_estimator(const FFTWindowState* fft, const float* real_fft, uint16_t k_max);
+    // init averaging FFT data
+    bool fft_init_average(FFTWindowState* fft);
+
+#endif // HAL_WITH_DSP
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "Device.h"
+
+#include <stdio.h>
+#include <AP_Common/AP_Common.h>
+
+/*
+  using checked registers allows a device check that a set of critical
+  register values don't change at runtime. This is useful on key
+  sensors (such as IMUs) which may experience brownouts or other
+  issues in flight
+
+  To use register checking call setup_checked_registers() once to
+  allocate the space for the checked register values. The set the
+  checked flag on any write_register() calls that you want protected.
+
+  Periodically (say at 50Hz) you should then call
+  check_next_register(). If that returns false then the sensor has had
+  a corrupted register value. Marking the sensor as unhealthy is
+  appropiate. The bad value will be corrected
+ */
+
+/*
+  setup nregs checked registers
+ */
+bool AP_HAL::Device::setup_checked_registers(uint8_t nregs, uint8_t frequency)
+{
+    if (_checked.regs != nullptr) {
+        delete[] _checked.regs;
+        _checked.n_allocated = 0;
+        _checked.n_set = 0;
+        _checked.next = 0;
+    }
+    _checked.regs = NEW_NOTHROW struct checkreg[nregs];
+    if (_checked.regs == nullptr) {
+        return false;
+    }
+    _checked.n_allocated = nregs;
+    _checked.frequency = frequency;
+    _checked.counter = 0;
+    return true;
+}
+
+void AP_HAL::Device::set_device_type(uint8_t devtype) {
+    _bus_id.devid_s.devtype = devtype;
+}
+
+
+bool AP_HAL::Device::read_bank_registers(uint8_t bank, uint8_t first_reg, uint8_t *recv, uint32_t recv_len)
+{
+    first_reg |= _read_flag;
+    return transfer_bank(bank, &first_reg, 1, recv, recv_len);
+}
+
+bool AP_HAL::Device::write_bank_register(uint8_t bank, uint8_t reg, uint8_t val, bool checked)
+{
+    uint8_t buf[2] = { reg, val };
+    if (checked) {
+        set_checked_register(bank, reg, val);
+    }
+    return transfer_bank(bank, buf, sizeof(buf), nullptr, 0);
+}
+
+/*
+  set value of one checked register
+ */
+void AP_HAL::Device::set_checked_register(uint8_t reg, uint8_t val)
+{
+    set_checked_register(0, reg, val);
+}
+
+void AP_HAL::Device::set_checked_register(uint8_t bank, uint8_t reg, uint8_t val)
+{
+    if (_checked.regs == nullptr) {
+        return;
+    }
+    struct checkreg *regs = _checked.regs;
+    for (uint8_t i=0; i<_checked.n_set; i++) {
+        if (regs[i].regnum == reg && regs[i].bank == bank) {
+            regs[i].value = val;
+            return;
+        }
+    }
+    if (_checked.n_set == _checked.n_allocated) {
+        printf("Not enough checked registers for reg 0x%02x on device 0x%x\n",
+               (unsigned)reg, (unsigned)get_bus_id());
+        return;
+    }
+    regs[_checked.n_set].bank = bank;
+    regs[_checked.n_set].regnum = reg;
+    regs[_checked.n_set].value = val;
+    _checked.n_set++;
+}
+
+/*
+  check one register value
+ */
+bool AP_HAL::Device::check_next_register(void)
+{
+    if (_checked.n_set == 0) {
+        return true;
+    }
+    if (++_checked.counter < _checked.frequency) {
+        return true;
+    }
+    _checked.counter = 0;
+
+    struct checkreg &reg = _checked.regs[_checked.next];
+    uint8_t v, v2;
+
+    if (_bank_select) {
+        if (!_bank_select(reg.bank)) {
+            // Cannot set bank
+#if 0
+            printf("Device 0x%x set bank 0x%02x\n",
+                   (unsigned)get_bus_id(),
+                   (unsigned)reg.bank);
+#endif
+            _checked.last_reg_fail = reg;
+            return false;
+        }
+    }
+
+    if ((!read_registers(reg.regnum, &v, 1) || v != reg.value) &&
+        (!read_registers(reg.regnum, &v2, 1) || v2 != reg.value)) {
+        // a register has changed value unexpectedly. Try changing it back
+        // and re-check it next time
+#if 0
+        printf("Device 0x%x fixing 0x%02x 0x%02x -> 0x%02x\n",
+               (unsigned)get_bus_id(),
+               (unsigned)reg.regnum, (unsigned)v, (unsigned)reg.value);
+#endif
+        write_register(reg.regnum, reg.value);
+        _checked.last_reg_fail = reg;
+        _checked.last_reg_fail.value = v;
+        return false;
+    }
+    _checked.next = (_checked.next+1) % _checked.n_set;
+    return true;
+}
+
+/*
+  check one register value, returning information on the failure
+ */
+bool AP_HAL::Device::check_next_register(struct checkreg &fail)
+{
+    if (check_next_register()) {
+        return true;
+    }
+    fail = _checked.last_reg_fail;
+    return false;
+}
+
+
+bool AP_HAL::Device::write_register(uint8_t reg, uint8_t val, bool checked)
+{
+    uint8_t buf[2] = { reg, val };
+    if (checked) {
+        set_checked_register(reg, val);
+    }
+    bool result = transfer(buf, sizeof(buf), nullptr, 0);
+    if (_register_rw_callback && result) {
+        _register_rw_callback(reg, &val, 1, true);
+    }
+    return result;
+}
+
+
+bool AP_HAL::Device::read_registers(uint8_t first_reg, uint8_t *recv, uint32_t recv_len)
+{
+    uint8_t read_reg = first_reg;
+    first_reg |= _read_flag;
+    bool result = transfer(&first_reg, 1, recv, recv_len);
+    if (_register_rw_callback != nullptr && result) {
+        _register_rw_callback(read_reg, recv, recv_len, false);
+    }
+    return result;
+}
+
+bool AP_HAL::Device::transfer_bank(uint8_t bank, const uint8_t *send, uint32_t send_len,
+                        uint8_t *recv, uint32_t recv_len)
+{
+    if (_bank_select) {
+        if (!_bank_select(bank)) {
+            return false;
+        }
+    }
+    return transfer(send, send_len, recv, recv_len);
+}
+
+
+/**
+ * Some devices connected on the I2C or SPI bus require a bit to be set on
+ * the register address in order to perform a read operation. This sets a
+ * flag to be used by #read_registers(). The flag's default value is zero.
+ */
+void AP_HAL::Device::set_read_flag(uint8_t flag)
+{
+    _read_flag = flag;
+}
+
+
+/**
+ * make a bus id given bus type, bus number, bus address and
+ * device type This is for use by devices that do not use one of
+ * the standard HAL Device types, such as UAVCAN devices
+ */
+uint32_t AP_HAL::Device::make_bus_id(enum BusType bus_type, uint8_t bus, uint8_t address, uint8_t devtype) {
+    union DeviceId d {};
+    d.devid_s.bus_type = bus_type;
+    d.devid_s.bus = bus;
+    d.devid_s.address = address;
+    d.devid_s.devtype = devtype;
+    return d.devid;
+}
+
+/**
+ * return a new bus ID for the same bus connection but a new device type.
+ * This is used for auxiliary bus connections
+ */
+uint32_t AP_HAL::Device::change_bus_id(uint32_t old_id, uint8_t devtype) {
+    union DeviceId d;
+    d.devid = old_id;
+    d.devid_s.devtype = devtype;
+    return d.devid;
+}
+
+/**
+ * return bus ID with a new devtype
+ */
+uint32_t AP_HAL::Device::get_bus_id_devtype(uint8_t devtype) const {
+    return change_bus_id(get_bus_id(), devtype);
+}
+
+/**
+ * get bus type
+ */
+enum AP_HAL::Device::BusType AP_HAL::Device::devid_get_bus_type(uint32_t dev_id) {
+    union DeviceId d;
+    d.devid = dev_id;
+    return d.devid_s.bus_type;
+}
+
+uint8_t AP_HAL::Device::devid_get_bus(uint32_t dev_id) {
+    union DeviceId d;
+    d.devid = dev_id;
+    return d.devid_s.bus;
+}
+
+uint8_t AP_HAL::Device::devid_get_address(uint32_t dev_id) {
+    union DeviceId d;
+    d.devid = dev_id;
+    return d.devid_s.address;
+}
+
+uint8_t AP_HAL::Device::devid_get_devtype(uint32_t dev_id) {
+    union DeviceId d;
+    d.devid = dev_id;
+    return d.devid_s.devtype;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * Copyright (C) 2015-2016  Intel Corporation. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <inttypes.h>
+
+#include "AP_HAL_Namespace.h"
+#include "utility/functor.h"
+#include "AP_HAL_Boards.h"
+
+#if CONFIG_HAL_BOARD != HAL_BOARD_QURT
+// we need utility for std::move, but not on QURT due to a include error in hexagon SDK
+#include <utility>
+#endif
+
+/*
+ * This is an interface abstracting I2C and SPI devices
+ */
+class AP_HAL::Device {
+public:
+    enum BusType {
+        BUS_TYPE_UNKNOWN = 0,
+        BUS_TYPE_I2C     = 1,
+        BUS_TYPE_SPI     = 2,
+        BUS_TYPE_UAVCAN  = 3,
+        BUS_TYPE_SITL    = 4,
+        BUS_TYPE_MSP     = 5,
+        BUS_TYPE_SERIAL  = 6,
+        BUS_TYPE_WSPI    = 7,
+    };
+
+    enum Speed {
+        SPEED_HIGH,
+        SPEED_LOW,
+    };
+
+    // Used for comms with devices that support wide SPI
+    // like quad spi
+    struct CommandHeader {
+        uint32_t  cmd; //Command phase data.
+        uint32_t  cfg; //Transfer configuration field.
+        uint32_t  addr; //Address phase data.
+        uint32_t  alt; // Alternate phase data.
+        uint32_t  dummy; // Number of dummy cycles to be inserted.
+    };
+
+    FUNCTOR_TYPEDEF(PeriodicCb, void);
+    typedef void* PeriodicHandle;
+
+    // Register Read Write Callback
+    // returns: void parameters: register address, register data, register datasize, direction R:false, W:true
+    FUNCTOR_TYPEDEF(RegisterRWCb, void, uint8_t, uint8_t*, uint32_t, bool);
+    typedef void* RegisterRWHandle;
+
+    FUNCTOR_TYPEDEF(BankSelectCb, bool, uint8_t);
+
+    Device(enum BusType type)
+    {
+        _bus_id.devid_s.bus_type = type;
+    }
+
+    // return bus type
+    enum BusType bus_type(void) const {
+        return _bus_id.devid_s.bus_type;
+    }
+
+    // return bus number
+    uint8_t bus_num(void) const {
+        return _bus_id.devid_s.bus;
+    }
+
+    // return 24 bit bus identifier
+    uint32_t get_bus_id(void) const {
+        return _bus_id.devid;
+    }
+
+    // return address on bus
+    uint8_t get_bus_address(void) const {
+        return _bus_id.devid_s.address;
+    }
+
+    // set device type within a device class (eg. AP_COMPASS_TYPE_LSM303D)
+    void set_device_type(uint8_t devtype);
+
+    virtual ~Device() {
+        delete[] _checked.regs;
+    }
+
+    /*
+     * Change device address. Note that this is the 7 bit address, it
+     * does not include the bit for read/write. Only works on I2C
+     */
+    virtual void set_address(uint8_t address) {};
+    
+    /*
+     * Set the speed of future transfers. Depending on the bus the speed may
+     * be shared for all devices on the same bus.
+     *
+     * Return: true if speed was successfully set or platform doesn't implement
+     * it; false otherwise.
+     */
+    virtual bool set_speed(Speed speed)  = 0;
+
+    /*
+     * Core transfer function. This does a single bus transaction which
+     * sends send_len bytes and receives recv_len bytes back from the slave.
+     *
+     * Return: true on a successful transfer, false on failure.
+     */
+    virtual bool transfer(const uint8_t *send, uint32_t send_len,
+                          uint8_t *recv, uint32_t recv_len) = 0;
+
+
+    /*
+     * Sets the required flags before transaction starts
+     * this is to be used by Wide SPI communication interfaces like
+     * Dual/Quad/Octo SPI
+     */
+    virtual void set_cmd_header(const CommandHeader& cmd_hdr) {}
+
+    /*
+     * Sets up peripheral for execution in place mode
+     * Only relevant for Wide SPI setup.
+     */
+    virtual bool enter_xip_mode(void** map_ptr) { return false; }
+    virtual bool exit_xip_mode() { return false; }
+
+    /**
+     * Wrapper function over #transfer() to read recv_len registers, starting
+     * by first_reg, into the array pointed by recv. The read flag passed to
+     * #set_read_flag(uint8_t) is ORed with first_reg before performing the
+     * transfer.
+     *
+     * Return: true on a successful transfer, false on failure.
+     */
+    bool read_registers(uint8_t first_reg, uint8_t *recv, uint32_t recv_len);
+
+    /**
+     * Wrapper function over #transfer() to write a byte to the register reg.
+     * The transfer is done by sending reg and val in that order.
+     *
+     * Return: true on a successful transfer, false on failure.
+     */
+    bool write_register(uint8_t reg, uint8_t val, bool checked=false);
+    
+    /*
+     * Sets a callback to be called when a register is read or written.
+     */
+    virtual void set_register_rw_callback(RegisterRWCb register_rw_callback) {
+        _register_rw_callback = register_rw_callback;
+    }
+
+    /**
+     * Wrapper function over #transfer() to call bank selection callback
+     * and then invoke the transfer call
+     *
+     * Return: true on a successful transfer, false on failure.
+     */
+    bool transfer_bank(uint8_t bank, const uint8_t *send, uint32_t send_len,
+                          uint8_t *recv, uint32_t recv_len);
+
+    /**
+     * Wrapper function over #transfer_bank() to read recv_len registers, starting
+     * by first_reg, into the array pointed by recv. The read flag passed to
+     * #set_read_flag(uint8_t) is ORed with first_reg before performing the
+     * transfer.
+     *
+     * Return: true on a successful transfer, false on failure.
+     */
+    bool read_bank_registers(uint8_t bank, uint8_t first_reg, uint8_t *recv, uint32_t recv_len);
+
+    /**
+     * Wrapper function over #transfer_bank() to write a byte to the register reg.
+     * The transfer is done by sending reg and val in that order.
+     *
+     * Return: true on a successful transfer, false on failure.
+     */
+    bool write_bank_register(uint8_t bank, uint8_t reg, uint8_t val, bool checked=false);
+
+    /**
+     * set a value for a checked register in a bank
+     */
+    void set_checked_register(uint8_t bank, uint8_t reg, uint8_t val);
+
+    /**
+     * set a value for a checked register
+     */
+    void set_checked_register(uint8_t reg, uint8_t val);
+
+    /**
+     * setup for register value checking. Frequency is how often to check registers. If set to 10 then
+     * every 10th call to check_next_register will check a register
+     */
+    bool setup_checked_registers(uint8_t num_regs, uint8_t frequency=10);
+
+    /**
+     * check next register value for correctness. Return false if value is incorrect
+     * or register checking has not been setup
+     */
+    bool check_next_register(void);
+
+    // checked registers
+    struct checkreg {
+        uint8_t bank;
+        uint8_t regnum;
+        uint8_t value;
+    };
+    
+    /**
+     * check next register value for correctness, with return of
+     * failure value. Return false if value is incorrect or register
+     * checking has not been setup
+     */
+    bool check_next_register(struct checkreg &fail);
+    
+    /**
+     * Wrapper function over #transfer() to read a sequence of bytes from
+     * device. No value is written, differently from the #read_registers()
+     * method and hence doesn't include the read flag set by #set_read_flag()
+     */
+    bool read(uint8_t *recv, uint32_t recv_len)
+    {
+        return transfer(nullptr, 0, recv, recv_len);
+    }
+
+    /*
+     * Get the semaphore for the bus this device is in.  This is intended for
+     * drivers to use during initialization phase only.
+     */
+    virtual AP_HAL::Semaphore *get_semaphore() = 0;
+
+    /*
+     * Register a periodic callback for this bus. All callbacks on the
+     * same bus are made from the same thread with lock already taken. In
+     * other words, the callback is not executed on the main thread (or the
+     * thread which registered the callback), but in a separate per-bus
+     * thread.
+     *
+     * After registering the periodic callback, the other functions should not
+     * be used anymore from other contexts. If it really needs to be done, the
+     * lock must be taken.
+     *
+     * Return: A handle for this periodic callback. To cancel the callback
+     * call #unregister_callback() or return false on the callback.
+     */
+    virtual PeriodicHandle register_periodic_callback(uint32_t period_usec, PeriodicCb) = 0;
+
+    /*
+     * Adjust the time for the periodic callback registered with
+     * #register_periodic_callback. Note that the time will be re-calculated
+     * from the moment this call is made and expire after @period_usec.
+     *
+     * Return: true if periodic callback was successfully adjusted, false otherwise.
+     */
+    virtual bool adjust_periodic_callback(PeriodicHandle h, uint32_t period_usec) = 0;
+
+    /*
+     * Cancel a periodic callback on this bus.
+     *
+     * Return: true if callback was successfully unregistered, false
+     * otherwise.
+     */
+    virtual bool unregister_callback(PeriodicHandle h) { return false; }
+
+    /*
+     * Sets a bank_select callback to be used for bank selection during register check
+     */
+    virtual void setup_bankselect_callback(BankSelectCb bank_select) {
+        _bank_select = bank_select;
+    }
+
+    /*
+     * Sets a bank_select callback to be used for bank selection during register check
+     */
+    virtual void deregister_bankselect_callback() {
+        _bank_select = nullptr;
+    }
+
+
+    /*
+        allows to set callback that will be called after DMA transfer complete.
+        if this callback is set then any read/write operation will return directly after transfer setup and
+        bus semaphore must not be released until register_completion_callback(0) called from callback itself
+    */
+    virtual void register_completion_callback(AP_HAL::MemberProc proc) {}
+    virtual void register_completion_callback(AP_HAL::Proc proc) {}
+    
+    /*
+     * support for direct control of SPI chip select. Needed for
+     * devices with unusual SPI transfer patterns that include
+     * specific delays
+     */
+    virtual bool set_chip_select(bool set) { return false; }
+
+    /**
+     * Some devices connected on the I2C or SPI bus require a bit to be set on
+     * the register address in order to perform a read operation. This sets a
+     * flag to be used by #read_registers(). The flag's default value is zero.
+     */
+    void set_read_flag(uint8_t flag);
+
+    /**
+     * make a bus id given bus type, bus number, bus address and
+     * device type This is for use by devices that do not use one of
+     * the standard HAL Device types, such as UAVCAN devices
+     */
+    static uint32_t make_bus_id(enum BusType bus_type, uint8_t bus, uint8_t address, uint8_t devtype);
+
+    /**
+     * return a new bus ID for the same bus connection but a new device type.
+     * This is used for auxiliary bus connections
+     */
+    static uint32_t change_bus_id(uint32_t old_id, uint8_t devtype);
+
+    /**
+     * return bus ID with a new devtype
+     */
+    uint32_t get_bus_id_devtype(uint8_t devtype) const;
+
+    /**
+     * get bus type
+     */
+    static enum BusType devid_get_bus_type(uint32_t dev_id);
+
+    static uint8_t devid_get_bus(uint32_t dev_id);
+
+    static uint8_t devid_get_address(uint32_t dev_id);
+
+    static uint8_t devid_get_devtype(uint32_t dev_id);
+
+
+    /* set number of retries on transfers */
+    virtual void set_retries(uint8_t retries) {};
+
+protected:
+    uint8_t _read_flag = 0;
+
+    /*
+      broken out device elements. The bitfields are used to keep
+      the overall value small enough to fit in a float accurately,
+      which makes it possible to transport over the MAVLink
+      parameter protocol without loss of information.
+     */
+    struct DeviceStructure {
+        enum BusType bus_type : 3;
+        uint8_t bus: 5;    // which instance of the bus type
+        uint8_t address;   // address on the bus (eg. I2C address)
+        uint8_t devtype;   // device class specific device type
+    };
+
+    union DeviceId {
+        struct DeviceStructure devid_s;
+        uint32_t devid;
+    };
+
+    union DeviceId _bus_id;
+
+    // set device address (eg. i2c bus address or spi CS)
+    void set_device_address(uint8_t address) {
+        _bus_id.devid_s.address = address;
+    }
+
+    // set device bus number
+    void set_device_bus(uint8_t bus) {
+        _bus_id.devid_s.bus = bus;
+    }
+
+private:
+    BankSelectCb _bank_select;
+    RegisterRWCb _register_rw_callback;
+    struct {
+        uint8_t n_allocated;
+        uint8_t n_set;
+        uint8_t next;
+        uint8_t frequency;
+        uint8_t counter;
+        struct checkreg last_reg_fail;
+        struct checkreg *regs;
+    } _checked;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+  interface to flash read/write
+ */
+#pragma once
+
+#include <stdint.h>
+#include "AP_HAL_Namespace.h"
+
+class AP_HAL::Flash {
+public:
+    virtual uint32_t getpageaddr(uint32_t page) = 0;
+    virtual uint32_t getpagesize(uint32_t page) = 0;
+    virtual uint32_t getnumpages(void) = 0;
+    virtual bool erasepage(uint32_t page) = 0;
+    virtual bool write(uint32_t addr, const void *buf, uint32_t count) = 0;
+    virtual void keep_unlocked(bool set) = 0;
+    virtual bool ispageerased(uint32_t page) = 0;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #include "GPIO.h"
+
+#include <AP_HAL/AP_HAL.h>
+
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
+
+AP_HAL::PWMSource::~PWMSource()
+{
+    if (interrupt_attached) {
+        // Assume this is always successful
+        hal.gpio->detach_interrupt(_pin);
+        interrupt_attached = false;
+    }
+}
+
+bool AP_HAL::PWMSource::set_pin(int16_t new_pin, const char *subsystem)
+{
+    if (new_pin == _pin) {
+        // we've already tried to attach to this pin
+        return interrupt_attached;
+    }
+
+    if (interrupt_attached) {
+        if (!hal.gpio->detach_interrupt(_pin)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "%s: Failed to detach interrupt from %d",
+                          subsystem,
+                          _pin);
+        }
+        interrupt_attached = false;
+    }
+
+    // don't want to try to attach more than once:
+    _pin = new_pin;
+
+    if (_pin <= 0) {
+        // invalid pin
+        return false;
+    }
+
+    // install interrupt handler on rising and falling edge
+    hal.gpio->pinMode(_pin, HAL_GPIO_INPUT);
+    if (!hal.gpio->attach_interrupt(
+            _pin,
+            FUNCTOR_BIND_MEMBER(&AP_HAL::PWMSource::irq_handler,
+                                void,
+                                uint8_t,
+                                bool,
+                                uint32_t),
+            AP_HAL::GPIO::INTERRUPT_BOTH)) {
+        // failed to attach interrupt
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                      "%s: Failed to attach interrupt to %d",
+                      subsystem,
+                      _pin);
+        return false;
+    }
+
+    interrupt_attached = true;
+
+    return interrupt_attached;
+}
+
+// interrupt handler for reading pwm value
+void AP_HAL::PWMSource::irq_handler(uint8_t a_pin, bool pin_high, uint32_t timestamp_us)
+{
+    if (pin_high) {
+        _pulse_start_us = timestamp_us;
+        return;
+    }
+    if (_pulse_start_us == 0) {
+        // if we miss interrupts we could get two lows in a row.  If
+        // we miss interrupts we're definitely handing back bad
+        // values anyway....
+        return;
+    }
+    _irq_value_us = timestamp_us - _pulse_start_us;
+    _pulse_start_us = 0;
+
+    // update fields for taking an average reading:
+    _irq_value_us_sum += _irq_value_us;
+    _irq_value_us_count++;
+}
+
+
+uint16_t AP_HAL::PWMSource::get_pwm_us()
+{
+    // disable interrupts and grab state
+    void *irqstate = hal.scheduler->disable_interrupts_save();
+    const uint32_t ret = _irq_value_us;
+    _irq_value_us = 0;
+    hal.scheduler->restore_interrupts(irqstate);
+
+    return ret;
+}
+
+uint16_t AP_HAL::PWMSource::get_pwm_avg_us()
+{
+    // disable interrupts and grab state
+    void *irqstate = hal.scheduler->disable_interrupts_save();
+    uint32_t ret;
+    if (_irq_value_us_count == 0) {
+        ret = 0;
+    } else {
+        ret = _irq_value_us_sum / _irq_value_us_count;
+    }
+    _irq_value_us_sum = 0;
+    _irq_value_us_count = 0;
+    hal.scheduler->restore_interrupts(irqstate);
+
+    return ret;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #pragma once
+
+#include <stdint.h>
+
+#include "AP_HAL_Namespace.h"
+
+#define HAL_GPIO_INPUT  0
+#define HAL_GPIO_OUTPUT 1
+#define HAL_GPIO_ALT    2
+
+class AP_HAL::DigitalSource {
+public:
+    virtual void    mode(uint8_t output) = 0;
+    virtual uint8_t read() = 0;
+    virtual void    write(uint8_t value) = 0;
+    virtual void    toggle() = 0;
+};
+
+class AP_HAL::PWMSource {
+public:
+
+    // Destructor detaches interrupt
+    ~PWMSource();
+
+    bool set_pin(int16_t new_pin, const char *subsystem);
+    int16_t pin() const { return _pin; }  // returns pin this is attached to
+
+    uint16_t get_pwm_us();            // return last measured PWM input
+    uint16_t get_pwm_avg_us();        // return average PWM since last call to get_pwm_avg_us
+
+private:
+    uint16_t _irq_value_us;         // last calculated pwm value (irq copy)
+    uint32_t _pulse_start_us;       // system time of start of pulse
+    int16_t _pin = -1;
+
+    uint32_t _irq_value_us_sum;     // for get_pwm_avg_us
+    uint32_t _irq_value_us_count;   // for get_pwm_avg_us
+
+    bool interrupt_attached;
+
+    // PWM input handling
+    void irq_handler(uint8_t pin,
+                     bool pin_state,
+                     uint32_t timestamp);
+};
+
+class AP_HAL::GPIO {
+public:
+    GPIO() {}
+    virtual void    init() = 0;
+    virtual void    pinMode(uint8_t pin, uint8_t output) = 0;
+
+    // optional interface on some boards
+    virtual void    pinMode(uint8_t pin, uint8_t output, uint8_t alt) {};
+
+    virtual uint8_t read(uint8_t pin) = 0;
+    virtual void    write(uint8_t pin, uint8_t value) = 0;
+    virtual void    toggle(uint8_t pin) = 0;
+    virtual bool    valid_pin(uint8_t pin) const { return true; }
+
+    // return servo channel associated with GPIO pin.  Returns true on success and fills in servo_ch argument
+    // servo_ch uses zero-based indexing
+    virtual bool    pin_to_servo_channel(uint8_t pin, uint8_t& servo_ch) const { return false; }
+
+    // allow for save and restore of pin settings
+    virtual bool    get_mode(uint8_t pin, uint32_t &mode) { return false; }
+    virtual void    set_mode(uint8_t pin, uint32_t mode) {}
+
+    /* Alternative interface: */
+    virtual AP_HAL::DigitalSource* channel(uint16_t n) = 0;
+
+    enum INTERRUPT_TRIGGER_TYPE {
+        INTERRUPT_NONE,
+        INTERRUPT_FALLING,
+        INTERRUPT_RISING,
+        INTERRUPT_BOTH,
+    };
+
+    /* Interrupt interface: */
+    //                                ret , pin    , state,timestamp
+    // where:
+    //    ret indicates the functor must return void
+    //    pin is the pin which has triggered the interrupt
+    //    state is the new state of the pin
+    //    timestamp is the time in microseconds the interrupt occurred
+    FUNCTOR_TYPEDEF(irq_handler_fn_t, void, uint8_t, bool, uint32_t);
+    virtual bool    attach_interrupt(uint8_t pin,
+                                     irq_handler_fn_t fn,
+                                     INTERRUPT_TRIGGER_TYPE mode) {
+        return false;
+    }
+
+    virtual bool    attach_interrupt(uint8_t pin,
+                                     AP_HAL::Proc proc,
+                                     INTERRUPT_TRIGGER_TYPE mode) {
+        return false;
+    }
+    bool detach_interrupt(uint8_t pin) {
+        if (attach_interrupt(pin, (irq_handler_fn_t)nullptr, AP_HAL::GPIO::INTERRUPT_NONE)) {
+            return true;
+        }
+        return attach_interrupt(pin, (AP_HAL::Proc)nullptr, AP_HAL::GPIO::INTERRUPT_NONE);
+    }
+
+    /*
+      block waiting for a pin to change. A timeout of 0 means wait
+      forever. Return true on pin change, false on timeout
+     */
+    virtual bool wait_pin(uint8_t pin, INTERRUPT_TRIGGER_TYPE mode, uint32_t timeout_us) { return false; }
+
+    /* return true if USB cable is connected */
+    virtual bool    usb_connected(void) = 0;
+
+    // optional timer tick
+    virtual void timer_tick(void) {};
+
+    // Run arming checks
+    virtual bool arming_checks(size_t buflen, char *buffer) const { return true; }
+
+};
+                                                                                                                                             #include <assert.h>
+
+#include "HAL.h"
+
+namespace AP_HAL {
+
+HAL::FunCallbacks::FunCallbacks(void (*setup_fun)(void), void (*loop_fun)(void))
+    : _setup(setup_fun)
+    , _loop(loop_fun)
+{
+}
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #pragma once
+
+class AP_Param;
+
+#include "AP_HAL_Namespace.h"
+
+#include "AnalogIn.h"
+#include "GPIO.h"
+#include "RCInput.h"
+#include "RCOutput.h"
+#include "SPIDevice.h"
+#include "WSPIDevice.h"
+#include "Storage.h"
+#include "UARTDriver.h"
+#include "system.h"
+#include "OpticalFlow.h"
+#include "DSP.h"
+#include "CANIface.h"
+
+
+class AP_HAL::HAL {
+public:
+    HAL(AP_HAL::UARTDriver* _serial0, // console
+        AP_HAL::UARTDriver* _serial1, // telem1
+        AP_HAL::UARTDriver* _serial2, // telem2
+        AP_HAL::UARTDriver* _serial3, // 1st GPS
+        AP_HAL::UARTDriver* _serial4, // 2nd GPS
+        AP_HAL::UARTDriver* _serial5, // extra1
+        AP_HAL::UARTDriver* _serial6, // extra2
+        AP_HAL::UARTDriver* _serial7, // extra3
+        AP_HAL::UARTDriver* _serial8, // extra4
+        AP_HAL::UARTDriver* _serial9, // extra5
+        AP_HAL::I2CDeviceManager* _i2c_mgr,
+        AP_HAL::SPIDeviceManager* _spi,
+        AP_HAL::WSPIDeviceManager* _wspi,
+        AP_HAL::AnalogIn*   _analogin,
+        AP_HAL::Storage*    _storage,
+        AP_HAL::UARTDriver* _console,
+        AP_HAL::GPIO*       _gpio,
+        AP_HAL::RCInput*    _rcin,
+        AP_HAL::RCOutput*   _rcout,
+        AP_HAL::Scheduler*  _scheduler,
+        AP_HAL::Util*       _util,
+        AP_HAL::OpticalFlow*_opticalflow,
+        AP_HAL::Flash*      _flash,
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+        class AP_HAL::SIMState*   _simstate,
+#endif
+#if HAL_WITH_DSP
+        AP_HAL::DSP*        _dsp,
+#endif
+#if HAL_NUM_CAN_IFACES > 0
+        AP_HAL::CANIface* _can_ifaces[HAL_NUM_CAN_IFACES])
+#else
+        AP_HAL::CANIface** _can_ifaces)
+#endif
+        :
+        serial_array{
+            _serial0,
+            _serial1,
+            _serial2,
+            _serial3,
+            _serial4,
+            _serial5,
+            _serial6,
+            _serial7,
+            _serial8,
+            _serial9},
+        i2c_mgr(_i2c_mgr),
+        spi(_spi),
+        wspi(_wspi),
+        analogin(_analogin),
+        storage(_storage),
+        console(_console),
+        gpio(_gpio),
+        rcin(_rcin),
+        rcout(_rcout),
+        scheduler(_scheduler),
+        util(_util),
+        opticalflow(_opticalflow),
+#if HAL_WITH_DSP
+        dsp(_dsp),
+#endif
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+        simstate(_simstate),
+#endif
+        flash(_flash)
+    {
+#if HAL_NUM_CAN_IFACES > 0
+        if (_can_ifaces == nullptr) {
+            for (uint8_t i = 0; i < HAL_NUM_CAN_IFACES; i++)
+                can[i] = nullptr;
+        } else {
+            for (uint8_t i = 0; i < HAL_NUM_CAN_IFACES; i++)
+                can[i] = _can_ifaces[i];
+        }
+#endif
+
+        AP_HAL::init();
+    }
+
+    struct Callbacks {
+        virtual void setup() = 0;
+        virtual void loop() = 0;
+    };
+
+    struct FunCallbacks : public Callbacks {
+        FunCallbacks(void (*setup_fun)(void), void (*loop_fun)(void));
+
+        void setup() override { _setup(); }
+        void loop() override { _loop(); }
+
+    private:
+        void (*_setup)(void);
+        void (*_loop)(void);
+    };
+
+    virtual void run(int argc, char * const argv[], Callbacks* callbacks) const = 0;
+
+public:
+    AP_HAL::I2CDeviceManager* i2c_mgr;
+    AP_HAL::SPIDeviceManager* spi;
+    AP_HAL::WSPIDeviceManager* wspi;
+    AP_HAL::AnalogIn*   analogin;
+    AP_HAL::Storage*    storage;
+    AP_HAL::UARTDriver* console;
+    AP_HAL::GPIO*       gpio;
+    AP_HAL::RCInput*    rcin;
+    AP_HAL::RCOutput*   rcout;
+    AP_HAL::Scheduler*  scheduler;
+    AP_HAL::Util        *util;
+    AP_HAL::OpticalFlow *opticalflow;
+    AP_HAL::Flash       *flash;
+    AP_HAL::DSP         *dsp;
+#if HAL_NUM_CAN_IFACES > 0
+    AP_HAL::CANIface* can[HAL_NUM_CAN_IFACES];
+#else
+    AP_HAL::CANIface** can;
+#endif
+
+    // access to serial ports using SERIALn_ numbering
+    UARTDriver* serial(uint8_t sernum) const;
+
+    static constexpr uint8_t num_serial = 10;
+
+private:
+    // UART drivers in SERIALn_ order
+    AP_HAL::UARTDriver* serial_array[num_serial];
+
+public:
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+    AP_HAL::SIMState *simstate;
+#endif
+
+#ifndef HAL_CONSOLE_DISABLED
+# define DEV_PRINTF(fmt, args ...)  do { hal.console->printf(fmt, ## args); } while(0)
+#else
+# define DEV_PRINTF(fmt, args ...)
+#endif
+
+};
+
+// access serial ports using SERIALn numbering
+inline AP_HAL::UARTDriver* AP_HAL::HAL::serial(uint8_t sernum) const
+{
+    if (sernum >= ARRAY_SIZE(serial_array)) {
+        return nullptr;
+    }
+    return serial_array[sernum];
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright (C) 2015-2016  Intel Corporation. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <inttypes.h>
+
+#include "AP_HAL_Namespace.h"
+#include "Device.h"
+#include "utility/OwnPtr.h"
+
+namespace AP_HAL {
+
+class I2CDevice : public Device {
+public:
+    I2CDevice() : Device(BUS_TYPE_I2C) { }
+
+    virtual ~I2CDevice() { }
+
+    /* Device implementation */
+
+    /* See Device::set_speed() */
+    virtual bool set_speed(Device::Speed speed) override = 0;
+
+    /* See Device::transfer() */
+    virtual bool transfer(const uint8_t *send, uint32_t send_len,
+                          uint8_t *recv, uint32_t recv_len) override = 0;
+
+    /*
+     * Read location from device multiple times, advancing the buffer each
+     * time
+     */
+    virtual bool read_registers_multiple(uint8_t first_reg, uint8_t *recv,
+                                         uint32_t recv_len, uint8_t times) = 0;
+
+    /* See Device::get_semaphore() */
+    virtual Semaphore *get_semaphore() override = 0;
+
+    /* See Device::register_periodic_callback() */
+    virtual Device::PeriodicHandle register_periodic_callback(
+        uint32_t period_usec, Device::PeriodicCb) override = 0;
+
+    /* See Device::adjust_periodic_callback() */
+    virtual bool adjust_periodic_callback(
+        Device::PeriodicHandle h, uint32_t period_usec) override = 0;
+
+    /*
+     * Force I2C transfers to be split between send and receive parts, with a
+     * stop condition between them. Setting this allows to conveniently
+     * continue using the read_* and transfer() methods on those devices.
+     *
+     * Some platforms may have transfers always split, in which case
+     * this method is not needed.
+     */
+    virtual void set_split_transfers(bool set) {};
+};
+
+class I2CDeviceManager {
+public:
+    /* Get a device handle */
+    virtual OwnPtr<AP_HAL::I2CDevice> get_device(uint8_t bus, uint8_t address,
+                                                 uint32_t bus_clock=400000,
+                                                 bool use_smbus = false,
+                                                 uint32_t timeout_ms=4) = 0;
+    /*
+      get mask of bus numbers for all configured I2C buses
+     */
+    virtual uint32_t get_bus_mask(void) const { return 0x0F; }
+
+    /*
+      get mask of bus numbers for all configured external I2C buses
+     */
+    virtual uint32_t get_bus_mask_external(void) const { return 0x0F; }
+
+    /*
+      get mask of bus numbers for all configured internal I2C buses
+     */
+    virtual uint32_t get_bus_mask_internal(void) const { return 0x01; }
+};
+
+/*
+  convenient macros for iterating over I2C bus numbers
+ */
+#define FOREACH_I2C_MASK(i,mask) for (uint32_t _bmask=mask, i=0; i<32; i++) if ((1U<<i)&_bmask)
+#define FOREACH_I2C_EXTERNAL(i) FOREACH_I2C_MASK(i,hal.i2c_mgr->get_bus_mask_external())
+#define FOREACH_I2C_INTERNAL(i) FOREACH_I2C_MASK(i,hal.i2c_mgr->get_bus_mask_internal())
+#define FOREACH_I2C(i) FOREACH_I2C_MASK(i,hal.i2c_mgr->get_bus_mask())
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #pragma once
+
+#include <AP_Logger/LogStructure.h>
+#include "UARTDriver.h"
+
+#define LOG_IDS_FROM_HAL \
+    LOG_UART_MSG
+
+// @LoggerMessage: UART
+// @Description: UART stats
+// @Field: TimeUS: Time since system startup
+// @Field: I: instance
+// @Field: Tx: transmitted data rate bytes per second
+// @Field: Rx: received data rate bytes per second
+struct PACKED log_UART {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t instance;
+    float tx_rate;
+    float rx_rate;
+};
+
+#if !HAL_UART_STATS_ENABLED
+#define LOG_STRUCTURE_FROM_HAL
+#else
+#define LOG_STRUCTURE_FROM_HAL                          \
+    { LOG_UART_MSG, sizeof(log_UART),                   \
+      "UART","QBff","TimeUS,I,Tx,Rx", "s#BB", "F---" },
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+class AP_HAL::OpticalFlow {
+public:
+    class Data_Frame {
+    public:
+        float pixel_flow_x_integral;
+        float pixel_flow_y_integral;
+        float gyro_x_integral;
+        float gyro_y_integral;
+        uint32_t delta_time;
+        uint8_t quality;
+    };
+
+    virtual void init() = 0;
+    virtual bool read(Data_Frame& frame) = 0;
+    virtual void push_gyro(float gyro_x, float gyro_y, float dt) = 0;
+    virtual void push_gyro_bias(float gyro_bias_x, float gyro_bias_y) = 0;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+#include "AP_HAL_Namespace.h"
+
+#define RC_INPUT_MIN_PULSEWIDTH 900
+#define RC_INPUT_MAX_PULSEWIDTH 2100
+
+class AP_HAL::RCInput {
+public:
+    /**
+     * Call init from the platform hal instance init, so that both the type of
+     * the RCInput implementation and init argument (e.g. ISRRegistry) are
+     * known to the programmer. (It's too difficult to describe this dependency
+     * in the C++ type system.)
+     */
+    virtual void init() = 0;
+    virtual void teardown() {};
+
+    /**
+     * Return true if there has been new input since the last call to new_input()
+     */
+    virtual bool new_input(void) = 0;
+
+    /**
+     * Return the number of valid channels in the last read
+     */
+    virtual uint8_t  num_channels() = 0;
+
+    /* Read a single channel at a time */
+    virtual uint16_t read(uint8_t ch) = 0;
+
+    /* Read an array of channels, return the valid count */
+    virtual uint8_t read(uint16_t* periods, uint8_t len) = 0;
+
+    /* get receiver based RSSI if available. -1 for unknown, 0 for no link, 255 for maximum link */
+    virtual int16_t get_rssi(void) { return -1; }
+    virtual int16_t get_rx_link_quality(void) { return -1; }
+    /* Return string describing method RC input protocol */
+    virtual const char *protocol() const = 0;
+
+    /**
+     * Overrides: these are really grody and don't belong here but we need
+     * them at the moment to make the port work.
+     * case v of:
+     *  v == -1 -> no change to this channel
+     *  v == 0  -> do not override this channel
+     *  v > 0   -> set v as override.
+     */
+
+    /* execute receiver bind */
+    virtual bool rc_bind(int dsmMode) { return false; }
+
+    /* enable or disable pulse input for RC input. This is used to
+       reduce load when we are decoding R/C via a UART */
+    virtual void pulse_input_enable(bool enable) { }
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include "AP_HAL.h"
+
+extern const AP_HAL::HAL &hal;
+
+uint32_t AP_HAL::RCOutput::DSHOT_BIT_WIDTH_TICKS = DSHOT_BIT_WIDTH_TICKS_DEFAULT;
+uint32_t AP_HAL::RCOutput::DSHOT_BIT_0_TICKS = DSHOT_BIT_0_TICKS_DEFAULT;
+uint32_t AP_HAL::RCOutput::DSHOT_BIT_1_TICKS = DSHOT_BIT_1_TICKS_DEFAULT;
+
+// helper function for implementation of get_output_mode_banner
+const char* AP_HAL::RCOutput::get_output_mode_string(enum output_mode out_mode) const
+{
+    // convert mode to string
+    switch (out_mode) {
+    case MODE_PWM_NONE:
+        return "None";
+    case MODE_PWM_NORMAL:
+        return "PWM";
+    case MODE_PWM_ONESHOT:
+        return "OneS";
+    case MODE_PWM_ONESHOT125:
+        return "OS125";
+    case MODE_PWM_BRUSHED:
+        return "Brush";
+    case MODE_PWM_DSHOT150:
+        return "DS150";
+    case MODE_PWM_DSHOT300:
+        return "DS300";
+    case MODE_PWM_DSHOT600:
+        return "DS600";
+    case MODE_PWM_DSHOT1200:
+        return "DS1200";
+    case MODE_NEOPIXEL:
+    case MODE_NEOPIXELRGB:
+        return "NeoP";
+    case MODE_PROFILED:
+        return "ProfiLED";
+    }
+
+    // we should never reach here but just in case
+    return "Unknown";
+}
+
+// convert output mode to string.  helper function for implementation of get_output_mode_banner
+void AP_HAL::RCOutput::append_to_banner(char banner_msg[], uint8_t banner_msg_len, output_mode out_mode, uint8_t low_ch, uint8_t high_ch) const
+{
+    const char* mode_str = get_output_mode_string(out_mode);
+
+    // make copy of banner_msg
+    char banner_msg_temp[banner_msg_len];
+    memcpy(banner_msg_temp, banner_msg, banner_msg_len);
+
+    if (low_ch == high_ch) {
+        // handle single channel case
+        hal.util->snprintf(banner_msg, banner_msg_len, "%s %s:%u", banner_msg_temp, mode_str, (unsigned)low_ch);
+    } else {
+        // the general case
+        hal.util->snprintf(banner_msg, banner_msg_len, "%s %s:%u-%u", banner_msg_temp, mode_str, (unsigned)low_ch, (unsigned)high_ch);
+    }
+}
+
+/*
+  true when the output mode is of type dshot
+*/
+bool AP_HAL::RCOutput::is_dshot_protocol(const enum output_mode mode)
+{
+    switch (mode) {
+    case MODE_PWM_DSHOT150:
+    case MODE_PWM_DSHOT300:
+    case MODE_PWM_DSHOT600:
+    case MODE_PWM_DSHOT1200:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * calculate the prescaler required to achieve the desire bitrate
+ */
+uint32_t AP_HAL::RCOutput::calculate_bitrate_prescaler(uint32_t timer_clock, uint32_t target_frequency, bool at_least_freq)
+{
+    if (target_frequency > timer_clock) {
+        // we can't achieve the desired frequency
+        return 0;
+    }
+
+    uint32_t prescaler;
+
+    if (at_least_freq) { // choose a frequency of at least the target, needed by BLHeli_S
+        prescaler = uint32_t(floorf((float) timer_clock / target_frequency + 0.01f) - 1);
+    } else { // original prescaler calculation from betaflight, chooses closest
+        // bi-dir dshot is incredibly sensitive to the bitrate
+        prescaler = uint32_t(lrintf((float) timer_clock / target_frequency + 0.01f) - 1);
+    }
+
+    return prescaler;
+}
+
+/*
+  returns the pwm value scaled to [-1;1] regrading to set_esc_scaling ranges range without constraints.
+*/
+float AP_HAL::RCOutput::scale_esc_to_unity(uint16_t pwm) const
+{
+    return 2.0 * ((float) pwm - _esc_pwm_min) / (_esc_pwm_max - _esc_pwm_min) - 1.0;
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #pragma once
+
+#include "AP_HAL_Namespace.h"
+#include <stdint.h>
+
+#define RC_OUTPUT_MIN_PULSEWIDTH 400
+#define RC_OUTPUT_MAX_PULSEWIDTH 2100
+
+/* Define the CH_n names, indexed from 1, if we don't have them already */
+#ifndef CH_1
+#define CH_1 0
+#define CH_2 1
+#define CH_3 2
+#define CH_4 3
+#define CH_5 4
+#define CH_6 5
+#define CH_7 6
+#define CH_8 7
+#define CH_9 8
+#define CH_10 9
+#define CH_11 10
+#define CH_12 11
+#define CH_13 12
+#define CH_14 13
+#define CH_15 14
+#define CH_16 15
+#define CH_17 16
+#define CH_18 17
+#define CH_19 18
+#define CH_20 19
+#define CH_21 20
+#define CH_22 21
+#define CH_23 22
+#define CH_24 23
+#define CH_25 24
+#define CH_26 25
+#define CH_27 26
+#define CH_28 27
+#define CH_29 28
+#define CH_30 29
+#define CH_31 30
+#define CH_32 31
+#define CH_NONE 255
+#endif
+
+class ByteBuffer;
+
+class ExpandingString;
+
+class AP_HAL::RCOutput {
+public:
+    virtual void init() = 0;
+
+    /* Output freq (1/period) control */
+    virtual void     set_freq(uint32_t chmask, uint16_t freq_hz) = 0;
+    virtual uint16_t get_freq(uint8_t chan) = 0;
+
+    /* Output active/highZ control, either by single channel at a time
+     * or a mask of channels */
+    virtual void     enable_ch(uint8_t chan) = 0;
+    virtual void     disable_ch(uint8_t chan) = 0;
+
+    /*
+     * Output a single channel, possibly grouped with previous writes if
+     * cork() has been called before.
+     */
+    virtual void     write(uint8_t chan, uint16_t period_us) = 0;
+
+    /*
+     * mark the channels in chanmask as reversible. This is needed for some ESC types (such as DShot)
+     * so that output scaling can be performed correctly. The chanmask passed is added (ORed) into any existing mask.
+     * The mask uses servo channel numbering
+     */
+    virtual void     set_reversible_mask(uint32_t chanmask) {}
+    
+    /*
+     * mark the channels in chanmask as reversed.
+     * The chanmask passed is added (ORed) into any existing mask.
+     * The mask uses servo channel numbering
+     */
+    virtual void     set_reversed_mask(uint32_t chanmask) {}
+    virtual uint32_t get_reversed_mask() { return 0; }
+
+    /*
+     * Update channel masks at 1Hz allowing for actions such as dshot commands to be sent
+     */
+    virtual void     update_channel_masks() {}
+
+    /*
+     * Allow channel mask updates to be temporarily suspended
+     */
+    virtual void     disable_channel_mask_updates() {}
+    virtual void     enable_channel_mask_updates() {}
+
+    /*
+     * Delay subsequent calls to write() going to the underlying hardware in
+     * order to group related writes together. When all the needed writes are
+     * done, call push() to commit the changes.
+     */
+    virtual void     cork() = 0;
+
+    /*
+     * Push pending changes to the underlying hardware. All changes between a
+     * call to cork() and push() are pushed together in a single transaction.
+     */
+    virtual void     push() = 0;
+
+    /* Read back current output state, as either single channel or
+     * array of channels. On boards that have a separate IO controller,
+     * this returns the latest output value that the IO controller has
+     * reported */
+    virtual uint16_t read(uint8_t chan) = 0;
+    virtual void     read(uint16_t* period_us, uint8_t len) = 0;
+
+    /* Read the current input state. This returns the last value that was written. */
+    virtual uint16_t read_last_sent(uint8_t chan) { return read(chan); }
+    virtual void     read_last_sent(uint16_t* period_us, uint8_t len) { read(period_us, len); };
+
+    /*
+      set PWM to send to a set of channels if the FMU firmware dies
+     */
+    virtual void     set_failsafe_pwm(uint32_t chmask, uint16_t period_us) {}
+
+    /*
+      force the safety switch on, disabling PWM output from the IO board
+      return false (indicating failure) by default so that boards with no safety switch
+      do not need to implement this method
+     */
+    virtual bool     force_safety_on(void) { return false; }
+
+    /*
+      force the safety switch off, enabling PWM output from the IO board
+     */
+    virtual void     force_safety_off(void) {}
+
+    /*
+      setup scaling of ESC output for ESCs that can output a
+      percentage of power (such as UAVCAN ESCs). The values are in
+      microseconds, and represent minimum and maximum PWM values which
+      will be used to convert channel writes into a percentage
+     */
+    void set_esc_scaling(uint16_t min_pwm, uint16_t max_pwm) {
+        _esc_pwm_min = min_pwm;
+        _esc_pwm_max = max_pwm;
+    }
+
+    /*
+      returns the pwm value scaled to [-1;1] regrading to set_esc_scaling ranges range without constraints.
+     */
+    float scale_esc_to_unity(uint16_t pwm) const;
+
+    /*
+      return the erpm and error rate for a channel if available
+     */
+    virtual uint16_t get_erpm(uint8_t chan) const { return 0; }
+    virtual float get_erpm_error_rate(uint8_t chan) const { return 100.0f; }
+    /*
+      allow all erpm values to be read and for new updates to be detected - primarily for IOMCU
+     */
+    virtual bool  new_erpm() { return false; }
+    virtual uint32_t  read_erpm(uint16_t* erpm, uint8_t len) { return 0; }
+
+    /*
+      enable PX4IO SBUS out at the given rate
+     */
+    virtual bool enable_px4io_sbus_out(uint16_t rate_hz) { return false; }
+
+    /*
+     * Optional method to control the update of the motors. Derived classes
+     * can implement it if their HAL layer requires.
+     */
+    virtual void timer_tick(void) { }
+
+    /*
+      setup for serial output to an ESC using the given
+      baudrate. Assumes 1 start bit, 1 stop bit, LSB first and 8
+      databits. This is used for passthrough ESC configuration and
+      firmware flashing
+
+      While serial output is active normal output to all channels in
+      the chanmask is suspended. Output to some other channels (such
+      as those in the same channel timer groups) may also be stopped,
+      depending on the implementation
+     */
+    virtual bool serial_setup_output(uint8_t chan, uint32_t baudrate, uint32_t chanmask) { return false; }
+
+    /*
+      write a set of bytes to an ESC, using settings from
+      serial_setup_output. This is a blocking call
+     */
+    virtual bool serial_write_bytes(const uint8_t *bytes, uint16_t len) { return false; }
+
+    /*
+      read a series of bytes from a port, using serial parameters from serial_setup_output()
+      return the number of bytes read. This is a blocking call
+     */
+    virtual uint16_t serial_read_bytes(uint8_t *buf, uint16_t len) { return 0; }
+    
+    /*
+      stop serial output. This restores the previous output mode for
+      the channel and any other channels that were stopped by
+      serial_setup_output()
+     */
+    virtual void serial_end(void) {}
+    
+    /*
+      output modes. Allows for support of PWM, oneshot and dshot 
+    */
+    // this enum is used by BLH_OTYPE and ESC_PWM_TYPE on AP_Periph
+    // double check params are still correct when changing
+    enum output_mode {
+        MODE_PWM_NONE,
+        MODE_PWM_NORMAL,
+        MODE_PWM_ONESHOT,
+        MODE_PWM_ONESHOT125,
+        MODE_PWM_BRUSHED,
+        MODE_PWM_DSHOT150,
+        MODE_PWM_DSHOT300,
+        MODE_PWM_DSHOT600,
+        MODE_PWM_DSHOT1200,
+        MODE_NEOPIXEL,  // same as MODE_PWM_DSHOT at 800kHz but it's an LED
+        MODE_PROFILED,  // same as MODE_PWM_DSHOT using separate clock and data
+        MODE_NEOPIXELRGB,  // same as MODE_NEOPIXEL but RGB ordering
+    };
+    // true when the output mode is of type dshot
+    // static to allow use in the ChibiOS thread stuff
+    static bool is_dshot_protocol(const enum output_mode mode);
+
+    static bool is_led_protocol(const enum output_mode mode) {
+      switch (mode) {
+      case MODE_NEOPIXEL:
+      case MODE_NEOPIXELRGB:
+      case MODE_PROFILED:
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    // BLHeli32: https://github.com/bitdump/BLHeli/blob/master/BLHeli_32%20ARM/BLHeli_32%20Firmware%20specs/Digital_Cmd_Spec.txt
+    // BLHeli_S: https://github.com/bitdump/BLHeli/blob/master/BLHeli_S%20SiLabs/Dshotprog%20spec%20BLHeli_S.txt
+    enum BLHeliDshotCommand : uint8_t {
+      DSHOT_RESET = 0,
+      DSHOT_BEEP1 = 1,
+      DSHOT_BEEP2 = 2,
+      DSHOT_BEEP3 = 3,
+      DSHOT_BEEP4 = 4,
+      DSHOT_BEEP5 = 5,
+      DSHOT_ESC_INFO = 6,
+      DSHOT_ROTATE = 7,
+      DSHOT_ROTATE_ALTERNATE = 8,
+      DSHOT_3D_OFF = 9,
+      DSHOT_3D_ON = 10,
+      DSHOT_SAVE = 12,
+      DSHOT_EXTENDED_TELEMETRY_ENABLE = 13,
+      DSHOT_EXTENDED_TELEMETRY_DISABLE = 14,
+      DSHOT_NORMAL = 20,
+      DSHOT_REVERSE = 21,
+      // The following options are only available on BLHeli32
+      DSHOT_LED0_ON = 22,
+      DSHOT_LED1_ON = 23,
+      DSHOT_LED2_ON = 24,
+      DSHOT_LED3_ON = 25,
+      DSHOT_LED0_OFF = 26,
+      DSHOT_LED1_OFF = 27,
+      DSHOT_LED2_OFF = 28,
+      DSHOT_LED3_OFF = 29,
+    };
+
+    const uint8_t DSHOT_ZERO_THROTTLE = 48;
+
+    enum DshotEscType {
+      DSHOT_ESC_NONE = 0,
+      DSHOT_ESC_BLHELI = 1,
+      DSHOT_ESC_BLHELI_S = 2,
+      DSHOT_ESC_BLHELI_EDT = 3,
+      DSHOT_ESC_BLHELI_EDT_S = 4
+    };
+
+    virtual void    set_output_mode(uint32_t mask, enum output_mode mode) {}
+
+    virtual enum output_mode get_output_mode(uint32_t& mask) {
+      mask = 0;
+      return MODE_PWM_NORMAL;
+    }
+
+
+    /*
+     * get output mode banner to inform user of how outputs are configured
+     */
+    virtual bool get_output_mode_banner(char banner_msg[], uint8_t banner_msg_len) const { return false; }
+
+    /*
+     * return mask of channels that must be disabled because they share a group with a digital channel
+     */
+    virtual uint32_t get_disabled_channels(uint32_t digital_mask) { return 0; }
+
+    /*
+      set default update rate
+     */
+    virtual void    set_default_rate(uint16_t rate_hz) {}
+
+    /*
+      enable telemetry request for a mask of channels. This is used
+      with DShot to get telemetry feedback
+     */
+    virtual void set_telem_request_mask(uint32_t mask) {}
+
+    /*
+      enable bi-directional telemetry request for a mask of channels. This is used
+      with DShot to get telemetry feedback
+     */
+    virtual void set_bidir_dshot_mask(uint32_t mask) {}
+
+    /*
+      mark escs as active for the purpose of sending dshot commands
+     */
+    virtual void set_active_escs_mask(uint32_t mask) {}
+
+    /*
+      Set the dshot rate as a multiple of the loop rate
+     */
+    virtual void set_dshot_rate(uint8_t dshot_rate, uint16_t loop_rate_hz) {}
+
+    /*
+      Set the dshot period in us, only for use by the IOMCU
+     */
+    virtual void set_dshot_period(uint32_t period_us, uint8_t dshot_rate) {}
+    virtual uint32_t get_dshot_period_us() const { return 0; }
+
+    /*
+      Set the dshot ESC type
+     */
+    virtual void set_dshot_esc_type(DshotEscType esc_type) {}
+
+    virtual DshotEscType get_dshot_esc_type() const { return DSHOT_ESC_NONE; }
+
+    const static uint32_t ALL_CHANNELS = 255;
+    /*
+      Send a dshot command, if command timeout is 0 then 10 commands are sent
+      chan is the servo channel to send the command to
+     */
+    virtual void send_dshot_command(uint8_t command, uint8_t chan = ALL_CHANNELS, uint32_t command_timeout_ms = 0, uint16_t repeat_count = 10, bool priority = false) {}
+
+    /*
+      set the number of motor poles to be used in rpm calculations
+     */
+    virtual void set_motor_poles(uint8_t poles) {}
+
+    /*
+      setup serial led output for a given channel number, with
+      the given max number of LEDs in the chain.
+     */
+    virtual bool set_serial_led_num_LEDs(const uint16_t chan, uint8_t num_leds, output_mode mode = MODE_PWM_NONE, uint32_t clock_mask = 0) { return false; }
+
+    /*
+      setup serial led output data for a given output channel
+      and led number. A led number of -1 means all LEDs. LED 0 is the first LED
+     */
+    virtual bool set_serial_led_rgb_data(const uint16_t chan, int8_t led, uint8_t red, uint8_t green, uint8_t blue) { return false; }
+
+    /*
+      trigger send of serial led
+     */
+    virtual bool serial_led_send(const uint16_t chan) { return false; }
+
+    virtual void timer_info(ExpandingString &str) {}
+
+    /*
+      Can this driver handle gpio as well as RC
+    */
+    virtual bool supports_gpio() { return false; };
+
+    /*
+      Writes gpio state to a channel
+    */
+    virtual void write_gpio(uint8_t chan, bool active) {};
+
+    /*
+     * calculate the prescaler required to achieve the desire bitrate
+     */
+    static uint32_t calculate_bitrate_prescaler(uint32_t timer_clock, uint32_t target_frequency, bool at_least_freq = false);
+
+    /*
+     * bit width values for different protocols
+     */
+    /*
+     * It seems ESCs are quite sensitive to the DSHOT duty cycle.
+     * Options are (ticks, percentage):
+     * 20/7/14, 35/70
+     * 11/4/8, 36/72
+     * 8/3/6, 37/75 <-- this is the preferred duty cycle and has some support on the interwebs
+     */
+    // bitwidths: 8/3/6 == 37%/75%
+    static constexpr uint32_t DSHOT_BIT_WIDTH_TICKS_DEFAULT = 8;
+    static constexpr uint32_t DSHOT_BIT_0_TICKS_DEFAULT = 3;
+    static constexpr uint32_t DSHOT_BIT_1_TICKS_DEFAULT = 6;
+    // bitwidths: 11/4/8 == 36%/72%
+    static constexpr uint32_t DSHOT_BIT_WIDTH_TICKS_S = 11;
+    static constexpr uint32_t DSHOT_BIT_0_TICKS_S = 4;
+    static constexpr uint32_t DSHOT_BIT_1_TICKS_S = 8;
+
+    static uint32_t DSHOT_BIT_WIDTH_TICKS;
+    static uint32_t DSHOT_BIT_0_TICKS;
+    static uint32_t DSHOT_BIT_1_TICKS;
+
+    // See WS2812B spec for expected pulse widths
+    static constexpr uint32_t NEOP_BIT_WIDTH_TICKS = 8;
+    static constexpr uint32_t NEOP_BIT_0_TICKS = 2;
+    static constexpr uint32_t NEOP_BIT_1_TICKS = 6;
+    // neopixel does not use pulse widths at all
+    static constexpr uint32_t PROFI_BIT_0_TICKS = 7;
+    static constexpr uint32_t PROFI_BIT_1_TICKS = 14;
+    static constexpr uint32_t PROFI_BIT_WIDTH_TICKS = 20;
+
+    // suitably long LED output period to support high LED counts
+    static constexpr uint32_t LED_OUTPUT_PERIOD_US = 10000;
+
+protected:
+
+    // helper functions for implementation of get_output_mode_banner
+    void append_to_banner(char banner_msg[], uint8_t banner_msg_len, output_mode out_mode, uint8_t low_ch, uint8_t high_ch) const;
+    const char* get_output_mode_string(enum output_mode out_mode) const;
+
+    uint16_t _esc_pwm_min;
+    uint16_t _esc_pwm_max;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "SIMState.h"
+
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+
+/*
+ *  This is a very-much-cut-down AP_HAL_SITL object.  We should make
+ *  PA_HAL_SITL use this object - by moving a lot more code from over
+ *  there into here.
+ */
+
+#include <SITL/SIM_Multicopter.h>
+#include <SITL/SIM_Helicopter.h>
+#include <SITL/SIM_SingleCopter.h>
+#include <SITL/SIM_Plane.h>
+#include <SITL/SIM_Glider.h>
+#include <SITL/SIM_QuadPlane.h>
+#include <SITL/SIM_Rover.h>
+#include <SITL/SIM_BalanceBot.h>
+#include <SITL/SIM_Sailboat.h>
+#include <SITL/SIM_MotorBoat.h>
+#include <SITL/SIM_Tracker.h>
+#include <SITL/SIM_Submarine.h>
+#include <SITL/SIM_Blimp.h>
+#include <SITL/SIM_NoVehicle.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+#include <AP_Baro/AP_Baro.h>
+
+extern const AP_HAL::HAL& hal;
+
+using namespace AP_HAL;
+
+#include <AP_Terrain/AP_Terrain.h>
+
+#ifndef AP_SIM_FRAME_CLASS
+#if APM_BUILD_TYPE(APM_BUILD_ArduCopter)
+#define AP_SIM_FRAME_CLASS MultiCopter
+#elif APM_BUILD_TYPE(APM_BUILD_Heli)
+#define AP_SIM_FRAME_CLASS Helicopter
+#elif APM_BUILD_TYPE(APM_BUILD_AntennaTracker)
+#define AP_SIM_FRAME_CLASS Tracker
+#elif APM_BUILD_TYPE(APM_BUILD_ArduPlane)
+#define AP_SIM_FRAME_CLASS Plane
+#elif APM_BUILD_TYPE(APM_BUILD_Rover)
+#define AP_SIM_FRAME_CLASS SimRover
+#elif APM_BUILD_TYPE(APM_BUILD_Blimp)
+#define AP_SIM_FRAME_CLASS Blimp
+#elif APM_BUILD_TYPE(APM_BUILD_ArduSub)
+#define AP_SIM_FRAME_CLASS Submarine
+#else
+#define AP_SIM_FRAME_CLASS NoVehicle
+#endif
+#endif
+
+#ifndef AP_SIM_FRAME_STRING
+#if APM_BUILD_TYPE(APM_BUILD_ArduCopter)
+#define AP_SIM_FRAME_STRING "+"
+#elif APM_BUILD_TYPE(APM_BUILD_Heli)
+#define AP_SIM_FRAME_STRING "heli"
+#elif APM_BUILD_TYPE(APM_BUILD_AntennaTracker)
+#define AP_SIM_FRAME_STRING "tracker"
+#elif APM_BUILD_TYPE(APM_BUILD_ArduPlane)
+#define AP_SIM_FRAME_STRING "plane"
+#elif APM_BUILD_TYPE(APM_BUILD_Rover)
+#define AP_SIM_FRAME_STRING "rover"
+#elif APM_BUILD_TYPE(APM_BUILD_Blimp)
+#define AP_SIM_FRAME_STRING "blimp"
+#elif APM_BUILD_TYPE(APM_BUILD_ArduSub)
+#define AP_SIM_FRAME_STRING "sub"
+#else
+#define AP_SIM_FRAME_STRING ""
+#endif
+#endif
+
+
+void SIMState::update()
+{
+    static bool init_done;
+    if (!init_done) {
+        init_done = true;
+        sitl_model = SITL::AP_SIM_FRAME_CLASS::create(AP_SIM_FRAME_STRING);
+    }
+
+    _fdm_input_step();
+}
+
+/*
+  setup for SITL handling
+ */
+void SIMState::_sitl_setup(const char *home_str)
+{
+    _home_str = home_str;
+
+    printf("Starting SITL input\n");
+}
+
+
+/*
+  step the FDM by one time step
+ */
+void SIMState::_fdm_input_step(void)
+{
+    fdm_input_local();
+}
+
+/*
+  get FDM input from a local model
+ */
+void SIMState::fdm_input_local(void)
+{
+    struct sitl_input input;
+
+    // construct servos structure for FDM
+    _simulator_servos(input);
+
+    // read servo inputs from ride along flight controllers
+    // ride_along.receive(input);
+
+    // update the model
+    sitl_model->update_home();
+    sitl_model->update_model(input);
+
+    // get FDM output from the model
+    if (_sitl == nullptr) {
+        _sitl = AP::sitl();
+    }
+    if (_sitl) {
+        sitl_model->fill_fdm(_sitl->state);
+    }
+
+    // output JSON state to ride along flight controllers
+    // ride_along.send(_sitl->state,sitl_model->get_position_relhome());
+
+#if AP_SIM_SOLOGIMBAL_ENABLED
+    if (gimbal != nullptr) {
+        gimbal->update();
+    }
+#endif
+#if HAL_SIM_ADSB_ENABLED
+    if (adsb != nullptr) {
+        adsb->update();
+    }
+#endif
+    if (vicon != nullptr) {
+        Quaternion attitude;
+        sitl_model->get_attitude(attitude);
+        vicon->update(sitl_model->get_location(),
+                      sitl_model->get_position_relhome(),
+                      sitl_model->get_velocity_ef(),
+                      attitude);
+    }
+    if (benewake_tf02 != nullptr) {
+        benewake_tf02->update(sitl_model->rangefinder_range());
+    }
+    if (benewake_tf03 != nullptr) {
+        benewake_tf03->update(sitl_model->rangefinder_range());
+    }
+    if (benewake_tfmini != nullptr) {
+        benewake_tfmini->update(sitl_model->rangefinder_range());
+    }
+    if (nooploop != nullptr) {
+        nooploop->update(sitl_model->rangefinder_range());
+    }
+    if (teraranger_serial != nullptr) {
+        teraranger_serial->update(sitl_model->rangefinder_range());
+    }
+    if (lightwareserial != nullptr) {
+        lightwareserial->update(sitl_model->rangefinder_range());
+    }
+    if (lightwareserial_binary != nullptr) {
+        lightwareserial_binary->update(sitl_model->rangefinder_range());
+    }
+    if (lanbao != nullptr) {
+        lanbao->update(sitl_model->rangefinder_range());
+    }
+    if (blping != nullptr) {
+        blping->update(sitl_model->rangefinder_range());
+    }
+    if (leddarone != nullptr) {
+        leddarone->update(sitl_model->rangefinder_range());
+    }
+    if (rds02uf != nullptr) {
+        rds02uf->update(sitl_model->rangefinder_range());
+    }
+    if (USD1_v0 != nullptr) {
+        USD1_v0->update(sitl_model->rangefinder_range());
+    }
+    if (USD1_v1 != nullptr) {
+        USD1_v1->update(sitl_model->rangefinder_range());
+    }
+    if (maxsonarseriallv != nullptr) {
+        maxsonarseriallv->update(sitl_model->rangefinder_range());
+    }
+    if (wasp != nullptr) {
+        wasp->update(sitl_model->rangefinder_range());
+    }
+    if (nmea != nullptr) {
+        nmea->update(sitl_model->rangefinder_range());
+    }
+    if (rf_mavlink != nullptr) {
+        rf_mavlink->update(sitl_model->rangefinder_range());
+    }
+    if (gyus42v2 != nullptr) {
+        gyus42v2->update(sitl_model->rangefinder_range());
+    }
+    if (efi_ms != nullptr) {
+        efi_ms->update();
+    }
+
+    if (frsky_d != nullptr) {
+        frsky_d->update();
+    }
+
+#if AP_SIM_CRSF_ENABLED
+    if (crsf != nullptr) {
+        crsf->update();
+    }
+#endif
+
+#if HAL_SIM_PS_RPLIDARA2_ENABLED
+    if (rplidara2 != nullptr) {
+        rplidara2->update(sitl_model->get_location());
+    }
+#endif
+
+#if HAL_SIM_PS_TERARANGERTOWER_ENABLED
+    if (terarangertower != nullptr) {
+        terarangertower->update(sitl_model->get_location());
+    }
+#endif
+
+#if HAL_SIM_PS_LIGHTWARE_SF45B_ENABLED
+    if (sf45b != nullptr) {
+        sf45b->update(sitl_model->get_location());
+    }
+#endif
+
+    if (vectornav != nullptr) {
+        vectornav->update();
+    }
+
+    if (microstrain5 != nullptr) {
+        microstrain5->update();
+    }
+    if (inertiallabs != nullptr) {
+        inertiallabs->update();
+    }
+
+#if HAL_SIM_AIS_ENABLED
+    if (ais != nullptr) {
+        ais->update();
+    }
+#endif
+    for (uint8_t i=0; i<ARRAY_SIZE(gps); i++) {
+        if (gps[i] != nullptr) {
+            gps[i]->update();
+        }
+    }
+
+    // update simulation time
+    if (_sitl) {
+        hal.scheduler->stop_clock(_sitl->state.timestamp_us);
+    } else {
+        hal.scheduler->stop_clock(AP_HAL::micros64()+100);
+    }
+
+    set_height_agl();
+
+    _synthetic_clock_mode = true;
+    _update_count++;
+}
+
+/*
+  create sitl_input structure for sending to FDM
+ */
+void SIMState::_simulator_servos(struct sitl_input &input)
+{
+    // output at chosen framerate
+    uint32_t now = AP_HAL::micros();
+
+    // find the barometer object if it exists
+    const auto *_barometer = AP_Baro::get_singleton();
+
+    float altitude = _barometer?_barometer->get_altitude():0;
+    float wind_speed = 0;
+    float wind_direction = 0;
+    float wind_dir_z = 0;
+
+    // give 5 seconds to calibrate airspeed sensor at 0 wind speed
+    if (wind_start_delay_micros == 0) {
+        wind_start_delay_micros = now;
+    } else if (_sitl && (now - wind_start_delay_micros) > 5000000 ) {
+        // The EKF does not like step inputs so this LPF keeps it happy.
+        wind_speed =     _sitl->wind_speed_active     = (0.95f*_sitl->wind_speed_active)     + (0.05f*_sitl->wind_speed);
+        wind_direction = _sitl->wind_direction_active = (0.95f*_sitl->wind_direction_active) + (0.05f*_sitl->wind_direction);
+        wind_dir_z =     _sitl->wind_dir_z_active     = (0.95f*_sitl->wind_dir_z_active)     + (0.05f*_sitl->wind_dir_z);
+        
+        // pass wind into simulators using different wind types via param SIM_WIND_T*.
+        switch (_sitl->wind_type) {
+        case SITL::SIM::WIND_TYPE_SQRT:
+            if (altitude < _sitl->wind_type_alt) {
+                wind_speed *= sqrtf(MAX(altitude / _sitl->wind_type_alt, 0));
+            }
+            break;
+
+        case SITL::SIM::WIND_TYPE_COEF:
+            wind_speed += (altitude - _sitl->wind_type_alt) * _sitl->wind_type_coef;
+            break;
+
+        case SITL::SIM::WIND_TYPE_NO_LIMIT:
+        default:
+            break;
+        }
+
+        // never allow negative wind velocity
+        wind_speed = MAX(wind_speed, 0);
+    }
+
+    input.wind.speed = wind_speed;
+    input.wind.direction = wind_direction;
+    input.wind.turbulence = _sitl?_sitl->wind_turbulance:0;
+    input.wind.dir_z = wind_dir_z;
+
+    for (uint8_t i=0; i<SITL_NUM_CHANNELS; i++) {
+        if (pwm_output[i] == 0xFFFF) {
+            input.servos[i] = 0;
+        } else {
+            input.servos[i] = pwm_output[i];
+        }
+    }
+
+    if (_sitl != nullptr) {
+        // FETtec ESC simulation support.  Input signals of 1000-2000
+        // are positive thrust, 0 to 1000 are negative thrust.  Deeper
+        // changes required to support negative thrust - potentially
+        // adding a field to input.
+        if (_sitl != nullptr) {
+            if (_sitl->fetteconewireesc_sim.enabled()) {
+                _sitl->fetteconewireesc_sim.update_sitl_input_pwm(input);
+                for (uint8_t i=0; i<ARRAY_SIZE(input.servos); i++) {
+                    if (input.servos[i] != 0 && input.servos[i] < 1000) {
+                        AP_HAL::panic("Bad input servo value (%u)", input.servos[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    float voltage = 0;
+    _current = 0;
+    
+    if (_sitl != nullptr) {
+        if (_sitl->state.battery_voltage <= 0) {
+        } else {
+            // FDM provides voltage and current
+            voltage = _sitl->state.battery_voltage;
+            _current = _sitl->state.battery_current;
+        }
+    }
+
+    // assume 3DR power brick
+    voltage_pin_value = ((voltage / 10.1f) / 5.0f) * 1024;
+    current_pin_value = ((_current / 17.0f) / 5.0f) * 1024;
+    // fake battery2 as just a 25% gain on the first one
+    voltage2_pin_value = ((voltage * 0.25f / 10.1f) / 5.0f) * 1024;
+    current2_pin_value = ((_current * 0.25f / 17.0f) / 5.0f) * 1024;
+}
+
+/*
+  set height above the ground in meters
+ */
+void SIMState::set_height_agl(void)
+{
+    static float home_alt = -1;
+
+    if (!_sitl) {
+        // in example program
+        return;
+    }
+
+    if (is_equal(home_alt, -1.0f) && _sitl->state.altitude > 0) {
+        // remember home altitude as first non-zero altitude
+        home_alt = _sitl->state.altitude;
+    }
+
+#if AP_TERRAIN_AVAILABLE
+    if (_sitl != nullptr &&
+        _sitl->terrain_enable) {
+        // get height above terrain from AP_Terrain. This assumes
+        // AP_Terrain is working
+        float terrain_height_amsl;
+        Location location;
+        location.lat = _sitl->state.latitude*1.0e7;
+        location.lng = _sitl->state.longitude*1.0e7;
+
+        AP_Terrain *_terrain = AP_Terrain::get_singleton();
+        if (_terrain != nullptr &&
+            _terrain->height_amsl(location, terrain_height_amsl)) {
+            _sitl->state.height_agl = _sitl->state.altitude - terrain_height_amsl;
+            return;
+        }
+    }
+#endif
+
+    if (_sitl != nullptr) {
+        // fall back to flat earth model
+        _sitl->state.height_agl = _sitl->state.altitude - home_alt;
+    }
+}
+
+#endif  // AP_SIM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #pragma once
+
+#include <SITL/SITL.h>
+
+#if AP_SIM_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+
+#include <SITL/SITL_Input.h>
+#include <SITL/SIM_SoloGimbal.h>
+#include <SITL/SIM_ADSB.h>
+#include <SITL/SIM_Vicon.h>
+#include <SITL/SIM_RF_Benewake_TF02.h>
+#include <SITL/SIM_RF_Benewake_TF03.h>
+#include <SITL/SIM_RF_Benewake_TFmini.h>
+#include <SITL/SIM_RF_NoopLoop.h>
+#include <SITL/SIM_RF_TeraRanger_Serial.h>
+#include <SITL/SIM_RF_LightWareSerial.h>
+#include <SITL/SIM_RF_LightWareSerialBinary.h>
+#include <SITL/SIM_RF_Lanbao.h>
+#include <SITL/SIM_RF_BLping.h>
+#include <SITL/SIM_RF_LeddarOne.h>
+#include <SITL/SIM_RF_RDS02UF.h>
+#include <SITL/SIM_RF_USD1_v0.h>
+#include <SITL/SIM_RF_USD1_v1.h>
+#include <SITL/SIM_RF_MaxsonarSerialLV.h>
+#include <SITL/SIM_RF_Wasp.h>
+#include <SITL/SIM_RF_NMEA.h>
+#include <SITL/SIM_RF_MAVLink.h>
+#include <SITL/SIM_RF_GYUS42v2.h>
+#include <SITL/SIM_VectorNav.h>
+#include <SITL/SIM_MicroStrain.h>
+#include <SITL/SIM_InertialLabs.h>
+#include <SITL/SIM_AIS.h>
+#include <SITL/SIM_GPS.h>
+
+#include <SITL/SIM_EFI_Hirth.h>
+
+#include <SITL/SIM_Frsky_D.h>
+#include <SITL/SIM_CRSF.h>
+#include <SITL/SIM_PS_RPLidarA2.h>
+#include <SITL/SIM_PS_TeraRangerTower.h>
+#include <SITL/SIM_PS_LightWare_SF45B.h>
+
+#include <SITL/SIM_RichenPower.h>
+#include <SITL/SIM_Loweheiser.h>
+#include <SITL/SIM_FETtecOneWireESC.h>
+#include <AP_HAL/utility/Socket_native.h>
+
+#include <AP_HAL/AP_HAL_Namespace.h>
+
+class AP_HAL::SIMState {
+public:
+
+    // simulated airspeed, sonar and battery monitor
+    uint16_t sonar_pin_value;    // pin 0
+    uint16_t airspeed_pin_value[2]; // pin 1
+    uint16_t voltage_pin_value;  // pin 13
+    uint16_t current_pin_value;  // pin 12
+    uint16_t voltage2_pin_value;  // pin 15
+    uint16_t current2_pin_value;  // pin 14
+
+    void update();
+
+#if HAL_SIM_GPS_ENABLED
+    void set_gps0(SITL::GPS *_gps) { gps[0] = _gps; }
+#endif
+
+    uint16_t pwm_output[32];  // was SITL_NUM_CHANNELS
+
+private:
+    void _set_param_default(const char *parm);
+    void _sitl_setup(const char *home_str);
+    void _setup_timer(void);
+    void _setup_adc(void);
+
+    void set_height_agl(void);
+    void _set_signal_handlers(void) const;
+
+    void _update_airspeed(float airspeed);
+    void _simulator_servos(struct sitl_input &input);
+    void _fdm_input_step(void);
+    void fdm_input_local(void);
+
+    void wait_clock(uint64_t wait_time_usec);
+
+    uint16_t pwm_input[16];  // was SITL_RC_INPUT_CHANNELS
+
+    // internal state
+    // enum vehicle_type _vehicle;
+    uint8_t _instance;
+    uint16_t _base_port;
+    pid_t _parent_pid;
+    uint32_t _update_count;
+
+    SITL::SIM *_sitl;
+    uint16_t _rcin_port;
+    uint16_t _fg_view_port;
+    uint16_t _irlock_port;
+    float _current;
+
+    bool _synthetic_clock_mode;
+
+    bool _use_rtscts;
+    bool _use_fg_view;
+    
+    const char *_fg_address;
+
+    // internal SITL model
+    SITL::Aircraft *sitl_model;
+
+#if AP_SIM_SOLOGIMBAL_ENABLED
+    // simulated gimbal
+    bool enable_gimbal;
+    SITL::SoloGimbal *gimbal;
+#endif
+
+#if HAL_SIM_ADSB_ENABLED
+    // simulated ADSb
+    SITL::ADSB *adsb;
+#endif
+
+    // simulated vicon system:
+    SITL::Vicon *vicon;
+
+    // simulated Benewake tf02 rangefinder:
+    SITL::RF_Benewake_TF02 *benewake_tf02;
+    // simulated Benewake tf03 rangefinder:
+    SITL::RF_Benewake_TF03 *benewake_tf03;
+    // simulated Benewake tfmini rangefinder:
+    SITL::RF_Benewake_TFmini *benewake_tfmini;
+    //simulated NoopLoop TOFSense rangefinder:
+    SITL::RF_Nooploop *nooploop;
+    // simulated TeraRangerSerial rangefinder:
+    SITL::RF_TeraRanger_Serial *teraranger_serial;
+
+    // simulated LightWareSerial rangefinder - legacy protocol::
+    SITL::RF_LightWareSerial *lightwareserial;
+    // simulated LightWareSerial rangefinder - binary protocol:
+    SITL::RF_LightWareSerialBinary *lightwareserial_binary;
+    // simulated Lanbao rangefinder:
+    SITL::RF_Lanbao *lanbao;
+    // simulated BLping rangefinder:
+    SITL::RF_BLping *blping;
+    // simulated LeddarOne rangefinder:
+    SITL::RF_LeddarOne *leddarone;
+    // simulated RDS02UF rangefinder:
+    SITL::RF_RDS02UF *rds02uf;
+    // simulated USD1 v0 rangefinder:
+    SITL::RF_USD1_v0 *USD1_v0;
+    // simulated USD1 v1 rangefinder:
+    SITL::RF_USD1_v1 *USD1_v1;
+    // simulated MaxsonarSerialLV rangefinder:
+    SITL::RF_MaxsonarSerialLV *maxsonarseriallv;
+    // simulated Wasp rangefinder:
+    SITL::RF_Wasp *wasp;
+    // simulated NMEA rangefinder:
+    SITL::RF_NMEA *nmea;
+    // simulated MAVLink rangefinder:
+    SITL::RF_MAVLink *rf_mavlink;
+    // simulated GYUS42v2 rangefinder:
+    SITL::RF_GYUS42v2 *gyus42v2;
+
+    // simulated Frsky devices
+    SITL::Frsky_D *frsky_d;
+    // SITL::Frsky_SPort *frsky_sport;
+    // SITL::Frsky_SPortPassthrough *frsky_sportpassthrough;
+
+#if HAL_SIM_PS_RPLIDARA2_ENABLED
+    // simulated RPLidarA2:
+    SITL::PS_RPLidarA2 *rplidara2;
+#endif
+
+    // simulated FETtec OneWire ESCs:
+    SITL::FETtecOneWireESC *fetteconewireesc;
+
+#if HAL_SIM_PS_LIGHTWARE_SF45B_ENABLED
+    // simulated SF45B proximity sensor:
+    SITL::PS_LightWare_SF45B *sf45b;
+#endif
+
+#if HAL_SIM_PS_TERARANGERTOWER_ENABLED
+    SITL::PS_TeraRangerTower *terarangertower;
+#endif
+
+#if AP_SIM_CRSF_ENABLED
+    // simulated CRSF devices
+    SITL::CRSF *crsf;
+#endif
+
+    // simulated VectorNav system:
+    SITL::VectorNav *vectornav;
+
+    // simulated MicroStrain Series 5 system
+    SITL::MicroStrain5 *microstrain5;
+
+    // simulated MicroStrain Series 7 system
+    SITL::MicroStrain7 *microstrain7;
+
+    // simulated InertialLabs INS-U
+    SITL::InertialLabs *inertiallabs;
+    
+#if HAL_SIM_JSON_MASTER_ENABLED
+    // Ride along instances via JSON SITL backend
+    SITL::JSON_Master ride_along;
+#endif
+
+#if HAL_SIM_AIS_ENABLED
+    // simulated AIS stream
+    SITL::AIS *ais;
+#endif
+
+    // simulated EFI MegaSquirt device:
+    SITL::EFI_MegaSquirt *efi_ms;
+
+    // simulated EFI Hirth device:
+    SITL::EFI_Hirth *efi_hirth;
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    // output socket for flightgear viewing
+    SocketAPM_native fg_socket{true};
+#endif
+
+    const char *defaults_path = HAL_PARAM_DEFAULTS_PATH;
+
+    const char *_home_str;
+
+    uint32_t wind_start_delay_micros;
+
+#if HAL_SIM_GPS_ENABLED
+    // simulated GPS devices
+    SITL::GPS *gps[2];  // constrained by # of parameter sets
+#endif
+};
+
+#endif // AP_SIM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+ * Copyright (C) 2015-2016  Intel Corporation. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <inttypes.h>
+
+#include "AP_HAL_Namespace.h"
+#include "Device.h"
+#include "utility/OwnPtr.h"
+
+namespace AP_HAL {
+
+class SPIDevice : public Device {
+public:
+    SPIDevice() : Device(BUS_TYPE_SPI) { }
+
+    virtual ~SPIDevice() { }
+    /* Device implementation */
+
+    /* See Device::set_speed() */
+    virtual bool set_speed(Device::Speed speed) override = 0;
+
+    /* See Device::transfer() */
+    virtual bool transfer(const uint8_t *send, uint32_t send_len,
+                          uint8_t *recv, uint32_t recv_len) override = 0;
+
+    /*
+     * Like #transfer(), but both @send and @recv buffers are transmitted at
+     * the same time: because of this they need to be of the same size.
+     */
+    virtual bool transfer_fullduplex(const uint8_t *send, uint8_t *recv,
+                                     uint32_t len) = 0;
+
+    /* 
+     *  send N bytes of clock pulses without taking CS. This is used
+     *  when initialising microSD interfaces over SPI
+    */
+    virtual bool clock_pulse(uint32_t len) { return false; }
+    
+    /* See Device::get_semaphore() */
+    virtual Semaphore *get_semaphore() override = 0;
+
+    /* See Device::register_periodic_callback() */
+    virtual Device::PeriodicHandle register_periodic_callback(
+        uint32_t period_usec, Device::PeriodicCb) override = 0;
+
+    /* See Device::adjust_periodic_callback() */
+    virtual bool adjust_periodic_callback(
+        PeriodicHandle h, uint32_t period_usec) override { return false; }
+
+    // setup a bus clock slowdown factor (optional interface)
+    virtual void set_slowdown(uint8_t slowdown) {}
+};
+
+class SPIDeviceManager {
+public:
+    virtual OwnPtr<SPIDevice> get_device(const char *name)
+    {
+        return nullptr;
+    }
+
+    /* Return the number of SPI devices currently registered. */
+    virtual uint8_t get_count() { return 0; }
+
+    /* Get spi device name at @idx */
+    virtual const char *get_device_name(uint8_t idx) { return nullptr; }
+
+    virtual void set_register_rw_callback(const char* name, AP_HAL::Device::RegisterRWCb cb) {}
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   

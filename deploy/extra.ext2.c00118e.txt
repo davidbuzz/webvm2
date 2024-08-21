@@ -1,0 +1,2595 @@
+H[i][22] * P[22][j];
+                res += KH[i][23] * P[23][j];
+                KHP[i][j] = res;
+            }
+        }
+        for (unsigned i = 0; i<=stateIndexLim; i++) {
+            for (unsigned j = 0; j<=stateIndexLim; j++) {
+                P[i][j] = P[i][j] - KHP[i][j];
+            }
+        }
+    }
+
+    // force the covariance matrix to be symmetrical and limit the variances to prevent ill-conditioning.
+    ForceSymmetry();
+    ConstrainVariances();
+}
+
+#if EK3_FEATURE_DRAG_FUSION
+/*
+ * Fuse X and Y body axis specific forces using explicit algebraic equations generated with SymPy.
+ * See AP_NavEKF3/derivation/main.py for derivation
+ * Output for change reference: AP_NavEKF3/derivation/generated/acc_bf_generated.cpp
+*/
+void NavEKF3_core::FuseDragForces()
+{
+    // drag model parameters
+    const ftype bcoef_x = frontend->_ballisticCoef_x;
+    const ftype bcoef_y = frontend->_ballisticCoef_y;
+    const ftype mcoef = frontend->_momentumDragCoef.get();
+    const bool using_bcoef_x = bcoef_x > 1.0f;
+    const bool using_bcoef_y = bcoef_y > 1.0f;
+    const bool using_mcoef = mcoef > 0.001f;
+
+    ZERO_FARRAY(Kfusion);
+    Vector24 Hfusion; // Observation Jacobians
+    const ftype R_ACC = sq(fmaxF(frontend->_dragObsNoise, 0.5f));
+    const ftype density_ratio = sqrtF(dal.get_EAS2TAS());
+    const ftype rho = fmaxF(1.225f * density_ratio, 0.1f); // air density
+
+    // get latest estimated orientation
+    const ftype &q0 = stateStruct.quat[0];
+    const ftype &q1 = stateStruct.quat[1];
+    const ftype &q2 = stateStruct.quat[2];
+    const ftype &q3 = stateStruct.quat[3];
+
+    // get latest velocity in earth frame
+    const ftype &vn = stateStruct.velocity.x;
+    const ftype &ve = stateStruct.velocity.y;
+    const ftype &vd = stateStruct.velocity.z;
+
+    // get latest wind velocity in earth frame
+    const ftype &vwn = stateStruct.wind_vel.x;
+    const ftype &vwe = stateStruct.wind_vel.y;
+
+    // predicted specific forces
+    // calculate relative wind velocity in earth frame and rotate into body frame
+    const Vector3F rel_wind_earth(vn - vwn, ve - vwe, vd);
+    const Vector3F rel_wind_body = prevTnb * rel_wind_earth;
+
+    // perform sequential fusion of XY specific forces
+    for (uint8_t axis_index = 0; axis_index < 2; axis_index++) {
+        // correct accel data for bias
+        const ftype mea_acc = dragSampleDelayed.accelXY[axis_index]  - stateStruct.accel_bias[axis_index] / dtEkfAvg;
+
+        // Acceleration in m/s/s predicted using vehicle and wind velocity estimates
+        // Initialised to measured value and updated later using available drag model
+        ftype predAccel = mea_acc;
+
+        // predicted sign of drag force
+        const ftype dragForceSign = is_positive(rel_wind_body[axis_index]) ? -1.0f : 1.0f;
+
+        if (axis_index == 0) {
+            // drag can be modelled as an arbitrary  combination of bluff body drag that proportional to
+            // speed squared, and rotor momentum drag that is proportional to speed.
+            ftype Kacc; // Derivative of specific force wrt airspeed
+            if (using_mcoef && using_bcoef_x) {
+                // mixed bluff body and propeller momentum drag
+                const ftype airSpd = (bcoef_x / rho) * (- mcoef + sqrtF(sq(mcoef) + 2.0f * (rho / bcoef_x) * fabsF(mea_acc)));
+                Kacc = fmaxF(1e-1f, (rho / bcoef_x) * airSpd + mcoef * density_ratio);
+                predAccel = (0.5f / bcoef_x) * rho * sq(rel_wind_body[0]) * dragForceSign - rel_wind_body[0] * mcoef * density_ratio;
+            } else if (using_mcoef) {
+                // propeller momentum drag only
+                Kacc = fmaxF(1e-1f, mcoef * density_ratio);
+                predAccel = - rel_wind_body[0] * mcoef * density_ratio;
+            } else if (using_bcoef_x) {
+                // bluff body drag only
+                const ftype airSpd = sqrtF((2.0f * bcoef_x * fabsF(mea_acc)) / rho);
+                Kacc = fmaxF(1e-1f, (rho / bcoef_x) * airSpd);
+                predAccel = (0.5f / bcoef_x) * rho * sq(rel_wind_body[0]) * dragForceSign;
+            } else {
+                // skip this axis
+                continue;
+            }
+
+            // intermediate variables
+            const ftype HK0 = vn - vwn;
+            const ftype HK1 = ve - vwe;
+            const ftype HK2 = HK0*q0 + HK1*q3 - q2*vd;
+            const ftype HK3 = 2*Kacc;
+            const ftype HK4 = HK0*q1 + HK1*q2 + q3*vd;
+            const ftype HK5 = HK0*q2 - HK1*q1 + q0*vd;
+            const ftype HK6 = -HK0*q3 + HK1*q0 + q1*vd;
+            const ftype HK7 = sq(q0) + sq(q1) - sq(q2) - sq(q3);
+            const ftype HK8 = HK7*Kacc;
+            const ftype HK9 = q0*q3 + q1*q2;
+            const ftype HK10 = HK3*HK9;
+            const ftype HK11 = q0*q2 - q1*q3;
+            const ftype HK12 = 2*HK9;
+            const ftype HK13 = 2*HK11;
+            const ftype HK14 = 2*HK4;
+            const ftype HK15 = 2*HK2;
+            const ftype HK16 = 2*HK5;
+            const ftype HK17 = 2*HK6;
+            const ftype HK18 = -HK12*P[0][23] + HK12*P[0][5] - HK13*P[0][6] + HK14*P[0][1] + HK15*P[0][0] - HK16*P[0][2] + HK17*P[0][3] - HK7*P[0][22] + HK7*P[0][4];
+            const ftype HK19 = HK12*P[5][23];
+            const ftype HK20 = -HK12*P[23][23] - HK13*P[6][23] + HK14*P[1][23] + HK15*P[0][23] - HK16*P[2][23] + HK17*P[3][23] + HK19 - HK7*P[22][23] + HK7*P[4][23];
+            const ftype HK21 = sq(Kacc);
+            const ftype HK22 = HK12*HK21;
+            const ftype HK23 = HK12*P[5][5] - HK13*P[5][6] + HK14*P[1][5] + HK15*P[0][5] - HK16*P[2][5] + HK17*P[3][5] - HK19 + HK7*P[4][5] - HK7*P[5][22];
+            const ftype HK24 = HK12*P[5][6] - HK12*P[6][23] - HK13*P[6][6] + HK14*P[1][6] + HK15*P[0][6] - HK16*P[2][6] + HK17*P[3][6] + HK7*P[4][6] - HK7*P[6][22];
+            const ftype HK25 = HK7*P[4][22];
+            const ftype HK26 = -HK12*P[4][23] + HK12*P[4][5] - HK13*P[4][6] + HK14*P[1][4] + HK15*P[0][4] - HK16*P[2][4] + HK17*P[3][4] - HK25 + HK7*P[4][4];
+            const ftype HK27 = HK21*HK7;
+            const ftype HK28 = -HK12*P[22][23] + HK12*P[5][22] - HK13*P[6][22] + HK14*P[1][22] + HK15*P[0][22] - HK16*P[2][22] + HK17*P[3][22] + HK25 - HK7*P[22][22];
+            const ftype HK29 = -HK12*P[1][23] + HK12*P[1][5] - HK13*P[1][6] + HK14*P[1][1] + HK15*P[0][1] - HK16*P[1][2] + HK17*P[1][3] - HK7*P[1][22] + HK7*P[1][4];
+            const ftype HK30 = -HK12*P[2][23] + HK12*P[2][5] - HK13*P[2][6] + HK14*P[1][2] + HK15*P[0][2] - HK16*P[2][2] + HK17*P[2][3] - HK7*P[2][22] + HK7*P[2][4];
+            const ftype HK31 = -HK12*P[3][23] + HK12*P[3][5] - HK13*P[3][6] + HK14*P[1][3] + HK15*P[0][3] - HK16*P[2][3] + HK17*P[3][3] - HK7*P[3][22] + HK7*P[3][4];
+            // const ftype HK32 = Kacc/(-HK13*HK21*HK24 + HK14*HK21*HK29 + HK15*HK18*HK21 - HK16*HK21*HK30 + HK17*HK21*HK31 - HK20*HK22 + HK22*HK23 + HK26*HK27 - HK27*HK28 + R_ACC);
+
+            // calculate innovation variance and exit if badly conditioned
+            innovDragVar.x = (-HK13*HK21*HK24 + HK14*HK21*HK29 + HK15*HK18*HK21 - HK16*HK21*HK30 + HK17*HK21*HK31 - HK20*HK22 + HK22*HK23 + HK26*HK27 - HK27*HK28 + R_ACC);
+            if (innovDragVar.x < R_ACC) {
+                return;
+            }
+            const ftype HK32 = Kacc / innovDragVar.x;
+
+            // Observation Jacobians
+            Hfusion[0] = -HK2*HK3;
+            Hfusion[1] = -HK3*HK4;
+            Hfusion[2] = HK3*HK5;
+            Hfusion[3] = -HK3*HK6;
+            Hfusion[4] = -HK8;
+            Hfusion[5] = -HK10;
+            Hfusion[6] = HK11*HK3;
+            Hfusion[22] = HK8;
+            Hfusion[23] = HK10;
+
+            // Kalman gains
+            // Don't allow modification of any states other than wind velocity - we only need a wind estimate.
+            // See AP_NavEKF3/derivation/generated/acc_bf_generated.cpp for un-implemented Kalman gain equations.
+            Kfusion[22] = -HK28*HK32;
+            Kfusion[23] = -HK20*HK32;
+
+
+        } else if (axis_index == 1) {
+            // drag can be modelled as an arbitrary combination of bluff body drag that proportional to
+            // speed squared, and rotor momentum drag that is proportional to speed.
+            ftype Kacc; // Derivative of specific force wrt airspeed
+            if (using_mcoef && using_bcoef_y) {
+                // mixed bluff body and propeller momentum drag
+                const ftype airSpd = (bcoef_y / rho) * (- mcoef + sqrtF(sq(mcoef) + 2.0f * (rho / bcoef_y) * fabsF(mea_acc)));
+                Kacc = fmaxF(1e-1f, (rho / bcoef_y) * airSpd + mcoef * density_ratio);
+                predAccel = (0.5f / bcoef_y) * rho * sq(rel_wind_body[1]) * dragForceSign - rel_wind_body[1] * mcoef * density_ratio;
+            } else if (using_mcoef) {
+                // propeller momentum drag only
+                Kacc = fmaxF(1e-1f, mcoef * density_ratio);
+                predAccel = - rel_wind_body[1] * mcoef * density_ratio;
+            } else if (using_bcoef_y) {
+                // bluff body drag only
+                const ftype airSpd = sqrtF((2.0f * bcoef_y * fabsF(mea_acc)) / rho);
+                Kacc = fmaxF(1e-1f, (rho / bcoef_y) * airSpd);
+                predAccel = (0.5f / bcoef_y) * rho * sq(rel_wind_body[1]) * dragForceSign;
+            } else {
+                // nothing more to do
+                return;
+            }
+
+            // intermediate variables
+            const ftype HK0 = ve - vwe;
+            const ftype HK1 = vn - vwn;
+            const ftype HK2 = HK0*q0 - HK1*q3 + q1*vd;
+            const ftype HK3 = 2*Kacc;
+            const ftype HK4 = -HK0*q1 + HK1*q2 + q0*vd;
+            const ftype HK5 = HK0*q2 + HK1*q1 + q3*vd;
+            const ftype HK6 = HK0*q3 + HK1*q0 - q2*vd;
+            const ftype HK7 = q0*q3 - q1*q2;
+            const ftype HK8 = HK3*HK7;
+            const ftype HK9 = sq(q0) - sq(q1) + sq(q2) - sq(q3);
+            const ftype HK10 = HK9*Kacc;
+            const ftype HK11 = q0*q1 + q2*q3;
+            const ftype HK12 = 2*HK11;
+            const ftype HK13 = 2*HK7;
+            const ftype HK14 = 2*HK5;
+            const ftype HK15 = 2*HK2;
+            const ftype HK16 = 2*HK4;
+            const ftype HK17 = 2*HK6;
+            const ftype HK18 = HK12*P[0][6] + HK13*P[0][22] - HK13*P[0][4] + HK14*P[0][2] + HK15*P[0][0] + HK16*P[0][1] - HK17*P[0][3] - HK9*P[0][23] + HK9*P[0][5];
+            const ftype HK19 = sq(Kacc);
+            const ftype HK20 = HK12*P[6][6] - HK13*P[4][6] + HK13*P[6][22] + HK14*P[2][6] + HK15*P[0][6] + HK16*P[1][6] - HK17*P[3][6] + HK9*P[5][6] - HK9*P[6][23];
+            const ftype HK21 = HK13*P[4][22];
+            const ftype HK22 = HK12*P[6][22] + HK13*P[22][22] + HK14*P[2][22] + HK15*P[0][22] + HK16*P[1][22] - HK17*P[3][22] - HK21 - HK9*P[22][23] + HK9*P[5][22];
+            const ftype HK23 = HK13*HK19;
+            const ftype HK24 = HK12*P[4][6] - HK13*P[4][4] + HK14*P[2][4] + HK15*P[0][4] + HK16*P[1][4] - HK17*P[3][4] + HK21 - HK9*P[4][23] + HK9*P[4][5];
+            const ftype HK25 = HK9*P[5][23];
+            const ftype HK26 = HK12*P[5][6] - HK13*P[4][5] + HK13*P[5][22] + HK14*P[2][5] + HK15*P[0][5] + HK16*P[1][5] - HK17*P[3][5] - HK25 + HK9*P[5][5];
+            const ftype HK27 = HK19*HK9;
+            const ftype HK28 = HK12*P[6][23] + HK13*P[22][23] - HK13*P[4][23] + HK14*P[2][23] + HK15*P[0][23] + HK16*P[1][23] - HK17*P[3][23] + HK25 - HK9*P[23][23];
+            const ftype HK29 = HK12*P[2][6] + HK13*P[2][22] - HK13*P[2][4] + HK14*P[2][2] + HK15*P[0][2] + HK16*P[1][2] - HK17*P[2][3] - HK9*P[2][23] + HK9*P[2][5];
+            const ftype HK30 = HK12*P[1][6] + HK13*P[1][22] - HK13*P[1][4] + HK14*P[1][2] + HK15*P[0][1] + HK16*P[1][1] - HK17*P[1][3] - HK9*P[1][23] + HK9*P[1][5];
+            const ftype HK31 = HK12*P[3][6] + HK13*P[3][22] - HK13*P[3][4] + HK14*P[2][3] + HK15*P[0][3] + HK16*P[1][3] - HK17*P[3][3] - HK9*P[3][23] + HK9*P[3][5];
+            // const ftype HK32 = Kaccy/(HK12*HK19*HK20 + HK14*HK19*HK29 + HK15*HK18*HK19 + HK16*HK19*HK30 - HK17*HK19*HK31 + HK22*HK23 - HK23*HK24 + HK26*HK27 - HK27*HK28 + R_ACC);
+
+            innovDragVar.y = (HK12*HK19*HK20 + HK14*HK19*HK29 + HK15*HK18*HK19 + HK16*HK19*HK30 - HK17*HK19*HK31 + HK22*HK23 - HK23*HK24 + HK26*HK27 - HK27*HK28 + R_ACC);
+            if (innovDragVar.y < R_ACC) {
+                // calculation is badly conditioned
+                return;
+            }
+            const ftype HK32 = Kacc / innovDragVar.y;
+
+            // Observation Jacobians
+            Hfusion[0] = -HK2*HK3;
+            Hfusion[1] = -HK3*HK4;
+            Hfusion[2] = -HK3*HK5;
+            Hfusion[3] = HK3*HK6;
+            Hfusion[4] = HK8;
+            Hfusion[5] = -HK10;
+            Hfusion[6] = -HK11*HK3;
+            Hfusion[22] = -HK8;
+            Hfusion[23] = HK10;
+
+            // Kalman gains
+            // Don't allow modification of any states other than wind velocity at this stage of development - we only need a wind estimate.
+            // See AP_NavEKF3/derivation/generated/acc_bf_generated.cpp for un-implemented Kalman gain equations.
+            Kfusion[22] = -HK22*HK32;
+            Kfusion[23] = -HK28*HK32;
+        }
+
+        innovDrag[axis_index] = predAccel - mea_acc;
+        dragTestRatio[axis_index] = sq(innovDrag[axis_index]) / (25.0f * innovDragVar[axis_index]);
+
+        // if the innovation consistency check fails then don't fuse the sample
+        if (dragTestRatio[axis_index] > 1.0f) {
+            return;
+        }
+
+        // correct the state vector
+        for (uint8_t j= 0; j<=stateIndexLim; j++) {
+            statesArray[j] = statesArray[j] - Kfusion[j] * innovDrag[axis_index];
+        }
+        stateStruct.quat.normalize();
+
+        // correct the covariance P = (I - K*H)*P
+        // take advantage of the empty columns in KH to reduce the
+        // number of operations
+        for (unsigned i = 0; i<=stateIndexLim; i++) {
+            for (unsigned j = 0; j<=6; j++) {
+                KH[i][j] = Kfusion[i] * Hfusion[j];
+            }
+            for (unsigned j = 7; j<=21; j++) {
+                KH[i][j] = 0.0f;
+            }
+            for (unsigned j = 22; j<=23; j++) {
+                KH[i][j] = Kfusion[i] * Hfusion[j];
+            }
+        }
+        for (unsigned j = 0; j<=stateIndexLim; j++) {
+            for (unsigned i = 0; i<=stateIndexLim; i++) {
+                ftype res = 0;
+                res += KH[i][0] * P[0][j];
+                res += KH[i][1] * P[1][j];
+                res += KH[i][2] * P[2][j];
+                res += KH[i][3] * P[3][j];
+                res += KH[i][4] * P[4][j];
+                res += KH[i][5] * P[5][j];
+                res += KH[i][6] * P[6][j];
+                res += KH[i][22] * P[22][j];
+                res += KH[i][23] * P[23][j];
+                KHP[i][j] = res;
+            }
+        }
+        for (unsigned i = 0; i<=stateIndexLim; i++) {
+            for (unsigned j = 0; j<=stateIndexLim; j++) {
+                P[i][j] = P[i][j] - KHP[i][j];
+            }
+        }
+    }
+
+    // record time of successful fusion
+    lastDragPassTime_ms = imuSampleTime_ms;
+}
+#endif // EK3_FEATURE_DRAG_FUSION
+
+/********************************************************
+*                   MISC FUNCTIONS                      *
+********************************************************/
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #include <AP_HAL/AP_HAL.h>
+
+#include "AP_NavEKF3.h"
+#include "AP_NavEKF3_core.h"
+#include <GCS_MAVLink/GCS.h>
+
+#include "AP_DAL/AP_DAL.h"
+
+// Control filter mode transitions
+void NavEKF3_core::controlFilterModes()
+{
+    // Determine motor arm status
+    prevMotorsArmed = motorsArmed;
+    motorsArmed = dal.get_armed();
+    if (motorsArmed && !prevMotorsArmed) {
+        // set the time at which we arm to assist with checks
+        timeAtArming_ms =  imuSampleTime_ms;
+    }
+
+    // Detect if we are in flight on or ground
+    detectFlight();
+
+    // Determine if learning of wind and magnetic field will be enabled and set corresponding indexing limits to
+    // avoid unnecessary operations
+    setWindMagStateLearningMode();
+
+    // Check the alignmnent status of the tilt and yaw attitude
+    // Used during initial bootstrap alignment of the filter
+    checkAttitudeAlignmentStatus();
+
+    // Set the type of inertial navigation aiding used
+    setAidingMode();
+
+}
+
+/*
+  return effective value for _magCal for this core
+ */
+NavEKF3_core::MagCal NavEKF3_core::effective_magCal(void) const
+{
+    // force use of simple magnetic heading fusion for specified cores
+    if (frontend->_magMask & core_index) {
+        return MagCal::NEVER;
+    }
+
+    // handle deprecated MagCal::EXTERNAL_YAW and MagCal::EXTERNAL_YAW_FALLBACK values
+    const int8_t magCalParamVal = frontend->_magCal.get();
+    if (magCalParamVal == 5) {
+        return MagCal::NEVER;
+    }
+    if (magCalParamVal == 6) {
+        return MagCal::WHEN_FLYING;
+    }
+
+    return MagCal(magCalParamVal);
+}
+
+// Determine if learning of wind and magnetic field will be enabled and set corresponding indexing limits to
+// avoid unnecessary operations
+void NavEKF3_core::setWindMagStateLearningMode()
+{
+    const bool canEstimateWind = ((finalInflightYawInit && dragFusionEnabled) || assume_zero_sideslip()) &&
+                                 !onGround &&
+                                 PV_AidingMode != AID_NONE;
+    if (!inhibitWindStates && !canEstimateWind) {
+        inhibitWindStates = true;
+        lastAspdEstIsValid = false;
+        updateStateIndexLim();
+    } else if (inhibitWindStates && canEstimateWind &&
+               (sq(stateStruct.velocity.x) + sq(stateStruct.velocity.y) > sq(5.0f) || dragFusionEnabled)) {
+        inhibitWindStates = false;
+        updateStateIndexLim();
+        // set states and variances
+        if (yawAlignComplete && assume_zero_sideslip()) {
+            // if we have a valid heading, set the wind states to the reciprocal of the vehicle heading
+            // which assumes the vehicle has launched into the wind
+            // use airspeed if if recent data available
+            Vector3F tempEuler;
+            stateStruct.quat.to_euler(tempEuler.x, tempEuler.y, tempEuler.z);
+            ftype trueAirspeedVariance;
+            const bool haveAirspeedMeasurement = (tasDataDelayed.allowFusion && (imuDataDelayed.time_ms - tasDataDelayed.time_ms < 500) && useAirspeed());
+            if (haveAirspeedMeasurement) {
+                trueAirspeedVariance = constrain_ftype(tasDataDelayed.tasVariance, WIND_VEL_VARIANCE_MIN, WIND_VEL_VARIANCE_MAX);
+                const ftype windSpeed =  sqrtF(sq(stateStruct.velocity.x) + sq(stateStruct.velocity.y)) - tasDataDelayed.tas;
+                stateStruct.wind_vel.x = windSpeed * cosF(tempEuler.z);
+                stateStruct.wind_vel.y = windSpeed * sinF(tempEuler.z);
+            } else {
+                trueAirspeedVariance = sq(WIND_VEL_VARIANCE_MAX); // use 2-sigma for faster initial convergence
+            }
+
+            // set the wind state variances to the measurement uncertainty
+            zeroCols(P, 22, 23);
+            zeroRows(P, 22, 23);
+            P[22][22] = P[23][23] = trueAirspeedVariance;
+
+            windStatesAligned = true;
+
+        } else {
+            // set the variances using a typical max wind speed for small UAV operation
+            zeroCols(P, 22, 23);
+            zeroRows(P, 22, 23);
+            for (uint8_t index=22; index<=23; index++) {
+                P[index][index] = sq(WIND_VEL_VARIANCE_MAX);
+            }
+        }
+    }
+
+    // determine if the vehicle is manoeuvring
+    manoeuvring = accNavMagHoriz > 0.5f;
+
+    // Determine if learning of magnetic field states has been requested by the user
+    bool magCalRequested =
+        ((effectiveMagCal == MagCal::WHEN_FLYING) && inFlight) || // when flying
+        ((effectiveMagCal == MagCal::WHEN_MANOEUVRING) && manoeuvring)  || // when manoeuvring
+        ((effectiveMagCal == MagCal::AFTER_FIRST_CLIMB) && finalInflightYawInit && finalInflightMagInit) || // when initial in-air yaw and mag field reset is complete
+        (effectiveMagCal == MagCal::ALWAYS); // all the time
+
+    // Deny mag calibration request if we aren't using the compass, it has been inhibited by the user,
+    // we do not have an absolute position reference or are on the ground (unless explicitly requested by the user)
+    bool magCalDenied = !use_compass() || (effectiveMagCal == MagCal::NEVER) || (onGround && effectiveMagCal != MagCal::ALWAYS);
+
+    // Inhibit the magnetic field calibration if not requested or denied
+    bool setMagInhibit = !magCalRequested || magCalDenied;
+    if (!inhibitMagStates && setMagInhibit) {
+        inhibitMagStates = true;
+        updateStateIndexLim();
+        // variances will be reset in CovariancePrediction
+    } else if (inhibitMagStates && !setMagInhibit) {
+        inhibitMagStates = false;
+        updateStateIndexLim();
+        if (magFieldLearned) {
+            // if we have already learned the field states, then retain the learned variances
+            P[16][16] = earthMagFieldVar.x;
+            P[17][17] = earthMagFieldVar.y;
+            P[18][18] = earthMagFieldVar.z;
+            P[19][19] = bodyMagFieldVar.x;
+            P[20][20] = bodyMagFieldVar.y;
+            P[21][21] = bodyMagFieldVar.z;
+        } else {
+            // set the variances equal to the observation variances
+            for (uint8_t index=16; index<=21; index++) {
+                P[index][index] = sq(frontend->_magNoise);
+            }
+
+            // set the NE earth magnetic field states using the published declination
+            // and set the corresponding variances and covariances
+            alignMagStateDeclination();
+
+        }
+        // request a reset of the yaw and magnetic field states if not done before
+        if (!magStateInitComplete || (!finalInflightMagInit && inFlight)) {
+            magYawResetRequest = true;
+        }
+    }
+
+    // inhibit delta velocity bias learning if we have not yet aligned the tilt
+    if (tiltAlignComplete && inhibitDelVelBiasStates) {
+        // activate the states
+        inhibitDelVelBiasStates = false;
+        updateStateIndexLim();
+
+        // set the initial covariance values
+        P[13][13] = sq(ACCEL_BIAS_LIM_SCALER * frontend->_accBiasLim * dtEkfAvg);
+        P[14][14] = P[13][13];
+        P[15][15] = P[13][13];
+    }
+
+    if (tiltAlignComplete && inhibitDelAngBiasStates) {
+        // activate the states
+        inhibitDelAngBiasStates = false;
+        updateStateIndexLim();
+
+        // set the initial covariance values
+        P[10][10] = sq(radians(InitialGyroBiasUncertainty() * dtEkfAvg));
+        P[11][11] = P[10][10];
+        P[12][12] = P[10][10];
+    }
+
+    // If on ground we clear the flag indicating that the magnetic field in-flight initialisation has been completed
+    // because we want it re-done for each takeoff
+    if (onGround) {
+        finalInflightYawInit = false;
+        finalInflightMagInit = false;
+        magFieldLearned = false;
+    }
+
+    updateStateIndexLim();
+}
+
+// Adjust the indexing limits used to address the covariance, states and other EKF arrays to avoid unnecessary operations
+// if we are not using those states
+void NavEKF3_core::updateStateIndexLim()
+{
+    if (inhibitWindStates) {
+        if (inhibitMagStates) {
+            if (inhibitDelVelBiasStates) {
+                if (inhibitDelAngBiasStates) {
+                    stateIndexLim = 9;
+                } else {
+                    stateIndexLim = 12;
+                }
+            } else {
+                stateIndexLim = 15;
+            }
+        } else {
+            stateIndexLim = 21;
+        }
+    } else {
+        stateIndexLim = 23;
+    }
+}
+
+// set the default yaw source
+void NavEKF3_core::setYawSource()
+{
+    AP_NavEKF_Source::SourceYaw yaw_source = frontend->sources.getYawSource();
+    if (wasLearningCompass_ms > 0) {
+        // can't use compass while it is being calibrated
+        if (yaw_source == AP_NavEKF_Source::SourceYaw::COMPASS) {
+            yaw_source = AP_NavEKF_Source::SourceYaw::NONE;
+        } else if (yaw_source == AP_NavEKF_Source::SourceYaw::GPS_COMPASS_FALLBACK) {
+            yaw_source = AP_NavEKF_Source::SourceYaw::GPS;
+        }
+    }
+    if (yaw_source != yaw_source_last) {
+        yaw_source_last = yaw_source;
+        yaw_source_reset = true;
+    }
+}
+
+// Set inertial navigation aiding mode
+void NavEKF3_core::setAidingMode()
+{
+    resetDataSource posResetSource = resetDataSource::DEFAULT;
+    resetDataSource velResetSource = resetDataSource::DEFAULT;
+
+    // Save the previous status so we can detect when it has changed
+    PV_AidingModePrev = PV_AidingMode;
+
+    setYawSource();
+
+    // Check that the gyro bias variance has converged
+    checkGyroCalStatus();
+
+    // Handle the special case where we are on ground and disarmed without a yaw measurement
+    // and navigating. This can occur if not using a magnetometer and yaw was aligned using GPS
+    // during the previous flight.
+    if (yaw_source_last == AP_NavEKF_Source::SourceYaw::NONE &&
+        !motorsArmed &&
+        onGround &&
+        PV_AidingMode != AID_NONE)
+    {
+        PV_AidingMode = AID_NONE;
+        yawAlignComplete = false;
+        yawAlignGpsValidCount = 0;
+        finalInflightYawInit = false;
+        ResetVelocity(resetDataSource::DEFAULT);
+        ResetPosition(resetDataSource::DEFAULT);
+        ResetHeight();
+        // preserve quaternion 4x4 covariances, but zero the other rows and columns
+        for (uint8_t row=0; row<4; row++) {
+            for (uint8_t col=4; col<24; col++) {
+                P[row][col] = 0.0f;
+            }
+        }
+        for (uint8_t col=0; col<4; col++) {
+            for (uint8_t row=4; row<24; row++) {
+                P[row][col] = 0.0f;
+            }
+        }
+        // keep the IMU bias state variances, but zero the covariances
+        ftype oldBiasVariance[6];
+        for (uint8_t row=0; row<6; row++) {
+            oldBiasVariance[row] = P[row+10][row+10];
+        }
+        zeroCols(P,10,15);
+        zeroRows(P,10,15);
+        for (uint8_t row=0; row<6; row++) {
+            P[row+10][row+10] = oldBiasVariance[row];
+        }
+    }
+
+    // Determine if we should change aiding mode
+    switch (PV_AidingMode) {
+        case AID_NONE: {
+            // Don't allow filter to start position or velocity aiding until the tilt and yaw alignment is complete
+            // and IMU gyro bias estimates have stabilised
+            // If GPS usage has been prohiited then we use flow aiding provided optical flow data is present
+            // GPS aiding is the preferred option unless excluded by the user
+            if (readyToUseGPS() || readyToUseRangeBeacon() || readyToUseExtNav()) {
+                PV_AidingMode = AID_ABSOLUTE;
+            } else if (readyToUseOptFlow() || readyToUseBodyOdm()) {
+                PV_AidingMode = AID_RELATIVE;
+            }
+            break;
+        }
+        case AID_RELATIVE: {
+            // Check if the fusion has timed out (flow measurements have been rejected for too long)
+            bool flowFusionTimeout = ((imuSampleTime_ms - prevFlowFuseTime_ms) > 5000);
+            // Check if the fusion has timed out (body odometry measurements have been rejected for too long)
+            bool bodyOdmFusionTimeout = ((imuSampleTime_ms - prevBodyVelFuseTime_ms) > 5000);
+            // Enable switch to absolute position mode if GPS or range beacon data is available
+            // If GPS or range beacons data is not available and flow fusion has timed out, then fall-back to no-aiding
+            if (readyToUseGPS() || readyToUseRangeBeacon() || readyToUseExtNav()) {
+                PV_AidingMode = AID_ABSOLUTE;
+            } else if (flowFusionTimeout && bodyOdmFusionTimeout) {
+                PV_AidingMode = AID_NONE;
+            }
+            break;
+        }
+        case AID_ABSOLUTE: {
+            // Find the minimum time without data required to trigger any check
+            uint16_t minTestTime_ms = MIN(frontend->tiltDriftTimeMax_ms, MIN(frontend->posRetryTimeNoVel_ms,frontend->posRetryTimeUseVel_ms));
+
+            // Check if optical flow data is being used
+            bool optFlowUsed = (imuSampleTime_ms - prevFlowFuseTime_ms <= minTestTime_ms);
+
+            // Check if body odometry data is being used
+            bool bodyOdmUsed = (imuSampleTime_ms - prevBodyVelFuseTime_ms <= minTestTime_ms);
+
+            // Check if airspeed data is being used
+            bool airSpdUsed = (imuSampleTime_ms - lastTasPassTime_ms <= minTestTime_ms);
+
+            // check if drag data is being used
+            bool dragUsed = (imuSampleTime_ms - lastDragPassTime_ms <= minTestTime_ms);
+
+#if EK3_FEATURE_BEACON_FUSION
+            // Check if range beacon data is being used
+            const bool rngBcnUsed = (imuSampleTime_ms - rngBcn.lastPassTime_ms <= minTestTime_ms);
+#else
+            const bool rngBcnUsed = false;
+#endif
+
+            // Check if GPS or external nav is being used
+            bool posUsed = (imuSampleTime_ms - lastPosPassTime_ms <= minTestTime_ms);
+            bool gpsVelUsed = (imuSampleTime_ms - lastVelPassTime_ms <= minTestTime_ms);
+
+            // Check if attitude drift has been constrained by a measurement source
+            bool attAiding = posUsed || gpsVelUsed || optFlowUsed || airSpdUsed || dragUsed || rngBcnUsed || bodyOdmUsed;
+
+            // Check if velocity drift has been constrained by a measurement source
+            // Currently these are all the same source as will stabilise attitude because we do not currently have
+            // a sensor that only observes attitude
+            velAiding = posUsed || gpsVelUsed || optFlowUsed || airSpdUsed || dragUsed || rngBcnUsed || bodyOdmUsed;
+
+            // Store the last valid airspeed estimate
+            windStateIsObservable = !inhibitWindStates && (posUsed || gpsVelUsed || optFlowUsed || rngBcnUsed || bodyOdmUsed);
+            if (windStateIsObservable) {
+                lastAirspeedEstimate = (stateStruct.velocity - Vector3F(stateStruct.wind_vel.x, stateStruct.wind_vel.y, 0.0F)).length();
+                lastAspdEstIsValid = true;
+            }
+
+            // check if position drift has been constrained by a measurement source
+            bool posAiding = posUsed || rngBcnUsed;
+
+            // Check if the loss of attitude aiding has become critical
+            bool attAidLossCritical = false;
+            if (!attAiding) {
+            	attAidLossCritical = (imuSampleTime_ms - prevFlowFuseTime_ms > frontend->tiltDriftTimeMax_ms) &&
+                		(imuSampleTime_ms - lastTasPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
+#if EK3_FEATURE_BEACON_FUSION
+                        (imuSampleTime_ms - rngBcn.lastPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
+#endif
+                        (imuSampleTime_ms - lastPosPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
+                        (imuSampleTime_ms - lastVelPassTime_ms > frontend->tiltDriftTimeMax_ms);
+            }
+
+            // Check if the loss of position accuracy has become critical
+            bool posAidLossCritical = false;
+            if (!posAiding) {
+                uint16_t maxLossTime_ms;
+                if (!velAiding) {
+                    maxLossTime_ms = frontend->posRetryTimeNoVel_ms;
+                } else {
+                    maxLossTime_ms = frontend->posRetryTimeUseVel_ms;
+                }
+                posAidLossCritical =
+#if EK3_FEATURE_BEACON_FUSION
+                    (imuSampleTime_ms - rngBcn.lastPassTime_ms > maxLossTime_ms) &&
+#endif
+                    (imuSampleTime_ms - lastPosPassTime_ms > maxLossTime_ms);
+            }
+
+            if (attAidLossCritical) {
+                // if the loss of attitude data is critical, then put the filter into a constant positio       timing.delVelDT_min = imuDataDelayed.delVelDT;
+    } else {
+        timing.dtIMUavg_max = MAX(timing.dtIMUavg_max, dtIMUavg);
+        timing.dtIMUavg_min = MIN(timing.dtIMUavg_min, dtIMUavg);
+        timing.dtEKFavg_max = MAX(timing.dtEKFavg_max, dtEkfAvg);
+        timing.dtEKFavg_min = MIN(timing.dtEKFavg_min, dtEkfAvg);
+        timing.delAngDT_max = MAX(timing.delAngDT_max, imuDataDelayed.delAngDT);
+        timing.delAngDT_min = MIN(timing.delAngDT_min, imuDataDelayed.delAngDT);
+        timing.delVelDT_max = MAX(timing.delVelDT_max, imuDataDelayed.delVelDT);
+        timing.delVelDT_min = MIN(timing.delVelDT_min, imuDataDelayed.delVelDT);
+    }
+    timing.count++;
+}
+
+/*
+  update estimates of inactive bias states. This keeps inactive IMUs
+  as hot-spares so we can switch to them without causing a jump in the
+  error
+ */
+void NavEKF3_core::learnInactiveBiases(void)
+{
+#if INS_MAX_INSTANCES == 1
+    inactiveBias[0].gyro_bias = stateStruct.gyro_bias;
+    inactiveBias[0].accel_bias = stateStruct.accel_bias;
+#else
+    const auto &ins = dal.ins();
+
+    // learn gyro biases
+    for (uint8_t i=0; i<INS_MAX_INSTANCES; i++) {
+        if (!ins.use_gyro(i)) {
+            // can't use this gyro
+            continue;
+        }
+        if (gyro_index_active == i) {
+            // use current estimates from main filter of gyro bias
+            inactiveBias[i].gyro_bias = stateStruct.gyro_bias;
+        } else {
+            // get filtered gyro and use the difference between the
+            // corrected gyro on the active IMU and the inactive IMU
+            // to move the inactive bias towards the right value
+            Vector3F filtered_gyro_active = ins.get_gyro(gyro_index_active).toftype() - (stateStruct.gyro_bias/dtEkfAvg);
+            Vector3F filtered_gyro_inactive = ins.get_gyro(i).toftype() - (inactiveBias[i].gyro_bias/dtEkfAvg);
+            Vector3F error = filtered_gyro_active - filtered_gyro_inactive;
+
+            // prevent a single large error from contaminating bias estimate
+            const ftype bias_limit = radians(5);
+            error.x = constrain_ftype(error.x, -bias_limit, bias_limit);
+            error.y = constrain_ftype(error.y, -bias_limit, bias_limit);
+            error.z = constrain_ftype(error.z, -bias_limit, bias_limit);
+
+            // slowly bring the inactive gyro in line with the active gyro. This corrects a 5 deg/sec
+            // gyro bias error in around 1 minute
+            inactiveBias[i].gyro_bias -= error * (1.0e-4f * dtEkfAvg);
+        }
+    }
+
+    // learn accel biases
+    for (uint8_t i=0; i<INS_MAX_INSTANCES; i++) {
+        if (!ins.use_accel(i)) {
+            // can't use this accel
+            continue;
+        }
+        if (accel_index_active == i) {
+            // use current estimates from main filter of accel bias
+            inactiveBias[i].accel_bias = stateStruct.accel_bias;
+        } else {
+            // get filtered accel and use the difference between the
+            // corrected accel on the active IMU and the inactive IMU
+            // to move the inactive bias towards the right value
+            Vector3F filtered_accel_active = ins.get_accel(accel_index_active).toftype() - (stateStruct.accel_bias/dtEkfAvg);
+            Vector3F filtered_accel_inactive = ins.get_accel(i).toftype() - (inactiveBias[i].accel_bias/dtEkfAvg);
+            Vector3F error = filtered_accel_active - filtered_accel_inactive;
+
+            // prevent a single large error from contaminating bias estimate
+            const ftype bias_limit = 1.0; // m/s/s
+            error.x = constrain_ftype(error.x, -bias_limit, bias_limit);
+            error.y = constrain_ftype(error.y, -bias_limit, bias_limit);
+            error.z = constrain_ftype(error.z, -bias_limit, bias_limit);
+
+            // slowly bring the inactive accel in line with the active
+            // accel. This corrects a 0.5 m/s/s accel bias error in
+            // around 1 minute
+            inactiveBias[i].accel_bias -= error * (1.0e-4f * dtEkfAvg);
+        }
+    }
+#endif
+}
+
+/*
+  return declination in radians
+*/
+ftype NavEKF3_core::MagDeclin ftype bcnMidPosD = 0.5f * (rngBcn.minPosD + rngBcn.maxPosD);
+
+                // calculate the delta to the estimated receiver position
+                ftype delta = rngBcn.receiverPos.z - bcnMidPosD;
+
+                // calculate the two hypothesis for our vertical position
+                ftype receiverPosDownMax;
+                ftype receiverPosDownMin;
+                if (delta >= 0.0f) {
+                    receiverPosDownMax = rngBcn.receiverPos.z;
+                    receiverPosDownMin = rngBcn.receiverPos.z - 2.0f * delta;
+                } else {
+                    receiverPosDownMax = rngBcn.receiverPos.z - 2.0f * delta;
+                    receiverPosDownMin = rngBcn.receiverPos.z;
+                }
+
+                rngBcn.posDownOffsetMax = stateStruct.position.z - receiverPosDownMin;
+                rngBcn.posDownOffsetMin = stateStruct.position.z - receiverPosDownMax;
+            } else {
+                // We are using the beacons as the primary height reference, so don't modify their vertical position
+                rngBcn.posOffsetNED.z = 0.0f;
+            }
+        }
+
+        // Add some process noise to the states at each time step
+        for (uint8_t i= 0; i<=2; i++) {
+            rngBcn.receiverPosCov[i][i] += 0.1f;
+        }
+
+        // calculate the observation jacobian
+        ftype t2 = rngBcn.dataDelayed.beacon_posNED.z - rngBcn.receiverPos.z + rngBcn.posOffsetNED.z;
+        ftype t3 = rngBcn.dataDelayed.beacon_posNED.y - rngBcn.receiverPos.y;
+        ftype t4 = rngBcn.dataDelayed.beacon_posNED.x - rngBcn.receiverPos.x;
+        ftype t5 = t2*t2;
+        ftype t6 = t3*t3;
+        ftype t7 = t4*t4;
+        ftype t8 = t5+t6+t7;
+        if (t8 < 0.1f) {
+            // calculation will be badly conditioned
+            return;
+        }
+        ftype t9 = 1.0f/sqrtF(t8);
+        ftype t10 = rngBcn.dataDelayed.beacon_posNED.x*2.0f;
+        ftype t15 = rngBcn.receiverPos.x*2.0f;
+        ftype t11 = t10-t15;
+        ftype t12 = rngBcn.dataDelayed.beacon_posNED.y*2.0f;
+        ftype t14 = rngBcn.receiverPos.y*2.0f;
+        ftype t13 = t12-t14;
+        ftype t16 = rngBcn.dataDelayed.beacon_posNED.z*2.0f;
+        ftype t18 = rngBcn.receiverPos.z*2.0f;
+        ftype t17 = t16-t18;
+        ftype H_RNG[3];
+        H_RNG[0] = -t9*t11*0.5f;
+        H_RNG[1] = -t9*t13*0.5f;
+        H_RNG[2] = -t9*t17*0.5f;
+
+        // calculate the Kalman gains
+        ftype t19 = rngBcn.receiverPosCov[0][0]*t9*t11*0.5f;
+        ftype t20 = rngBcn.receiverPosCov[1][1]*t9*t13*0.5f;
+        ftype t21 = rngBcn.receiverPosCov[0][1]*t9*t11*0.5f;
+        ftype t22 = rngBcn.receiverPosCov[2][1]*t9*t17*0.5f;
+        ftype t23 = t20+t21+t22;
+        ftype t24 = t9*t13*t23*0.5f;
+        ftype t25 = rngBcn.receiverPosCov[1][2]*t9*t13*0.5f;
+        ftype t26 = rngBcn.receiverPosCov[0][2]*t9*t11*0.5f;
+        ftype t27 = rngBcn.receiverPosCov[2][2]*t9*t17*0.5f;
+        ftype t28 = t25+t26+t27;
+        ftype t29 = t9*t17*t28*0.5f;
+        ftype t30 = rngBcn.receiverPosCov[1][0]*t9*t13*0.5f;
+        ftype t31 = rngBcn.receiverPosCov[2][0]*t9*t17*0.5f;
+        ftype t32 = t19+t30+t31;
+        ftype t33 = t9*t11*t32*0.5f;
+        rngBcn.varInnov = R_RNG+t24+t29+t33;
+        ftype t35 = 1.0f/rngBcn.varInnov;
+        ftype K_RNG[3];
+        K_RNG[0] = -t35*(t19+rngBcn.receiverPosCov[0][1]*t9*t13*0.5f+rngBcn.receiverPosCov[0][2]*t9*t17*0.5f);
+        K_RNG[1] = -t35*(t20+rngBcn.receiverPosCov[1][0]*t9*t11*0.5f+rngBcn.receiverPosCov[1][2]*t9*t17*0.5f);
+        K_RNG[2] = -t35*(t27+rngBcn.receiverPosCov[2][0]*t9*t11*0.5f+rngBcn.receiverPosCov[2][1]*t9*t13*0.5f);
+
+        // calculate range measurement innovation
+        Vector3F deltaPosNED = rngBcn.receiverPos - rngBcn.dataDelayed.beacon_posNED;
+        deltaPosNED.z -= rngBcn.posOffsetNED.z;
+        rngBcn.innov = deltaPosNED.length() - rngBcn.dataDelayed.rng;
+
+        // calculate the innovation consistency test ratio
+        rngBcn.testRatio = sq(rngBcn.innov) / (sq(MAX(0.01f * (ftype)frontend->_rngBcnInnovGate, 1.0f)) * rngBcn.varInnov);
+
+        // fail if the ratio is > 1, but don't fail if bad IMU data
+        rngBcn.health = ((rngBcn.testRatio < 1.0f) || badIMUdata || !rngBcn.alignmentCompleted);
+
+        // test the ratio before fusing data
+        if (rngBcn.health) {
+
+            // update the state
+            rngBcn.receiverPos.x -= K_RNG[0] * rngBcn.innov;
+            rngBcn.receiverPos.y -= K_RNG[1] * rngBcn.innov;
+            rngBcn.receiverPos.z -= K_RNG[2] * rngBcn.innov;
+
+            // calculate the covariance correction
+            for (unsigned i = 0; i<=2; i++) {
+                for (unsigned j = 0; j<=2; j++) {
+                    KH[i][j] = K_RNG[i] * H_RNG[j];
+                }
+            }
+            for (unsigned j = 0; j<=2; j++) {
+                for (unsigned i = 0; i<=2; i++) {
+                    ftype res = 0;
+                    res += KH[i][0] * rngBcn.receiverPosCov[0][j];
+                    res += KH[i][1] * rngBcn.receiverPosCov[1][j];
+                    res += KH[i][2] * rngBcn.receiverPosCov[2][j];
+                    KHP[i][j] = res;
+                }
+            }
+
+            // prevent negative variances
+            for (uint8_t i= 0; i<=2; i++) {
+                if (rngBcn.receiverPosCov[i][i] < 0.0f) {
+                    rngBcn.receiverPosCov[i][i] = 0.0f;
+                    KHP[i][i] = 0.0f;
+                } else if (KHP[i][i] > rngBcn.receiverPosCov[i][i]) {
+                    KHP[i][i] = rngBcn.receiverPosCov[i][i];
+                }
+            }
+
+            // apply the covariance correction
+            for (uint8_t i= 0; i<=2; i++) {
+                for (uint8_t j= 0; j<=2; j++) {
+                    rngBcn.receiverPosCov[i][j] -= KHP[i][j];
+                }
+            }
+
+            // ensure the covariance matrix is symmetric
+            for (uint8_t i=1; i<=2; i++) {
+                for (uint8_t j=0; j<=i-1; j++) {
+                    ftype temp = 0.5f*(rngBcn.receiverPosCov[i][j] + rngBcn.receiverPosCov[j][i]);
+                    rngBcn.receiverPosCov[i][j] = temp;
+                    rngBcn.receiverPosCov[j][i] = temp;
+                }
+            }
+
+        }
+
+        if (rngBcn.numMeas >= 100) {
+            // 100 observations is enough for a stable estimate under most conditions
+            // TODO monitor stability of the position estimate
+            rngBcn.alignmentCompleted = true;
+        }
+        // Update the fusion report
+        if (rngBcn.dataDelayed.beacon_ID < rngBcn.numFusionReports) {
+            auto &report = rngBcn.fusionReport[rngBcn.dataDelayed.beacon_ID];
+            report.beaconPosNED = rngBcn.dataDelayed.beacon_posNED;
+            report.innov = rngBcn.innov;
+            report.innovVar = rngBcn.varInnov;
+            report.rng = rngBcn.dataDelayed.rng;
+            report.testRatio = rngBcn.testRatio;
+        }
+    }
+}
+
+/*
+Run a single state Kalman filter to estimate the vertical position offset of the range beacon constellation
+Calculate using a high and low hypothesis and select the hypothesis with the lowest innovation sequence
+*/
+void NavEKF3_core::CalcRangeBeaconPosDownOffset(ftype obsVar, Vector3F &vehiclePosNED, bool aligning)
+{
+    // Handle height offsets between the primary height source and the range beacons by estimating
+    // the beacon systems global vertical position offset using a single state Kalman filter
+    // The estimated offset is used to correct the beacon height when calculating innovations
+    // A high and low estimate is calculated to handle the ambiguity in height associated with beacon positions that are co-planar
+    // The main filter then uses the offset with the smaller innovations
+
+    ftype innov;    // range measurement innovation (m)
+    ftype innovVar; // range measurement innovation variance (m^2)
+    ftype gain;     // Kalman gain
+    ftype obsDeriv; // derivative of observation relative to state
+
+    const ftype stateNoiseVar = 0.1f; // State process noise variance
+    const ftype filtAlpha = 0.1f; // LPF constant
+    const ftype innovGateWidth = 5.0f; // width of innovation consistency check gate in std
+
+    // estimate upper value for offset
+
+    // calculate observation derivative
+    ftype t2 = rngBcn.dataDelayed.beacon_posNED.z - vehiclePosNED.z + rngBcn.posDownOffsetMax;
+    ftype t3 = rngBcn.dataDelayed.beacon_posNED.y - vehiclePosNED.y;
+    ftype t4 = rngBcn.dataDelayed.beacon_posNED.x - vehiclePosNED.x;
+    ftype t5 = t2*t2;
+    ftype t6 = t3*t3;
+    ftype t7 = t4*t4;
+    ftype t8 = t5+t6+t7;
+    ftype t9;
+    if (t8 > 0.1f) {
+        t9 = 1.0f/sqrtF(t8);
+        obsDeriv = t2*t9;
+
+        // Calculate innovation
+        innov = sqrtF(t8) - rngBcn.dataDelayed.rng;
+
+        // covariance prediction
+        rngBcn.posOffsetMaxVar += stateNoiseVar;
+
+        // calculate the innovation variance
+        innovVar = obsDeriv * rngBcn.posOffsetMaxVar * obsDeriv + obsVar;
+        innovVar = MAX(innovVar, obsVar);
+
+        // calculate the Kalman gain
+        gain = (rngBcn.posOffsetMaxVar * obsDeriv) / innovVar;
+
+        // calculate a filtered state change magnitude to be used to select between the high or low offset
+        ftype stateChange = innov * gain;
+        rngBcn.maxOffsetStateChangeFilt = (1.0f - filtAlpha) * rngBcn.maxOffsetStateChangeFilt + fminF(fabsF(filtAlpha * stateChange) , 1.0f);
+
+        // Reject range innovation spikes using a 5-sigma threshold unless aligning
+        if ((sq(innov) < sq(innovGateWidth) * innovVar) || aligning) {
+
+            // state update
+            rngBcn.posDownOffsetMax -= stateChange;
+
+            // covariance update
+            rngBcn.posOffsetMaxVar -= gain * obsDeriv * rngBcn.posOffsetMaxVar;
+            rngBcn.posOffsetMaxVar = MAX(rngBcn.posOffsetMaxVar, 0.0f);
+        }
+    }
+
+    // estimate lower value for offset
+
+    // calculate observation derivative
+    t2 = rngBcn.dataDelayed.beacon_posNED.z - vehiclePosNED.z + rngBcn.posDownOffsetMin;
+    t5 = t2*t2;
+    t8 = t5+t6+t7;
+    if (t8 > 0.1f) {
+        t9 = 1.0f/sqrtF(t8);
+        obsDeriv = t2*t9;
+
+        // Calculate innovation
+        innov = sqrtF(t8) - rngBcn.dataDelayed.rng;
+
+        // covariance prediction
+        rngBcn.posOffsetMinVar += stateNoiseVar;
+
+        // calculate the innovation variance
+        innovVar = obsDeriv * rngBcn.posOffsetMinVar * obsDeriv + obsVar;
+        innovVar = MAX(innovVar, obsVar);
+
+        // calculate the Kalman gain
+        gain = (rngBcn.posOffsetMinVar * obsDeriv) / innovVar;
+
+        // calculate a filtered state change magnitude to be used to select between the high or low offset
+        ftype stateChange = innov * gain;
+        rngBcn.minOffsetStateChangeFilt = (1.0f - filtAlpha) * rngBcn.minOffsetStateChangeFilt + fminF(fabsF(filtAlpha * stateChange) , 1.0f);
+
+        // Reject range innovation spikes using a 5-sigma threshold unless aligning
+        if ((sq(innov) < sq(innovGateWidth) * innovVar) || aligning) {
+
+            // state update
+            rngBcn.posDownOffsetMin -= stateChange;
+
+            // covariance update
+            rngBcn.posOffsetMinVar -= gain * obsDeriv * rngBcn.posOffsetMinVar;
+            rngBcn.posOffsetMinVar = MAX(rngBcn.posOffsetMinVar, 0.0f);
+        }
+    }
+
+    // calculate the mid vertical position of all beacons
+    ftype bcnMidPosD = 0.5f * (rngBcn.minPosD + rngBcn.maxPosD);
+
+    // ensure the two beacon vertical offset hypothesis place the mid point of the beacons below and above the flight vehicle
+    rngBcn.posDownOffsetMax = MAX(rngBcn.posDownOffsetMax, vehiclePosNED.z - bcnMidPosD + 0.5f);
+    rngBcn.posDownOffsetMin  = MIN(rngBcn.posDownOffsetMin,  vehiclePosNED.z - bcnMidPosD - 0.5f);
+
+    // calculate the innovation for the main filter using the offset that is most stable
+    // apply hysteresis to prevent rapid switching
+    if (!rngBcn.usingMinHypothesis && (rngBcn.minOffsetStateChangeFilt < (0.8f * rngBcn.maxOffsetStateChangeFilt))) {
+        rngBcn.usingMinHypothesis = true;
+    } else if (rngBcn.usingMinHypothesis && (rngBcn.maxOffsetStateChangeFilt < (0.8f * rngBcn.minOffsetStateChangeFilt))) {
+        rngBcn.usingMinHypothesis = false;
+    }
+    if (rngBcn.usingMinHypothesis) {
+        rngBcn.posOffsetNED.z = rngBcn.posDownOffsetMin;
+    } else {
+        rngBcn.posOffsetNED.z = rngBcn.posDownOffsetMax;
+    }
+
+    // apply the vertical offset to the beacon positions
+    rngBcn.dataDelayed.beacon_posNED.z += rngBcn.posOffsetNED.z;
+}
+
+#endif  // EK3_FEATURE_BEACON_FUSION
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 e arming, then we definitely are diving
+            if ((stateStruct.position.z - posDownAtTakeoff) > 1.5f) {
+                inFlight = true;
+            }
+
+            // If rangefinder has decreased since arming, then we definitely are diving
+            if ((rangeDataNew.rng - rngAtStartOfFlight) < -0.5f) {
+                inFlight = true;
+            }
+#else
+            // If height has increased since exiting on-ground, then we definitely are flying
+            if ((stateStruct.position.z - posDownAtTakeoff) < -1.5f) {
+                inFlight = true;
+            }
+
+            // If rangefinder has increased since exiting on-ground, then we definitely are flying
+            if ((rangeDataNew.rng - rngAtStartOfFlight) > 0.5f) {
+                inFlight = true;
+            }
+#endif
+
+            // If more than 5 seconds since likely_flying was set
+            // true, then set inFlight true
+            if (dal.get_time_flying_ms() > 5000) {
+                inFlight = true;
+            }
+        }
+
+    }
+
+    // Store vehicle height and range prior to takeoff for use in post takeoff checks
+    if (onGround) {
+        // store vertical position at start of flight to use as a reference for ground relative checks
+        posDownAtTakeoff = stateStruct.position.z;
+        // store the range finder measurement which will be used as a reference to detect when we have taken off
+        rngAtStartOfFlight = rangeDataNew.rng;
+        // if the magnetic field states have been set, then continue to update the vertical position
+        // quaternion and yaw innovation snapshots to use as a reference when we start to fly.
+        if (magStateInitComplete) {
+            posDownAtLastMagReset = stateStruct.position.z;
+            quatAtLastMagReset = stateStruct.quat;
+            yawInnovAtLastMagReset = innovYaw;
+        }
+    }
+
+    // handle reset of counters used to control how many times we will try to reset the yaw to the EKF-GSF value per flight
+    if ((!prevOnGround && onGround) || !gpsSpdAccPass) {
+        // disable filter bank
+        EKFGSF_run_filterbank = false;
+    } else if (yawEstimator != nullptr && !EKFGSF_run_filterbank && (inFlight || dal.get_takeoff_expected()) && gpsSpdAccPass) {
+        // flying or about to fly so reset counters and enable filter bank when GPS is good
+        EKFGSF_yaw_reset_ms = 0;
+        EKFGSF_yaw_reset_request_ms = 0;
+        EKFGSF_yaw_reset_count = 0;
+        EKFGSF_yaw_valid_count = 0;
+        EKFGSF_run_filterbank = true;
+        Vector3f gyroBias;
+        getGyroBias(gyroBias);
+        yawEstimator->setGyroBias(gyroBias);
+    }
+
+    // store current on-ground  and in-air status for next time
+    prevOnGround = onGround;
+    prevInFlight = inFlight;
+
+}
+
+// Set to true if the terrain underneath is stable enough to be used as a height reference
+// in combination with a range finder. Set to false if the terrain underneath the vehicle
+// cannot be used as a height reference. Use to prevent range finder operation otherwise
+// enabled by the combination of EK3_RNG_USE_HGT and EK3_RNG_USE_SPD parameters.
+void NavEKF3_core::setTerrainHgtStable(bool val)
+{
+    terrainHgtStable = val;
+}
+
+// Detect takeoff for optical flow navigation
+void NavEKF3_core::detectOptFlowTakeoff(void)
+{
+    if (!onGround && !takeOffDetected && (imuSampleTime_ms - timeAtArming_ms) > 1000) {
+        // we are no longer confidently on the ground so check the range finder and gyro for signs of takeoff
+        const auto &ins = dal.ins();
+        Vector3f angRateVec;
+        Vector3f gyroBias;
+        getGyroBias(gyroBias);
+        angRateVec = ins.get_gyro(gyro_index_active) - gyroBias;
+
+        takeOffDetected = (takeOffDetected || (angRateVec.length() > 0.1f) || (rangeDataNew.rng > (rngAtStartOfFlight + 0.1f)));
+    } else if (onGround) {
+        // we are confidently on the ground so set the takeoff detected status to false
+        takeOffDetected = false;
+    }
+}
+
+                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#ifdef WITH_SITL_OSD
+
+#include "Display_SITL.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Notify/AP_Notify.h>
+
+#include <stdio.h>
+#include <unistd.h>
+
+// constructor
+Display_SITL::Display_SITL()
+{
+}
+
+Display_SITL::~Display_SITL()
+{
+}
+
+Display_SITL *Display_SITL::probe()
+{
+    Display_SITL *driver = NEW_NOTHROW Display_SITL();
+    if (!driver || !driver->hw_init()) {
+        delete driver;
+        return nullptr;
+    }
+    return driver;
+}
+
+// main loop of graphics thread
+void Display_SITL::update_thread(void)
+{
+    {
+        WITH_SEMAPHORE(AP::notify().sf_window_mutex);
+        w = NEW_NOTHROW sf::RenderWindow(sf::VideoMode(COLUMNS*SCALE, ROWS*SCALE), "Display");
+    }
+    if (!w) {
+        AP_HAL::panic("Unable to create Display_SITL window");
+    }
+
+    const sf::Color color_black = sf::Color(0,0,0);
+    const sf::Color color_white = sf::Color(255,255,255);
+
+    const sf::Uint8 pixels[ROWS*COLUMNS*4]{};
+    sf::Image image;
+    image.create(COLUMNS, ROWS, pixels);
+
+    while (true) {
+        {
+            WITH_SEMAPHORE(AP::notify().sf_window_mutex);
+            sf::Event event;
+            while (w->pollEvent(event)) {
+                if (event.type == sf::Event::Closed) {
+                    w->close();
+                }
+            }
+            if (!w->isOpen()) {
+                break;
+            }
+            if (_need_hw_update) {
+                _need_hw_update = false;
+
+                uint8_t buffer2[ROWS*COLUMNS];
+                {
+                    WITH_SEMAPHORE(mutex);
+                    memcpy(buffer2, _displaybuffer, sizeof(buffer2));
+                }
+                w->clear();
+
+                for (uint16_t y=0; y<ROWS; y++) {
+                    for (uint16_t x=0; x<COLUMNS; x++) {
+                        if (buffer2[x+y/8*COLUMNS] & 1<<y%8) {
+                            image.setPixel(x, y, color_white);
+                        } else {
+                            image.setPixel(x, y, color_black);
+                        }
+                    }
+                }
+
+                sf::Texture texture;
+                texture.loadFromImage(image);
+                sf::Sprite sprite;
+                sprite.setTexture(texture, true);
+                sprite.setScale(SCALE, SCALE);
+                w->draw(sprite);
+
+                w->display();
+            }
+        }
+        usleep(10000);
+    }
+}
+
+// trampoline for update thread
+void *Display_SITL::update_thread_start(void *obj)
+{
+    ((Display_SITL *)obj)->update_thread();
+    return nullptr;
+}
+
+bool Display_SITL::hw_init()
+{
+    pthread_create(&thread, NULL, update_thread_start, this);
+    _need_hw_update = true;
+
+    return true;
+}
+
+void Display_SITL::hw_update()
+{
+    _need_hw_update = true;
+}
+
+void Display_SITL::set_pixel(uint16_t x, uint16_t y)
+{
+    // check x, y range
+    if ((x >= COLUMNS) || (y >= ROWS)) {
+        return;
+    }
+    // set pixel in buffer
+    WITH_SEMAPHORE(mutex);
+    _displaybuffer[x + (y / 8 * COLUMNS)] |= 1 << (y % 8);
+    _need_hw_update = true;
+}
+
+void Display_SITL::clear_pixel(uint16_t x, uint16_t y)
+{
+    // check x, y range
+    if ((x >= COLUMNS) || (y >= ROWS)) {
+        return;
+    }
+    // clear pixel in buffer
+    WITH_SEMAPHORE(mutex);
+    _displaybuffer[x + (y / 8 * COLUMNS)] &= ~(1 << (y % 8));
+    _need_hw_update = true;
+}
+
+void Display_SITL::clear_screen()
+{
+    WITH_SEMAPHORE(mutex);
+    memset(_displaybuffer, 0, sizeof(_displaybuffer));
+    _need_hw_update = true;
+}
+
+#endif // WITH_SITL_OSD
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #pragma once
+
+#ifdef WITH_SITL_OSD
+
+#include "Display.h"
+#include "Display_Backend.h"
+
+#ifdef HAVE_SFML_GRAPHICS_H
+#include <SFML/Graphics.h>
+#else
+#include <SFML/Graphics.hpp>
+#endif
+
+
+class Display_SITL: public Display_Backend {
+
+public:
+
+    static Display_SITL *probe();
+
+    void hw_update() override;
+    void set_pixel(uint16_t x, uint16_t y) override;
+    void clear_pixel(uint16_t x, uint16_t y) override;
+    void clear_screen() override;
+
+protected:
+
+    Display_SITL();
+    ~Display_SITL() override;
+
+private:
+
+    static constexpr const uint16_t COLUMNS = 132;
+    static constexpr const uint8_t ROWS = 64;
+    static constexpr const uint8_t SCALE = 4; // make it more readable
+
+    bool hw_init() override;
+
+    void _timer();
+
+    uint8_t _displaybuffer[COLUMNS * ROWS];
+    bool _need_hw_update;
+
+    static void *update_thread_start(void *obj);
+    void update_thread(void);
+    sf::RenderWindow *w;
+    pthread_t thread;
+    HAL_Semaphore mutex;
+};
+
+#endif // WITH_SITL_OSD
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "Display_SSD1306_I2C.h"
+
+#include <utility>
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/I2CDevice.h>
+
+// constructor
+Display_SSD1306_I2C::Display_SSD1306_I2C(AP_HAL::OwnPtr<AP_HAL::Device> dev) :
+    _dev(std::move(dev))
+{
+}
+
+Display_SSD1306_I2C::~Display_SSD1306_I2C()
+{
+}
+
+
+Display_SSD1306_I2C *Display_SSD1306_I2C::probe(AP_HAL::OwnPtr<AP_HAL::Device> dev)
+{
+    Display_SSD1306_I2C *driver = NEW_NOTHROW Display_SSD1306_I2C(std::move(dev));
+    if (!driver || !driver->hw_init()) {
+        delete driver;
+        return nullptr;
+    }
+    return driver;
+}
+
+bool Display_SSD1306_I2C::hw_init()
+{
+    struct PACKED {
+        uint8_t reg;
+        uint8_t seq[31];
+    } init_seq = { 0x0,  {
+                          // LEGEND:
+                          //    *** is out of sequence for init steps recommended in datasheet
+                          //    +++ not listed in sequence for init steps recommended in datasheet
+
+            0xAE,         // Display OFF
+            0xD5, 0x80,   // *** Set Display Clock Divide Ratio and Oscillator Frequency
+                          //    Clock Divide Ratio: 0b (== 1)
+                          //    Oscillator Frequency: 1000b (== +0%)
+            0xA8, 0x3F,   // MUX Ratio: 111111b (== 64MUX)
+            0xD3, 0x00,   // Display Offset: 0b (== 0)
+            0x40,         // Display Start Line: 0b (== 0)
+            0x8D, 0x14,   // *** Enable charge pump regulator: 1b (== Enable)
+            0x20, 0x00,   // *** Memory Addressing Mode: 00b (== Horizontal Addressing Mode)
+            0xA1,         // Segment re-map: 1b (== column address 127 is mapped to SEG0)
+            0xC8,         // COM Output Scan Direction: 1b (== remapped mode. Scan from COM[N-1] to COM0)
+            0xDA, 0x12,   // COM Pins hardware configuration: 01b (POR)
+                          //    (== Alternative COM pin configuration + Disable COM Left/Right remap)
+            0x81, 0xCF,   // Contrast Control: 0xCF (== 207 decimal, range 0..255)
+            0xD9, 0xF1,   // +++ Pre-charge Period: 0xF1 (== 1 DCLK P1 + 15 DCLK P2)
+            0xDB, 0x40,   // +++ VCOMH Deselect Level: 100b (INVALID?!) (== ?!)
+            0xA4,         // Entire Display ON (ignoring RAM): (== OFF)
+            0xA6,         // Normal/Inverse Display: 0b (== Normal)
+            0xAF,         // Display ON: 1b (== ON)
+            0x21, 0, 127, // +++ Column Address: (== start:0, end:127)
+            0x22, 0, 7    // +++ Page Address: (== start:0, end:7)
+    } };
+
+    memset(_displaybuffer, 0, SSD1306_COLUMNS * SSD1306_ROWS_PER_PAGE);
+
+    // take i2c bus semaphore
+    if (!_dev) {
+        return false;
+    }
+    _dev->get_semaphore()->take_blocking();
+
+    // init display
+    bool success = _dev->transfer((uint8_t *)&init_seq, sizeof(init_seq), nullptr, 0);
+
+    // give back i2c semaphore
+    _dev->get_semaphore()->give();
+
+    if (success) {
+        _need_hw_update = true;
+        _dev->register_periodic_callback(20000, FUNCTOR_BIND_MEMBER(&Display_SSD1306_I2C::_timer, void));
+    }
+
+    return success;
+}
+
+void Display_SSD1306_I2C::hw_update()
+{
+    _need_hw_update = true;
+}
+
+void Display_SSD1306_I2C::_timer()
+{
+    if (!_need_hw_update) {
+        return;
+    }
+    _need_hw_update = false;
+
+    struct PACKED {
+        uint8_t reg;
+        uint8_t cmd[6];
+    } command = { 0x0, {0x21, 0, 127, 0x22, 0, 7} };
+
+    struct PACKED {
+        uint8_t reg;
+        uint8_t db[SSD1306_COLUMNS/2];
+    } display_buffer = { 0x40, {} };
+
+    // write buffer to display
+    for (uint8_t i = 0; i < (SSD1306_ROWS / SSD1306_ROWS_PER_PAGE); i++) {
+        command.cmd[4] = i;
+        _dev->transfer((uint8_t *)&command, sizeof(command), nullptr, 0);
+
+        memcpy(&display_buffer.db[0], &_displaybuffer[i * SSD1306_COLUMNS], SSD1306_COLUMNS/2);
+        _dev->transfer((uint8_t *)&display_buffer, SSD1306_COLUMNS/2 + 1, nullptr, 0);
+
+        memcpy(&display_buffer.db[0], &_displaybuffer[i * SSD1306_COLUMNS + SSD1306_COLUMNS/2 ], SSD1306_COLUMNS/2);
+        _dev->transfer((uint8_t *)&display_buffer, SSD1306_COLUMNS/2 + 1, nullptr, 0);
+    }
+}
+
+void Display_SSD1306_I2C::set_pixel(uint16_t x, uint16_t y)
+{
+    // check x, y range
+    if ((x >= SSD1306_COLUMNS) || (y >= SSD1306_ROWS)) {
+        return;
+    }
+    // set pixel in buffer
+    _displaybuffer[x + (y / 8 * SSD1306_COLUMNS)] |= 1 << (y % 8);
+}
+
+void Display_SSD1306_I2C::clear_pixel(uint16_t x, uint16_t y)
+{
+    // check x, y range
+    if ((x >= SSD1306_COLUMNS) || (y >= SSD1306_ROWS)) {
+        return;
+    }
+    // clear pixel in buffer
+    _displaybuffer[x + (y / 8 * SSD1306_COLUMNS)] &= ~(1 << (y % 8));
+}
+
+void Display_SSD1306_I2C::clear_screen()
+{
+     memset(_displaybuffer, 0, SSD1306_COLUMNS * SSD1306_ROWS_PER_PAGE);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #pragma once
+
+#include "Display.h"
+#include "Display_Backend.h"
+#include <AP_HAL/I2CDevice.h>
+
+#define SSD1306_COLUMNS 128		// display columns
+#define SSD1306_ROWS 64		    // display rows
+#define SSD1306_ROWS_PER_PAGE 8
+
+class Display_SSD1306_I2C: public Display_Backend {
+
+public:
+
+    static Display_SSD1306_I2C *probe(AP_HAL::OwnPtr<AP_HAL::Device> dev);
+
+    void hw_update() override;
+    void set_pixel(uint16_t x, uint16_t y) override;
+    void clear_pixel(uint16_t x, uint16_t y) override;
+    void clear_screen() override;
+
+protected:
+
+    Display_SSD1306_I2C(AP_HAL::OwnPtr<AP_HAL::Device> dev);
+    ~Display_SSD1306_I2C() override;
+
+private:
+
+    bool hw_init() override;
+
+    void _timer();
+
+    AP_HAL::OwnPtr<AP_HAL::Device> _dev;
+    uint8_t _displaybuffer[SSD1306_COLUMNS * SSD1306_ROWS_PER_PAGE];
+    bool _need_hw_update;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright (C) 2017 Emlid Ltd. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/system.h>
+
+#if HAL_ENABLE_DRONECAN_DRIVERS
+#include "DroneCAN_RGB_LED.h"
+
+#include <AP_DroneCAN/AP_DroneCAN.h>
+
+#include <AP_CANManager/AP_CANManager.h>
+
+#define LED_OFF 0
+#define LED_FULL_BRIGHT 255
+#define LED_MEDIUM ((LED_FULL_BRIGHT / 5) * 4)
+#define LED_DIM ((LED_FULL_BRIGHT / 5) * 2)
+
+DroneCAN_RGB_LED::DroneCAN_RGB_LED()
+    : DroneCAN_RGB_LED(LED_OFF,
+                     LED_FULL_BRIGHT, LED_MEDIUM, LED_DIM)
+{
+}
+
+DroneCAN_RGB_LED::DroneCAN_RGB_LED(uint8_t led_off,
+                               uint8_t led_full, uint8_t led_medium,
+                               uint8_t led_dim)
+    : RGBLed(led_off, led_full, led_medium, led_dim)
+{
+}
+
+bool DroneCAN_RGB_LED::init()
+{
+    // LEDs can turn up later
+    return true;
+}
+
+
+bool DroneCAN_RGB_LED::hw_set_rgb(uint8_t red, uint8_t green, uint8_t blue)
+{
+    uavcan_equipment_indication_LightsCommand msg {};
+    msg.commands.len = 1;
+    msg.commands.data[0].light_id =0;
+    msg.commands.data[0].color.red = red >> 3;
+    msg.commands.data[0].color.green = green >> 2;
+    msg.commands.data[0].color.blue = blue >> 3;
+
+    // broadcast the message on all ifaces
+    uint8_t can_num_drivers = AP::can().get_num_drivers();
+    bool ok = false;
+    for (uint8_t i = 0; i < can_num_drivers; i++) {
+        auto *dronecan = AP_DroneCAN::get_dronecan(i);
+        if (dronecan != nullptr) {
+            ok |= dronecan->rgb_led.broadcast(msg);
+        }
+    }
+    return ok;
+}
+
+#endif // HAL_ENABLE_DRONECAN_DRIVERS
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #pragma once
+
+#include "RGBLed.h"
+#if HAL_ENABLE_DRONECAN_DRIVERS
+
+#include <AP_DroneCAN/AP_DroneCAN.h>
+
+class DroneCAN_RGB_LED: public RGBLed {
+public:
+    DroneCAN_RGB_LED(uint8_t led_off, uint8_t led_full,
+                   uint8_t led_medium, uint8_t led_dim);
+    DroneCAN_RGB_LED();
+    bool init() override;
+protected:
+    virtual bool hw_set_rgb(uint8_t red, uint8_t green, uint8_t blue) override;
+};
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "AP_Notify_config.h"
+
+#if AP_NOTIFY_EXTERNALLED_ENABLED
+
+#include "ExternalLED.h"
+
+#include "AP_Notify.h"
+
+#include <AP_HAL/AP_HAL.h>
+
+#if (defined(EXTERNAL_LED_ARMED) && defined(EXTERNAL_LED_GPS) && \
+    defined(EXTERNAL_LED_MOTOR1) && defined(EXTERNAL_LED_MOTOR2))
+
+extern const AP_HAL::HAL& hal;
+
+bool ExternalLED::init(void)
+{
+    // setup the main LEDs as outputs
+    hal.gpio->pinMode(EXTERNAL_LED_ARMED, HAL_GPIO_OUTPUT);
+    hal.gpio->pinMode(EXTERNAL_LED_GPS, HAL_GPIO_OUTPUT);
+    hal.gpio->pinMode(EXTERNAL_LED_MOTOR1, HAL_GPIO_OUTPUT);
+    hal.gpio->pinMode(EXTERNAL_LED_MOTOR2, HAL_GPIO_OUTPUT);
+
+    // turn leds off
+    hal.gpio->write(EXTERNAL_LED_ARMED, HAL_GPIO_LED_OFF);
+    hal.gpio->write(EXTERNAL_LED_GPS, HAL_GPIO_LED_OFF);
+    hal.gpio->write(EXTERNAL_LED_MOTOR1, HAL_GPIO_LED_OFF);
+    hal.gpio->write(EXTERNAL_LED_MOTOR2, HAL_GPIO_LED_OFF);
+    return true;
+}
+
+/*
+  main update function called at 50Hz
+ */
+void ExternalLED::update(void)
+{
+    // reduce update rate from 50hz to 10hz
+    _counter++;
+    if (_counter < 5) {
+        return;
+    }
+    _counter = 0;
+
+    // internal counter used to control step of armed and gps led
+    _counter2++;
+    if (_counter2 >= 10) {
+        _counter2 = 0;
+    }
+
+    // initialising
+    if (AP_Notify::flags.initialising) {
+        // blink arming and gps leds at 5hz
+        switch(_counter2) {
+            case 0:
+            case 2:
+            case 4:
+            case 6:
+            case 8:
+                armed_led(true);
+                gps_led(false);
+                break;
+            case 1:
+            case 3:
+            case 5:
+            case 7:
+            case 9:
+                armed_led(false);
+                gps_led(true);
+                break;
+        }
+        return;
+    }
+
+    // arming led control
+    if (AP_Notify::flags.armed) {
+        armed_led(true);
+    }else{
+        // blink arming led at 2hz
+        switch(_counter2) {
+            case 0:
+            case 1:
+            case 2:
+            case 5:
+            case 6:
+            case 7:
+                armed_led(false);
+                break;
+            case 3:
+            case 4:
+            case 8:
+            case 9:
+                armed_led(true);
+                break;
+        }
+    }
+
+    // GPS led control
+    switch (AP_Notify::flags.gps_status) {
+        case 0:
+            // no GPS attached
+            gps_led(false);
+            break;
+        case 1:
+        case 2:
+            // GPS attached but no lock, blink at 4Hz
+            switch(_counter2) {                             // Pattern: 3(off), 2(on), 3(off), 2(on), repeat
+                case 0:
+                case 1:
+                case 2:
+                case 5:
+                case 6:
+                case 7:
+                    gps_led(false);
+                    break;
+                case 3:
+                case 4:
+                case 8:
+                case 9:
+                    gps_led(true);
+                    break;
+            }
+            break;
+        case 3:
+            // solid blue on gps lock
+            gps_led(true);
+            break;
+    }
+
+    // motor led control
+    // if we are displaying a pattern complete it
+    if (_pattern != NONE) {
+        _pattern_counter++;
+        switch(_pattern) {
+            case NONE:
+                // do nothing
+                break;
+            case FAST_FLASH:
+                switch(_pattern_counter) {
+                    case 1:
+                    case 3:
+                    case 5:
+                    case 7:
+                    case 9:
+                        motor_led1(true);
+                        motor_led2(true);
+                        break;
+                    case 2:
+                    case 4:
+                    case 6:
+                    case 8:
+                        motor_led1(false);
+                        motor_led2(false);
+                        break;
+                    case 10:
+                        motor_led1(false);
+                        motor_led2(false);
+                        set_pattern(NONE);
+                        break;
+                }
+                break;
+            case OSCILLATE:
+                switch(_pattern_counter) {
+                    case 1:
+                        motor_led1(true);
+                        motor_led2(false);
+                        break;
+                    case 4:
+                        motor_led1(false);
+                        motor_led2(true);
+                        break;
+                    case 6:
+                        set_pattern(NONE);
+                        break;
+                }
+                break;
+        }
+    }else{
+        if (AP_Notify::flags.failsafe_battery || AP_Notify::flags.failsafe_radio || AP_Notify::flags.failsafe_gcs) {
+            // radio or battery failsafe indicated by fast flashing
+            set_pattern(FAST_FLASH);
+        } else {
+            // otherwise do whatever the armed led is doing
+            motor_led1(_flags.armedled_on);
+            motor_led2(_flags.armedled_on);
+        }
+    }
+}
+
+// set_pattern - sets pattern for motor leds
+void ExternalLED::set_pattern(LEDPattern pattern_id)
+{
+    _pattern = pattern_id;
+    _pattern_counter = 0;
+}
+
+// armed_led - set armed light on or off
+void ExternalLED::armed_led(bool on_off)
+{
+    if (_flags.armedled_on != on_off) {
+        _flags.armedled_on = on_off;
+        hal.gpio->write(EXTERNAL_LED_ARMED, _flags.armedled_on);
+    }
+}
+
+// gps_led - set gps light on or off
+void ExternalLED::gps_led(bool on_off)
+{
+    if (_flags.gpsled_on != on_off) {
+        _flags.gpsled_on = on_off;
+        hal.gpio->write(EXTERNAL_LED_GPS, _flags.gpsled_on);
+    }
+}
+
+// motor_led - set motor light on or off
+void ExternalLED::motor_led1(bool on_off)
+{
+    if (_flags.motorled1_on != on_off) {
+        _flags.motorled1_on = on_off;
+        hal.gpio->write(EXTERNAL_LED_MOTOR1, _flags.motorled1_on);
+    }
+}
+
+// motor_led - set motor light on or off
+void ExternalLED::motor_led2(bool on_off)
+{
+    if (_flags.motorled2_on != on_off) {
+        _flags.motorled2_on = on_off;
+        hal.gpio->write(EXTERNAL_LED_MOTOR2, _flags.motorled2_on);
+    }
+}
+#else
+bool ExternalLED::init(void) {return true;}
+void ExternalLED::update(void) {return;}
+#endif
+
+#endif  // AP_NOTIFY_EXTERNALLED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "AP_Notify_config.h"
+
+#if AP_NOTIFY_EXTERNALLED_ENABLED
+
+#include "NotifyDevice.h"
+
+class ExternalLED: public NotifyDevice
+{
+public:
+    // constructor
+    ExternalLED() : _pattern(NONE) {}
+
+    // initialise the LED driver
+    bool init(void) override;
+
+    // should be called at 50Hz
+    void update(void) override;
+
+private:
+
+    enum LEDPattern {
+        NONE = 0,
+        FAST_FLASH = 1,
+        OSCILLATE = 2
+    };
+
+    /// buzzer_flag_type - bitmask of current state and ap_notify states we track
+    struct copterleds_flag_type {
+        // individual led status
+        uint8_t armedled_on         : 1;    // 1 if the armed led is currently on
+        uint8_t gpsled_on           : 1;    // 1 if the gps led is currently on
+        uint8_t motorled1_on        : 1;    // 1 if motor led #1 is currently on
+        uint8_t motorled2_on        : 1;    // 1 if motor led #2 is currently on
+    } _flags;
+
+    uint8_t         _counter;           // reduces 50hz calls to 10hz
+    uint8_t         _counter2;          // used to control steps of arming and gps leds
+    LEDPattern      _pattern;           // current pattern for motor leds
+    uint8_t         _pattern_counter;   // used to time on/off of current patter
+
+    // armed_led - set armed light on or off
+    void armed_led(bool on_off);
+
+    // gps_led - set gps light on or off
+    void gps_led(bool on_off);
+
+    // set_pattern - sets pattern for motor leds
+    void set_pattern(LEDPattern pattern_id);
+
+    // motor_led1, motor_led2 - set motor lights on or off
+    void motor_led1(bool on_off);
+    void motor_led2(bool on_off);
+};
+
+#endif  // AP_NOTIFY_EXTERNALLED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   Copyright (C) 2017 Emlid Ltd. All rights reserved.
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "AP_Notify_config.h"
+
+#if AP_NOTIFY_SYSFS_LED_ENABLED
+
+#include "Led_Sysfs.h"
+
+Led_Sysfs::Led_Sysfs(const char *red, const char *green, const char *blue,
+                    uint8_t off_brightness, uint8_t low_brightness, uint8_t medium_brightness, uint8_t high_brightness):
+    RGBLed(off_brightness, high_brightness, medium_brightness, low_brightness),
+    red_led(red),
+    green_led(green),
+    blue_led(blue)
+{
+}
+
+bool Led_Sysfs::init()
+{
+    if (red_led.init() && green_led.init() && blue_led.init()) {
+        return true;
+    }
+
+    return false;
+}
+
+bool Led_Sysfs::hw_set_rgb(uint8_t red, uint8_t green, uint8_t blue)
+{
+    red_led.set_brightness(red);
+    green_led.set_brightness(green);
+    blue_led.set_brightness(blue);
+
+    return true;
+}
+#endif  // AP_NOTIFY_SYSFS_LED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+  Copyright (C) 2017 Emlid Ltd. All rights reserved.
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#pragma once
+
+#include "AP_Notify_config.h"
+
+#if AP_NOTIFY_SYSFS_LED_ENABLED
+
+#include <AP_HAL_Linux/Led_Sysfs.h>
+
+#include "RGBLed.h"
+
+class Led_Sysfs: public RGBLed
+{
+public:
+    Led_Sysfs(const char *red, const char *green, const char *blue,
+              uint8_t off_brightness = 0xff , uint8_t low_brightness = 0x00,
+              uint8_t medium_brightness = 0x00, uint8_t high_brightness = 0x00);
+    bool init(void) override;
+
+protected:
+    bool hw_set_rgb(uint8_t r, uint8_t g, uint8_t b) override;
+
+private:
+    Linux::Led_Sysfs red_led;
+    Linux::Led_Sysfs green_led;
+    Linux::Led_Sysfs blue_led;
+};
+#endif  // AP_NOTIFY_SYSFS_LED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #include "MMLPlayer.h"
+
+#include <ctype.h>
+#include <math.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Notify/AP_Notify.h>
+
+#if HAL_CANMANAGER_ENABLED
+#include <AP_DroneCAN/AP_DroneCAN.h>
+#include <AP_CANManager/AP_CANManager.h>
+#endif
+
+extern const AP_HAL::HAL& hal;
+
+void MMLPlayer::update()
+{
+    // Check if note is over
+    if (_playing && AP_HAL::micros()-_note_start_us > _note_duration_us) {
+        next_action();
+    }
+}
+
+void MMLPlayer::prepare_to_play_string(const char* string)
+{
+    stop();
+
+    _string = string;
+    _next = 0;
+    _tempo = 120;
+    _default_note_length = 4;
+    _note_mode = MODE_NORMAL;
+    _octave = 4;
+    _volume = 255;
+    _silence_duration = 0;
+    _repeat = false;
+
+    _playing = true;
+    _note_duration_us = 0;
+}
+
+void MMLPlayer::play(const char* string)
+{
+    prepare_to_play_string(string);
+    next_action();
+}
+
+void MMLPlayer::stop()
+{
+    _playing = false;
+    hal.util->toneAlarm_set_buzzer_tone(0,0,0);
+}
+
+void MMLPlayer::start_silence(float duration)
+{
+    _note_start_us = AP_HAL::micros();
+    _note_duration_us = duration*1e6;
+    hal.util->toneAlarm_set_buzzer_tone(0, 0, 0);
+}
+
+void MMLPlayer::start_note(float duration, float frequency, float volume)
+{
+    _note_start_us = AP_HAL::micros();
+    _note_duration_us = duration*1e6;
+    hal.util->toneAlarm_set_buzzer_tone(frequency, volume, _note_duration_us/1000U);
+
+#if HAL_ENABLE_DRONECAN_DRIVERS
+    // support CAN buzzers too
+    uint8_t can_num_drivers = AP::can().get_num_drivers();
+    uavcan_equipment_indication_BeepCommand msg;
+
+    for (uint8_t i = 0; i < can_num_drivers; i++) {
+        AP_DroneCAN *uavcan = AP_DroneCAN::get_dronecan(i);
+        if (uavcan != nullptr &&
+            (AP::notify().get_buzzer_types() & uint8_t(AP_Notify::BuzzerType::UAVCAN))) {
+            msg.frequency = frequency;
+            msg.duration = _note_duration_us*1.0e-6;
+            uavcan->buzzer.broadcast(msg);
+        }
+    }
+#endif
+}
+
+char MMLPlayer::next_char()
+{
+    while (_string[_next] != '\0' && isspace(_string[_next])) {
+        _next++;
+    }
+
+    return toupper(_string[_next]);
+}
+
+uint8_t MMLPlayer::next_number()
+{
+    uint8_t ret = 0;
+    while (isdigit(next_char())) {
+        ret = (ret*10) + (next_char() - '0');
+        _next++;
+    }
+    return ret;
+}
+
+size_t MMLPlayer::next_dots()
+{
+    size_t ret = 0;
+    while (next_char() == '.') {
+        ret++;
+        _next++;
+    }
+    return ret;
+}
+
+float MMLPlayer::rest_duration(uint32_t rest_length, uint8_t dots) const
+{
+    float whole_note_period = 240.0f / _tempo;
+    if (rest_length == 0) {
+        rest_length = 1;
+    }
+
+    float rest_period = whole_note_period/rest_length;
+    float dot_extension = rest_period * 0.5f;
+
+    while (dots--) {
+        rest_period += dot_extension;
+        dot_extension *= 0.5f;
+    }
+
+    return rest_period;
+}
+
+void MMLPlayer::next_action()
+{
+    if (_silence_duration > 0) {
+        start_silence(_silence_duration);
+        _silence_duration = 0;
+        return;
+    }
+
+    uint8_t note = 0;
+    uint8_t note_length;
+
+    while (note == 0) {
+        char c = next_char();
+        if (c == '\0') {
+            if (_repeat) {
+                // don't "play" here, as we may have been called from
+                // there, and it turns out infinite recursion on
+                // invalid strings is suboptimal.  The next call to
+                // update() will push things out as appropriate.
+                prepare_to_play_string(_string);
+            } else {
+                stop();
+            }
+            return;
+        }
+
+        _next++;
+
+        switch (c) {
+        case 'V': {
+            _volume = next_number();
+            break;
+        }
+        case 'L': {
+            _default_note_length = next_number();
+            if (_default_note_length == 0) {
+                stop();
+                return;
+            }
+            break;
+        }
+        case 'O':
+            _octave = next_number();
+            if (_octave > 6) {
+                _octave = 6;
+            }
+            break;
+        case '<':
+            if (_octave > 0) {
+                _octave--;
+            }
+            break;
+        case '>':
+            if (_octave < 6) {
+                _octave++;
+            }
+            break;
+        case 'M':
+            c = next_char();
+            if (c == '\0') {
+                stop();
+                return;
+            }
+            _next++;
+            switch (c) {
+            case 'N':
+                _note_mode = MODE_NORMAL;
+                break;
+            case 'L':
+                _note_mode = MODE_LEGATO;
+                break;
+            case 'S':
+                _note_mode = MODE_STACCATO;
+                break;
+            case 'F':
+                _repeat = false;
+                break;
+            case 'B':
+                _repeat = true;
+                break;
+            default:
+                stop();
+                return;
+            }
+            break;
+        case 'R':
+        case 'P': {
+            uint8_t num = next_number();
+            uint8_t dots = next_dots();
+            start_silence(rest_duration(num, dots));
+            return;
+        }
+        case 'T':
+            _tempo = next_number();
+            if (_tempo < 32) {
+                stop();
+                return;
+            }
+            break;
+        case 'N':
+            note = next_number();
+            note_length = _default_note_length;
+            if (note > 84) {
+                stop();
+                return;
+            }
+            if (note == 0) {
+                uint8_t num = next_number();
+                uint8_t dots = next_dots();
+                start_silence(rest_duration(num, dots));
+                return;
+            }
+            break;
+        case 'A':
+        case 'B':
+        case 'C':
+        case 'D':
+        case 'E':
+        case 'F':
+        case 'G': {
+            static const uint8_t note_tab[] = {9,11,0,2,4,5,7};
+            note = note_tab[c-'A'] + (_octave*12) + 1;
+
+            c = next_char();
+
+            switch (c) {
+            case '#':
+            case '+':
+                if (note < 84) {
+                    note++;
+                }
+                _next++;
+                break;
+            case '-':
+                if (note > 1) {
+                    note--;
+                }
+                _next++;
+                break;
+            default:
+                break;
+            }
+            note_length = next_number();
+            if (note_length == 0) {
+                note_length = _default_note_length;
+            }
+            break;
+        }
+        default:
+            stop();
+            return;
+        }
+    }
+
+    // Avoid division by zero
+    if (_tempo == 0 || note_length == 0) {
+        stop();
+        return;
+    }
+
+    float note_period = 240.0f / (float)_tempo / (float)note_length;
+
+    switch (_note_mode) {
+    case MODE_NORMAL:
+        _silence_duration = note_period/8;
+        break;
+    case MODE_STACCATO:
+        _silence_duration = note_period/4;
+        break;
+    case MODE_LEGATO:
+        _silence_duration = 0;
+        break;
+    }
+    note_period -= _silence_duration;
+
+    float dot_extension = note_period * 0.5f;
+    uint8_t dots = next_dots();
+    while (dots--) {
+        note_period += dot_extension;
+        dot_extension *= 0.5f;
+    }
+
+    float note_frequency = 880.0f * expf(logf(2.0f) * ((int)note - 46) / 12.0f);
+    float note_volume = _volume/255.0f;
+    note_volume *= AP::notify().get_buzz_volume() * 0.01;
+    note_volume = constrain_float(note_volume, 0, 1);
+
+    note_frequency = constrain_float(note_frequency, 10, 22000);
+
+    start_note(note_period, note_frequency, note_volume);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #pragma once
+
+#include <stdint.h>
+#include <stdlib.h>
+
+class MMLPlayer {
+public:
+    void update();
+    void play(const char* string);
+    void stop();
+
+private:
+
+    // initialise ready to play string
+    void prepare_to_play_string(const char* string);
+
+    bool _playing;
+
+    uint32_t _note_duration_us;
+    uint32_t _note_start_us;
+    const char* _string;
+    uint8_t _tempo;
+    uint8_t _default_note_length;
+    uint8_t _volume;
+    size_t _next;
+    uint8_t _octave;
+    float _silence_duration;
+    bool _repeat;
+    enum node_mode_t {
+        MODE_NORMAL,
+        MODE_LEGATO,
+        MODE_STACCATO
+    } _note_mode;
+
+    void start_silence(float duration);
+    void start_note(float duration, float frequency, float volume);
+    char next_char();
+    uint8_t next_number();
+    size_t next_dots();
+    float rest_duration(uint32_t rest_length, uint8_t dots) const;
+
+    // Called when the MML player should start the next action
+    void next_action();
+};
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+  NCP5623 I2C LED driver
+*/
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "NCP5623.h"
+#include <utility>
+
+#include <AP_HAL/AP_HAL.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define NCP5623_LED_BRIGHT  0x1f    // full brightness
+#define NCP5623_LED_MEDIUM  0x18    // medium brightness
+#define NCP5623_LED_DIM     0x0f    // dim
+#define NCP5623_LED_OFF     0x00    // off
+
+#define NCP5623_LED_I2C_ADDR 0x38    // default I2C bus address
+#define NCP5623_C_LED_I2C_ADDR 0x39    // default I2C bus address for the NCP5623C
+
+#define NCP5623_LED_PWM0    0x40    // pwm0 register
+#define NCP5623_LED_PWM1    0x60    // pwm1 register
+#define NCP5623_LED_PWM2    0x80    // pwm2 register
+#define NCP5623_LED_ENABLE  0x20    // enable register
+
+NCP5623::NCP5623(uint8_t bus)
+    : RGBLed(NCP5623_LED_OFF, NCP5623_LED_BRIGHT, NCP5623_LED_MEDIUM, NCP5623_LED_DIM)
+    , _bus(bus)
+{
+}
+
+bool NCP5623::write(uint8_t reg, uint8_t data)
+{
+    uint8_t msg[1] = { 0x00 };
+    // scale to 0 to 0x1F
+    data = (data * 255U) / 0x1FU;
+    msg[0] = ((reg & 0xe0) | (data & 0x1f));
+    bool ret = _dev->transfer(msg, 1, nullptr, 0);
+    return ret;
+}
+
+bool NCP5623::write_pwm(uint8_t _rgb[3])
+{
+    uint8_t reg = NCP5623_LED_PWM0;
+    for (uint8_t i=0; i<3; i++) {
+        if (!write(reg+i*0x20, _rgb[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool NCP5623::init(void)
+{
+    uint8_t addrs[] = { NCP5623_LED_I2C_ADDR, NCP5623_C_LED_I2C_ADDR };
+    for (uint8_t i=0; i<ARRAY_SIZE(addrs); i++) {
+        // first look for led on external bus
+        _dev = std::move(hal.i2c_mgr->get_device(_bus, addrs[i]));
+        if (!_dev) {
+            continue;
+        }
+
+        _dev->get_semaphore()->take_blocking();
+        _dev->set_retries(10);
+
+        // enable the led
+        bool ret = write(NCP5623_LED_ENABLE, 0x1f);
+        if (!ret) {
+            _dev->get_semaphore()->give();
+            continue;
+        }
+
+        // update the red, green and blue values to zero
+        uint8_t off[3] = { _led_off, _led_off, _led_off };
+        ret = write_pwm(off);
+
+        _dev->set_retries(1);
+
+        // give back i2c semaphore
+        _dev->get_semaphore()->give();
+
+        if (ret) {
+            _dev->register_periodic_callback(20000, FUNCTOR_BIND_MEMBER(&NCP5623::_timer, void));
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// set_rgb - set color as a combination of red, green and blue values
+bool NCP5623::hw_set_rgb(uint8_t red, uint8_t green, uint8_t blue)
+{
+    rgb[0] = red;
+    rgb[1] = green;
+    rgb[2] = blue;
+    _need_update = true;
+    return true;
+}
+
+void NCP5623::_timer(void)
+{
+    if (!_need_update) {
+        return;
+    }
+    _need_update = false;
+
+    write_pwm(rgb);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+  NCP5623 Linux driver
+*/
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <AP_HAL/I2CDevice.h>
+#include "RGBLed.h"
+
+class NCP5623 : public RGBLed {
+public:
+    NCP5623(uint8_t bus);
+    bool init(void) override;
+protected:
+    bool hw_set_rgb(uint8_t r, uint8_t g, uint8_t b) override;
+private:
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> _dev;
+    void _timer(void);
+    bool write(uint8_t reg, uint8_t data);
+    bool write_pwm(uint8_t rgb[3]);
+    uint8_t rgb[3];
+    bool _need_update;
+    uint8_t _bus;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    

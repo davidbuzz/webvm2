@@ -1,0 +1,1897 @@
+/*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Copyright (C) 2021 Siddharth Bharat Purohit, CubePilot Pty Ltd
+ */
+
+#include <CrashCatcher.h>
+#include <ch.h>
+#include "hal.h"
+#include "string.h"
+#include "watchdog.h"
+#include "stm32_util.h"
+#include "flash.h"
+
+CRASH_CATCHER_TEST_WRITEABLE CrashCatcherReturnCodes g_crashCatcherDumpEndReturn = CRASH_CATCHER_TRY_AGAIN;
+static                       CrashCatcherInfo        g_info;
+
+static bool do_flash_crash_dump = true;
+static void* dump_start_address;
+static void* dump_end_address;
+
+static void CrashCatcher_DumpStartFlash(const CrashCatcherInfo* pInfo);
+static CrashCatcherReturnCodes CrashCatcher_DumpEndFlash(void);
+static void CrashCatcher_DumpMemoryFlash(const void* pvMemory, CrashCatcherElementSizes elementSize, size_t elementCount);
+
+#if defined(HAL_CRASH_SERIAL_PORT)
+static bool uart_initialised = false;
+static bool do_serial_crash_dump = false;
+
+#ifndef HAL_CRASH_SERIAL_PORT_BAUD
+#define HAL_CRASH_SERIAL_PORT_BAUD 921600
+#endif // HAL_CRASH_SERIAL_PORT_BAUD
+
+#if !defined(USART_ISR_RXNE)
+#define USART_ISR_RXNE                      USART_ISR_RXNE_RXFNE
+#endif
+static void printString(const char* pString);
+static void waitForUserInput(void);
+static void dumpBytes(const uint8_t* pMemory, size_t elementCount);
+static void dumpByteAsHex(uint8_t byte);
+static void dumpHexDigit(uint8_t nibble);
+static void dumpHalfwords(const uint16_t* pMemory, size_t elementCount);
+static void dumpWords(const uint32_t* pMemory, size_t elementCount);
+static void CrashCatcher_DumpStartHex(const CrashCatcherInfo* pInfo);
+static CrashCatcherReturnCodes CrashCatcher_DumpEndHex(void);
+static void CrashCatcher_DumpMemoryHex(const void* pvMemory, CrashCatcherElementSizes elementSize, size_t elementCount);
+#endif // HAL_CRASH_SERIAL_PORT
+
+extern uint32_t __crash_log_base__, __crash_log_end__;
+
+uint32_t stm32_crash_dump_size(void)
+{
+    uint32_t* page_addr = (uint32_t*)&__crash_log_base__;
+    uint32_t page_size = stm32_crash_dump_max_size();
+    return page_addr[(page_size / sizeof(uint32_t)) - 1];
+}
+
+uint32_t stm32_crash_dump_max_size(void)
+{
+    return (uint32_t)&__crash_log_end__ - (uint32_t)&__crash_log_base__;
+}
+
+uint32_t stm32_crash_dump_addr(void)
+{
+    return (uint32_t)&__crash_log_base__;
+}
+
+bool stm32_crash_dump_region_erased(void)
+{
+    for (uint32_t i = 0; i < stm32_crash_dump_max_size(); i += 4) {
+        if (((uint32_t*)stm32_crash_dump_addr())[i / 4] != 0xFFFFFFFF) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#define ARRAY_SIZE(X) (sizeof(X)/sizeof(X[0]))
+extern uint32_t __ram0_start__, __ram0_end__, __heap_base__, __heap_end__, __bss_base__, __bss_end__;
+#define REMAINDER_MEM_REGION_SIZE (15000) // remainder memory for crashcatcher internal regions
+static uint32_t dump_size = 0;
+static uint8_t dump_buffer[32]; // we need to maintain a dump buffer of 32bytes for H7
+static uint8_t buf_off = 0;
+
+const CrashCatcherMemoryRegion* CrashCatcher_GetMemoryRegions(void);
+const CrashCatcherMemoryRegion* CrashCatcher_GetMemoryRegions(void)
+{
+    // do a full dump if on serial
+    static CrashCatcherMemoryRegion regions[60] = {
+    {(uint32_t)&__ram0_start__, (uint32_t)&__ram0_end__, CRASH_CATCHER_BYTE},
+    {(uint32_t)&ch_system, (uint32_t)&ch_system + sizeof(ch_system), CRASH_CATCHER_BYTE}};
+    uint32_t total_dump_size = dump_size + buf_off + REMAINDER_MEM_REGION_SIZE;
+    // loop through chibios threads and add their stack info
+    uint8_t curr_region = 2;
+    for (thread_t *tp = chRegFirstThread(); tp && (curr_region < (ARRAY_SIZE(regions) - 1)); tp = chRegNextThread(tp)) {
+        uint32_t total_stack;
+        if (tp->wabase == (void*)&__main_thread_stack_base__) {
+            // main thread has its stack separated from the thread context
+            total_stack = (uint32_t)((const uint8_t *)&__main_thread_stack_end__ - (const uint8_t *)&__main_thread_stack_base__);
+        } else {
+            // all other threads have their thread context pointer
+            // above the stack top
+            total_stack = (uint32_t)(tp) - (uint32_t)(tp->wabase);
+        }
+        // log names if in RAM
+        if (tp->name != NULL && is_address_in_memory((void*)tp->name)) {
+            regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+            regions[curr_region].startAddress = (uint32_t)(tp->name);
+            regions[curr_region++].endAddress = (uint32_t)(tp->name) + 13;
+        }
+        // log thread info
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = (uint32_t)(tp);
+        regions[curr_region++].endAddress = (uint32_t)(tp) + sizeof(thread_t);
+        // log thread stacks
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = (uint32_t)(tp->wabase);
+        regions[curr_region++].endAddress = (uint32_t)(tp->wabase) + total_stack;
+
+        total_dump_size += total_stack;
+        if ((total_dump_size) >= stm32_crash_dump_max_size()) {
+            // we can't log anymore than this
+            goto finalise;
+        }
+    }
+
+    // log statically alocated memory
+    int32_t bss_size = ((uint32_t)&__bss_end__) - ((uint32_t)&__bss_base__);
+    int32_t available_space = stm32_crash_dump_max_size() - total_dump_size;
+    if (available_space < 0) {
+        // we can't log anymore than this
+        goto finalise;
+    }
+    if (bss_size > available_space) { // dump however much we can
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = (uint32_t)&__bss_base__;
+        regions[curr_region++].endAddress = (uint32_t)&__bss_base__ + available_space;
+        total_dump_size += available_space;
+    } else { // dump the entire bss
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = (uint32_t)&__bss_base__;
+        regions[curr_region++].endAddress = (uint32_t)&__bss_end__;
+        total_dump_size += bss_size;
+    }
+
+    // dump the Heap as well as much as we can
+    int32_t heap_size = ((uint32_t)&__heap_end__) - ((uint32_t)&__heap_base__);
+    available_space = stm32_crash_dump_max_size() - total_dump_size;
+    if (available_space < 0) {
+        // we can't log anymore than this
+        goto finalise;
+    }
+    if (heap_size > available_space) { // dump however much we can
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = (uint32_t)&__heap_base__;
+        regions[curr_region++].endAddress = (uint32_t)&__heap_base__ + available_space;
+        total_dump_size += available_space;
+    } else { // dump the entire heap
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = (uint32_t)&__heap_base__;
+        regions[curr_region++].endAddress = (uint32_t)&__heap_end__;
+        total_dump_size += heap_size;
+    }
+
+finalise:
+    // ensure that last is filled with 0xFFFFFFFF
+    if (curr_region < ARRAY_SIZE(regions)) {
+        regions[curr_region].elementSize = CRASH_CATCHER_BYTE;
+        regions[curr_region].startAddress = 0xFFFFFFFF;
+        regions[curr_region].endAddress = 0xFFFFFFFF;
+    } else {
+        regions[ARRAY_SIZE(regions) - 1].elementSize = CRASH_CATCHER_BYTE;
+        regions[ARRAY_SIZE(regions) - 1].startAddress = 0xFFFFFFFF;
+        regions[ARRAY_SIZE(regions) - 1].endAddress = 0xFFFFFFFF;
+    }
+
+    if (do_flash_crash_dump) {
+        // smaller dump if on flash
+        regions[0].startAddress = (uint32_t)dump_start_address;
+        regions[0].endAddress = (uint32_t)dump_end_address;
+    }
+    return regions;
+}
+
+void CrashCatcher_DumpMemory(const void* pvMemory, CrashCatcherElementSizes elementSize, size_t elementCount)
+{
+    (void)pvMemory;
+    (void)elementSize;
+    (void)elementCount;
+#if defined(HAL_CRASH_SERIAL_PORT)
+    if (do_serial_crash_dump) {
+        CrashCatcher_DumpMemoryHex(pvMemory, elementSize, elementCount);
+    }
+#endif
+    if (do_flash_crash_dump) {
+        CrashCatcher_DumpMemoryFlash(pvMemory, elementSize, elementCount);
+    }
+}
+
+
+void CrashCatcher_DumpStart(const CrashCatcherInfo* pInfo)
+{
+    // Record the fault info for watchdog
+    struct port_extctx* ctx = (struct port_extctx*)pInfo->sp;
+    FaultType faultType = (FaultType)__get_IPSR();
+    save_fault_watchdog(__LINE__, faultType, pInfo->sp, ctx->lr_thd);
+#if defined(HAL_CRASH_SERIAL_PORT)
+    if (do_serial_crash_dump) {
+        CrashCatcher_DumpStartHex(pInfo);
+    }
+#endif
+    if (do_flash_crash_dump) {
+        CrashCatcher_DumpStartFlash(pInfo);
+    }
+}
+
+CrashCatcherReturnCodes CrashCatcher_DumpEnd(void)
+{
+#if defined(HAL_CRASH_SERIAL_PORT)
+    if (do_serial_crash_dump) {
+        return CrashCatcher_DumpEndHex();
+    }
+#endif
+    if (do_flash_crash_dump) {
+        return CrashCatcher_DumpEndFlash();
+    }
+    do_flash_crash_dump = false;
+#if defined(HAL_CRASH_SERIAL_PORT)
+    do_serial_crash_dump = true;
+#endif
+    return CRASH_CATCHER_TRY_AGAIN;
+}
+
+// -------------- FlashDump Code --------------------
+static void CrashCatcher_DumpStartFlash(const CrashCatcherInfo* pInfo)
+{
+    // initialise for dumping
+    void *sp = (void*)pInfo->sp;
+    if (sp == NULL || !is_address_in_memory(sp)) {
+        do_flash_crash_dump = false;
+        return;
+    }
+    // let's set the memory range to be dumped
+    if (get_addr_mem_region_start_addr(sp) + HAL_MAX_STACK_FRAME_SIZE > sp) {
+        // only go until the start of the region
+        dump_start_address = get_addr_mem_region_start_addr(sp);
+    } else {
+        // go back as far as we need to
+        dump_start_address = sp - HAL_MAX_STACK_FRAME_SIZE;
+    }
+
+    if (get_addr_mem_region_end_addr(sp) < sp + HAL_PROCESS_STACK_SIZE) {
+        // only go until the end of the region
+        dump_end_address = get_addr_mem_region_end_addr(sp);
+    } else {
+        // go ahead as far as we need to
+        dump_end_address = sp + HAL_PROCESS_STACK_SIZE;
+    }
+
+    dump_size = 0;
+    buf_off = 0;
+    // we expect crash dump flash page to already be empty
+    if (!stm32_crash_dump_region_erased()) {
+        // stuff is already there, maybe last dump
+        // so just do nothing
+        do_flash_crash_dump = false;
+        return;
+    }
+    stm32_watchdog_pat();
+    // unlock flash page for write
+    stm32_flash_keep_unlocked(true);
+}
+// only flushes if we have a full buffer
+static void flush_dump_buffer(void)
+{
+    if (buf_off == sizeof(dump_buffer)) {
+        uint32_t page_start = (uint32_t)stm32_crash_dump_addr();
+        // write dump buffer to flash
+        stm32_flash_write(page_start + dump_size, dump_buffer, sizeof(dump_buffer));
+        dump_size += sizeof(dump_buffer);
+        buf_off = 0;
+        memset(dump_buffer, 0, sizeof(dump_buffer));
+        stm32_watchdog_pat();
+    }
+}
+
+// Does the requested Dump to Flash
+static void CrashCatcher_DumpMemoryFlash(const void* pvMemory, CrashCatcherElementSizes elementSize, size_t elementCount)
+{
+    const uint8_t* pv = (const uint8_t*)pvMemory;
+    size_t cnt = 0;
+    while (cnt < elementCount) {
+        if (dump_size + buf_off + sizeof(dump_size) >= stm32_crash_dump_max_size()) {
+            // when this happens, buf_off will be sizeof(buffer)-sizeof(dump_size)
+            // 0xFF will be used to detect that we were in the middle of taking a dump
+            memset(&dump_buffer[sizeof(dump_buffer)-sizeof(dump_size)], 0xFF, sizeof(dump_size));
+            buf_off = sizeof(dump_buffer);
+            return;
+        }
+        flush_dump_buffer();
+        switch (elementSize)
+        {
+            case CRASH_CATCHER_BYTE:
+                dump_buffer[buf_off++] = pv[cnt++];
+                break;
+            case CRASH_CATCHER_HALFWORD:
+                // we need to split the half word into two parts
+                dump_buffer[buf_off++] = (uint16_t)*pv & 0xFF;
+                flush_dump_buffer();
+                dump_buffer[buf_off++] = ((uint16_t)*pv >> 8) & 0xFF;
+                cnt++;
+                break;
+            case CRASH_CATCHER_WORD:
+                // we need to split the word and then write
+                for (size_t i = 0; i < sizeof(uint32_t); i++) {
+                    dump_buffer[buf_off++] = ((uint32_t)*pv >> (8*i)) & 0xFF;
+                    flush_dump_buffer();
+                }
+                cnt++;
+                break;
+        }
+    }
+}
+
+static CrashCatcherReturnCodes CrashCatcher_DumpEndFlash(void)
+{
+    // flush the buffer
+    if (dump_size + buf_off + sizeof(dump_size) >= stm32_crash_dump_max_size()) {
+        // when this happens, buf_off will be sizeof(buffer)-sizeof(dump_size)
+        // 0xFF will be used to detect that we were in the middle of taking a dump
+        memset(&dump_buffer[sizeof(dump_buffer)-sizeof(dump_size)], 0xFF, sizeof(dump_size));
+        buf_off = sizeof(dump_buffer);
+    }
+    if (buf_off > 0) {
+        if (dump_size + sizeof(dump_buffer) >= stm32_crash_dump_max_size() && buf_off < sizeof(dump_buffer)) {
+            // we have a partially full buffer towards the end, so we need to write the buffer
+            // and then write the size of the buffer
+            memcpy(&dump_buffer[sizeof(dump_buffer)-sizeof(dump_size)], &dump_size, sizeof(dump_size));
+            buf_off = 32;
+        }
+        stm32_flash_write(stm32_crash_dump_addr() + dump_size, dump_buffer, 32);
+        dump_size += buf_off;
+        buf_off = 0;
+        memset(dump_buffer, 0, sizeof(dump_buffer));
+        stm32_watchdog_pat();
+    }
+
+    // write size to buffer if not already written
+    if (dump_size < stm32_crash_dump_max_size()) {
+        memcpy(&dump_buffer[sizeof(dump_buffer)-sizeof(dump_size)], &dump_size, sizeof(dump_size));
+        stm32_flash_write(stm32_crash_dump_addr() + stm32_crash_dump_max_size() - sizeof(dump_buffer), dump_buffer, sizeof(dump_buffer));
+        stm32_watchdog_pat();
+    }
+
+    stm32_flash_keep_unlocked(false);
+    // How big of a dump did we take, record that at the end of flash sector
+    if (g_crashCatcherDumpEndReturn == CRASH_CATCHER_TRY_AGAIN && g_info.isBKPT)
+        return CRASH_CATCHER_EXIT;
+    else
+        return g_crashCatcherDumpEndReturn;
+}
+
+// -------------- HexDump Code --------------------
+/* Copyright (C) 2018  Adam Green (https://github.com/adamgreen)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+#if defined(HAL_CRASH_SERIAL_PORT)
+
+static void CrashCatcher_DumpStartHex(const CrashCatcherInfo* pInfo)
+{
+    g_info = *pInfo;
+    
+    printString("\r\n\r\n");
+    if (pInfo->isBKPT)
+        printString("BREAKPOINT");
+    else
+        printString("CRASH");
+    printString(" ENCOUNTERED\r\n"
+                 "Enable logging and then press any key to start dump.\r\n");
+    
+    waitForUserInput();
+    printString("\r\n");
+}
+
+static void printString(const char* pString)
+{
+    while (*pString)
+        CrashCatcher_putc(*pString++);
+}
+
+static void waitForUserInput(void)
+{
+    CrashCatcher_getc();
+}
+
+static void CrashCatcher_DumpMemoryHex(const void* pvMemory, CrashCatcherElementSizes elementSize, size_t elementCount)
+{
+    switch (elementSize)
+    {
+        case CRASH_CATCHER_BYTE:
+            dumpBytes(pvMemory, elementCount);
+            break;
+        case CRASH_CATCHER_HALFWORD:
+            dumpHalfwords(pvMemory, elementCount);
+            break;
+        case CRASH_CATCHER_WORD:
+            dumpWord
+
+/*
+ * Copyright (C) Siddharth Bharat Purohit 2017
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "hal.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t stm32_flash_getpageaddr(uint32_t page);
+uint32_t stm32_flash_getpagesize(uint32_t page);
+uint32_t stm32_flash_getnumpages(void);
+bool stm32_flash_erasepage(uint32_t page);
+bool stm32_flash_write(uint32_t addr, const void *buf, uint32_t count);
+void stm32_flash_keep_unlocked(bool set);
+bool stm32_flash_ispageerased(uint32_t page);
+void stm32_flash_protect_flash(bool bootloader, bool protect);
+void stm32_flash_unprotect_flash(void);
+void stm32_flash_set_NRST_MODE(uint8_t nrst_mode);
+#if defined(STM32H7)
+void stm32_flash_corrupt(uint32_t addr);
+#endif
+#ifndef HAL_BOOTLOADER_BUILD
+bool stm32_flash_recent_erase(void);
+#endif
+#ifdef __cplusplus
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+    ChibiOS - Copyright (C) 2006..2016 Giovanni Di Sirio
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+*/
+/*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ * Modified for use in AP_HAL by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+/**
+ * @file    templates/halconf.h
+ * @brief   HAL configuration header.
+ * @details HAL configuration file, this file allows to enable or disable the
+ *          various device drivers from your application. You may also use
+ *          this file in order to override the device drivers default settings.
+ *
+ * @addtogroup HAL_CONF
+ * @{
+ */
+
+#pragma once
+#define _CHIBIOS_HAL_CONF_
+#define _CHIBIOS_HAL_CONF_VER_8_4_
+
+#include "mcuconf.h"
+
+/**
+ * @brief   Enables the PAL subsystem.
+ */
+#if !defined(HAL_USE_PAL) || defined(__DOXYGEN__)
+#define HAL_USE_PAL                 TRUE
+#endif
+
+/**
+ * @brief   Enables the ADC subsystem.
+ */
+#if !defined(HAL_USE_ADC) || defined(__DOXYGEN__)
+#define HAL_USE_ADC                 TRUE
+#endif
+
+/**
+ * @brief   Enables the CAN subsystem.
+ */
+#if !defined(HAL_USE_CAN) || defined(__DOXYGEN__)
+#define HAL_USE_CAN                 FALSE
+#endif
+
+/**
+ * @brief   Enables the cryptographic subsystem.
+ */
+#if !defined(HAL_USE_CRY) || defined(__DOXYGEN__)
+#define HAL_USE_CRY                         FALSE
+#endif
+
+/**
+ * @brief   Enables the DAC subsystem.
+ */
+#if !defined(HAL_USE_DAC) || defined(__DOXYGEN__)
+#define HAL_USE_DAC                         FALSE
+#endif
+
+/**
+ * @brief   Enables the EFlash subsystem.
+ */
+#if !defined(HAL_USE_EFL) || defined(__DOXYGEN__)
+#define HAL_USE_EFL                         FALSE
+#endif
+
+/**
+ * @brief Enables the GPT subsystem. We don't need it on most boards
+ * in ArduPilot, so it is disabled by default
+ */
+#if !defined(HAL_USE_GPT) || defined(__DOXYGEN__)
+#define HAL_USE_GPT                 FALSE
+#endif
+
+/**
+ * @brief   Enables the I2C subsystem.
+ */
+#if !defined(HAL_USE_I2C) || defined(__DOXYGEN__)
+#define HAL_USE_I2C                 TRUE
+#endif
+
+/**
+ * @brief   Enables the I2S subsystem.
+ */
+#if !defined(HAL_USE_I2S) || defined(__DOXYGEN__)
+#define HAL_USE_I2S                 FALSE
+#endif
+
+/**
+ * @brief   Enables the ICU subsystem.
+ */
+#if !defined(HAL_USE_ICU) || defined(__DOXYGEN__)
+#define HAL_USE_ICU                 FALSE
+#endif
+
+/**
+ * @brief   Enables the MAC subsystem.
+ */
+#if !defined(HAL_USE_MAC) || defined(__DOXYGEN__)
+#define HAL_USE_MAC                 FALSE
+#endif
+
+/**
+ * @brief   Enables the MMC_SPI subsystem.
+ */
+#if !defined(HAL_USE_MMC_SPI) || defined(__DOXYGEN__)
+#define HAL_USE_MMC_SPI             FALSE
+#endif
+
+/**
+ * @brief   Enables the PWM subsystem.
+ */
+#if !defined(HAL_USE_PWM) || defined(__DOXYGEN__)
+#define HAL_USE_PWM                 TRUE
+#endif
+
+/**
+ * @brief   Enables the RTC subsystem.
+ */
+#if !defined(HAL_USE_RTC) || defined(__DOXYGEN__)
+#define HAL_USE_RTC                 FALSE
+#endif
+
+/**
+ * @brief   Enables the SDC subsystem.
+ */
+#if !defined(HAL_USE_SDC) || defined(__DOXYGEN__)
+#define HAL_USE_SDC                 TRUE
+#endif
+
+/**
+ * @brief   Enables the SERIAL subsystem.
+ */
+#if !defined(HAL_USE_SERIAL) || defined(__DOXYGEN__)
+#define HAL_USE_SERIAL              TRUE
+#endif
+
+/**
+ * @brief   Enables the SERIAL over USB subsystem.
+ */
+#if !defined(HAL_USE_SERIAL_USB) || defined(__DOXYGEN__)
+#define HAL_USE_SERIAL_USB          FALSE
+#endif
+
+/**
+ * @brief   Enables the SIO subsystem.
+ */
+#if !defined(HAL_USE_SIO) || defined(__DOXYGEN__)
+#define HAL_USE_SIO                         FALSE
+#endif
+
+/**
+ * @brief   Enables the SPI subsystem.
+ */
+#if !defined(HAL_USE_SPI) || defined(__DOXYGEN__)
+#define HAL_USE_SPI                 TRUE
+#endif
+
+/**
+ * @brief   Enables the TRNG subsystem.
+ */
+#if !defined(HAL_USE_TRNG) || defined(__DOXYGEN__)
+#define HAL_USE_TRNG                        FALSE
+#endif
+
+/**
+ * @brief   Enables the UART subsystem.
+ */
+#if !defined(HAL_USE_UART) || defined(__DOXYGEN__)
+#define HAL_USE_UART                FALSE
+#endif
+
+/**
+ * @brief   Enables the USB subsystem.
+ */
+#if !defined(HAL_USE_USB) || defined(__DOXYGEN__)
+#define HAL_USE_USB                 FALSE
+#endif
+
+/**
+ * @brief   Enables the WDG subsystem.
+ */
+#if !defined(HAL_USE_WDG) || defined(__DOXYGEN__)
+#define HAL_USE_WDG                         FALSE
+#endif
+
+/**
+ * @brief   Enables the WSPI subsystem.
+ */
+#if !defined(HAL_USE_WSPI) || defined(__DOXYGEN__)
+#define HAL_USE_WSPI                        FALSE
+#endif
+
+/*===========================================================================*/
+/* PAL driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables synchronous APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(PAL_USE_CALLBACKS) || defined(__DOXYGEN__)
+#define PAL_USE_CALLBACKS                   TRUE
+#endif
+
+/**
+ * @brief   Enables synchronous APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(PAL_USE_WAIT) || defined(__DOXYGEN__)
+#define PAL_USE_WAIT                        FALSE
+#endif
+
+/*===========================================================================*/
+/* ADC driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables synchronous APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(ADC_USE_WAIT) || defined(__DOXYGEN__)
+#define ADC_USE_WAIT                TRUE
+#endif
+
+/**
+ * @brief   Enables the @p adcAcquireBus() and @p adcReleaseBus() APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(ADC_USE_MUTUAL_EXCLUSION) || defined(__DOXYGEN__)
+#define ADC_USE_MUTUAL_EXCLUSION    FALSE
+#endif
+
+/*===========================================================================*/
+/* CAN driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Sleep mode related APIs inclusion switch.
+ */
+#if !defined(CAN_USE_SLEEP_MODE) || defined(__DOXYGEN__)
+#define CAN_USE_SLEEP_MODE          TRUE
+#endif
+
+/**
+ * @brief   Enforces the driver to use direct callbacks rather than OSAL events.
+ */
+#if !defined(CAN_ENFORCE_USE_CALLBACKS) || defined(__DOXYGEN__)
+#define CAN_ENFORCE_USE_CALLBACKS           TRUE
+#endif
+
+/*===========================================================================*/
+/* CRY driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables the SW fall-back of the cryptographic driver.
+ * @details When enabled, this option, activates a fall-back software
+ *          implementation for algorithms not supported by the underlying
+ *          hardware.
+ * @note    Fall-back implementations may not be present for all algorithms.
+ */
+#if !defined(HAL_CRY_USE_FALLBACK) || defined(__DOXYGEN__)
+#define HAL_CRY_USE_FALLBACK                FALSE
+#endif
+
+/**
+ * @brief   Makes the driver forcibly use the fall-back implementations.
+ */
+#if !defined(HAL_CRY_ENFORCE_FALLBACK) || defined(__DOXYGEN__)
+#define HAL_CRY_ENFORCE_FALLBACK            FALSE
+#endif
+
+/*===========================================================================*/
+/* DAC driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables synchronous APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(DAC_USE_WAIT) || defined(__DOXYGEN__)
+#define DAC_USE_WAIT                        TRUE
+#endif
+
+/**
+ * @brief   Enables the @p dacAcquireBus() and @p dacReleaseBus() APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(DAC_USE_MUTUAL_EXCLUSION) || defined(__DOXYGEN__)
+#define DAC_USE_MUTUAL_EXCLUSION            TRUE
+#endif
+
+/*===========================================================================*/
+/* I2C driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables the mutual exclusion APIs on the I2C bus.
+ */
+#if !defined(I2C_USE_MUTUAL_EXCLUSION) || defined(__DOXYGEN__)
+#define I2C_USE_MUTUAL_EXCLUSION    TRUE
+#endif
+
+/*===========================================================================*/
+/* MAC driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables the zero-copy API.
+ */
+#if !defined(MAC_USE_ZERO_COPY) || defined(__DOXYGEN__)
+#define MAC_USE_ZERO_COPY           FALSE
+#endif
+
+/**
+ * @brief   Enables an event sources for incoming packets.
+ */
+#if !defined(MAC_USE_EVENTS) || defined(__DOXYGEN__)
+#define MAC_USE_EVENTS              TRUE
+#endif
+
+/*===========================================================================*/
+/* MMC_SPI driver related settings.                                          */
+/*===========================================================================*/
+
+/**
+ * @brief   Timeout before assuming a failure while waiting for card idle.
+ * #note    Time is in milliseconds.
+ */
+#if !defined(MMC_IDLE_TIMEOUT_MS) || defined(__DOXYGEN__)
+#define MMC_IDLE_TIMEOUT_MS                 1000
+#endif
+
+/**
+ * @brief   Mutual exclusion on the SPI bus.
+ */
+#if !defined(MMC_USE_MUTUAL_EXCLUSION) || defined(__DOXYGEN__)
+#define MMC_USE_MUTUAL_EXCLUSION            TRUE
+#endif
+
+/*===========================================================================*/
+/* SDC driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Number of initialization attempts before rejecting the card.
+ * @note    Attempts are performed at 10mS intervals.
+ */
+#if !defined(SDC_INIT_RETRY) || defined(__DOXYGEN__)
+#define SDC_INIT_RETRY              100
+#endif
+
+/**
+ * @brief   Include support for MMC cards.
+ * @note    MMC support is not yet implemented so this option must be kept
+ *          at @p FALSE.
+ */
+#if !defined(SDC_MMC_SUPPORT) || defined(__DOXYGEN__)
+#define SDC_MMC_SUPPORT             FALSE
+#endif
+
+/**
+ * @brief   Delays insertions.
+ * @details If enabled this options inserts delays into the MMC waiting
+ *          routines releasing some extra CPU time for the threads with
+ *          lower priority, this may slow down the driver a bit however.
+ */
+#if !defined(SDC_NICE_WAITING) || defined(__DOXYGEN__)
+#define SDC_NICE_WAITING            TRUE
+#endif
+
+/**
+ * @brief   OCR initialization constant for V20 cards.
+ */
+#if !defined(SDC_INIT_OCR_V20) || defined(__DOXYGEN__)
+#define SDC_INIT_OCR_V20                    0x50FF8000U
+#endif
+
+/**
+ * @brief   OCR initialization constant for non-V20 cards.
+ */
+#if !defined(SDC_INIT_OCR) || defined(__DOXYGEN__)
+#define SDC_INIT_OCR                        0x80100000U
+#endif
+
+/*===========================================================================*/
+/* SERIAL driver related settings.                                           */
+/*===========================================================================*/
+
+/**
+ * @brief   Default bit rate.
+ * @details Configuration parameter, this is the baud rate selected for the
+ *          default configuration.
+ */
+#if !defined(SERIAL_DEFAULT_BITRATE) || defined(__DOXYGEN__)
+#define SERIAL_DEFAULT_BITRATE      38400
+#endif
+
+/**
+ * @brief   Serial buffers size.
+ * @details Configuration parameter, you can change the depth of the queue
+ *          buffers depending on the requirements of your application.
+ * @note    The default is 16 bytes for both the transmission and receive
+ *          buffers.
+ */
+#if !defined(SERIAL_BUFFERS_SIZE) || defined(__DOXYGEN__)
+#if defined(STM32H7) && HAL_MEMORY_TOTAL_KB>=512
+#define SERIAL_BUFFERS_SIZE     512
+#else
+#define SERIAL_BUFFERS_SIZE     256
+#endif
+#endif
+
+/*===========================================================================*/
+/* SIO driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Default bit rate.
+ * @details Configuration parameter, this is the baud rate selected for the
+ *          default configuration.
+ */
+#if !defined(SIO_DEFAULT_BITRATE) || defined(__DOXYGEN__)
+#define SIO_DEFAULT_BITRATE                 38400
+#endif
+
+/**
+ * @brief   Support for thread synchronization API.
+ */
+#if !defined(SIO_USE_SYNCHRONIZATION) || defined(__DOXYGEN__)
+#define SIO_USE_SYNCHRONIZATION             TRUE
+#endif
+
+/*===========================================================================*/
+/* SERIAL_USB driver related setting.                                        */
+/*===========================================================================*/
+
+/**
+ * @brief   Serial over USB buffers size.
+ * @details Configuration parameter, the buffer size must be a multiple of
+ *          the USB data endpoint maximum packet size.
+ * @note    The default is 256 bytes for both the transmission and receive
+ *          buffers.
+ */
+#if !defined(SERIAL_USB_BUFFERS_SIZE) || defined(__DOXYGEN__)
+#if defined(STM32H7) && HAL_MEMORY_TOTAL_KB>=512
+#define SERIAL_USB_BUFFERS_SIZE     768
+#else
+#define SERIAL_USB_BUFFERS_SIZE     256
+#endif
+#endif
+
+/**
+ * @brief   Serial over USB number of buffers.
+ * @note    The default is 2 buffers.
+ */
+#if !defined(SERIAL_USB_BUFFERS_NUMBER) || defined(__DOXYGEN__)
+// more USB buffers works well on H7 and higher end F7
+#if (defined(STM32H7) || defined(STM32F7)) && HAL_MEMORY_TOTAL_KB>=512
+#define SERIAL_USB_BUFFERS_NUMBER   4
+#else
+#define SERIAL_USB_BUFFERS_NUMBER   2
+#endif
+#endif
+
+/*===========================================================================*/
+/* SPI driver related settings.                                              */
+/*===========================================================================*/
+
+/**
+ * @brief   Enables synchronous APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(SPI_USE_WAIT) || defined(__DOXYGEN__)
+#define SPI_USE_WAIT                TRUE
+#endif
+
+/**
+ * @brief   Inserts an assertion on function errors before returning.
+ */
+#if !defined(SPI_USE_ASSERT_ON_ERROR) || defined(__DOXYGEN__)
+#define SPI_USE_ASSERT_ON_ERROR             TRUE
+#endif
+
+/**
+ * @brief   Enables circular transfers APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(SPI_USE_CIRCULAR) || defined(__DOXYGEN__)
+#define SPI_USE_CIRCULAR                    FALSE
+#endif
+
+/**
+ * @brief   Enables the @p spiAcquireBus() and @p spiReleaseBus() APIs.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(SPI_USE_MUTUAL_EXCLUSION) || defined(__DOXYGEN__)
+#define SPI_USE_MUTUAL_EXCLUSION    TRUE
+#endif
+
+/**
+ * @brief   Handling method for SPI CS line.
+ * @note    Disabling this option saves both code and data space.
+ */
+#if !defined(SPI_SELECT_MODE) || defined(__DOXYGEN__)
+#define SPI_SELECT_MODE                     SPI_SELECT_MODE_PAD
+#endif
+
+/*======# hwdef for Luminousbees flight board
+
+# MCU class and specific type
+MCU STM32F4xx STM32F427xx
+
+# board ID for firmware load
+APJ_BOARD_ID 11
+
+# crystal frequency
+OSCILLATOR_HZ 24000000
+
+# ChibiOS system timer
+STM32_ST_USE_TIMER 5
+
+# flash size
+FLASH_SIZE_KB 2048
+
+env OPTIMIZE -O3
+
+# serial port for stdout disabled, use USB console
+# STDOUT_SERIAL SD7
+# STDOUT_BAUDRATE 57600
+
+# only one I2C bus
+I2C_ORDER I2C1
+
+# to match px4 we make the first bus number 1
+define HAL_I2C_BUS_BASE 1
+define HAL_I2C_INTERNAL_MASK 0
+
+# order of UARTs (and USB)
+SERIAL_ORDER OTG1 USART2 USART3 UART4 UART8 USART1 UART7
+
+# UART4 is GPS
+PA0 UART4_TX UART4
+PA1 UART4_RX UART4 
+
+# Battery & current control
+PA2 BATT_VOLTAGE_SENS ADC1
+PA3 BATT_CURRENT_SENS ADC1
+PA4 VDD_5V_SENS ADC1 SCALE(2)
+
+# SPI1 is sensors bus
+PA5 SPI1_SCK SPI1
+PA6 SPI1_MISO SPI1
+PA7 SPI1_MOSI SPI1
+
+
+PA11 OTG_FS_DM OTG1
+PA12 OTG_FS_DP OTG1
+
+PA13 JTMS-SWDIO SWD
+PA14 JTCK-SWCLK SWD
+
+
+PB2 BOOT1 INPUT
+PB5 VDD_BRICK_VALID INPUT
+
+# USART1 
+PB6 TIM4_CH1 TIM4 PWM(7) GPIO(56)  # PB6 as led strip control
+#PB6 USART1_TX USART1
+PB7 USART1_RX USART1
+
+# UWB DW1000
+PB4 UWB_CS CS
+
+PB8 I2C1_SCL I2C1
+PB9 I2C1_SDA I2C1
+
+# SPI2 is FRAM
+PB10 SPI2_SCK SPI2
+PB14 SPI2_MISO SPI2
+PB15 SPI2_MOSI SPI2
+
+PC0 VBUS_VALID INPUT
+PC4 SAFETY_IN INPUT PULLDOWN
+
+PC7 TIM8_CH2 TIM8 RCIN PULLDOWN LOW # also USART6_RX for serial RC
+
+PC8 SDIO_D0 SDIO
+PC9 SDIO_D1 SDIO
+PC10 SDIO_D2 SDIO
+PC11 SDIO_D3 SDIO
+PC12 SDIO_CK SDIO
+PD2 SDIO_CMD SDIO
+
+# USART2 serial2 telem1 connected to ESP
+
+PD4 BMI088_ACCEL_CS CS
+PD3 BMI088_GYRO_CS CS
+PD5 USART2_TX USART2
+PD6 USART2_RX USART2
+
+PD7 BARO_CS CS
+# PB7 BARO2_CS CS	# FOR DPS310 ON FRAME MICRO
+
+# USART3 serial3 telem2
+PD8 USART3_TX USART3
+PD9 USART3_RX USART3
+PD10 FRAM_CS CS
+
+
+PD13 TIM4_CH2 TIM4 PWM(5) GPIO(54)
+PD14 TIM4_CH3 TIM4 PWM(6) GPIO(55)
+
+# UART8
+PE0 UART8_RX UART8
+PE1 UART8_TX UART8
+
+#set up SPI bus4 for UWB
+PE2 SPI4_SCK SPI4
+PE5 SPI4_MISO SPI4
+PE6 SPI4_MOSI SPI4
+
+
+# UART7 is debug
+PE7 UART7_RX UART7 NODMA
+PE8 UART7_TX UART7 NODMA
+
+PE11 TIM1_CH2 TIM1 PWM(1) GPIO(50)     #52
+PE14 TIM1_CH4 TIM1 PWM(2) GPIO(51)     #50
+PE9 TIM1_CH1 TIM1 PWM(3) GPIO(52)      #53
+PE13 TIM1_CH3 TIM1 PWM(4) GPIO(53)     #51
+
+
+# SPI device table. The DEVID values are chosen to match the PX4 port
+# of ArduPilot so users don't need to re-do their accel and compass calibrations
+# when moving to ChibiOS
+ SPIDEV ms5611_int  SPI2 DEVID3  BARO_CS    MODE3  20*MHZ  20*MHZ
+SPIDEV bmi088_g    SPI4 DEVID1  BMI088_GYRO_CS    MODE3 10*MHZ 10*MHZ
+SPIDEV bmi088_a    SPI4 DEVID2  BMI088_ACCEL_CS   MODE3 10*MHZ 10*MHZ
+SPIDEV ramtron     SPI2 DEVID10 FRAM_CS    		MODE3   8*MHZ   8*MHZ
+SPIDEV dwm1000     SPI4 DEVID5  UWB_CS     		MODE0   3*MHZ  20*MHZ
+define HAL_CHIBIOS_ARCH_FMUV4 1
+
+define HAL_STORAGE_SIZE        16384
+
+# enable RAMTROM parameter storage
+define HAL_WITH_RAMTRON 1
+
+# enable FAT filesystem
+define HAL_OS_FATFS_IO 1
+
+# pixracer has 3 LEDs, Red, Green, Blue
+define AP_NOTIFY_GPIO_LED_RGB_ENABLED 1
+
+# LED setup for PixracerLED driver
+PB11 LED_RED   OUTPUT GPIO(0)
+PB1  LED_GREEN OUTPUT GPIO(1)
+PB3  LED_BLUE  OUTPUT GPIO(2)
+
+define AP_NOTIFY_GPIO_LED_RGB_RED_PIN 0
+define AP_NOTIFY_GPIO_LED_RGB_GREEN_PIN 1
+define AP_NOTIFY_GPIO_LED_RGB_BLUE_PIN 2
+
+# enable RTSCTS
+define AP_FEATURE_RTSCTS 1
+
+# battery setup
+define HAL_BATT_VOLT_PIN 2
+define HAL_BATT_CURR_PIN 3
+define HAL_BATT_VOLT_SCALE 10.1
+define HAL_BATT_CURR_SCALE 17.0
+
+# setup serial port defaults for ESP8266
+define DEFAULT_SERIAL5_PROTOCOL SerialProtocol_MAVLink2
+define DEFAULT_SERIAL5_BAUD 921600
+
+# Set one or two IMUs
+#IMU Invensense SPI:icm20608 ROTATION_YAW_180
+IMU BMI088 SPI:bmi088_a SPI:bmi088_g ROTATION_ROLL_180_YAW_90
+define HAL_DEFAULT_INS_FAST_SAMPLE 1
+
+# 2 compasses. R15 has LIS3MDL instead of HMC5843
+COMPASS HMC5843 SPI:hmc5843 false ROTATION_PITCH_180
+COMPASS LIS3MDL SPI:lis3mdl false ROTATION_NONE
+
+# also probe all types of external I2C compasses
+define HAL_PROBE_EXTERNAL_I2C_COMPASSES
+
+# Barometer ( DPS310 under test on micro frame )
+BARO MS56XX SPI:ms5611_int
+# BARO DPS310      SPI:dps310
+
+# reserve plenty of memory for DMA for LED buffers
+define DMA_RESERVE_SIZE 32768
+
+# bootloader embedding / bootloader flashing not available
+define AP_BOOTLOADER_FLASHING_ENABLED 0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       AHRS_GPS_USE,2
+AHRS_ORIENTATION,6
+ANGLE_MAX,4500
+ARMING_CHECK,13822
+ATC_ACCEL_P_MAX,200000
+ATC_ACCEL_R_MAX,200000
+ATC_ACCEL_Y_MAX,50000
+ATC_ANG_PIT_P,18
+ATC_ANG_RLL_P,18
+ATC_ANG_YAW_P,10
+ATC_RAT_PIT_D,0.003
+ATC_RAT_PIT_FLTD,50
+ATC_RAT_PIT_FLTT,25
+ATC_RAT_PIT_I,0.14
+ATC_RAT_PIT_P,0.14
+ATC_RAT_RLL_D,0.003
+ATC_RAT_RLL_FLTD,50
+ATC_RAT_RLL_FLTT,25
+ATC_RAT_RLL_I,0.14
+ATC_RAT_RLL_P,0.14
+ATC_RAT_YAW_D,0
+ATC_RAT_YAW_FLTD,50
+ATC_RAT_YAW_FLTE,3.7
+ATC_RAT_YAW_FLTT,25
+ATC_RAT_YAW_I,0.05
+ATC_RAT_YAW_P,0.5
+AUTOTUNE_AGGR,0.075
+AUTOTUNE_MIN_D,0.0003
+AVOID_ENABLE,0
+BATT_AMP_OFFSET,0
+BATT_AMP_PERVLT,4.6135
+BATT_ARM_MAH,0
+BATT_ARM_VOLT,7.2
+BATT_CAPACITY,3400
+BATT_CRT_MAH,0
+BATT_CRT_VOLT,6
+BATT_CURR_PIN,15
+BATT_FS_CRT_ACT,1
+BATT_FS_LOW_ACT,2
+BATT_FS_VOLTSRC,0
+BATT_LOW_MAH,0
+BATT_LOW_TIMER,10
+BATT_LOW_VOLT,6.2
+BATT_MONITOR,4
+BATT_OPTIONS,0
+BATT_SERIAL_NUM,-1
+BATT_VOLT_MULT,3.28
+BATT_VOLT_PIN,14
+BRD_SAFETYENABLE,0
+BRD_SAFETYOPTION,0
+BRD_SAFETY_DEFLT,0
+CAN_D1_PROTOCOL,0
+CAN_D2_PROTOCOL,0
+COMPASS_AUTODEC,1
+COMPASS_EXTERNAL,1
+COMPASS_ORIENT,12
+COMPASS_DISBLMSK,510846
+COMPASS_USE2,0
+COMPASS_USE3,0
+COMPASS_CAL_FIT,16
+DISARM_DELAY,10
+EK3_IMU_MASK,1
+EK3_POSNE_M_NSE,0.1
+EK3_SRC1_POSXY,3
+EK3_SRC1_POSZ,3
+EK3_SRC1_VELXY,3
+EK3_SRC1_VELZ,3
+EK3_SRC3_POSZ,1
+EK3_ALT_M_NSE,2
+ESC_CALIBRATION,9
+FLTMODE3,2
+FLTMODE4,2
+FLTMODE5,5
+FLTMODE6,5
+FRAME_CLASS,1
+FRSKY_DNLINK1_ID,-1
+FRSKY_DNLINK2_ID,-1
+FRSKY_DNLINK_ID,-1
+FRSKY_UPLINK_ID,-1
+FS_OPTIONS,20
+FS_THR_ENABLE,0
+FS_VIBE_ENABLE,0
+FENCE_ENABLE,1
+GND_EFFECT_COMP,0
+GPS_AUTO_SWITCH,0
+GPS1_GNSS_MODE,0
+GPS1_RATE_MS,140
+GPS1_SBAS_MODE,0
+GPS1_TYPE,2
+GPS_MIN_ELEV,15
+INS_ACC_BODYFIX,1
+INS_ACCEL_FILTER,10
+INS_ENABLE_MASK,1
+INS_FAST_SAMPLE,1
+INS_GYRO_FILTER,80
+INS_GYRO_RATE,2
+INS_HNTC2_ATT,16
+INS_HNTC2_BW,50
+INS_HNTC2_ENABLE,0
+INS_HNTC2_FREQ,103
+INS_HNTC2_HMNCS,1
+INS_HNTC2_MODE,0
+INS_HNTC2_OPTS,0
+INS_HNTC2_REF,0
+INS_HNTCH_ATT,40
+INS_HNTCH_BW,8
+INS_HNTCH_ENABLE,1
+INS_HNTCH_FREQ,40
+INS_HNTCH_HMNCS,22
+INS_HNTCH_MODE,3
+INS_HNTCH_OPTS,22
+INS_HNTCH_REF,1
+INS_LOG_BAT_CNT,32
+INS_LOG_BAT_OPT,2
+LAND_ALT_LOW,500
+LAND_SPEED,80
+LAND_SPEED_HIGH,300
+LOG_BITMASK,141310
+LOG_FILE_DSRMROT,1
+LOIT_SPEED,2000
+MOT_BAT_VOLT_MAX,7.56
+MOT_BAT_VOLT_MIN,5.2
+MOT_HOVER_LEARN,1
+MOT_PWM_MAX,2000
+MOT_PWM_MIN,1000
+MOT_PWM_TYPE,6
+MOT_SPIN_ARM,0.05
+MOT_SPIN_MIN,0.16
+MOT_THST_EXPO,0.55
+MOT_THST_HOVER,0.47
+NTF_BUZZ_TYPES,1
+NTF_LED_BRIGHT,1
+NTF_LED_TYPES,1
+PSC_ACCZ_I,0.94
+PSC_ACCZ_P,0.47
+PSC_JERK_XY,6
+PSC_JERK_Z,6
+PSC_POSZ_P,1
+RC1_MAX,1900
+RC1_MIN,1100
+RC2_MAX,1900
+RC2_MIN,1100
+RC3_MAX,1900
+RC3_MIN,1100
+RC4_MAX,1900
+RC4_MIN,1100
+RC6_OPTION,5
+RC_PROTOCOLS,0
+RTL_ALT,1500
+SCHED_LOOP_RATE,800
+SERIAL1_BAUD,921
+SERIAL1_PROTOCOL,2
+SERIAL2_OPTIONS,8
+SERIAL2_PROTOCOL,2
+SERIAL4_BAUD,115
+SERIAL4_PROTOCOL,16
+SERIAL5_BAUD,921
+SERIAL5_PROTOCOL,-1
+SERIAL6_BAUD,921
+SERIAL6_PROTOCOL,-1
+SERVO1_FUNCTION,33
+SERVO1_MAX,2000
+SERVO1_MIN,1000
+SERVO1_TRIM,1500
+SERVO2_FUNCTION,34
+SERVO2_MAX,2000
+SERVO2_MIN,1000
+SERVO2_TRIM,1500
+SERVO3_FUNCTION,35
+SERVO3_MAX,2000
+SERVO3_MIN,1000
+SERVO3_TRIM,1500
+SERVO4_FUNCTION,36
+SERVO4_MAX,2000
+SERVO4_MIN,1000
+SERVO4_TRIM,1500
+SERVO_BLH_AUTO,1
+SERVO_BLH_BDMASK,15
+SERVO_BLH_POLES,12
+SERVO_BLH_TRATE,0
+SERVO_DSHOT_ESC,1
+SERVO_DSHOT_RATE,2
+SERVO_BLH_RVMASK,3
+SHOW_CTRL_MODE,1
+SHOW_CTRL_RATE,10
+SHOW_GROUP,0
+SHOW_LED0_CHAN,1
+SHOW_LED0_COUNT,100
+SHOW_LED0_GAMMA,2.2
+SHOW_LED0_TYPE,1
+SHOW_MAX_XY_ERR,3
+SHOW_MODE_BOOT,2
+SHOW_PRE_LIGHTS,2
+SHOW_START_AUTH,0
+SHOW_SYNC_MODE,1
+SHOW_TAKEOFF_ALT,2.5
+SHOW_VEL_FF_GAIN,1
+SR1_EXT_STAT,0
+SR1_EXTRA1,0
+SR1_EXTRA2,0
+SR1_EXTRA3,0
+SR1_POSITION,0
+SR1_RAW_SENS,0
+SR1_RC_CHAN,0
+SRTL_POINTS,0
+TERRAIN_ENABLE,0
+WP_YAW_BEHAVIOR,0
+WPNAV_ACCEL,300
+WPNAV_ACCEL_Z,300
+WPNAV_JERK,6
+WPNAV_SPEED,1000
+WPNAV_SPEED_DN,300
+WPNAV_SPEED_UP,300
+                                                                                                                                                                                                                                                                                                                                                                                                                                       # LUMINOUS BEE 5.32/5.4
+# hw definition file for processing by chibios_hwdef.py
+#define new bootloader baudrate
+
+define BOOTLOADER_BAUDRATE 921600
+
+# MCU class and specific type
+MCU STM32H7xx STM32H743xx
+
+# board ID for firmware load
+APJ_BOARD_ID 1029
+
+# crystal frequency
+OSCILLATOR_HZ 24000000
+
+# flash size
+FLASH_SIZE_KB 2048
+
+# bootloader is installed at zero offset
+FLASH_RESERVE_START_KB 0
+
+# the location where the bootloader will put the firmware
+# the H743 has 128k sectors
+FLASH_BOOTLOADER_LOAD_KB 128
+
+# only one I2C bus
+I2C_ORDER I2C1
+
+define HAL_I2C_INTERNAL_MASK 0
+
+# order of UARTs (and USB) for bootloading
+SERIAL_ORDER USART2 OTG1
+
+# USART2 serial2 telem1
+
+
+PD5 USART2_TX USART2
+PD6 USART2_RX USART2
+
+# UART7 is debug
+PE7 UART7_RX UART7 NODMA
+PE8 UART7_TX UART7 NODMA
+
+# pins that USB is connected on.
+PA11 OTG_FS_DM OTG1
+PA12 OTG_FS_DP OTG1
+
+# These are the pins for SWD debugging with a STlinkv2 or black-magic probe.
+PA13 JTMS-SWDIO SWD
+PA14 JTCK-SWCLK SWD
+
+# CS lines
+#PB4 UWB_CS CS
+PC2 BMI088_ACCEL_CS CS
+PC15 BMI088_GYRO_CS CS
+PD7 BARO_CS CS
+PE15 MAG_CS CS
+
+PB11 LED_BOOTLOADER  OUTPUT
+define HAL_LED_ON 0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        # hw definition file for processing by chibios_hwdef.py
+# for MindPX-v2 hardware bootloader
+
+# MCU class and specific type
+MCU STM32F4xx STM32F427xx
+
+define HAL_CHIBIOS_ARCH_MINDPXV2 1
+
+# board ID for firmware load
+APJ_BOARD_ID 88
+
+# crystal frequency
+OSCILLATOR_HZ 8000000
+
+STM32_ST_USE_TIMER 5
+
+
+# flash size
+FLASH_SIZE_KB 2048
+
+# location of application code
+FLASH_BOOTLOADER_LOAD_KB 16
+
+# bootloader loads at start of flash
+FLASH_RESERVE_START_KB 0
+
+# order of UARTs (and USB)
+SERIAL_ORDER OTG1 USART2
+
+PA9 VBUS INPUT
+
+PA11 OTG_FS_DM OTG1
+PA12 OTG_FS_DP OTG1
+
+PA13 JTMS-SWDIO SWD
+PA14 JTCK-SWCLK SWD
+
+# USART2 serial2 telem1
+PD5 USART2_TX USART2
+PD6 USART2_RX USART2
+
+PA8 LED_BOOTLOADER OUTPUT
+define HAL_LED_ON 1
+
+
+# Add CS pins to ensure they are high in bootloader
+PB2 GYRO_CS CS
+PC15 BARO_CS CS
+PD11 ACCEL_MAG_CS CS
+PE3 MPU_CS CS
+PE12 FRAM_CS CS
+PE15 NRF_CS CS
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           # ModalAI Flight Core v1 Controller
+
+The [ModalAI](http://www.modalai.com/) FlightCore is a flight controller made in the USA. 
+The Flight Core can be paired with ModalAI VOXL for obstacle avoidance and GPS-denied navigation, or used independently as a standalone flight controller.
+
+Buy [Here](https://www.modalai.com/products/flight-core)
+
+See Flight Core Documentation [Here](https://docs.modalai.com/flight-core/)
+
+See Flight Core Datasheet [Here](https://docs.modalai.com/flight-core-datasheets/)
+
+![ModalAI_FC](flight-core.jpg "modal-fc")
+
+## Features
+
+| Feature          | Details                                                                                                                                                         |
+|:-----------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Weight           | 6 g                                                                                                                                                             |
+| MCU              | 216MHz, 32-bit ARM M7 [STM32F765II](https://www.st.com/en/microcontrollers-microprocessors/stm32f765ii.html)                                                    |
+| Memory           | 256Kb FRAM                                                                                                                                                      |
+|                  | 2Mbit Flash                                                                                                                                                     |
+|                  | 512Kbit SRAM                                                                                                                                                    |
+| IMUs             | [ICM-20602](https://www.invensense.com/products/motion-tracking/6-axis/icm-20602/) (SPI1)                                                                       |
+|                  | [ICM-42688-P](https://invensense.tdk.com/products/motion-tracking/6-axis/icm-42688-p/) (SPI2)                                                                   |
+|                  | [BMI088](https://www.bosch-sensortec.com/bst/products/all_products/bmi088_1) (SPI6)                                                                             |
+| Barometer        | [BMP388](https://www.bosch-sensortec.com/bst/products/all_products/bmp388) (I2C4)                                                                               |
+| Secure Element   | [A71CH](https://www.nxp.com/products/security-and-authentication/authentication/plug-and-trust-the-fast-easy-way-to-deploy-secure-iot-connections:A71CH) (I2C4) |
+| microSD Card     | [Information on supported cards](https://dev.px4.io/v1.9.0/en/log/logging.html#sd-cards)                                                                        |
+| Inputs           | GPS/Mag                                                                                                                                                         |
+|                  | Spektrum                                                                                                                                                        |
+|                  | Telemetry                                                                                                                                                       |
+|                  | CAN bus                                                                                                                                                         |
+|                  | PPM                                                                                                                                                             |
+| Outputs          | 6 LEDs (2xRGB)                                                                                                                                                  |
+|                  | 8 PWM Channels                                                                                                                                                  |
+| Extra Interfaces | 3 serial ports                                                                                                                                                  |
+|                  | I2C                                                                                                                                                             |
+|                  | GPIO                                                                                                                                                            |
+
+
+## Pinout
+
+![ModalAI_v1 Board](fc-overlay-top-144-dpi.jpg "ModalAI_v1")
+
+For detailed pinout descriptions see [FlightCore Pinout](https://docs.modalai.com/flight-core-datasheets-connectors/)
+
+## Dimensions
+
+![ModalAI-fc-dims](flight_core_v1_imu_locations.png "modal-fc-dims")
+
+![ModalAI_fc-dims2](flight-core-dims.png "modal-fc-dims2")
+
+## Block Diagram
+
+![ModalAI_FC](fc-dk-preliminary-datasheet.png "modal-fc-block")
+
+## UART Mapping
+
+The UARTs are marked Rn and Tn in the above pinouts. The Rn pin is the
+receive pin for UARTn. The Tn pin is the transmit pin for UARTn.
+
+ - SERIAL0 -> USB
+ - SERIAL1 -> UART7 (Telem1)
+ - SERIAL2 -> UART5 (Telem2)
+ - SERIAL3 -> USART1 (GPS)
+ - SERIAL4 -> UART4 (GPS2)
+ - SERIAL5 -> USART2
+ - SERIAL6 -> USART6 (spektrum RCIN)
+ - SERIAL7 -> USART3
+ - SERIAL8 -> USB2
+
+## RC Input
+
+RC input is configured on both the PPM input pin and the "spektrum"
+USART6 UART. The PPM pin supports all one-way RC protocols. For
+protocols requiring half-duplex serial to transmit telemetry (such as
+FPort) you should use the spektrum port, mapped to SERIAL6. Both PPM
+and spektrum ports are enabled for RCIN by default.
+
+## PWM Output
+
+The ModalAI_v1 supports up to 8 PWM outputs on the PWM output connector
+
+The PWM is in 2 groups:
+
+ - PWM 1, 2, 3, 4 in group1
+ - PWM 5, 6, 7, 8 in group2
+
+Channels within the same group need to use the same output rate. If
+any channel in a group uses DShot then all channels in the group need
+to use DShot.
+
+## Power Monitoring
+
+In addition to the normal range of ArduPilot power monitoring options,
+the modalAI build supports two I2C power monitors, the INA231 and the
+LTC2946. The FlightCore board comes with the INA231 and you should set
+BATTERY_MONITOR to 21. For the LTC2946 based power brick you should
+set BATTERY_MONITOR to 22.
+
+## Compass
+
+The ModalAI_v1 does not have a built-in compass, but you can attach an
+external compass
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         ‰PNG
+
+   IHDR  f  6   'Öuí  JiCCPICC Profile  H‰•WTSÉ[RIhH	½	R¤K	¡E*ØI ¡Ä˜DìÊ²
+®]D@]ÑU] kE]ë¢Ø]Ë‹²¨¬¬‹*oR@×=ï½óşsæÎ—şùş’¹sg Ğ«ãI¥¨> …’"YRt8kbF&‹Ô0`t€;0äñåRvbb€2Ôÿ]^ß ˆª¿ê¦âúçøPÎ I„8[ çB|  ¼Œ/•@ô‡zÛ™ER±‘±T…s5¸L…³5¸Zm“’Äx7 d'Ë@·êYÅü\È£{b‰@,@q_Ä@ñ¨ÂÂé*í€Sö<¹ãÌæäñr‡±&µ#ÄrioÖÿYÿ-…Š!°ÑD²˜$UÎ°n·ò§Çª0â^Iv|Ä†¿Ôö£T‘"&UcšóåX3À„ØCÀ‹ˆ…Øâ(IA|œVŸ#âBWZ".â¦hç.Ê#“µœu²éI	C8GÆakç6ñdj¿*ûSŠüT¶–ÿ–HÈâU*JI×ÄŒQ‹ÅiñëBÌ”ç'Çjl0»R'~ÈF¦HRÅoq P®áÇ¦æÈ¢’´ö²BùP¾Ø‘˜¯Å5E¢”-Ïn>O¿	Ä­B	;uˆG(Ÿ7”‹@©É»,”¤jóÅ”Ò¢ğ$íÜÒ‚D­=ND«ô6›Ë‹“µsñ"¸ 5üx¼´(1E'Ç—¨‰/q€" (`ËÓAwô¶ôÂ_š‘(À2„ÀM«š‘®‘Àg2(B$òáyáêQ!(†úÃZÍÓä¨G‹Õ3òÁ#ˆA,(€¿êY’aoiàw¨ÿÃ;ÆZ ›jìŸ:6ÔÄi5Š!^–Ş%1’AŒ!Fq3<Âãà36/ÜŠö³=á¡“ğp $Ü&^$û*”ĞC”6çì/sÆ «C~È3q3à†Øx(ôíµmäªì¿æş[_T]kGñ  ””0ŠÓ×3u]t}†YT5ı²BšX³‡ëÊùÚ?ç‹J`ûµ%¶ÛÁN`ç°ÃX`aÇ°Vì"vD…‡WÑïêU4ä-IO>äÿÃOëSUI¹G£GÇÍX‘°Dµ?Îté,™8WTÄbÃ_ÈâJøî£X^ ¨¾#šmê%Sı}@˜ç?ëS–ş¬‹}Àk ¨ÊÏ:Ç+p;€{ıÙU|…¬X£ÃU =øF™K`œ`>^À0	Æ2ÀTXe\Ï20ÌA9¨+Á:P6ƒ­`'øì-à08~ÀepÜ«§<}à5@„„ĞbŠX!öˆ+â…ø#!H$‡$!H’‹H2YŒT"«‘dÒ€ü„BN çNä6ò éA^ ïQ¥¡F¨ê€FıQ6‹¦ SĞ\tZŠ–¡ËÑj´İ6£'ĞèuT‰>Eû1€é`LÌsÃü1–€eb9˜›‡U`UX=Ö„µÁÿù*¦Äz±w8gà,Ü®à<çã3ğyø2¼ß‰7ã§ğ«ø¼ÿD Ì	®„@—0‘K˜I('T¶NÃ·©›ğšH$2‰D?ø6fóˆ³‰Ëˆ‰{ˆÇ‰Ä.b?‰D2%¹’‚I	$©ˆTNÚ@ÚM:FºBê&½%ë­È^ä(r&YB^D®"ï"%_!?&Pô)ö”@JE@™EYAÙFi£\¢tS¨TGj05…šG]H­¦6QOSïR_êèèØèèLĞë,Ğ©ÖÙ«sVçÎ;š!Í…Æ¡M¦)hËi;hÇi·i/étº=ŒI/¢/§7ĞOÒïÓßê2tİu¹ºİùºµºÍºWtŸéQôìõØzSõJõªôöë]ÒëÕ§è;èsôyúóôkõéßÔï7`x$,3ØepÎà‰!ÉĞÁ0ÒP`Xf¸Õğ¤acØ28>c1cã4£ÛˆhähÄ5Ê3ª4úÑ¨Ã¨ÏØĞxŒqšq‰q­ñc%c:0¹Ìæ
+æ>ææû#Ø#„#–hqeÄ“‘&a&B“
+“=&×MŞ›²L#MóMW™¶˜Ş3ÃÍ\Ì&˜Í4ÛdvÚ¬w¤ÑÈ ‘ü‘#÷üÍ5w1O2Ÿm¾Õü¢y¿…¥E´…ÔbƒÅI‹^K¦e˜eåZË£–=V«+±ÕZ«cV°ŒYlV«šuŠÕgmnc­°Şbİa=`ãh“j³ÈfÍ=[ª­¿míZÛvÛ>;+»ñvsìí~³§ØûÛ‹ì×ÛŸ±ãàèîğ­C‹ÃGG®c©c£ã]'ºS¨Ó§z§kÎDgç|çÎ—]P‘K­Ë%WÔÕ×UìºÑµsaTÀ(É¨úQ7İhnl·b·F·îL÷8÷Eî-îÏFÛÎ½jô™ÑŸ<|<
+<¶yÜñ4ôç¹È³Íó…—‹ß«Öëš7İ;Ê{¾w«÷ó1®c„c6¹åÃğïó­O»ÏG_?_™o“oŸ_–_ßM#ÿDÿeşgáó¼ô,
+ÜøW[P~Ğ® 'cÇ
+ÇnÛlÌŞ¬a…d…|¢µå…Ö‡>³„m{Ìvfç±w³Ÿ…{„ËÂ†¿árærG`Ñ‘†‘©‘5‘÷£l¢r££ú¢}¢gG!ÄÄÆ¬Š¹Éµàò¹Ü¾q~ãæ;K‹M­‰}ç'‹k7~Íø»ñöñ’ø–ÀMX“p/Ñ1qFâÏˆ'ÔNx”ä™4'éL2#yZò®ä×)á)+Rî¤:¥*RÛÓôÒ&§5¤½IH_®œ8zâÜ‰2Ì2Ä­™¤Ì´Ìí™ı“"'­›Ô=ÙgrùäS§”L97ÕljÁÔ#Óô¦ñ¦íÏ"d¥gíÊúÀKàÕóú³¹ÙuÙ}|=ÿ© L°VĞ#®>Î	ÎYó$78wMn(TT%êsÄ5âçy1y›óŞä'äïÈ,H/ØSH.Ì*<$1”äKNM·œ^2½Sê*-—*gÎX7£O+Û.GäSä­EFğÀ~Qá¤øFñ 8¤¸¶øíÌ´™ûKJ$%g¹ÌZ:ëqiTé³ñÙüÙís¬ç,œó`.{î–yÈ¼ìyíómç—Íï^½`çBêÂü…¿.òX´zÑ«Åé‹ÛÊ,Ê”u}ıMc¹n¹¬üæ·Aßn^‚//éXê½tÃÒO‚Šó••U•–ñ—ÿÎó»êï—ç,ïXá»bÓJâJÉÊ«BWí\m°ºtu×šñkš×²ÖV¬}µnÚºsUcª6¯§®W¬WVÇU·n°Û°rÃ‡QÍõÚğÚ=uæuKëŞll¼²)lSÓf‹Í•›ß/şşÖ–è-ÍõõU[‰[‹·>Ú–¶íÌş?4l7Û^¹ıãÉåÎ¤§üv™ïZÑˆ6*{vOŞ}ùÇˆ[›Üš¶ìaî©Üö*öşñSÖO7öÅîkßï¿¿é€ıºƒŒƒÍHó¬æ¾Q‹²5£µóĞ¸CímAmvÿyÇaëÃµGŒ¬8J=ZvtğXé±şãÒã½'rOtµOk¿srâÉk§&œê8{úì/Q¿œ<Ã>sìlğÙÃçÏ:ï¾å‚ï…æ‹>şêóëÁßæK~—Z/\nëÛyôJè•W#®şr{íÂõøë7RoÜº9ù¦ò–àÖ“Û·ŸÿVüÛÀw	w+îéß«ºo~¿ş_ÎÿÚ£ôUyñàâÃä‡wºø]O—ÿş¡»ìıQÕc«ÇO¼î‰ê¹üÇ¤?ºŸJŸô–ÿiğgİ3§gş
+ûëbßÄ¾îç²çƒ/–½4}¹ãÕ˜Wíı‰ı÷_¾xSñÖôíÎwşïÎ¼Oÿx`æÒ‡êÎÛ>Å~º;X88(åÉxê£ š“À‹ Ğ3 `\†ç‡Iš{ZÍİTÀÂš» Z|h‚ê¸Î9À^Ø@nØTGõ”0€z{7­Ès¼½4\4xã!¼|i ©€²ÁÁƒƒ·Á`op|†æ~©"¼|¢B×MÀWòo­ÀY|Š"   	pHYs  %  %IR$ğ  ŸiTXtXML:com.adobe.xmp     <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 5.4.0">
+   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description rdf:about=""
+            xmlns:exif="http://ns.adobe.com/exif/1.0/">
+         <exif:PixelXDimension>1382</exif:PixelXDimension>
+         <exif:PixelYDimension>1590</exif:PixelYDimension>
+      </rdf:Description>
+   </rdf:RDF>
+</x:xmpmeta>
+‰|Û   iDOT            (     áÎô™  @ IDATxì€ÅıÇ¿¯¿wıJ•bÃŞ;*öÄvEc7–˜¨±'1‰1&±×¨‰5ÿX¢Æ;"b`Aáh×ï^/ÿïwöíq MÙà³°÷ŞÛùÎììÎgó_ìb°
+X¬V«€UÀ*`°
+X¬V«€UÀ*`°
+X¬kLŸ³kLk{"«€UÀ*`°
+X¬V«€UÀ*`°
+X¬V«€UÀ*`°`ÖV«€UÀ*`°
+X¬V«€UÀ*`°
+X¬V«€UÀ*°†°`vnOg°
+X¬V«€UÀ*`°
+X¬V«€UÀ*`°
+X,˜µuÀ*`°
+X¬V«€UÀ*`°
+X¬V«€UÀ*`°
+¬a,˜]Ã‚ÛÓY¬V«€UÀ*`°
+X¬V«€UÀ*`°
+X¬Vfm°
+X¬V«€UÀ*`°
+X¬V«€UÀ*`°
+X¬kXf×°àötV«€UÀ*`°
+X¬V«€UÀ*`°
+X¬V«€U`I0[°‚X¬V«€UÀ*`°
+X–£@.$ã@0B€/À€~ÄÓ@?ó\ã9 ®(©`0îö1„1µú¹º¿“ùÍC Xìòı äĞêÕ£¼ÊÈ]¿ª–<ÒëøT—ToÜú¤³¹õ¬ã÷¥·åµ“ËÒZ)ÅçU]tÏ«ó-}.nú^‹«¡>½Z”>W/âìX.^Ä'í¼LãÿBC/òÙ1åWí£V¶´íõRÚjuë–>Æ-?}j>	„Ø T—òxnôe’;A/kOd«€UÀ*`ğDf=‘ÑFb°
+X¬V«€U`=P ÏŞ~&Å>;ø‚²ÅU`VPVkS¢€ÏfÔaVí<ä¸ßç÷!É N!D0àó0B.Ãß!}a2áY¯[xßÿ"ywx2WğØx^|D=Î*-—·ğ\Kì^V§‡)dDJ©7‹Ÿ1ø5ª=”à[ß—Şf V‡pnj”® w–È“»÷»šZÈº_â\näüÔ	Ûºı—ó¥CØâ_¹.0ÏüôdaòÅ4z#ñ
+Ô5ÑMşjFlô3é\ÍˆŠ‡+]’Ş«ô9ÑšYùô¹úKíf–íbÎ¢–ÙöÕÏëÇÏß¶˜WÖÿx:§­‡>—C$èGY¸€ºTbóa=e’B*Vb«€UÀ*`è„
+X0Û	Å&É*`°
+X¬V«@§T @¸–§VKÄÄ'ËÙ Ü”ã×,7ÍkÈcÒ”¸¾Ç ~×˜MÒÒ6ğÃï´! c±H”Œ–`-ç1yÑg'^ÀÄÑºú‹0ªÀ¬w‹Ğg—ç²ÒÎmFöå¤Ã'$*8ëMÙø	'ÿn¾İÓÏ Íf-f@gmÿ]Û1%Jµ ¬ßÛâA«ùQ`=ø\biÿ½Ôv¨ã¶ß|,_^HÚ›ëEgP¿}¦%Rü~“ÎzUÎN²ûN	YA`Ê»½(VvÕv©<LŒ«|%¡ò®Y¶­.˜2Ô4Ç­³9^™˜U¸D&œ?„h4Ê—_i³¿¦4Œ-†Âş#¶Gy»IÓ§]¬V«€U Ó)`Ál§+› «€UÀ*`°
+X¬TÌjğ¬Á BaĞ`–p Hpó¬Ú^ÿ6>øøDJJQQQ€?@hg‰/üHEJ¢1$ä4ÔÖ«Å @ïÀWÉZO‘’xeõÈˆ]ûV->Ó÷ÿæÆ¸<Jé’gp©T¶¿ú|ª0Ë‹ïÛáW¶ÅÏó-fy€›„v˜WÜæÖ®¥÷ëî>åˆïŒÕ¬¶¯î¢s	y:çtÏRŒõ[D°ãşß—J#óÓbÖ»r.æ_™÷jáïl·ô-½J#åUTß*‚ÕÊ¿‰Q±®V,îÁz-’˜¥#"Zi%+KÙ µÕç¯&O—2¾PŒïÇ‚hnjBİ¢(¥ÿ‚m6†£¼*"E‹Y7‰îIì§UÀ*`°
+t,˜í4Eab°
+X¬V«€U “+ 0K@` -]+º#Èğ«¶¦=f/Èáõ·&`a}#zõÙ }ûnˆªª*ÂY4‚*ZÜæ³’Ü¬~
+ElåIÑ«EäEpKkg\(–¡u"%Ş,í¹õ*JIÈ¤-v°¬t~×“Sés,féÈ`©b6?™4s¶â§Roà^1Ã˜}ü£ÜÌjõji?ç·¤ZÑI–¿OÖÁú×i«¶+œÉïòóá[ÕOÅd.™U=`%áTg¼Mâ·
+x%)XñnåWôC^–Üráï få&FMpŠM²F*ä¦¶¶¼7-õó±ñF}1êĞ]A.K÷3N~9¸Á.V«€UÀ*Ğ	°`¶ŠM’UÀ*`°
+X¬VÎ©@0ë äeËÄÊ2K80§>7'¼ƒ¯fÎB¿ş±ñ°¡èİ«© ˆíÒ½¬ñˆ"(Ğ¨g3ò¹sfx­H%ôœÕ¹ƒ³WY %b9‹—PÍ=…Ò·´í¨›÷|FÖ9-fŸêŸó³ıÓåœ
+&`·fÀl1úpän*¦×ıÙñÓ E†_AÁWíûÒç_µ£–ÊÕ~¹¾ãÅçq~ípö;¦gMW~e•wÊ_p›\ÀÈEŒ ¬VAY°mU¦.ÊãµWßÆ¼Ù30d@Ô„‘|'Ë-8=ÉØÅ*`°
+X:¡ÌvÂB±I²
+X¬V«€UÀ*Ğ9˜•ù•èÌ¯4ĞÖo|Ìø3ÏÍµE0ûßO§aà ÁØl“M°AŸjD8¿—¸ ¹‚1º-ĞÄ+¢c#a—ÕSÀKÅzÌêU¤ŒÌÊı\½Ü:uii0«8İø]@¨ßf[‡4¸çî¸İÍ¯>½ZÜø½ŠO1lÍD¼ú±ºyÕåìÕb@ê2´^øİ²\8:ëîÛ:Ûw·HTÇå³×µ–•»¬e³®Å,ÛÓ<Û^z”ACS/½4³g|F0»N>v¤³AÕVËe;[)ÛôX¬VGfmM°
+X¬V«€UÀ*`XEfó´UŸ3†›IjˆğZSÜD0 ˜0·.7ŞzÓ¦MÇ AaS‚ÙŞ=»:Ö4™•Õ—æp&q3S¸KˆV1+æe\+<ÑjîtÉËjFcW=Ì·ê<ŒÒ¤Ïë,Ëš°c;ÆïÂ<w›û[z¹ÛŒvKıéßR»¾óOsïá
+§¨Ü²ùÎ‰YÆ&i<ßwMâ2¢jß$5ßËå{é¸¼óë¥Ë;•ÛÍ„tzıÅ6Óñİë‚Ù á¬mlÓÔ›aĞÏãÅßÂ¬/§cØÀ¾sÜ~<Î1¨uü{3EFL/Rfã°
+X¬V¯°`Ö+%m<V«€UÀ*`°
+XÖyrt›D `ÿ>H0K8À<·Ñˆ–sĞë×9‹rxãÍñ˜[;C6‚M†CnQãÂ@ÀØÙ$ÈŒ\)‚…ŒÌf=[4n×Ëø<KØâˆ%ôÎ~ÍG@£¡Ê^.Šî[2šs,K[w›û¹dJÜ­©ºä_¤èY7K¦lñ/7Üâ-^|c]	ëX6&!7è<îï¥?;¤¡˜…X±ïßÇ¬ô«ã£÷[å¼Òã–@P¶Àÿ7z.ÿ¼ße›_Wíïrìš
+kÊ˜–²fL_fiÒ/Õ%Çb6Äv—«?ˆÛİÛQímMæñÜsï0»Qÿ>8ñè}àç03*72&¿+»ÖTíy¬V«€U ]fÛ¥°_¬V«€UÀ*`°
+XV¤@8 “I & Å¬|Ë’ËC,ù˜[ÇÉ¿^3f|…Á³reĞ«G|²ş
+
+Èú‹°A‚™In1XÑ™¿Ë>`|—#Ö|XeØC0Käâ“IœG‹‰‰eõíEu´vXår·-c1¨ƒ”ã·cíÛ*•z~éU8ÂMİŠ‚º qUÂ®(%ö©Ò½ÜXİÔºŸÚí~×gÇïnLÅmç YÇrÒİ»zŸ³ÎºøÜ«c$0/0»t=Y½h==Ú(í‰§1{™{µ°…5P–£ØÒ:@Y³„²¾0']Êúå[®$ßµĞböùç_Ç7_}aƒúãäcöE–£bruÀ0¦ÅéÔùöJ?UÀ*`X»°`ví*/›Z«€UÀ*`°
+X¬? 9dsi‚²ß
+W_;˜ÕÌàreğæ[ãñÙôÏ1dÈPlnÀl5|$¸²’‘.èHÍ f(éü°à£äDÜõ”j¹§vœû¹Ü€«¼C:®¢\2JÇ€U¸ÿŒÕ2uãF?ıK¤“iD#´t&DÇÛPQQ 0›Í!ŸÏÓ§emmmÜæG(HË=–i<GI,Êmd²¤R)¹/D˜Š>Oèç¾\.ÇxyN®Š«À5Lóé ÃjÑşl6kâ|Íò·âR´]ûJ's­ãƒÁ “Íï¹<"ÑZZZL"Ñ¨ÙeZ”íWº"‘’É”I»Òšgâr¹,ë¡„¤’Š›õRqë»Éóœ:"‘4<ÀIï´_éŠò<n^ttš×ã-ª
+Y”””p[¦¨1k'µÈd24çQéùŸ>sLc€–A^cmñd±øJ„ºËì\8E¨½Î—ây”7ÅïœŸ@YPÚ•¾µÊçyŒÊƒçS¾¥ù8yäE+8«c´Äã	SÒ4Esvå_‹ŸÚøŒßós¹eóÒŒÒ³ÅÃ¨LÓ ø<ÓäTmÎÊ•¹êZ6Ã²áµf9hÑu”c§Ò)”—•±®´²¼5KbtÕ/*Ëğ¦œB1äü¤éØ;Íb“+ƒƒ&Òy<óÌ+˜3s6< ÇÚ>FeV'fW^<6„UÀ*`øA°`ö‘İÔ*`°
+X¬V«ÀZ¨€± ”ó:vóå)VkZL‚p@ğM“ÿ6¦Ìm³•:À¸1n”|„8ù"ü1¯ÖŸ"ÄèÄ‹Q…†´®şò]béVĞMk^€”ÀNª	„
+ê	Ì–•–üåÑØØ` d,B2•10PûZZ[P
+Ò¢¯¥¥™áÊ$|J¥’‹m,Fb1ÂÕ2šğ J0SçtÓ"X( )€¨ô2f	¯¤~k2‘@iii{zI	›X™Ö_œn^pY€·¹¹Ùl‹ñ¼Ú/¨%”ÔM&“ÌW)›šÌ9+Íù0™yä/OâÀV}ç"+`Ö¥K¤t•3
+!A%Uü„Mó„²‚iÒ¤•Z1)ÌcP¹r (Ïíç$NŠóœú'½¥Q(äÇÂ…¨(¯0iĞ9}ºnêJK¢
++/‚ÃÆ‚ÁZî”}j¿Sãñ8Êü2“ü.P-(-³õ Ã«T¦
+¯²Ğ1íå¢T0+[rÌ:×õÊÂ®Ê~¯/eå@q®<'«’:7Œ®­+_XePÁ~r-ûÒÙ­Ÿååe¦¬ó|y•ÏĞä•Ÿa‚rAx?}øÃ¥´–qåæ$É84ò Ãºğø¯`î¬ØtÈ@Œ>bD¸]ãx¥˜c«˜L†¶‹UÀ*`°
+¬),˜]SJÛóX¬V«€UÀ*`XÛ˜•;ûÎàZMáåGJüŠ=1yõ9‚Ù‰³œ|ÈP/º2˜•¥l˜†òPZŞ
+fÈï¨Y=Ó†q{Ms<K›Ñ
+¿xƒ†ÜXÌ§ÈßŠÿÀ=Ê	oş•ÅfŒE6'ş‰x[‹ê¡ºªéLÚ@WÁ£òòR,FÆ:S¦yŒKßYº”ÊÒ2‘¦Ö0!Tš–˜:&	ÓÂV„@SS«‰Wµ¥‹‚ƒÍÍ-&œ k4ÂçŸ‰={okE	ãŠÅÛâŒê˜VZËVVV*K_Ë/K&x)pY·¨ÎÀUYŠEhé›£,ÍŒW€¬¦¦šy¢#arŠ S0Sğºœµ©±É¤«GÏF£ææ6Ú8aš¥1¦+A,‹Ùh$h \sS³®eeåÆ‚Xñ‹dê«ïñ¶„Ù®bˆ„«ã¹sç11sœÑ Rà¹›Y>æÊ! è«ú^_ßd,…#„º½zw'ÈÎ¢' --)5`XÖÄµÊŸ´jlœ±6øU²t*)óØœ±~–åtiY)Ó%KiZfÒêwe‹c1ËôytzQİø<J^QÚ*D( ¯—••´ìÖ„º|™ıĞZÜy)!p[W·Ğ”kõ'›"ø'¤/aÙ%“	s¾B(Šæxá²Jdƒ¼ÔörÍ´?şÄ8‚Ù¯˜E0e¶`veµÖî·
+X¬?¬Ìş°úÛ³[¬V«€UÀ*`X‹uÀ¬†¥kJšáMG0[[—Åø	éÊÀ³®+pÉ#­±˜5`ÖñL«ã-˜ışUÀA¬¾·.76lÓ"h*KQ­ÆVSĞ–«a¶4¿k¨k •^Ä€ÈXÌOè—$ĞŒôÑŸ%­FÛâ­ to@+SY“¦ÒI¼ G²„–­¬W5l[V˜ş cŒVš¬B‚²²”Õi,ê@×dÒqm¡¡ôrE°aß>„r	à'D¤B­_ÍDîİHmnn2îºÔÔÙtÑÕ`oˆKĞKÖ­U„´©Æ"” SV®¥´öÍĞòWäH;BÉ<ó—…"5)+/Ç¢…™/äjx¹¬^c'3ÔÜ§<
+Â
+tÊ¢Wy3–§´Ú•ukŒ N ´ğXaC¡Zğ*ÿ•UÔSÖÅiZ²få«Ê&•¢eo"etîÒ¥FÉá9d©›Due)À¬8dÙªU–Áxşœ¼JŸ Ÿ ¸´i¦¦ÕUUÆRÙ±„% /¥u3¡t†Î¡U¦:V°½¹¹Õ¤¯k×jSŞuu-¦d%p‹€¬¬7½³«À=Wª%wéšY¥ëeÉÃVğKÊëÔçò•£êGœ.@>ÿâsL˜ğ6Şyg~şó_`àÀFóéÓ§ã¦›oÂ~ì‡=öÜ%‘^÷2şñØ#:t=ô0ì¾÷H$ø¡‰³.æ‚¬·ô3»Ìí f÷µ`vùÅa÷X¬VN£€³¦(lB¬V«€UÀ*`°
+tvHÕŠ³‚Ù<¡VÌ’½b³+ƒ!C†}ÌÖçÒ×¥,f	•–«E`Vqx·0n‘ƒ©¼‹Õ»˜œ!ëÅDz­ì–&Ä¼¯d1°aRH«±’%ØÓ>Ú<2§_K–˜`«V…‘jŒpV.âôÚÖÖÂ!ñôoÊrü“5©¶i˜¶,h#„¤ÆW©,-t%nÆQIË[© °(h)°(`ªE Wiª¨ Uk]“±ä”¨ÂÈÚ3È´(ñY‚GY¤Ê§­,ÍPïî×0~ùñÔ~Ç]€“FX¹ƒv\.¤®¤…l–"&²_Õr‚ÙpY+1ñÊ¥(iT.˜ˆ¶Vºj u¬Ü.(ıÊ“Ü(`
+:¿ „‚ë,­¡g3Z¤ÒÂ¶„ Z>e]eµZAKJı–O]ı´%ß&4¥æ%‘?_Y¯Ê—×5XU^Ã<¿¶	Ë…t7™Tyr•¥°ÜÈU…Ü.h„"ÜÏáğŒC:ªlä;Xçx×’T¾¹mÍ·åÿUİê¬`Ö{(+-L‹Ÿú½ìEuNå¯—&LÀã?I³·Şr+6ß|3¾ìˆãmÂÚ‹q1.¾ô:l(¾ùzÆ¿ş*^7#öcvÁ|YÁ—ºJåcvI0KWCaÔáÌ.»$ìV«€UÀ*Ğ¹°`¶s•‡MUÀ*`°
+X¬VN¬@Ì*…œ±Ë€YYLÒˆ–OF±p,ffe1K0»é&èÙ½É¡-f9*× ZùM4Ñø4q”×`V ¤3/š¶JˆÈ›EÓw™• n…‹9%‘ŸÌ^VşT5<ßÇß|‚vÚ–¥õf–	ÍšùfÎüšnš9ÔŸe6`@c¹WRÃ«¯#hm!ô“/Ó,­LKø«ò‡Ê!Ôá ±õÓ¯j‚ˆ›šh¥åèf›mfê† ¦ ¥€¢ü¤j¸ÿÌ™31sÖL“AÛ6Ø€çÀ	‘Ê™¶ëÕtÌ™3‡Ö°	e±;xğ`ôëÛ×X­ëUÁOÂà…´xñÅ—ÆÜ<ÊÃ°¡ÃË[‚Í¯¿‰÷¦LŸÓÖçSf•YÌÊvÃ74 ò‹/¾0Z¥üÕÊå‚üµ–Ãôe8åAÖÁÒ«©±‹ÍGcı"£MïŞ}xŞÑ¿MM-øğÃM~eI›¢õ®à±|Ë
+ÎöíÛ2ù›<y*jkç¡k×nØv›-]³xï½IÌÛ"nëŠ-·ÜÒÀ>	6wî\L›6Í€æÍ7ßİºuk÷7«ô×ÖÖÜ¯_?hızæ,|Cw	êê…±€øÀ¨ù†ÆºV VÀ[`ZuDe¼ò…`ÖyK°ò «BQ©Úze{|ærX…4¬<ˆ®;¶+M$İ„°ŞHç±cÇâá‡Æ¬Y³pÃ7`º|©¯¯Ç¸WÆá÷×_+¯½öï‹éÿıS&MÀ«Ü~üqÇáˆ#G¿ACĞÊë³¼¦ä&!+tfFğÿñ'Æ¢–>f72ˆ>f0«)õÔÂ²‰v²>íb°
+X¬Ff;MQØ„X¬V«€UÀ*`èì
+@9‹°!{üÌ²÷/0;·h1;Í€ÙÁ˜íÑ•;iYteà—¯ZY†/p›‚™Ì£¼+nEÜ‰YC:¨Ä›DÒv™1®b¾);Y–&’µ§±°”U,ÿÉŠUşN¿1ÿzòi<ÿüóøìóéÆ"sÀÀşØsİqĞÁÒÂoS\uÕ•xyìK˜7¯–áù©½\È¬¬lƒ„Æõ ­2ë[±`Q“±=àÀpÆég`ø[–ê8¨ùÑGáşûîÇ_ïºËXèİlSœzê©=j4j9]dŒçîà•W8óüœÙ´|-#”á¨£ÂñÇ-·Ø’¾c™°iíúúk¯ãá‡ÂäIïĞz6ƒŞ½za»m·#Ü:{a İ³Ï<‹ßÿîw˜A ícºSœ¬«À°á’F0Ìn»íO>ùüıïL'ËûÍ§Šé.#Œ=Î ³#±ÕV[=ÿóâ‹øÏşƒ‰oÇÌ¯¿$töİw$N>ùl¿İˆŞô—›0iÒ»ôóÚÈˆ_¶v[n±5F1¿‡v„9Áùç_€w'OÁN;íD½/C·®•¸âŠK0nì8l¼ÉÆøÕ¯~-¶n¬__|ñÜsÏ=˜:u*~ö³ŸaäÈ‘ÖıÄ›q3‡Ç+MôÙ £iuyÈ!‡àÆûóÿæÛ“0Ş|cé¼Ë.»`Ì˜1Øk¯½”CcI[CwÁ ê†êØÊ…ñîúóÌ²(L¹¯”¡®,›KìWPWœo½8P9¿ğÂ‹xâ‰Ç<?çœsĞ¿|õÕWxî¹çğÒ¸q8ı¬³°Ç>{ó’Êà?Ïÿ×ıúZ\tá…=zJ+ªù¬	eU]‘ñ%3¥I5ù×;`Ö™ükä“©ÕYI—È•ıa°
+X¬kFf×ŒÎö,V«€UÀ*`°
+XÖ~˜İ Å¬€’>˜åkºªDí¢,Şz[³Ó1Øµ˜%˜-Ärğ-Bùš%ü˜5ˆD`ÖÆî‰@í`vÅÄ“s}¯H$,f&ù^1,}À¬³®8ÏC‚B²•k}7®d1«¡ğü­‰¨ê5à†ëoÄë¯¾…Úys¥¤&"’¿Vù<İ{Ÿ8ë¬3pıõ¿#$‹††zï³ó´ Õ$WÖÏlj2t]TÒ
+v!å\øècu“M7ÅÅ_Œ‘ûäpùrZ´r¢*÷ÑGÅC©ï,ú{÷ë‹3Ï<Ç|ÊïìYgE×¯iiÚ„¶æFcåZ (•µáñÇŸ€sÎ>‹ü?GÈ8÷ß?úûƒh ¢\Hmù™­®ªÆN;îDpyúÑ2ôù^ÀÕW]…´lÕpĞÕ†àU€“-±7öÜs‚Ùÿâ¦«„aÅé¾@…Éwk’Cş+ª«qÙe—b¿ıö3–«'NÂwŞ‰Ï>›n\vÄ{kçÌå„\½pÎ9çr(úqÆMÀW\E+È×èÇ¶B9õAubÛí¶Ç	ÇŸdàl0˜Ç±ÇœŠÉ“'ãÀÂM7İ@kÛ…¸è¢ó0aüì¸ã¸á7øÚØÔˆgywŞq'>&H¾€@W V–Æÿş÷¿qãŸn$Ôí†“N>	ì >úø#üæºßbú—_!A×
+²&öÒ×pB³Ÿ÷SœtÒ‰èÒµœº§M‘Û×İÄÒõ¯ãoÕC	(n/‰³ŞDg’äÆéEúœ8˜¸övgù±êšÓ„oxğÁñÜ¿ŸÃá´€Õ‹‚®¼®&N|÷?p?Õ7àW\a´,¯3/¿ø<î¾ãvŒ9åd|àèÒkÄÊ+Q×§;ƒúG âÌT¶Ì~ÉÉ¿d1;Òø˜u-fM‹ã¡ËÏ©İc°
+X¬ßEf¿‹Z6¬UÀ*`°
+X¬VõYÌJƒ"˜%e5`¶ ‹Yn+0K?‰Ó	¦q-f»üĞïhÑ•c1«A¸B$zY}_Í¥İjMô¡³Ù¥‘ˆZŠ¦¬ö"G«f³—§šÀJ`Öøƒ•OR[ç¾º&˜_»ó§X0o-5wÄAH‹Ì-=g¸Oãğş>¸ègâ¿fİĞ°ÎÇÇH0ø4Ã%pÈÆ.»ìL×*Û<^¥åêëoNÂœyõPİ§Õà	'œ@Hy†ß”îRö¿·Şz+^~ùeãjACïåà'?ù	NdXÍfå•WaĞ Øh£Á„¹q¼ÿÁTZ¥N0®$°ºêÊ+Ñ³GO|3{6$”<iöØ}“Î_€ño½…wN+	˜o¸şØf›­ñÚ«¯Ñõ*$	%Gt †o·5t•±lìK0,‹Óºú:ã"À¸[à¤brÕ ëŞşóq³¯¹öZZÄîc†¢Ëâw-zûôé]vÚ›Ñªµ•PY0|ë­·¡«€ğÕŒ¯qÕÕ×`Î7ó°é¦›+Ú2T?Ë¡K—î&ıyî–æ$AêÉ˜òî{üşá×ÑÙ‡.<o¾ñÓ¿-~ó›_£İ=(~iwóÍ7ãm¾˜İgŸ}°¨nî½÷^N2õÑ\Z–S×[n¾?ù$úŠ÷Øo¼±ñ¹+÷²ÄİŠ.féÊ—.$TIu=­¬¾ª.Êß±w×ŸÎ(Vî¥…«âô2¾ÅPÖÅØ—·8ú©LyäcÑ}Şyç‹gşhñü·À6;ìˆãN9ı6‚/?ûÿı~¼7y.<ÿ|SÏ‚N^G¥ãº#	„g¦$Ã‚zò‰—QËëÔ±˜İ¯}ò/££’ÕY›ÅåIf·[¬Võ@f×ƒB¶Y´
+X¬V«€UÀ*à‰.ô9iYÂ1F3ùá€<P‹YNl3í³Ïf7*º2pÀ,lÓb–‡ĞºL³>&iî%“/Ï‘‡•ÏNöı"¢nZÌ~:pvÅÔEV‘i’¶}¤º¾.åºÀ™,*hÜÈ?êÜoji©z.İ4$=èÆ`şüyøœn‚A¿±$UñG"AZ Ò7&g¿úê+Øı'/:ñDÀòR+oüÓŸñÌ¿_Ban±ÅVxó­70=eÌ)Mû}Ë~M‹Ğ›Ğß”µ/Ò€–ÓN;Í­Wzå—SÖ±ƒ¢%g#şóÒ‹¸çî»Ì„[‡t0.½ôRcÕÛJx*¿±õôº×{¢’“}}ùå—xøÁ‡ø’OÜ{ïº—n
+v3n.æ°ÿ<'+»ø——âZ0Êºµ¡¡¾Ucˆpr/ùá5eiB-.òqûÔSOá;î ;…rvwŞygúıĞ|—ë€QGr †dÜ@´ÒÒV>k}ô%ûé§Óè>áº>“v!èÖÔªòCÛ¿ß@‚ï~¨ääg	æıT¼ûîc½û»ß]Kp[‚³Ï9¯¿şº±˜ııõ¿G÷nİµî8ÿË_şb&–ºøç?7ZLyï=Œ?®'6Çi§jüû~úé§øãÿˆ¯gÍÆa£ÁaG6`6@êë	ÓÁ´–Ğ?m„ùÈwòM¿ÒEPÖÔÅWÅ•Æãp!ªà¬W‹ƒG›WqkY‰³rä³W¾€f'ñÅêl/ºØ¯eY<?öØc8÷‚±×~Ğ2¶7>şp*îºí¶•9œwîÙØ~Ûmg™ÄSœp®¤Y^ƒ²ô6³³OÌÒÇìfC`ôáû·ƒYs°ºWyöª0l<V«€UÀ*À6^cšÜeñ7w‹ı´
+X:›¯Óö'Ë‰tpç2÷wk¿¯
+¸EîUf¼®7^§Où\ÓèUù®Ïñ˜º¨?Å
+äÖM·>-ı»£Vn˜ö¼w¸Çu¿®~×c£ñ1«|Kv÷Él’bµí³¹eXÌ:>fdC$,}Ì‚>fÍÁ^èø­rê¬!0ÛØÕN¤3ù£éğXïDJQÛOÃI™¸_¾V53¼ŸO+ZŠ	=åwVV±Í„Š².½âÒ+ğş”©¨îÒ{ï½<ø`ô0 İh‘+Ñõ@ÊøÌ“•ìäIñó‹/BíÜÙ¸ä?Ã©§œ„šêJú«mÁu¿ı~n,"e5ôO{(İ<H¯}pü	GáÈ£!”JãÍ×&š>
+_ ‰ƒÛn½nò³çá¬³OAuM	9¼©©•iŒ›‰½¦¾?>ô p"+ù˜maúK	Tå¾@~NÓLëÇL0û £»„ÂÖûşzvÜa<ıô¿púé§på1æì3±×û¡g·iå*Ÿ´}h]å_A‚ì¼Á²¦}ıÕ·ñàÿG8ú*µÙçıô,ôïß“0ùYœwŞ…Ø ×@úĞ=Ûï¸óÃ	Çh¡šä„j55]P]Ã‚ofâ7Şˆç^zæ×³Ü²à)ŒÙİö>»ï{¶¦ÿİ@!ƒ“OƒñßÅ{Ä¸å±Ó{"ÆÑyç½öÃ·ßŠ®•¥È'ZğÂóÏâvú’}÷ıpÒ™çáÓ/gã½w'aÃ^=pİµWa—m·Dã¢yxê…±¸ço Z^…QÇ‹m©ƒ,6óü½	+«*‹ÆT¡İé¡Ì¸1È«~-Yue…ªºèg8Ï\«°§®Lvûe±d¾ç/%’ë*ÜäÎ@î8`ÌGm,ÃÓ©4üd|@¸ùUW£'á|"›ÇÔw'âŸ<„~öÆÑGMiÙZÉ"Ayuã_V“é=™,fŸàä_s	f+ƒÃ÷E„ÛÕÂ
+Ìj]…$*”]¬V«€U`*`ÁìÛÊ*ğ½Ğ³»èáKÏz¢4OXÅæ	Ó}(Ô'wš@îösU cığ"“ŞöVœÙ4zQ26ÕU@æ^j@ıj<‰èWQÖk‹ê¬féò”nÛçõ1§s¯‡oµ±ªÔŠ‡«×õÛœ¸“ş‘~ÒQ÷f	÷(¸Lï_“Õ.Ê0;­ècvø¦› WÏB2ú–%˜Ì³Y‘6åAÑ—¸¡­nŞİB[İx¾Çñ<õªW/ÓÉ³šòPšİ
+YülFÎoY¹jÉ²Âçó„²¥?UYÎ&“	Çµ-kï¿ûüëñ'1ıó/	`#œõ=€]÷Ü'œ<{î5©,abY”×€e3Ò;øõ5Wâ›™_á¢óÎÂ˜“G®5ôÃê€ÙgÇ¾†òn½éOóxüíşÇh5¸ ûî¿Î8û80§ôs|ğŞ—œğh3Œ>núm½õ
+sÒE8ëÜcQUãÇä)ñÇ?ÜB—S8¼^m}:l(N3?âdV=ºW‹Å"Ì*ÕJx›M§Ñ³{šãøç?Ã£<ÌIÍfà(úôüé¹ç¢GŸ>„^ãÌ3Î@’ƒÃå%È’d²(‹öæö3qÀÁ»Óštú-Ğ¥Á\Öá n¿éAüı¾§ù‚!‡ë®»ŠV¿»Ğ=Ãüß?ïÃµWÿÃoÁğ]P×T‡yóQ^U…-¶İcN=î¾-êgOÇe—_^ŸÌ0)‚³8J³)–Šå½`ßÃOÂ™cNÁ >=p?Ç½1#ö?÷İùGø“qñEgá‰q“0d›=q×í7cHï*ä›à¥çÿ…¿ò÷k“§Á_Õ­ùNöÕÇõcœ;æxt!Ô­›9>ÿ:.ûİ-Ød›PVVBËè˜9s&áóœ0l_{ì±Øc=£ßà…ëùY‚a¾ âÊAY/Á¬{>¯Á¬¯Ÿ« ‹9ñ1`Şü:Œ¥Û	¹Â˜Ä)ÖÓ*Ö‘]vŞ…ş”ÅN»ìŠûşöşõìsøô£©he=âaØŸesäá‡b—İ÷B´´‚ÔU C÷)K«&ÿzü‰q˜3ë+lB³£ØÛ€Yµ°ºÍimoôİ.V«€UÀ*Ğ)°`¶SƒM„U`
+,Õ¿2!µÍ}6v?õ¤e†Ri'WvĞr|J“Í‚]:“*'¥Gå´ú‹:*ŠÎ«‹úõJY{ÿ~õ“hÒæ¦ÓƒèLÚh÷åiıÌ°WªDÔA²×¥í]jiØç\,"Sªä´F¢9›ÃYñfÉ¨3B¾˜}7ÃTu…ğ8s¥¨›[Œ‹ßÖ‹E •VuªçÒ°@"Ñf©fÇO˜HŸœÎä_Ã7Û½{VÓuÀ §ùú˜¥†ŒGÊz³˜ÂbTî§7±®J, Yóçm÷÷kò,%İU2è»[gÉ¿då*‹Yí“XùLÕ§ÀQˆ¾f#´9ı3|úáxõñûÊ˜Ç	ÁômÙwà`Zoî‹£ii9``osFMõîÛãqÉÏ.@Sİ\şó1æ„cÌpüdK~ıõxê¥WPÕ«/Î8ã"üçÅ·W'2®~ô²Ñ¸ğ¼?pò©jqÌÀƒh){:ÕqöéWã§Hi3^û<nş3ı¥Nüˆ•Mé F %˜x$]ìN×a^ÄúĞ•e· Jz}®şıo`}â<çr’°aœ”LÒüë©'qåUW “–%‚9äÃ:¢'ªÊá„ãNÂHÂãM6åïªÛæó)¸íOá½‰3±ëÎ;à’KÏ¥‚
+Ì[ğ_<õôıøí¯şŠšŠˆ†{¢%ÓŠºÖd™ÔÒšîÔì8œ9ú l7¬¦ÓÁçÑŸo2€pólÔ1÷Üuä˜ŸcÎÁÏÏ=•œüëgô+:éƒÏ°ıà·W^€Şå\uùExüõÑÛ}pçÍBßr¶]ñùxëåçñà=·ãµw?C×M·Ç×Í´‚&°İz“A¸ë†k1¼oZçNÇC/NÂ¯n{ÍyºÉ¥	¢SóüL$Ñ{À€â„TGÒ‚wsZÑòºeS§÷1¾ÌZÙh³+¹ní_h­ËRÏ/
++—!µµµ¨««£dNâÅúÚ£{ó¢¡”ş†gÏYßÌE\P–mk:Ş‚®´@ïß·º÷ìƒMdC1NFÇr‘Å¬.Ù>ñ
+Áì×Øx¨Àì^PuÖmMw+}š¦AŸv±
+X¬VN£€³¦(lB¬ËQ@ı)wq¿óákñ¢§<=(kUÇK«ªû«U»tLÙ-ÈÕO•¢3ÕÁ«(™¢òÌ*«¥Ñ²êÜx±H?ciæi¦	«Lâ–¸X½H®ã{*à¼¦b©˜‹†í"¿f}~vUµ²:i„>ƒY«cšë×mcUÿÔ¾ò oª¢ÎÖùfWXF?˜mA 
+«
+Y¬”í÷w›bµ_ 6HŸ©9š˜jb­ al˜“uhQ¥ålŒŸINZõéô/0aÒ»øœşP'MyŸx-ÂaãÌsÎÃî{ìÉ!ï—Èâİ‰ãqö™§!—ä$]—ş'sb!?Ò‰Vú½	O¼85}àÒË~…O?ù>úO´Ä¿Æ6Û $İŠV¨c‹Í÷Ä	cöF¿Aú¨=ß|•Â™§]….>eUiú·ı„“}}€Ù3ëĞÚ–Ä\º\˜À‰æJJb8ğÀp:-R{tï†2úr-Ğ¢·¹©_Ñ·ìœë¿„0Ö²#9)VŠy,d£ßÚß^÷Ì˜3[í¾#6Üx#T”DidCl³Õv¶qwÔtñS+Z¶†³øí¯‹g²H_ºk8Çw(µLaöœñô³Ã¯¯¾‹P·öÚıPô: Éf|Ì	Ó&MıÛn¿Î:æ@¹ïæ‘ŒuE³¯Œ`vâ³?|İN˜¶Ûî.9ÿlX]ŠÎ9ãß›†]÷=ùİåˆåêpå//À“³ƒwÜÜ};ºG³(É6âM‚Ù{oı^yç3ì3ú,È”`ú“‘$œ½ôÜ1µÿ®(/´â±—ßÁe7Üƒ@E7lÅÉ×†l4À€ù)ôËûùgŸcNü5jÔ(rÈÁtQB¿ÄycM»*ğÑ‚Ùå7òñ,_²%%%¬OAã:BşÓ´˜M¥é„ÛÊÊè&„N»ó|(¦UvE	­bÛÚÈĞ“|±ÅÛ-Øåc6L«Ù¯ı$/of—¯»İc°
+X:»Ìvö²é³
+ûV®tCÆá‡üc@¬,\²ík;”eG¬À÷âZ—¤
+n,öóSÀt’uö¥
+ö{&HÑ9`ñ{F°Ôab“J™§ŒRi,¦s©Ó}¯ŸN8û½"XÆAÖbv¢¬s›X	ùËÏÊ$ˆÕİÍ;ıôÕ„U˜¬Cìğú‚¼taiq?Û¿»`VŸEŠ«‹f}Y,˜]aIÿp`V·û"¶X!ÍıÆ­œú”¥_'ĞRV¾dƒœ…MÃÓó¼.ä—5Bw‚µ‚´sè3Ä²îÕ­+ı£V£-™Á¬9µxà¡Gğò+¯Ó½e	;ş$vØáôYn¬ıfO<n´IW_~);úB¤<²ô?{Ûm·áI‚Ù®}ÑßìŸè;¶€Ûo¿'¿ˆÒŠÜS&ÍÆè£ÎÀ±'@Î?‡“Y_&pò	á´Óä°íVºYHĞlWNÊEËO‚Ùw§~€_ÿæ7øï'søÎ¸’î6Şx˜ñ1;wÎ7xŸ_ÉZvüoĞ¥Aw~Øa³‡#ÆÉÏê-â¤\A¼É}¿ºö|I0û³k.Çˆí]†Ñz7J«W€£ø	È’t×°€şrá˜£ÁÓ±×®‡ãüŸvØœP;E‹Ùiœàì!\qÙ¨)ï«¯ºû1®†x}É¾Œ?ßv'zmØ§:ï¶%šZ[Ğk“íÊjD8‘Yzİ\r	Ÿô†í| .aÜÛp§³Oÿ	Æ½ı>ö:à0Ü{ûõÈÔ…Ë~~xm*6Ùå <òÀ_Qé£­xsì‹¸ó/7àµIÓqê¥× ¤Ï0|8ù-Œû÷“Ø|P\qŞ)>°~ãœõËßc£áÛ1çàÀıöeŞÚpß}÷á¡‡F·nİf&?••hm›z¯IãV¶X0»|…˜MÄÍä{
+•Ír2DÖAoùÖwaúáH¦sĞá£¬fË8Á^>çË†4ï:‚¶$&+G†÷/MşeÁìòu·{¬V«@gWÀ‚ÙÎ^B6}V)Ğ¡_ÕÜØÄI/`ÈsRˆ‚Y³d|­Î‡5‡ˆ
+$d2¾q×6ş°K'SÀ-ĞÕO–<Mÿ{õ£3@Ötß=¬6ÿ“42Rıój‘Å¬à¬‹£_qX¶7Qz‘,ëK@*L†Ø!Î³ı”ë‚(WÁ)?-C„PUœ¼Œp¶¹:–¡ùnJ˜z
+Ì*Wïªbç/'fWXF?,˜íPYÛo
+n}U²ù"‚×@4â$ZMEHƒ„E%š0‹Ö³³fÍÄø×_ÃÄ7ŞÄÈ½ö4n*kº!ÌaÓwÜ}/şşğ?Ì$CgŸ{>ö¦åiuU£Îãí7ßÀa‡Hßª~üöê«èö8”DBhknÀü#ä„S=ÅºLõÃİwŞ‡GşïLÿâ}T”U¡W÷Íé;õW±ßføà£±¸æÚkÑÚÆ¨#ÏÂŞ#·Á§½oæ|…m·Ù[oµÊÊ+ñşáÊ«¯Æ‡¼Ï‰¼vÄ—ÿ[!ã3ÿúşöÀıøœ¾AKTMôµñĞ¡œ¬ójçš	À‚´
+~öÙgpÙ¥—Â_ÂÅ×\‘‡Œ>=ú#G—¯tK+YJçk%˜]ÈI›¦áÂó/@>UCö?'?İº–NÑÒ6/¼ø¸ô’kI”Ğ²öì{ĞHÌ¯Ÿ7'MÂ·ŞÁÃ6ÁI³[ê†×ß|;8İ‡Gvş—xç…ÿÃo~õ+|^_Àî‡Áe¦ƒ{wÅ/.¼ oMù[í¼7~så…èY^0®zm
+†í°7şzçíÈ6ÎE4×J÷
+¯ã1‚Ú	ïÿ£Îº»|æ}ıËã—hœû%~ı‹s±ßnÛ`Â'³ğ“‹¯E´¦'®øåe8ìĞCĞP_{ï½—z<‹Át÷0†~{O8şHSßéáÀÔUñŸ¼ØÇ¬9t½ù³*ÖÄÒ/ãD{¼T57]†pUÏ2~ÖCYªËÇ¹ÜFèª•K¤ë`š/ r©6šZäP^åVHŞ³ä‡£ñX‹Ùõ¦šÙŒZ¬ë¨Ì®£k³µ*àö§–×Áçv½Moª¯ã$|»^´šå§Ãœ4Ãµ ¬OŸìù|šqY½	×‚f-ÔÄ&y¥
+x=yFc‘êÖÇ•¦`åLY½ŠÒI¡ÚÊO½J!”.ÙÅç¬Òa+¤4ªSe—Î¤@/¬RäGYv|	f9FT®^´6òq2½Ì
+r–ëÊÊÎÀ^N0ËòÒeØş[µO«6põª2v&¹–—f—§ŒÙşƒ‚Y·.(Û±RºßW f‹Ã«³9ZÆÎš…×_GàwB„?•U´àËÂŠbÎü…Æzv‹-·Æ…?»Ûl·yÊÚŞ{Ç>ÚXÉ^|şy8ş˜#QSY}·Ş|Ë-xòù±¨êÙ—ÀõzŞh¼ôŸ±øÛC·â•WŸåäRøñÁ'Ó:öllµ]_|2ı-ZkDµœsÖå8æ¸ƒñş‡oà¶;n1yEÃdS1N¸•ÂW_Ï4–¯ûî»Î=çì?À@Æ¿?ğ zğïÆ¸{×®èI+ĞX,Š'9ËpèøhÕß•“-}ğşT\uå•œİ>s/ûöıñÁè¿Á¦Ì‡l.Ø.|¥š1}ú‡xğÁ{ñ'dÚn«½qòqçbß}ve[’"PKs¸òÛ¸ûûğÚ¸)¨ªìƒòj5/¤ÑObaS+u?d„9QØu¿ÿ=ê²%ˆGªQÊß %lsc3zo¶+8á<œxäaôÛ€sÎ8°b‡=Fâ†ß^ô'{ÉÏÎÁãcßÆ¦;ŒÀÃ»5ÑÂÙV¼úÒó¸‹>gßœü)Îºìjìºÿ¨*‹àƒw&àÚK/D·?N>úÜrÜtÿ?ğöÔOPM‹Ønœ¤MÖœsçÎ!ø‹â ƒÂ±ô!¼Ã[ÑjÍœÜMÖÕå„ğ+Y,˜]¾@zwF½Ñ—3+VPÖ²çö<Gqh>­y6$^o"µ|~¾%ñº²úiáåCF/“4“ÍcÈÑ¿µ˜]¾îvUÀ*`èì
+X0ÛÙKÈ¦oıP ØÙ7İ|·ÿ´¬œóÁ­µ¹M	9> q˜`€«? — ,­¸Ô)+°'aÖbäËŠÏn[Ã
+¸eá~®şéôT4+ª7ßå4Lš¢Xôjñ>rcà¬¤‘öÑZÒXy¡£ÑPéSê¼ˆĞ“\ÚHTz‰ÅwU~úôË¦9”…äó…èÒÀG‹Av~ù2«‚`6RRÆ@lC—µ¯Y9™:£0ëS1[0»¬ZÑ¾í‡³J‚Ûp/]!İß+ù•ÓBV>eÛ´´pX}”@NµMMøôãñ ‡µOüæÎ›6™îñ…Fïúc‡wÃZÊn·ãèÛ·¯9^Ãà'g~ÊbaœÎ™„´G¡[—*,š_‹?ıùÏxnìèÒg .¿âZZ¼nG÷Ÿqæù[ñÈ£÷ğÅsçŸw%>ò$Z•vÃ§ŸMÄI³óçÆñ“Ó.ÄON?­ñ¸ã®[ñöø)˜9s.ÚZ„³Ql°a?l¿İ¶Øo¿‘±×^ÌSÓ§MÃ½wßşß?£û'½‰1¬†çs9¤2	NNv
+9ø`ÌŸ77ıå/øºv6~ùë«1’`¶W8i’iÌ	Ò
+¨¯¯¥/ÛWğ›ß\9tépêIçâŒ1ÒmB/>“e8Ù*ıÕ¢ÍÂ›¯OÄsO¿Š÷¦|ŠEM‹¤…rIU5vØm/vÔ(ŒØzÒu3h}|7ûf.lC(U‡Êlûí³6ÛãPl¾Ç±Õ°AHÕÕâœ7Ş¡«†áÏ7\CJ¼×\}	^xc2†l¹3n¹éOØ«B³ãşó<î¼å/x~xÏûåÕØçÇ£Ñ¿wÌ›ıîøóõ˜øÊØbãşØçĞcíº!î¼ïA|H0 +‹0-¦«kª±ÓN;áĞŠ=÷Üİ{TÒR8m`¢|¡ÊêÊœukãÊÂ¯+ûWÅbVyõóeGuĞÏëOÖê±ú­Ep<GgçáH)ù@ç5æ³=M°¿fAY¹3Èò™%-AŠo€‰l‘á}Í‚Y#¡ıc°
+XÖJ,˜]+‹Í&zS ½£ï0Õåç/‡¸À,­OeCAYx9«ŸÖ²~?ìf9Ä¶ãÄ_y‡²³Ë×ó‡ØãmW¥zz˜uáÿ'`Ö³4Á¬g4Ì±–m‡l¤ÓÑĞ…!Dh£ğ@¶‘ôküÇ
+ºÒy_Ú|A¯l?C´˜íÂÙßi’Fk¤Å «xú—¯J·ıçúTÔÌ®°.ş°`ÖMÚ²*¤»í'­[µ†eeµ'(ÔJ0+Nş%°¦‘9oÑÁÔÉ“1sö7R6tĞàaØe·=°Ùğ-ÆhĞ407•ŒãÓ>"½¥‘‡°öÜm'TW”¡¹¡O>õ/Lùx:*ºõÁGÃ¡òCQ_×„q¯>—Ç>kàç¨£NÆöÛî†®İ£ø¦v:'»¶t|  @ IDATuIìµÇş8ğà½	c?áMNşõ.>ûŒÖ¥Í-`6Œ~^wÄğá›Óò³+ñ¾š1/¾ğ‚ñ/¥ï\vxŒ•l ,J?©‚µ»Ò'í¶ÛlËğmxùå—1cöLŒ>ùl±Ã¶œğªI-fÅËøB§‰“g}ğş»ôÁzıÎFpä¡'`äŞ‡Ğ…İ@ÄåVJV³YB¶VÔÎ]ˆ?øoOxµæÒ7n1ZïwÈáØtË­Ğ¯Š€3>Sßÿÿ÷k˜>¿Õ…&Tç1’V¿}·²7G› tİ\ú½Ó¾M·Ş	§|R­óğGÀûÓ¾BïÃpò‰Ç£gM9ü™8>~ÿ=Œ¥Õìg_ÎÂG‡á;î]*ÑÖXO?˜‚±Ï?ÍpmØn÷}0â #pÿCá£?¤k‹ú6£wï>³;b›­·Aï>½˜/6•s¡Sç»İš¶¬OÊZ0»,môœ!W©¤ÕeË‰»’)såÇ€7ÁÙ²Š-ÓGx>î#oædt´°ÕKi‚Ù}ÌFË*È ‘Mñ8f—¥¸İf°
+XÖ,˜];ÊÉ¦r}P@cÊ'ÿ´wö—È·:Rœa¸n>g®g*Ï¡{ô—(WS„³€–54W“ÑšÖGË@ŒÛ,˜]BÆú‡)äe—ğj%ÍÄ»Z18ÿ’Ö*ÏÒ¨ˆ¸ŠJ{µè†×4Ziû_êéUŞ×›xd‰D€Â—W>vj¡lk"‘#äáÄ*ôâWUÓ°¥>“vÚÏb!v(K·æµor7¬ZZ0»ÂRşáÀlÇJØñûÒÉåu@?²²Ô“å¬|[j"¼L&mÀ›,JÃ„³á€‹,Dy©àkÈ¸¨¨®ä‹ğ;'ôÊç+bÁ‚f6sIee(ãÌñ	Z±j²/Ú¥Òj’î¸OÇ©1Lgè33¯áÛ!‚)>±0Ÿ/Ãßy‚¿˜ñ»i¶Ów>|Iış"¡2³JËBæ\Í-mtÀç9åµ,xYÿæ8‘R‚.d[ZZŠardµK—
+sÜ‚ùõH‚U0­•’/ëù­a“É$ÓÃÙîcœé>Gè¥8#• VŒ³¢"F÷&ØbMuèRSCÕZİÓï*_êdiékâ@µiÆ•5>s[šùûôB¨%•Ay—´1İ‘x=º„¹/€¾Z˜Dk¨ıé7¶"Ğ‚–ùó‘«ì‡\E	Â”!Mxli?Z	'z
+ò%|ßÕ-œ‹x†mUu%]:4·21Iº^Èğùaè8Çrk¡¡så]š¡ğ	ÎQP õ¥?R†`I9]SÔ1•L{ˆí`ÒÔ‹ÒÒ©‰D–À¾ÕÔMúµ*Ö²ªm‚àªíí£6®ËªXÌªf…Âcí­k°¤4ÌkÿXO²|a˜àKŠÊ2cW¡Ç’È¶°Ş	ÌFrt7’ã}+ÆrkäÅL Š¼ue°Ô0›E«€U`]VÀ‚Ùu¹tmŞÖŠO¯»RfSû}!x%pmkZˆVÎŞ
+ñá>ì3« -P1Œ†ë¥ÍìÈt:EãYù®²`¶SUÿ¼ï®xc{•óX4¯Ò§di¹e‹“ÕO*SÇrñòZYœÆÕOÁT&y¶£EJø ğ@÷Æ7!Q*ßf««»#TJ?Š´uÀl±-Vâ×H{½î¸Ñ›ävŞX,˜]aÙü°`våÑñAïÔ\ùºlŸ	à-Ë!Õiú^•m”p6DØ) ‚±>ÂO?-úäkV.@ü´”¨s`ıa2ùAÓ‰6Z›–ìrì}¯f’„´„¼¾*Ğ·³Ÿ/ùF™‡òš£ûºa*+óœ,ZØh m8B@•K¢œ •W+mÏÓLkör‚¬444ò¸ŠÉ$ÓKÀ«ECí5’ò =Èõñ™‰n˜?C¿”Öa¥GÖ³F/kQ?Ã·*ÈÂ¡¡1!t<Íx‚—&èMr¢³JZóŒ“†ÔŒ Ô n†U>s»­-­èÚ¥›±¤•Ëù3İš8‰-ñ»†Ó(Æ'ÄN–÷D}\—Æuõ3Ÿ¡ÉXO$¢¥úæù"¾ŒĞ4HëHWOŠ‡ôg›lFˆËa†K§RØibChı.0!uoKfX®iºq`›Ç²Ñ=ƒà®†Â›¡ò= °úÜ–%Ú!Æ•"H–¥¬t‰F´ISWBf&4#÷rÿ8PÖ‚ÙeDıùB¤™®#TõAºëIˆå—âÛY‚—º¶Ğ/±Ê°”Ïú¹D+*ËT'ù²€×X‚nÊ*«ÑÜFøÏ9%²¼Ş¬Åì²·[­V«ÀÚ €³kC)Ù4®û
+ğ~éî”é6µoT§C`6‹8ı•µ´4°óA‹’ ˜	8X!Ÿâ'Ã°“Ã™-”$ú²³©ú°TÙ™T/·å1úsóÓ§Ÿ1ÛaG²¹©‰–EÕœ}7EË¢ŒÙÏŞ$r­mì„²<ù0Ÿäwujêd²3™ãq’ä´€aš\°üUh‰$s mÓÂYùÕ©Ò6vŞÌ±Œ+_ôo&‹-†U‡U“™0Üç6õRuMšRºÕ³æ÷6±ƒhö+†KÊ_aI©‰OéÔš/¦É§ó3-IZ3E9éˆ¾ç†ï˜_£‡aºL‡…áı:jÌ©6ËÎq†äg'¦¦“]Ğñü§N¸±ZQŞM~x=(í´3ñêÜÂë,,'C½Cšá˜TåSÇûØa2W¥zæÊ§~™4Ê¯3ã °OÅM„Â8²´ÂÊSÓp9M™tñ²œ1°í±‰Ãşù `Á¨ÈÌDF Õ‘|qË’¯¥5e m×n½.£…a	š«
+T«ó±t‰š=KotB¯›×!0kÊ®X´Ş–ç®RÒLsÏ?©4áÛ;?Û.ÁRµÇÆŸ¥€-(ÕÎë·;	‘ÚXµÍ¬š¶O§Ó±ò?KK_´b™‘HÔ@£$/–ÛcMå.ŠKíª,3ól›Ü&Ë>×‚SmjZ`Ö¡E®|Ù
+2Òœ“çŒq–y5×m„ jG•‡y?ˆÑ€@c\÷8†äLñ·\.”––ñ¹àµj®Aİä/\M° 2ÓÀø2„Éò¥+øeJÇ…³ü­siÑ=O‰ÊS§”füb„rh£°ÚsÆ/ğeÚ°ºoñXÅWN­sh»´×ıWé¸–ßbÊs’Áa(PQ^ d%i™A¢¤šxŞ2æ©«¯™À•–Â¨¤mÊ©QŸı‚Ô4ÅQPi¦0~?OëV>y¬îÙŞûuVQd‹å+ëgéà–q†e'ıT–Ú§tJ#?ÓFÎgtvÊ÷GÏABZå=NkZ•³És­s˜É'©‚áªCjävm3ZKÜµ|ÑsÅ*-«LõPzi	ñšÌóÚÑs‡c½®úÊrâ5æú˜h	Nşåƒ€î_Y¾ğ M~§É¿R|‰h}Ì®R	Ù@V«€U Ó*`Ál§-›°õJ>Ì©O¡U‹íÌóÙ ?ê8t ³ô3«áå´2‰Ì’ñÁ;Á‡d>ÜÉL…ñòv€ØÓàj—N£€  ­R³ZJ_L\Î¦†Tõèa€¤f¨ãË^O–ğAv*¶Àašlª©;`$¸HÉ‚‡=[Øš}ê¡©·ËN€ ªYô[‹:RìÈïêdútÅ§x‹Çey>snÅ¥xØÑÌHš°Â0|FC@	‡Í±J½Œ
+RvX_Õñ0yæq)Æ©ªrÎ§4°i ªâU¯a(UÚŠq³×B˜šà9f•¦—y1Ç(~ÓsezİO¥Aßu¼V¦×äQßÙT´ Î´¬ÀÜô)<ÓcÂómò×!?èå‘é,0Nu~Cú­ãØ÷ÔÕB‡óÚ¯ßWÖ	Z´™—ˆğúcçV¾¸3YZÕµe¸¦Ñ£Ç†ˆT°^r06`9²N¹sÎX–ÓVsÇú°¨-0/7$õãµ’§D)VyIFÃGÔ.ÊÓèDL›6ƒ‡ÁğÍ6AïÕæ² :¢Õ_Âğ¾&_‰†$¯[iëÍÂ´™Åı\v¬f¯®õu`‘•¢|Ì«R›)H¦öLğ0Í6S‹ , xHhÉ²Ô¿âçÙƒÇšv˜²È‚/C«W=Ghb0½LK3~^İdQ)h%˜ªóËb”<—åÌ—ƒZ•–³@Ü!äÀ|.ññ·&8Êx²&øRLï,1ó|ÉóùÅøÈgœş ãÖËgãnÆÎ$§l÷ymÊ-	C9 ’m±JS>`•©,¯s^¥QPUŸK—¶ù-étÿøyOIò¾#÷Ñ-eùQğxùãTó%8Ã:“­ò•ÓšUCĞåÖ@é %“m„ „gÌ«,Ut™b8¹2ˆfšQM0›bö›Ã5há9+yÊ\}ˆ|@3ÏWÆtUòZñ¶'ò„o„¯Ò)'°>#ğe½Váè¼Ü³µ –ç?>Òz7Èır÷ «Ø´è«"`YğNn5×ŸFÈrVñ(³¬ª;*K5r!®mì›òfSØL	ËY/lõ[¯9n%¤Íº±˜ëagÅÔi•"ëCímî=TÖ*× Ÿ/TÖ,A~†ÖÊr²³k¸ìé¬V«€‡
+X0ë¡˜6*«À÷V€^zÌæ#³yà×C¿V³¨,(«½|(KĞ•AssÎ0«IfsYÎ°,k0ú™j³ôÖ!&ıóC*ÀRåÃ´Y$$Å`‡F Q R&‘§àªös{Ë"úãHcY+É‰ª´Ê‰©ìx·ôªÓ‰V
+r°ŞÈò&,‹RaÌñ{€ W3ÇãÍPOv¾¢²ø”¨ê™*-?½hV9‚cŸ:_
+CuØ6ÍPI£N¾O€Yá¹İä…Fó)½‚¼²fX¥µ¯éé)<]®ëSOifş5ŒS?ƒ¥jÔn¬ü°ÂsãVUßMÏ™ÛuNœ'iÆ¯lÉ‚ÇhªŒ3C­ä70Äó>VŠ\-•bÊ‹tR¼ÔIÃ:·¬WH&œô3œqXNíäÑt’^y¥ˆiİ•dã6W6?ìÒ9P=bùû˜e²èòÅ€YZëµ¶¦Ñ½§Àl5w°Ş²¥]˜e‰k¯ÓVëÇú²è:²`¶Ó•vÖ©™Œ`bÔ@TÁ±<)¹€šF`äõ‹‹yÑEÚ&`«öW -Jÿ£ªÈiºô0a¹OÇÊùUe9ÉEà]`7ËvP¾Yğ©fqÑ
+S0W×˜³’ìhkT3~ï…Ii\jÀ§Îáç0lwÀ_£(bë¤G—k“ÚëBÓYÎÑrm`šqZÊ¶ÒÍ@’îª;…ÛjåQpP`Ö¸&`y¶Ïjï…`¶ıZe†Û·.ş&•ä?7Ÿç½Ï/+P¥§”m:ıx2š6:mMñŞPVÆKº¥R?Á˜Ÿ Uï}¤’.‘6Ütº•çãıƒ÷¤©™Ÿ.R2[’çPu´!Í“5Ó¿l­k+¨g4^KŸ¾eHFª	gWœ·Îxx*ä™YE’ÿXÇT"Ä	ÇÂr_Å‚Ê2^­Ğ2ÂvyNE{c3>J²wBô€,_°iu[Âs§	Ù ÒAÄh®[™MLÙê~ÊE€Z¾Ã|ÆL¥«NÕ½ p­­¥¿¬?Ux²¦]Wf×•’´ù°
+X¬Wf;oÙØ”­O
+ğùÕy”u:ùzœuiù°¬'|³—!Š`¶…`–Å8¹„†òI]&´˜•‡qì&ë™0ÿ‰ëÎÃñÚ_%hB?n~‘®äPiÁDv&ØcgR=¢4İ„å@€•pQ Ó©¬•²LU• t4 Ğ3Í–±|àT}¡US–@UğUşâØ£E’ñF	}5T_U²’’QP°QÀUqr»@¤ ±ñÇg€+÷1®©:øê€•
+HvfÙaV'¾DyQ/ÎtfÕÙg^_eE*¿„ĞånÆ-Ÿj&Ì{Ó­s•ÓÊTi¹2ğ—°§«|«g¨xu¹xn…LrxmP.èÛÍ¹µİìS~´ª3I‹\s¼à+ÓÒJ‹ä2hi$PÌ¸óšTE 8Ìc”VÆ—¦@Ys÷n\*'¥GÏ«Y¿cœ ¦mÑ"“ß˜ÊEqê¼ê˜
+ËRÉk²:ƒ*c*úî3¤‚î²Æb–`–³İi1˜5®XæLÛQo±Tõ©­¦VèÇú²èú±`¶Ó•¶&Õªá÷Ò.H&KFY@:CêÙÆ²ì²´špKÉı
+‹2ÌöQí—Úf·ˆÖ.`û¦!ëjÓµO°3Æ6ÚØÙò`ÿ×}$DX§ö;É{E¼0’ô³„é(á}L/Útß‘ÏÒ6úG¥KXÏö•®˜ÊÊ9Áã×m®¹…mo¶i×Ë®2Í2të¡ŸÍV‚Ò&ãı“%ñÚÕd\yBÉ¶6ºà¤aÊWØÀXZãòzM0z¡f^ü±¤²¼ïÊÊ×lÅk¹c	ÒTÖÙª	Êä3– •éhK,bZåÓ•é]qB°’_ªáñtJÄsûèÎ‡/KiÑÊWL7]
+°QĞmRï+uoÌºÒ¶I‚ÓoGe,§pº`ÖF%­fƒ¨à}/Ò:×@Üx¤;š9¡S˜fè±TjJø”P:Î“6Çi±LK^_ÄGóÌ?2sJ‹É¡/ïËl·`åÕ*Æı±µà³`Û´D¦ÌŒ‡Gµ#œpŒ®"|te@¯
+ÔM£¯h™Ér5uÄÜw³„Ğ¥¼Os25Rá6S¾²T¦50Ãég$"8kn|·+c¾ø”HËº£ìkËwf×–’²é´
+X¬k¯Ì®½egS¾.)À‡W¢>ä;‹:úÎó¬:ÀÚª½|"çğ¥D#}ÌÒ•í#˜Á,I	Ãute !k6à§]:ƒ©6Za²˜J4„ß…}²‚˜UÎø*U‡’Ö5‚’ƒ)MtÂß!DÍ2m|Ã±^ød=Jèš%\ÔĞPùßSu1ĞU@Q€SP’=¦LK³Lê|+QÅ­Ş°@©‚HûTGK³S«†Ùá’ŸY±ô©4š…ç¡¥¨ãÃVû³f"Mba¬rÕ!cBd¬T´èSV4‚©ì¨ša´ç„!hUïNßµ¨w«s
+Œi›`PñS“Êh¬±¬U^uÅĞ¢Y§¯u…˜‡q¯À	5Œî¦ÓÈ5a­ÍvfåXúÒÓĞ\ùò¼Uş_]¥S=m‰Ìı´f1–YÚ®¼)ÍZéP¾íÒÉÅºLş–³âè‚²Z»Ñb6,W.˜UªŠ¤…ŸªîªÍÜëlĞçú°˜FF÷$‰Á¶€×–ueğÃ|€$N³½çØÊÅ€à˜Ú=AY¦Ğ"KWYÊ-AÎ Z¹pa0¶Y™:Æü6÷‰ A)ï7¼è¥Wœí©¾—pD|®ÊİÚ>]Ù·ÉJR×„ñËß¶Ùº>:ƒtã“ÉÊ*!¹-ñ¢£_üB®„«sÂl³q¾Ó¢gÕ4}•r’ÓT¶‰u¬‰Ö¨Œ¿‚ñó…bˆĞ97pYõPiñÅcÌÜx-·ÆM^0KØÊ{­üª:¾Ã•B-îçâï>ÖgMf#ì”¤éWu!›|¹#(§5qĞY÷H¾ĞaÅyO¦ŸP”`–~w¥„²¼Gó¶*]R&=[H	©©“/\‚F‚Ö'+C+Ál“ñ;Û¨¢u,]ğ®'Kó…b<Ü€)o›|	XÂ9|aú±e’Û(ß#éÒ£å-ıœçø"‘íZÊO—F\3,;íJ“t]!ğ~Îs§øª9ExN_µyN&UÁ[VŸ)³´ÈDÊ8˜&r#äeı0£tX$YZÒê…¬)dY­|k$Âƒyµ›æE¯Ê™uHşjåÓVáU/–X2¯¥‹³kiÁÙd[¬VµHf×¢Â²I]‡à®º¹êìkáÏâª-Ü£^GÌ&˜•+‚Y;i"-G0Ëp.˜•c*f›]:‡ì@jÈ KÏÇN¢±bUGR‚>ãs•Ö²ê˜kWZ&ù5+µ,?	ÿ2´2Æš¡Øì$kØ}ÛÔqP§ZÖ.:C´º†õ‚u‡pVCJÕ]VgÚøÙ#L]4w.-*Ø¢ïZ†5V.›ÉN¸@N–,¥¢²åyÍvU¯cL7œğ4K`¬8u•£¬±„m5 R ô*q°úT|dYcYëø LøF”uêtör5dV<fr3AO]êüQ3Ÿâ@Õ¢N%Áƒñ{Çğ¦ÓÌ*m€*á4;¸!YÌrª“&ÂÚfZsè¨ò¥Ü˜ÉS˜ãÇWP–ºê\YvN;SshîSO=…İvßV]İŒşÊ¿éøKw]¯fÌ¬2j—N¡€H†±˜ejhAGòÂrç6ÍõÓÊ—&-tgĞ½ç¬'E³æÅÃğ¿E¡uKU›U#Û7èûº¾°›¶E¢Pf;GÌÊ§©ÚP½d(3¾`Ùj(¿ñ+k*®S™åZ@àRí–ö©·Ig{(k[Ÿ $­9Zå¶ Â—ƒ‚ri‚Ç4ı‹I¶“	B[Á[M°¥ÕÌ¯v“m½¶+-¿@à_øñvV€`®ÜÅÌÒ w#­ôñÊûY®ßmiIØãìõ¡&6§•D²•æıW*#7l“	|•ö4Ûd?}¤†˜µÁJ»y	É{¦²œ2/4•.§Î:%Æºk¾8zè"7÷IMÆxaZÿ¦æ™”QúÍgJx‹á=‰æ¨ŞÇaÂÕ˜&$#°3ïAcŞKÙ´ğ–EİrÛtHÀ´E˜¶hyêèÇ:CëÔr_¥tgDĞí‚z&¤Œiìêká3BÉh®>”0_3İûĞß-"ô_¢c68I†WÓUF([–£«*“ UoÒ_B£LÃ„Y†%ÉfTøiÕbÚéK»9ÅúA76}Õ,ƒ+Åıºi(ĞÍ„ÛĞ©¼œ—½²ŒÕ-yáı4ÀíaŞ·Íí™U&EĞ¬g3ZEšIÆ"0k*”+­ÑyíıcÁìÚ[v6åV«€U`mQÀ‚Ùµ¥¤l:×møğ*”ã<Ì:Æzuº|ÀUGX G£Æ:ZÌ6ğ1<Ç	'fe¹°,0+‚ +>ó˜Ì»tX&šÀDTZ%ØécÇŒppæ×3/½á›on¬™”Xu‚UòòÕÚ°p!æÕÖš<4Èt e-Z …Ò7³gsFùv	pYW*éZ`Ğ Øùõc~í<´Ğ¢vÀÀìÄª>8K]Lš4	Ã‡G×®]M|³ÆµWy¤æË3PWÇá¬ìÜ›¡¢L‹†½jBYÆ43ŒcQ#>ª‰eX'‹ç‘?:Í ÍƒyR¡Õ°ZBO¦YÖ¿Ì ÒM˜şÙt”öéÓÇÄ%×ŒˆU>©ÙaU<ÈHÎâÍ¹	cLRÊ5fç‘ÄÀ9¯ ²¶–æÕy§¿^c±«m²Æ•Õ²àW]f9A~7V¼
+ÃßJ»éi³‡*è!«"uÔÎ<ãL\rÉ%ØxãMúÔ©W‡Vaüfªá½æXşµK'P@m¢¬`YmŒ£F×Ç,Á¬^˜ÈZ¶…3¼wëÙÇ³
++*¡z .ÌJ^æåE±`ÖÔ‹ÎğGd©rgi©/àªöRà2Ëv2Î—R‘~j_3İĞ”ò% ¬HU¹õòMÛ£QúİfÓÉ¦šÃøé_U¸|:1>¾YÜB9]
+Y¾0ËÈ4”õ@#8Ì$^¬wjC|ö0/ÈVç•Ò-tem`”¦‚/Î°¬KyYÇªíå÷`!_o$Œ†Fºlª! 61L_ ĞíÿµÆøÃğù¢-Mªpz'‹MYYHh|º;Í¸\-ğ\Š³ùìgÙ‚3€îV4åÿz¾ş®3íx8Ø•îû«Ì²5·• _ğt›â¹™ß‚üĞÆh]Ë8t«eDÊ£F`˜ÆÒŠÔ'2éÎ ÜŸ Ù8Z¸=[Õ‹n¨mœ–Ì­µ(ã‹ÄT´†“1
+nµ5Ñ]­VC|¢;†MrŸÚ¢rZä–g	i	±ˆû¹ŸûÒÜf^ÊÓ³Ü/7ôF‹6Zô&XI>‚TğÖ¦ãƒ„¾)Z2¸]–Ôº?'9rGÏºßê9DŠ¹÷=$q`¾&o“…5G½¨ÌÍıÙ¹*½n—Zš®Å‹³kqáÙ¤[¬VµDf×’‚²É\ÇàSï·Á,;&Û|ºæC®	A0›*‚Y¸¦Ål”=ı³Wc\0œ&Ş „é@æÄ²+¸VdOÅ¸`ŞB‡L¡ÿ€ğ•q2úk{æÉ§pëm·bÎ7õ¸ì²pğÁ£÷Íe:wß}î»ïqôêU‚ë®»Ûm·ñÍ:ë›Ù¸ûŞ{ğô3Ï¢¶6~ı"øÑ~„Q£F™Îé«¯¾Š¹´Œ=eÌ)Ü×ÏX·466búôéxô‘GÍöÍ6ÛÌUçYk×N†5uêTÜ}÷İxçO@şjÜÛöíWm·Ù_|16 œıüƒpÿı÷ŞÖáÄOÄN;í„ ­|åÆ ¾¾UÕÕˆÊm{¼m<¯ ®|·ÆÊiµÃô—Ó>ÅO<Ş½{ãÀD—®]LGOy­êğ9îŠŒi+ĞeAšpT•\p@P!D \Æcy€ñ'›¡u—¶ÀKYuÚƒÇ)âÙ{–¿Ä8'i)“Ÿ\şË-aœ ¶,Ä´j)cY¹şôHa‘b¹m´Ñö¸í¶_cÇwäş2Ó©õ³sšáä_>úÔÌÜÎ…h¢°~h\0«q¾šA§İÇ,ë‚ lK[İ{m€ \^ÌªV1WµÄîªìh3^¿ŠY™³*õNµ8k{ÏA’AYVµ¡š/‹ÇõçW½Ò;3ÕeñUµú!§Çq’3SÅ*ühhæñTÁ6P£$d+×:ò«ç¹6?QÁ[µ—­lCu^µ¡ru ¸'È—¦•z$TnÀ¬&îád)_.GCÆóK­Qs¾:Z¡Òoj`CxğñÅ…T´q¨=­:³•'áL/-Aƒ!º' HŒ·%PUUÍö™€˜	—?Y¹fP¾SftC€¾lËèö@®”cçb^ü„å^àLwSF$é
+¡à_„šîzÑÖÆÉ5i	š¯f^kÌÑ”NH–Îóe)] T”wç¤`LW+-x3š„“y¡hõ¡…l€/$QN÷Åv†ÙD)_¦‡2M˜öÅ×¨Øh+ä*Bœø‹Ãÿ[æ¢º¢õ¹2Ì'}¤èKŸaZBë<dåhá‹%2kf+˜mà÷Z‹`6%0Ë5Ê&®+8\j!›7¾ä¥ÅmeEI±·µPK5üÕ•şz³œ 1Iò—«ú£÷¢‚óI:Mò­zQZB ÎmmÔ;Íú ‘1BäXÌ± e3¾vpeÖ,wF,om_,˜]ÛKĞ¦ß*`°
+t~,˜íüedS¸>(ÀgnÚ¤˜Ê®ÛMĞ'¿ù_+Ÿ²9F.Õ ‹Yú˜-#˜5³À¬qe 0Ëcd¶a,¾LDöÏÿ³w RÙ»;³9/9#Q2‚d%ˆ‚YÁp¦3¡r99gQOÌzçáY(" ˆ€%çœÃ6ïÎ¦ÿï«ÙÙCÿzŠ»z€İºÌLOwuÕ«®z_}ï{ÿs¨£ñ˜øˆ5„£0À‰“&Ù;o¿#g‡rˆ2Ä:tèH*3v„mİºÕÆ¼şº½ûÎ;$ğŠ±¿¿úªµnÓÖ–/[jŸNøÌV¯]kG>
+Ğ¶>NS¾b•p¥}ûö»nİ:»üòË­Q£FL'¡‹Ø²<ğ =òÈÃX”Ã.€S÷œB÷Kl)å¿ñÆ.T¿e‹‰»æî€½} `{ñW·n]Ëp•CŞœºÜ•cV·yó ­ON÷¶Ø»N¯V} {’vÉIŞ	Û÷Á´ÆÛ…^hiuêXmPxªØY>éÃâdKGW×Ãïç\T-ƒò
+b¹¦Ó7T¶É‡¦cÓ¨›Ú“H,‡=±^½àïBà.Î¦²GD.ËÃñ´(Å‰“,09Ï´œcäÜ„ˆ‹WàûTo9jGq¤=üğÃvØa‡AYÓæ’Î !/_¿_oÛ?, `Ö˜@ØfóÈò.Æ¬ORº·ô4Öi•¡õªvë¨ßU7sÿ{À¬:}Ûx~Ãš•îµQ
+ßWˆ¿¤ZS·‰9+ 3‘…Eè»HÂã#™Gè^..F»§ÎGÂ 6!Ü6o'Ç6mR×•±'3‡sHåˆÌCºÀÏ9
+g2,µ¸§qK²0ZXÓ¦ço±÷åd¾
+jÄò3,'¡d@z²I(0‘(ŒG}IE®å²YPi€º$Ğª Ş	Š¸Ëb"˜?¬–’#£‘”!„_ã~œµÒj3° HâFĞiiiNn!ä`ú×bÑ®¸˜±H¬ÜĞ™× 8«–71fcÀ›s2 •[¬I3ÆÀî=™œ0›H,† H,” åº“:[­ÔÆ€’Ô¿’âü°y3ˆ‰cÑÄ’>ØÂùØ¶Æk13QèËæïŞhoıÈwhµía-“Â­i<òŒ#éEQ–‹5‰²X‹µr"b2“,¾N‚åğÓã,±Æl	 µ€Y_¬YÊg¿ÀÙ¦Œ)¥H”d ;	 ia|˜€(Â÷IZÄ/ÌaZÂøx+Ûé¾PÔ‹úPãœúN›€Xv±ò€ı‘Ü#Ú§©C÷‚Òı§—•Í±Ãæ³C/zmğ,àYÀ³Àşm˜İ¿ûÇ«İïÅL^ƒÀ,3e6ÍeCn‡&Æî/ÌæU³	UÀ,`1fåU„€Y!˜u%xÿìP¯Bµ± U) x(çuòäÉöÁ ?ĞÂ–-[æ³ƒ†ñIb ÁdÅ^]¿~½mÈ|òÉ'2›pŞ$ûô³ñ6xè;ú˜cpNÓ°¸eË'_ †ì;œ»hÑ" J"@²¤¾újº]qÅ_`»şÍúôí‹£sw%PVÒŒ7o½òÊ+Ö·O_0p€vW­\e=üµiÓÆáš’oØ°Á:wêl6n°¥K—Â&mi+V¬€i›m›4¶^}ú &·vìWHãİª}rûĞxäÈ‘ü-†á*Æ—œC9ŞªÿÌ¯¿¶İ»v»ìĞí¸öÑ Ññ0r6oÚdsçÎuÇŒ–¶`4ìC°åĞ¡CH=cút'É -XÉ%ôèÑÃs=…ºŠİ5ö£ *’-ÇráÂE–”œd=9¦]»vx–ƒ*»@_È‹”ƒúêñÇwvíÙ³'xœë”eË’µ8Øï
+±Û/~d?^	Éˆè÷àaÄ˜u³|èÈ”0[`6Â1f…BpJè·CSèOÿ
+¬P©¿«nvc‘Æ*pKàF@nÒ=Ú”[m{z¹Í˜ùÏ€•Nö¤S‡vÖ ^ŠÓßdI†°pÂŞ5ê‘\Êmğ('hW´º›:M[è5øéûÿºo…4[ ¢³		qnaKd+X°ò#³yóéßò7ß-	”mP¿¡[ìÚõ0ÆØ‘¬mÁÕë³¯¾™e/pcËPÆ™ÔäD7ÆÄ(é!,Ù¬Ìú´ÔE+–/wbzk|èÔ¥³5iÒÔ-ê¹ºpÁbÆ–Dkß®‹u=¬%§Z_CôCÓ–8@Ør[ºjMıj¬m^_j-šôµóÎ;	ÀP’Û,;3ÜV,İeÛ·¥[ß#º šÖ¢ƒ5v•²P¹Â‘’ÓÑ¢™dŠX`«gzÀ¬ g''DûB ìŞ÷œÖÒò÷Ú´ISmÎ·Ÿ"£À¢21Q¬K§Ö·÷`S „4fó;lùê¯lúôo ¥»iõjj‡uæ¸#êÛî¬lê€ƒ3\{WV.IkÃ\Eî§$Ïv®_j÷>ü˜µ?ò$ëĞÿDëÜ(ÁÒ`°FE Ì–Œ10™GPó½o¦L´MÛ3¬á!mlÀĞ–£á…z$9`6ƒÛ<ÒrfóÌê·ÈwfYæ´¨¼-¶~k†ÍZ¼Âæ­Úl‘uZX«îm`‡zÖ,d`Y;‘1`üòÅÒ·y¶xñbwháR2=ı˜$$ÆÙÎéDÏp?,Xà”õ»uºïüvBéöí;Ğ·‡Ñï°/Æ<8~Z ş­Z"G)Úõ³¾ğAå ‡=¼ #ÓÁİÏ«ßÉcˆ%ü1kåöÎ{_ØÖMìĞ6-ìÌá-’ï˜u:™½ªk¼Í³€gÏö/xÀìşÕ^m~¯`2¥y’cVÚ@óY7§u(9Á¼q³é•ŒY.€ÙH—üç¶„Ø´pƒÁ õÃ9^T†»UÖ°¦^j²LË¬¦*Wãå(ÉP9`†KZ;%'rÊÄ‰öá‡ÂBíëÂúû÷èäÄFgò}ÿıà„;Gó£ÆÙí·ßîØ±&L °œaO?ó`Rmœ¤ ÖŸœ$1_|0NŸyêiçL½üò+.QÌ'ßÌš‹ö{ùåg¬ ©œYiÀ†RDŞ_StÖÌ6
+X çĞ!C­> ëÊ%KíÎ;ï@J¡‡Å.ıâ‹ÉNáè£Æi[hŸ>ÁÚ¶mkb×îŞA8g
+àïvŞÏÇÑMem½\ºà€Æ¶y²uëÕ±‹/¾ØÉ3ˆE˜€/bkV­¶yİ-½*íÀ†õëÚ…çŸouj¥Úô3ìãqã,€ –ÎŠU«¸^’tòI6ü´Ó  ¿²³sÇKló…GØÉ'hıqÜSÒjÙ€Ö«¯½Îâ9'.)Ñ¹bÉ6oÖŒ2N¶şıûc—7î?~¼íÚµ6Vª5lĞĞ>úxœ=õÔ(wL @ì´"dÚëôËøMêwèmûÄVwŒÙ½ÙôC³fY”³Ò§Ôós¯G”€Ù½·ª¿§nvà–Æ$Z_£À,:—{÷ŞWÙû¾ûÿ»~æÑ?˜ı©Úıÿü–{* mÊËKX8R'¬0,.“Ü"ƒÙäIS g¸E¦íh5ÇÃ¬Å!-í4•gÅT´B6‘.°·ß{Ç/[‚|M7»öÚkxî5 €,
+^ƒû`ıÚµ¶dÉb›öå—¶	ÙŸzFwêÜ‰çâ‘ ´m]Yo¿õ¶ıéœHR;'œÂ"Ük·˜yK ˆ$da$ºô•Úó/=e~òoÛ´>Ç:w8Âá9KJE ½×•Ë6Ù{ïŒ·µ«×ÙE#Îµşz9y%ßÚ¾}'ãÎç6ş·®½KÒĞNwrt›’^Ê56JÚFl"Ğ
+ÔÕ&­ÜüÜB[xıùøÏmÑ² ’aÈ<äÙ¬€õ<|r=#¬å!­&ËlŞÂ)öõ¬‰h¤¯aNVŒ½YlK´í·ó/8ËRj¬&û-fq8¡ÿéYùæ‹¯0‹N;2»ÖÏ³+¯»Ù:ú£õ=~„uo….pŞFlQa{ÊëY€q$ÁWa™ÖÛË£³õ[²ìğ¾CìÒË/`®XfÛ¶¬µÂŒ–Ìœ¯Y«ö–ohÌÒ ¬ .–ÇWr‹ö9›¨ë"{ãwí­?³€ÙSÏ¹ÔFœušµ¨›l¥y9:‹±±Â6!µôô³/Û¤/gZQY„:æ8»îºk­^íhÛ¾9Ó>ÿø}ûrâxØÃHfp|yY‰å#±'· àx—yŞ…vì‰§X‡CÛX,ëüå·Ÿù(©É¶zÀlMZÓ+Ë³€gÏû¿<`vÿï#¯†¿0é“ËrûBs@`ƒ›&·|Àñ*@c6ä_›ÃŒBß‹Ù7ÎXŒY%ÒsŒYh/ò8È\s›j¥Š†jW%»¢j°<çÈhU†«JÖp¢¹à$¢I`å
+³Ä¦&|S9Ñ†;Í>ã}\lZ­}èmëÖ­Gºà5ÜC­Ní:vï½÷¹¿ ƒbÚ~»`®~öi”`8‘ÈEµ€M±–Ğ>÷Üs6wŞ\{âñ',­~=ËŞî´_Åj½ç{ìî»ï¶~Ga	ÒåxÿĞšH”Uló;xê©§p€û[oê"ÕhÊ>ÿüóv:¼ […=~úÉ'îZ½z÷²Ï©ÿ'|>ş„ãí¢‹.v×z}Ì[€Ãl kİõ)Ÿºáff¥#ßc÷Şw¥¥¦Ø¹çkµëÔvÌØ4BSK	ÿœ9s–ıíég np`ïšÕkm2Ào“†õ­+Œ¬¯çÌ²ÕkÖØ÷ŞMhi4¯÷ÀLÊ°ó‘EKêUd5ldÇ>ÚRÑ‘}aôsV@vğ€Av(ßİ$]»läe(ÃìÔ3NÌîØ·÷Ş{¯uÔQvöÙgÛÎ;]9İ '¤í+‡~şüùvıõ·<eƒtReØ½t4‰ÉÂ•ˆGÀìAá˜ÖğoàYœ˜™ O 4ü‰æEÜM¢·aË’ü‹`µfãSøi
+˜åøzœ„öÕäãëi—}¹öÿ˜ıÙIMwL¨ÃC¯ûb°_ÿXµV¦ÑŸX¤ÒvUÒÄÁ\0Æé…"epÁ°fÔŸ}öÙçlÊ”©vÊ)'Ûé§ŸîÿbÎ!
+áô3Î`\	ÊXpò)§Ø#È¶HSTİ/ğW‹k_Nê¤h4œÄ‚Wä± E>]C›ˆjxóÍ7\Ï. ácx®>ùä0f“İO+,œ¸zXYYvöygZVv&å§XjJ{êéQV«v"e•ÚŠå«ì_ÿü·e¢g~Î¹€ÉÙ“¨	-à¡ƒ›µ‡±g³X°N°ë®¿ŞÙAÉ¬4.æ¡úÄ#E——škMšÖ”5¢:‚ºâb…nÜ°É waÈFÛGö¶Úš¤î¾û>¢3¶ÛÉ'ŸjgıáØ·ED›¼H]wÛˆ—X½º8.“±zãò—Œı‘æ9ÏRSO	 ’ò€•º§$\È9$úÓ-/}¡]~Õ_¬}¿Ö÷¸?YŸÈí„mE!Û2Jš#7k	dğJß°Æ^{å)Û™Ua‡õjçu¢E…eÙc·of~;µİxË½N¿¶@ÁSô¦I<Ş*
+s-¼4ƒ…Ó%öÖ›¯#‰ôsÄd;ûüËí²‹/·ºi`èrB`:¸™¶pÅ;í‚Ë-±ns’Œ%X·¾ƒíÖ[®BVÙ$Û£)?²8Ğ•gh4)ÔuÛî,ûrÖ·vûCÛ5·İk=úm’cØ–'ØßxSƒş?Ğ7˜=Ğ{Ğ«¿gÏöÍ0»oöòö,ğëX€I$Sã*ÿ_sJ7¯ÔN·éáJ`6WÀ,ÀO||$ 3pBœÌJÓ2¼˜­€¦ÙyÍPUÉªš«Uİ“íZZİ’*ÏÇFUàlYÓÅÀ|u^“^ašæMùbª}“éØ¡ÇÁÈÌÄ]I2¬†0ROÄI|Ÿ¾°æÍ[`+Ó{öy{ô‘Ç,Ù‚/¾˜bK–.°ûî»œİ:é±â;€•r¥µ:fÌ[½zµ`ã¥“Jø~àáœ9sìÊ+¯Dgö§1› ãÏÕJa|–AëU²—ùßÎwl]9¦ÚäØ¦Â•Ì‚’‹)a×¶íÛ^­$dÊ¡ÿæ›oì­Ò^Õı÷ö[ŞN´Q£0:ÇQ°½…y•äÚM7İ€sÙĞşôç?“(ŒpLX¶18¥›6â$¿;Öşö·-…ıQQèà ‘›ÄN;å$rÌÑ¶lår[£èú[n²]$õÌÓV@İO=}¸m¤NÿøÇ?`le[BLRzè^zv>køéÖ«Ûá–…“íu×Y÷>½ì¤Ó†ÛÔV­Ze÷Şs¯“oà ÆíÓO?M=o²c=ÖÉAlP²³»îºË:uìä4õ[ $&†0_Ià{À,&Øo6£Òfñ¡`6LÀ,Œ2’êT³€³µë6†)0Kğ§œc·qjÕ“*ô\Ök?ƒÛÏÿıU€YÆ*‰!Óş˜\ülpöÇJù%ûC5½ş’2~½sÜmˆ]ñ F¨ô^ÎŠ«	½WÂG¦­[·vŸ%kóî»ïòlşÔ-ˆ)#%9Á&|>Ùşõ¯¹ˆ‡$6Ôó¯MÛ6öÄ£Üí‹ä‹Î]·n­_6 csÑE¹ÅDEÄ'D¡e«èbw\–ËO²D'äf[“õìøãO°~Gàw–Èúú¨°{—._aÏ¿ø‘Q•É»
+í±ÇEŞ†ä`03—ÁÌ}}Ìk ³»íœsÎ¶¾}{[,¿áâ¢23ã\[$	¤qê…ç_p’Ù<óKˆdH#º" 6ù?	RË˜iáRº¨Ò#—$} b;vîpßéºÉI$ábLV‚Ê%K–8-ô#F¸Å¹dJº&‘ãfKöİwß³ÏRÄÈ9gŸƒ.o#€ÙB4Í‘(ˆCj¨€Y"E|¹¶{Ó4»æÆ;­Ï­]ï3­U½"Kò¯ ‘X´åûÚÎ2åbm/6<¹‡–™à^Ëê¥ÕR¼ÑŞyı›5o­5kİİşzûàÖTr0ºØmñ((D mQ0;ötûÇ«Ï2¦næ7gmífƒ:Õu"Ú½$·Ïµ‚Œe6 ÷¾§ÿn­ºö·õ;ò¬A«Îvß=—YJYQ<+Sù™&¢í[”³Ëj‘LlOº}³x¹›2Ã¦Ì]l7Şû¸Ò±3 3ÇÁ,ğ3gı­7˜õ¤~ë{Î»gÏjÂ0[VôÊğ,P]0‰•»rùœ“¥2C;Ü›_ÌÖ cÖ²)T»Ú\Q5XeÎV®†*ZSÅĞVW5ì€W£Iá•_LâXKÇ¢cŞ|ğáÇ0zò`¤goüûM’µ&›ÁV]dÿ|íuÇ‚õû#a ½ö{ùÕçè•…;˜t%LeÌÊé|ÿı÷&ÜğaÃqÆÚ¢XöPM2Åî†1;zôhëŞ½;ÉJ JÙ
+ø.‚D]>œW…¨>şØã°~R­EË–„e&»e]»t±X£J–°9{öl[÷dXWÒ¥ı–pR9ùrX¦ûh‚ÿt2 ë3}!	ƒx’ÑPçŒ-íæ›o²CÛµ(¾‡¸‚¶ÄàllÕÊÕ0‰'ÛX¤œzÊiN¶D·Ñ4ìÈñõ`×¾÷áX{wìû°_;ŒIßSïn={X?X¾'OrÒÁíÖ©‹¨dO}Z4if-ù«šæ€Ú †B?ñøá§Z<¬Úí„äşxàÀAvæÎtZ±‹oşËÍ6ôØ¡®¥9û¾{™ìƒıÔµrì&Y·ñÆÙã:\¦õ¶ÿ¹è˜­~/xÀlõmXÃ%hU´„şÓ‘€Ù( ÎHÄ%óóĞófL(F×[º¡bj¿§ÂxöÕ4¾°Àw¯{¾oX¿Mîµíª(‰—_y°0Ñyô^Šq*@ò[îƒq+–ì9çœc­Zµ¢œ"®EÄÏZiŒê}qz·æµhÑ¬¬ Ä^}ÍµV¿a#€YŸmÚ²ÍŞ‚©ª„Y)<—³H(¹eëV€ÙG Goià*áŞzã_È
+dr½³ˆâèIpG´’|+"Üoã?ûÌÉêd½õÖ[->Ÿø92ÓªÎd#i¯K¼{÷ÃİX§Gt€Å<µIcœ"NB’ÊnÙ¼Í$rd÷î],ëÆ9I!È–¼õì/„–LĞgÔAû®¹æØ»èçÌ&2¼–U0FøS`¹§8Ë¶¬šd£şöŠÕm3¶…íÙ2FêB’O&Xû>—X«nC­YY0TçÏh+6äXrí6Ö³KsûìıgmîŒÏmùšt‹ˆ®c=úE¨¡:úDëĞ±®‚^eX*ë­¾°›ıõ{õ¥Ñ@NJ®ÏÜ É–Övİw:`6.,ÛV-$	éø)¶tS–µìÜÏæ.ßh	µ›±H9R)I’IÂ0ä²H1fÅÙ;a+û¬8o½÷Ù${ııqÖ±Ï v!lÛú$n ö€ÙêıÈ=ÆlõìçíYÀ³€gÍ0{ õ˜WßƒÓ•x]ÂqN–ZÚáŞì+0+R2f«Ø²•²šè	5´F·([e¸-½&
++…š'ÙHØ9¥HHo³&L´SOf;wµ7ßx–Ò×èÈ6°hçıéò?[³¦Íq:§ÚÓOıÊÀ"J¶Æ~`ŸO[é<’ôul 9Œ
+³T±Æ;fìÌ™3aÜ6·aÃ†¹lÕ7n´‰•º¶=ö˜Kğ[-‚ìÚ¥„­–¢QEr%syğ¡‡ (À†ì’)LÖ ›~¬’gÉY:õK[+W ¦4çÁš}æ™g G8GpìûŸ8ÆìK/½Œ	+8ëCz!2!Öv â¾ûï±–-q¬+nàhqn>!°[lîœùh¾m·İv‡u;¬;l* ]Ú'å¼Ü=öÀó‡ã>¶44j}Ô¹S·®Ö[4lÚ„äC3\í ¤N?e˜ÅHÄ „!‘ 9fá¸…$'»êê«íèãĞÑ=é„Jà!Ï%"ë[løğáÎ–÷İwŸ]rÉ%&]9ã²áYÈ<Ã.Ş±•XÑf'!Ñşó#®‰ÛÇ+£Z <`¶Zt'{ÀlõmXÃ%„†R½jNãŠGƒZ²Z—
+‚¥Av§I±Æ&"¡³dé÷l¿]V=Û$} …7-ì­^³¦ì ›~»›è šùù„ÿçØ´i_ºçü!C\2J1U%{Ås¶~ıúÈï´vc˜€Ùûï¿ß²÷dZ§v‡"Rnô±=È¢Vûcv>‹=ò(,ÚşhÊ¦¹(uë×!y€”AZ*Õ0ÿÛ«¯¼d×¯GÆ 7	›»5°Ò@9 j™-g¼ÚNGãFíò?_îÚñÅ_0n~á@éÜ¼\ÀİUÖ”¨ˆsÏ9©†Óƒ ,m“8ÀY@´’OjüÃXöË$R%h£ÆŒ¡§Z§N`!bŸ|ÚII‚edæ8t±e§"Ñ=v-îÅ"ıVd‰1€Ñ±¤ã‚­6}óL{ø‰çlw %I»ÚYbø
+‹/_Æ˜¿ÙÒZœ`=¾ÂÄ‚hT½öêS6kÁFkİ¾Ÿ]LB´Ş|ÊæLÿŒäcéH¤Ùa=¶¸ä†6ø˜“­cÇ†ô¹€Ù<KKGª ßÎŸ‰ÄËDÂ”¡ÿÛÛ–.[tD	ãûhI°ˆÀ6›6áßöö92r  @ IDAT'“­íáÍŸÜÈ¾š»Â¢RÚm·Œ´Z(¢c~‘NtVI®•gìŞfcŞgNšj·=ô¤µéŞÏJ‘8ğÑV˜­ŞÜf«g?ïlÏ<hğ€Ù­Ç¼úœÀ›”‚å\9G+´Ã}óK€Y±÷\I5`·P­jª¼P#k jUET³Uv«úb¿yS,f h4R%èâEà1q2Àì4şÎ$,¾‹}ùåWö¼¨ºØÎ<c˜]zéeÖ¸i3›0~‚]wíõ0˜^A_õ0œÇå„N¾i‹—Ì·[oû«bóóÉöŒ&ê¤I“+çzúôé.“öI¾%Ç{)ìVi¤ŠtÉ%#¬IR„µˆåƒ'i€­JÌ¥ãÄ<’và`4Z›àl–ë@XG±$ôª€Y»gxš²¹høI£P€ï7_ãôı„–ÂŒóÚ0wÇÙË/½âgŠ¸£‘â@Ó/=ØQ£F9Ç{0 g“&Må(s™Ä• mÙ²•vú~C†ç€Ù†0¬âcÑÒ…5[DR–%8Ğ;Òw[Ï¾}Í4|…¥äCN FÓã Ï-Z´´£ú@^€pSôEk'§ZœÿäŠaü^zÙH;`öèã%éX¼EÆÄÚ]·İfmùíİ§·cÌ>ûì³€ßG8İßXU$»îºëm E=­zĞôûÀÿá$Œô?¿êıæüW„{×f«ßÿzğÛr£ãKÏd>ÑÎdC¸“mO/gaä[±b¥µâwÔ©C;kPgÇDğë÷Ã@WÁ‹{øHä¹È©ÿus£è“¿ùªYèõ7¯À½`È"z(ãcáªÈ¨õë§ñ¬&ôÒ÷
+ÙWøşÒeKİÂ•€Ó‘#G¤¶ie~è8*	Øõ^xñ¢¢í/ù‹Ú¶%E$IÜê’!>C„Û1·oßæ®­cÛµk‡>÷Y ¨ı\„ÆßYL\²x‘è×íÓX{üñÇakŞ8)|?ÑSíáGµëo¼É’ÃÙ¼eúéÏXİ:)9å6î{ø¡g9mT¤Ï
+òŠ¸&"ÜtÒÏçùİ«g/òn³†:0Zm(=yÒdûğ£a¤¦8)şıûØ®Í:O2d$ığâK/1ÿÃíÓdìÔSN¥ƒDtÒ• +=c»uk¥%S×m¶uëVûèÃœÎ°áÃìH@æzuk#ÅŠ&¨f	Ú²%áH*U °ËJ²—“Èë:ûv½ßv“]ik”¸“H˜7í­	ë,®Ş‘6âüc­_×:öW¶™óÖXë}íækÿHhË6{ıÕ¿ÙŒÙ+­iË®ö×;îp9!##”3@¾İ‰0X®­^¹Ø>û6u[ }¾-^¼ÊæÌ_	kù6’¬µ·¼ŒUöÙ¯Ú”oØHX´Wo³/ç,µøZMìÊËGZóF¬7¶ú·+ò,Å¤‚Œ6ë›éöÉäi¶#§ÈzæócÛ~ã˜å7îó¤şëïö¿}é³ÿÍ:Şw<x8ø,à³_Ÿz-:-ÀÄ_î^Èå“ó¤¿ªîğ>iÌÊÏõïU†
+¬Îª•«Yu
+úÏ¹5XT°P,(Ğà?†ûÏµö‹w4§×p~UÅ¡H‡OÎïìYsĞ/=‡¶ƒÛ÷É¸Oqšß&éÕu€°İPù5€çC=Œ^ì=Ö³GOj:oŞ,{û7lîÜ9h©æâdF8¬dĞ”Í"ìS ¬2b‹Q$UÚyíÚµwU…áGøHÒ‚C	KÊÕÀ¤€W/èë¨ÁGÙ AGYƒC`(Á˜ÉÜµÓÒêÔd)³ £S¦N¡ãwÌÚ™3¿¶Å‹Ù_oı«-€&4PÇiÓ¾&YÖÖŒ2@‡ñòJÀvJlçÖ-$3»Û¾„}U\Œ+À‹èİèßƒA,§{ìû:[lÛ¶ó*\¢°»ï¸İêãô¾÷ÁX{óí·-D2h#mïİÓNC·ß‘G8­DÓk`JíÚ¶ÃRÉ½öŠ«ìd4“H¦¶{ı ‚ëmÈñÇ9Æ¬{eF{/ÊVö_h.~úé§¶°@Ò;w†}µÒîG£WÈ*
+y!5 ±JnD„À«Ğ¯z¿¸ç• /<`¶ú÷€ÌVß†5\‚†R…é‹[Â‚›’*J.  ”®^½TÛ³§À%èªç™ÀG%FÔØĞ²eK»êª«M‡fY°?÷ğX¹gù?^S„F’ıõ–¿Z£ÆuaŠ f·Ù8"åzòÉ'ÂãÊI'’böœÙNBçˆ#t‰õüòË/0{Tÿ#¬1³/½ø’“1¸èâ õ~÷éx[´d©]0»+=	›Ï;7£§ş°¯Âùİ®Yµ‚qà_–	|
+ã]ºt²’†–8É„™Œ£sçÌu‹c×^{-ög8óIÇÂd¶ŸEà÷©©qh¤g:i%ş;vëÖí„Ö8©è-d
+¸~bÔ&-İAƒ¹„²‡Ÿ1OßÇÄFP~‹t£l!É1;tì`W_u5Ï4ÛYx †ë#JÃgá1‰VÌuÂ
+öØ®õ_Û££³ò¤Ã¬ûQ#ìÄ¬nÂnËØ¹Õî5Î6ç¦Ùy§´¡ZÙ‹£³sV[ó¶İíÊKÎ&yX½÷ÆË6íë%V«~+»òºÛH`Q‘!L]k§Ø&¨á^Q’më×,³	Ÿ~@4Ë<»üŠˆtÉµ	“fĞ­ìÒÙ¶uómÆ”±¶ĞøúÛ²·ÆM²IÓç[Jıæö§Ë.³†u [\ı¬¾Ä¢ië/³¼ÌİöÄcÙ†™vìğ?XÇX4ùtx n<c —üë—ÿĞ=`ö—ÛÎ;Ó³€gÏ¢<`ö@ì5¯ÎŸ˜@ËyÑŸ6çdéMh‡{³¯À,jsá5Í˜ÕN¯5°©¡5ºa0ÌÖh¡5[Àb	N_ztÒRË2ƒä(9€ªõêÖƒéGÿ‡ÃzİM¸ü&@Öv.ó´€¿í “óæÍ·şıû£…—êêµ‡äK—-âü=N'¯–“œè? M;®“IùeÅUÂmr,ÊÊ±T§n:?!¨Å„©F%Æ[)¯Ûa@íŞîFµk×Æ¡ÇëãÀ0˜²¡{3—crÒË #›5kn›Ñgc÷H®_F¹
+«İ±=İ¶mİÛ¨Kö"¶] ¤ˆºÈñõÓ¦¹8È*£Ì¯PZ%OIÅÉ+*
+8e€E‹–¸ú N€ÕÛµsGTs`ıÌ·ìÜkÖ²…ùaÉ s°Æ¯/:pøV[¿n½­]»Ær÷ä8)ƒbXU]IÖUPÖÏïÃ‡ó,fpJZV«^]ØbRÓ« ¡Ùl'ûp@²lª>+¦lŒZ…ônTîØ±c0iõ’½CZŠ–b s„²]‡Å;oû_[€şğ€Ùêw‚±c¶úv¬Á4”
+ôóüÉá™,€Vº²’ ĞZà®İYpÔóXãˆÂ$;£çÛÀ[¶v­TËeNkUÒ6’¢™Ã3ö©§Ÿ²¤Ä$·X%¶miI‰åì~6~¼İƒööÅ#.v‹hM›5ãy]ˆví.I‚"	N9õT7n¼ÿşX$ÖÙĞ£²n ª“'O¶>şÄ.!¤i™É„ÿŞ£—9î8[Ã3ûÁÖ“ÔññÇs‰¥{¾fõJ{ëÍÌî²ÓOnİºFÛxæVh1ÌˆÖø xíöÙ·ßá4ĞËøbë–­N÷UlÙ“N:™¤šÇ3V5sººaN€¬6ÙLã`!lbkl”{ ıİiÓ¦¹2
+øî©§tZ´’ˆğ-¦ìœÙs\”ŠXºJÚÙ§OÆ³r[€ŞúÔIŸÚ¢¹_£ã(kñÖµÇ rDk«›g<ò”Õk{¬~Ì…Ö§=2…ëTËlä-/ÚŠí~»ô'ØiÇnÏŒºß,ßl;Ò®y¾ÅZ¦½ñÏìË™­^ã¶vã_ï²ê^JSF{Ïiß
+ÜØcKÍ·ß†ğN»lä5ŒsñöÉ„©6uÚl»ûÎ;lÙ·_Ú¶K¬m§ÃíÔs.¶w>dOúÊRëb7ßø'Ç–M„S8º4Ï" ÏÎ…-ûìè§->­®]}Ëí°kXYdÚñ>‹¥.¾˜u7Ö/üÇf¡á¼Ó<xğ,p€ZÀfĞóª}Y@ÎM
+º5ÌÂ&	–VSö¢¢ò\jd£µ5UTU}(3dÄª}ûß›€[’VØÚ5kN³°E0ŒRÌÕD
+GUxf¡ÂJÖ"c)A‹¶Ò—•ó(Ç0†èìŞµ•ÀDb	Eà„Ë1w!šì{H€p!Î¤ÁÈÉ.æX1­¢]¢˜ ;(>!–ïƒáŸ4p¾p*g?55Å¶rò• Lı(0@Œ+§ĞQ±J%«àótVD°¿”ó+`ñ2
+8VRRÌµ‹\vë ç¨µG@²tşò©£4ÿ@ÒĞ¬MY8Áj³ß…±*IÙ’Em#I¸Â`ü¶lÓšÄ]‰–4ÂZ4Iæò‡³şàXSÙÙ{ JÍê"Ù°P">:–0j.ˆãL‘õÃ;¶•X¯°¤¤¡+›é{…¿J®A¸ ÙN}¨÷­J4E†!p¶Œv‹LN¶à†T5}á³Õïi˜­¾k¸fnQKÀlÚ¢JL%ö\,áó u™„İëÙ­…¥¯¾úÊIt!‰£4³Û·oïÎ­S'•q¥Ä³Jbèà\¼d‰=øàƒ‡<Ì£Hˆ…d‚–: ôÎ;ï"×ÙN‹»y³ænŒ(ây~òI'Yl{î¹DN$ØK/¿dé,˜@’ÅÁûÛš5kì†ÿbGˆöj1 ìf»ñæ›­q³CĞs]jŸ!í³qÓF’=LşÅst%É¿Şü÷ë$ÿÊp2	=ïnÑ‘1ÔİÏ¾l"Æ;İ[µû¢J’S’Ü8%¶î˜1cH ÙÄÎ9÷$qº:£ùÊ³<11†q©{/›¥¤$»qFİ£qQÇÈnwÇ¼>Æ1rÇKm”ØÌ½Û¾œ:ÕŞ{ï=ôrÛÃ“·‹ÃTÆz’¨Íıfš-]8Ï¢b“,¯Äoí»ô²¾ZdÉ{ì©ç¬y×­sÿ³¬Ks÷
+Ö1eWÜñ‚­Şå·Kşx’{d{{aô£¶|íëÔ½¿]>â\€Ù=H<kSg~k›·CÊàn³€Ê ²é€çfäÖ´è> ûí\4f_{Õ-Ì^zÙ•V¯ASû|òWöØ¨gí¢Î·UKg[
+2é§œ~®µëÖÇ>şüKû`üdKkĞÌî¼ıjËN/¶Ô„(K`Ló!ËP˜“i/¿ğ¬-üv®u<¼—]8òJtóÓ,3ŸyFBœ%*(ùŒi—üÆ›àéÿ}ó€Ù½½ú{ğ,àY`ß,à³ûf/ïhÏ¿˜D
+¾	A8šSºyeh‡ûf_³df>V£ÀlU­jĞ4Ğ5´&‹¬2ZZSEÑXg¼#Ë%éÔzÂè²¹&¦œCª¥0h#pŠ#`srûJ«ôVU9ÌÚ' 4P4}»´U‹‹ƒw	`c	^™€C1}´)|U §˜Ÿb	hx+½Ûh4Y£`©,³rÜÃ`Åˆ«°Ïzõê¹°V:O™¾%‘ Vl ”#¬pO1Œ´Oà¯XUrËa‡Ix€5/¯ =Û4 ƒö—^K¢¼rrõªk$¡ášCUìŞ$´l]½©{	gTZß+œUZ®YY–IØmb2ú¸8Û{°‹¶l]t •ÀFa»²U€w22é8ÒÑ0rc»ıØ²{P~0~ÚCİ,Ë!—AåÀ«Mj³ÀğPÆn±¬dc#Yƒ^½{¡IÛÆÙÓ1…ö¯Ç˜u÷ßşó:”ß ÷^ıÁo¬¬Âgüü,¯ `¹üÕ®Ûfw
+Õf¡€ûÖmœZõ¨â}hŸÛYõEåşƒıÅf÷»İ‚z1@õ<¬Ágo0âbMœ4íßö 2,]»våI „¾Æ0”¸gŸÃ‘<ë×­[gêÿàºñ#¸RÆ˜/¾˜â@[•qÙ¥—ZÇN9·±a‡IÏ|À€şîUçşíoã™„Ì±vò	Ç!±³ÇFşérº¥VÈ³¹VzöøOºÅ±‹»:nŞ¼0øaj¼X¾l‰fs‰¹ 0±oŸ^ ³±ªò”PLÌÖxÕw¢¹ª×ùóæ9]ÙY³f!t­õíÛ×±]µÀ©ñ)–qO€l!²bûjÌÛƒ¢6‰*ÑÂœôv©òïÿÛÖ±è÷odmòX|Óx°|YPc}ÉâÅv×İw¹Dúyq¢-@;lyI!)qVP†v¯†Ãœ[·xš=÷òk]¿«µës²Ñ¡ÕÉ±‚ü\»ë©7-³¢¶]öÇaÖ¥U-{õÅ§mÙÚíÖ¾ko»ô‚³ fs fŸ·©3æYıæmì–ÛïÓ@oeÜ š7`.ÌF°@()…y³gÚËÏvcìŸ¯¸ÖZµ9Ô¦Íœk÷>ğˆÕFï>/k»Ù»«]ü§«,.¥®}2ñKûpü$K«ßØîºãF+È-AÆ´²ü,Û¶qİrÓ€İÑf?Éz1À’‘7ÚšoşX€YÖ’Ë™Ëèûo0[nï¼÷…mİ´ÁmÓÂÎ>}}fü¼øÓ«æ-ŞæYÀ³€gÏû—<`vÿê¯6¿W0™Ö<)4W’s¥¿ªîÜŸ­1f–íJRiÕÜ*Ë©©db¡ÖèVÃÅÕhİ(¬°´'829É8“JÆ!-=³b§
+˜ÕŸœ;ÌYe¸–ŞŸúÑã%‡YßÉé£§@Q ¬¸E1VÊêø4œ-+<÷Ê{İ
+±„áPÔùk×­uÙ³`£â”Š©*2Ç0Ös1GÆŠ)%ğTa¢¹€´qƒ×ÇQÃ›4UlX›*§N:°y³qœ+(/Ş2H´¥ıbÅêúÑ$ÊP, AN²6…ªr®Â(KßÉÙWh­ê-ĞZò	1—(7ÖÓ¶;,€5™ŞQ€Í…ªu•TÎ/(NÀ>ñ8%0ºÊ	Ù•!KC™PX®U}Ô–<Ú’ø+{„XS¦Î
+èUûÖã KÎ@ínŞ¼¹{¯úËÖ.‰š< XÁ{ıˆõµ·ıO- ¬{ÎfyOè˜å(^ò¯_nÇ<SÃ©¡ZÒs’GŸefåºçSÓ&„˜sÏÿıÕ×í­·ß¢ë*`¢>fmÚ¶q‹^b¸*r ˜E2ElœŒbq+ê¬Ù³ìŸcşé" nºé/î8±J‹Ç¾ùæk{é¥—a«fÙ•W]	(Ù×-¨Is|ôèÑ$ƒ<ÃÎ9ûlwí—H¦µaİz;	`öŒa§ğL.°ĞKÿèãq E>;ñäSí¶;îDæ§Üæ~û­}BBÉÕ«×8…:ÈÌDHJzæÿ|íï ¿ÛIŠyšõìÙğ1†büê y;ÎÉhÌ|àûøû:,W1„{õêe—Œ¸ÄÙFãŠÆ!=ÇõüNÂ^‰’ï!¢C@ë+¯’\°ùŒ3Î¨—î»ï>´Ó[ïŞ½íÌ?œi5¶>úÈ^ıu·˜ùôÓO»q@ãƒÆ67Ncg‡‘h­†æ™ËŸX‹$•€¥ÅéV‘³ÍzüI{oÊ"ëwü¹vçUçZ›º‘ör¾úÕoßÏ¾ëFkY7ÚFzÌf-\iíëc7]3ÂÊr3ì_Á¾˜>Ûj7ln×ßr;À,Q2ôMsÃrÁŒA…Ç›%çÛKÏ=ãPo½ıNkÛ®“Í_´Ä^zõ5gë¦õkÙ¥gü³X¨z‹dŸLœl©uêÛõ Ú‰ñ,dîE´ìAGøëévçmµ3NnÃÿpÕiØ˜„›‰aÖÃšyFp?2²òî·İ4wĞÿúæ1fôôêïYÀ³€g}³€Ìî›½¼£=ü:`‰«[…ÃjNéæ•Úé6½Ù7`¶T)²	!÷ÅÆ“.[¡âÌª)T U„Bã	õv3xXxOùü…Ø6ašİëO—†=)-Ô …h? `¹Êe”ÏîXeP,öäAï´b€4•sFNXÌ™ÄÚµ8“ÂB.°DŸ˜Èë8€NÇT;qn\Y0Km—Ö\¸Ê•à€’Q	<ÃSÌJé†
+pS3\m#Ì½p0
+fŒ Ár9Ô_í+W»Ùú9ƒ‹= §á0'U»c‚u ™mñ©\}'›ñ¾L `È*`0 ãÓÙÒÕfÚ°*[r¦…é3Œ›ÂNå+lT’’+puÇ¹©ËˆùêX´ÔYLŸúNú´JÅ$*°—“/v€¥ŞëÄHúBY¦ÅìQ]æ*§ÑµŸj*‹µQßê{i¤ŠTT[”ZêØ ×Ò«zÈõ}ÔÕ= ÃÔ$UmbºÊ9RÙAU0L_êâÎqGq+Ğ‡îl
+½êZb0é@İR*\ ‚6±~U‡2úÜÏqbåª-`‹ J9N}#)½×}áîõi}ºotOñÇ |ÏqZo0+;”Òç²•’¢©ºg´ÏÇg9ôjŸlª>Pûb°›ÀJã|®£{AŸş©¹°·ı¨è=k¸7<`öGôÓ_èwó3Ù•«V»LöÛ·³õ’ø1ó»ç
+yø%ÓŒ*ßl…Ã?¹é¡ğ¿Ø¨£ÛB¯Õ¯CğùTırªJà™¦±CÏ.'îYV¹0·Póƒ>°	ŸO@|³µmÓÖ±ûõ,ÓÂ[³¦Íì˜!ÇX«V­ 9}úW69lÆ»í,z©ÌfÍ›»«3Ï<ÃúôîãÆŸY$ˆüğÃ Kw1.£$qúé§[¿~G¬…“|ıÌhÛ€f¬³§‘¸K:Ÿü=óìsV«v]yùÖMÚp¤jfäò£?²M›6Û/>ç’•±X·rÅ2{ï·m5IÀ.ºèBëd?êÅ˜‰ü‚ÇæNš4É=‹o¸á§¥ûÊ+¯ØÔO€©>%½£µ^={9mİZÌCÄE’´~fô3¶lé2·X™è¬1)½óÃĞ´•o‹-‘ÙÉs ñ[o½åÆ ÙÍE}pKö¡	²6:¶@nÔ$+cñ4’¹X)cHFn™E¡û–»Ëî{øQÛ]g;‹£,<{“%²H>™a;÷³ş§üÑØvm¦½öòó¶dšó»ÙekI‘å6}ÊçöæØìëù‹H~Y×Z·ïl'Ÿv&R]4±â|¢mHš±ÛæÏşÚ&~ö)c{¡vÆ™vX÷Ã-;¿Ğ> õäSvìQíâÎ³®İ{‘D3Ë>üt‚Í]°İõöÇóÎ³&jYIs§²bÛ°z¹½øÜhÛ¶e³I’Íc=Ş’$7TÄ,‚…UÒpôã£#¤–¯±ü¿oš+Ôøö+Yãuü‰÷˜-AÎ£„«fJÅü¦ß}oŠmÙ¸ŞÚµi	cvÀw³zşºÉÊO\ßûÚ³€gÏ~[xÀìokoïj~ØL"åî…\>Í)İ¼2´Ã}Ãw_³¥Lw™$[$3tu8”PÉ9Á€Hƒ %Î° C&sî@*w€S© V>; I ›?À5Äª›:Få†ÊÖ>S€¤!qº…®_Á÷
+ãO„uJÆµpÎ”¸¶V5ØY@U	s ,`™ôKğ)ì^ K	 ¤œ[éÁ]Ê“s3ZF½"p8œÃ ‚íèÚ¨ú©`œ-º†Ş«g–Â ó(BíU¥ô=ŸÕVë<µGmëNŸuŒÙPÀ-Njh¿ìèS]ô½€!ÙGçÑËØªû"p+§T{ä\sTğz´·ª\öÊ~ºV ¬na°›
+÷“»„a%ğÒ&Võ–óí®¯*X›L­:ë³{­4Š}ëª§ãª½….z­,Ğ1¯¿·ï¯¥Ê±íÍ¬võî~WùâÜW?Rl¨ˆĞ«;8TLèœĞkhÿ/yuU–CZY÷_R†wÎ¯`úÃf«oW=7ö˜íÔ¡Õ¯0ËÏ‚§g˜¥ŒŠR÷Tó<»÷ß_L¨f¡×ê›QÚßnŒ¨~QÁñ‚r4~è.CjaIRú¼uÛV[±|:­+mç®Œ‘î;’SSRRûY£Æ,›ñYìĞ9óæºï4~kQË-JÑg²öíÚ¹‚İDTLCÃUå+2A}©ã‡fuIf©ë¨1}†1çhuHSkX«ı[·oü]×4;fèqHÉÄ¸qw=I/—$‹ÍúØ©Ò"/güÏËÍv	ÀÄ˜í[¶QÃ,ö1³ ­»•+V¢U»`6Êµ%—„šsçÎµE‹UÎ4®¡Y^«–µ#©f·îİ šIfFò1-R–2¦à7	#×á‘IÁaœoÑ¢…u Ñck XÉÿ(*eúWÓM€·5Æ%wXÀ¯•VË:uîd°S"I3K…–€æm6º«¹Ô¡!‹ä€·¨‡Ø†ìbÛ½|¡ùrèú­m¿ÁvÈáı¬ac8cûê¥‹lkV%Õi`=ºt0D',kç6›»d™-\¾Òò)3¥^CëÓ µnÙÜİV…¹,r‹•±Ğš…¾¯BÛ‹
+¬ióæÖ qc·p½jí:›4y²ÚºµõèÖ	 €ñ¶Œ•›·Xlâ='ít¦4úgÇ–öéÇ»¤lÒëmzHKtŞıD¬À¶f£Nã8ËŒå'ïnÌÖÄ¸û“W:°Ø'`–èªR¦”Lû-ÀÜû€Ù­›ÖÓ¯ ³§Ì²_ËÅzöêïgt‹ò6Ï<xø-à³¿¡±½KyøQ0iÒô54…ÕUU;Ü<Ú} f‰Íf&€©äKb¶.V9qÖª£$Cß‡@C@ÏbX!b2ºäS8,[Kq`ä …9p”kàl9Oçá”8'´‚ó]â°H´Úğì8¶ÈJa”s¤r}Q€Ÿh–)œ\›¬âè(ßíCULZ²²Š€Æ]« ­@Z•í%ØV@MhîúaW©—@ËôE]ûÕNÎuàª^÷U6ë{9¶Qµé{Ş‡Bí#ğê{'gŒ¿pÙBŸ+ËV]£Ôf]_Ç
+¼¦²‰wµ'Ê[	Î£cb/f±Â0³—rW såµœ±}ĞFÔ•ãüˆİ[³GÎ®l!MU1ƒd+mÒ˜WûC}%{iSİô²İ©_^2$“dÁ¯»é¦¯¬GğnÿË©Ô†Ğ_å!®Y:ßıJ8¦rèµòŒÊ½îe¯¯‚Å…¾teñá;„¾ü¥¯¡ú†
+ÿ¥åxçÕ¬è˜­¾Iõ\áí~4?!ebÌzÀìÿ7{M³zöK+V:Ø.:KŠÅé¤hxÔJ›\ÑzÃ?’qA ­Æ+IŒYz*:@ûm¡ÒÙÖ"Ÿ×, É ¤Ñœ£ã÷ìÉfŒaœ×¸Æx©±Rc‘+~õøVyÒ/…9Ê€ïÊ`:a[HÆègÌK«†>8 ,%jŒÔ“S€g\\$Ò\öJysK9_à¥^‹’ LrªŒ‘5?óUó	EÃ|VÔ‰¾S™õ³×Q2NÙLõÕ¹ÚÄ¢ÕXNe3µ5hK¿›(™¥ÊÑ<ÆEœğ*û«}È«Ï²I˜Ào ã·eæj@¶T(ã1Hİì"²&²^#ËEÔ—o±ù9®Tƒ›M;òWRDb®Xôi™óğ{‹õÁD-Î³Ê(¢ ËôONQÀ¢â\?Ğ
+¦Ì×
+`ÍFY"¶K½˜¶ ¹MlVú¿œWÉR”Ğ(_”KÊeœ-saÔ–3ş&'¡ãK7j]Ï"~ÓÑáM‘Ü,àêÇ±ah±'Æ9ûÄÕüÒfİíô‹şñ€Ù_d6ï$Ï<°ğ€Ù¶ë¼ŠT`²«¹°ş´ÉÙÑ_Õ÷fß€Ù éyËg£a¦ÊaÂù(‡9›ÇŸ€¿x´9#ĞÜtßiÖÍ^¡á+ Vçh?N[)“y9~ˆ¬©œÀÊ9¼c:ö¨v1pqdÜ†ƒb–q91µëXyö$	˜éã)4Ş…•c¤ëâJÀ1WU† JmÊx¯òå!ğĞtût=É/ĞF:Šaº‹PLI	¨mª£âH]KeĞ.…U–ğ'0Ó¯*Ùwé´îUŒW]à¹˜p@1tœ#J™xˆA¶-ï+°oÆ®].ÉÚ î;ÇŞ…yâÎW½hŸ’N…`vÎ/õÀŞ8<aj›Ñ†-JS%_ 'O­cõ+”^û¤§*ûÉyŒCÕÕU 6Ìõi€ı:ÎÇwùh¼Ê>]‹¶8Nh 1è;7lÊ¹€½Aà%Xêÿ‹İB4Õ˜ê’*açªÏ\û;[åı&[èï{eÔÕ¹ß?MeüĞ>í¯,Ro«¶Ğ¾;§êÀ}}£‚C…ïë¹Şñ¿è˜­¾iõô€ÙjÛñ× fı –e f:ğ”±*$o pUääJü‘1_ë{A¶§ÍgÒ¹ÒOKK$1b	ßEÁ¸ÅBja %-×¢«ÀÖDô½c?´¨ãâÓÉü´{w[ÔFÕC:®€Ëa¿wº1HÀl¾Ì„#feç"ICâJ´ÊãˆˆaÊÎ.„ÅØÈš{®Bcç”´LB\¢ûN×ÓO‚ªâ@…mŞ´…q-ÊI/ÄÆF2Ñ=«ip*E•pL¾æBü'€V@¬Æ´Ò÷3ßÆx$TÃâârÊ¤îŒËNöˆ¨íZğ”4Ñµ?†zjÚÄ[7„çª*Á¥ ŞxÆîèøHÛ’c‘ŒÍ,ÛZÌäHêœÏw¹\>™¦ÅWw%Ç;ù€%›€¡jc¿ÑúÈb‰jÑ8-éœ€D]rÑ©/b^!à]Cf×)Íg1˜Ï>‰¡Æƒ»d—ÄD9´Õp(Â¦Ì%G¡v¦¤bW¦6** €\€­ÔáôƒîiÁËşÒÏ%©§{*)œæ(EH”b/é0KGÿÂÍf¡á¼Ó<xğ,p€ZÀfĞóª}Y@>MÒŸ6>±¥Ğ÷3í}`ÌÜäXzs0?¨IaòÈ˜\‹£¼b2W %%Q ĞV“smrÎn
+H#F„O€Ÿ<çá0I/c.öˆÓeåZ¥°jÔ ŸX¶x*«r`ÈŠƒPNùáñ|'
+F9à*çË!’C¬œ4Iƒ,< w­ õÀXL•Kú¥ ¹”á#Kpçt
+ìƒ½¡º¸k9 —} ©P„şúr­R1h §à+ Xm–·
+Ko”,Ä¹Î±S2£²‹_À§u ª Ó¢ {WõÌ1
+%u6ã½^ÅQg¬ dmì«à±xt¼X±!–4^İ¹B›Ê¡M¬ŸØ¹” ~:ÊcWáÀ]ueS?éÔFÆaàìäÔoj£î*ç9òä ähÉñ,ÇM¬&ÚS3uw ¬úV[eÛ?¥±ÁÏœİ«Í:L7iÕyœë Zöi¿eu®şö×Muõ¶ıËô‰ÌV¿Kx^¸ç‘~Ëüvõ<S€†dÍ/+Æİöôr›1óó³?nîšf50”|AHÛIã0®
+ÕâªÆ=ƒ¥%®ÏÒ×x)P3
+†¦†k’9ŠK ,±GÉÁ4¾jŒk4 5P"ğıqÆLíÓ°§cT‡èhŸmÛ¶©ƒDKˆQ †L’5¦òfüÑbh2>ÑÌ_Æ}$ú"ÀEiû¸†@Ó=$ sÉÌø\SÀ¬~ÂùyD—°pš˜ÌpÅx.Ö(uÕX&V¬nQ(b¼
+¼T½4¯ˆ¬¹ƒÚ,°UsŠ {XsÎhÁR®,u®$”½£…c‘j‡¶"ôVİ¶W»õYåºäbšïpêZF¢IÉEÆÅX6s‘ÀËxìW8yƒ­…¹¶‡È¡âĞãòIJ–¦$X	LÕ8Úá'£V -ú|ú0<6ÊR‰Ú‰blT„M6Ào °4&‰ñ±[i3K¹^öˆaî¦H´™DĞ-Àr­ Z±EÈˆ”E°àÜ•ÏOûéì`)=zæR\GÓFİWbN‡óA¿wÙ[óŒ
+úMó±è¨S ”îŸb˜»º¢4—pcxĞT?ö¯l¦ÿ½í»ğ€ÙïÚÃûäYÀ³€gƒİ0{°÷°×¾ÃLJ™»?UXsT7OÕN·é^Ã> ³V†§Ğ&ğ
+§@Àgˆ9é¼&Ún“G%àO`¼fÖ
+a”sáPè<a¢MŒ!Ÿ™Ø3qWˆœÓ-Å±)xÔ¹~±U¦ÊR#pplÊYT¢ª7Úøñã]¢‘FMHÆÇ5ˆr|NbUâ+]×y{8)8Ú|c)ß1lu˜œ#GÆ±uI€àŒ( Ò]Ÿ
+P?¼×
+¤víÜa[¶lÁ©(vºq)))4ÇR×èIû+¨¯X'b¶8ÏJŞ†Êãš… ¢:^ 6£Î6ºÚ®ıœ´€ÊëV¶Ö{}¯ãdN9J”§räôÈ©•ƒ(çªçM¤ì/àÔ]>Ò1¡s
+`ÉÁŒÄù-§¾á:¸\öàX'ƒ ™r„Ë..iZè.S=(s|	Œ\9îÒôËrŞå¥ÖÈÆ…¨ZéÈ†îî*`–zü0[Äê~R]ô'›ëUçèáÕÛ<ülèGÀO‹"<SÂ¢ù}s;•‘…<Âò
+–Ë_íº	ÉM¡T@ø¯Û8tİ†ÚôªU_hçï`Ó3Î=h¸Ìşâ¯i`V}#ÄŞÔXï€4-¢²	äÔ¸ qEÀ¥Æ-–ºÏìÓ±b†Æ#e±ŒÍ…ŒSÒNÀë4kİB"ccŠÊĞñkf
+ ‚˜>ˆ!Ä˜¤Å]×*[aôFæ#¬ßM9 ô"´ËoPº˜’4d,†İªÿÎæÃøô³€Îï6OÌÙŞ—À¼ÕWú²¹h¢&Ã²U]‚`a9€p‚³E!c©l"àYíĞø©¶ -@kŸl¡ß±umå³l¢-ÔÎèªWí“u®›§TãGeSõÆmÙz<èy£)Y °³‚q9šU_¬ÒÔx"[`–ˆ°È= ÃŒË…ñh¶ÆÂÂ¬…İØZ,0PÕ‡ñâT_ætÄ‘PŒ+€Š–3‡£·$ÛÏ·áê¹rnğúš`¿òpêRÁ¸ÏÔUs:TkÌª®˜Ó
+°Ç^ÔWSîÇˆh®mz.øj,°‰Ò"4U‚}Õ_nÀ¨B|ó€Ù¶l,º4{}ü¶|$îÅ`¯ô!óqf„¼*ñ—§1ûÃVôözğ,àYàÀ±€Ì8}åÕô`¶ /Í…õ§MsY7ŸíÎ”5»¶2öæædá”jS–‹1a++…‰¡I4Yx¥áf€Ò˜­€½°lÉRÛ°aƒÑ“%'IzrÊ$\§Å!ĞÓ$oÃ]ŸÙ;ómfã8)nÓ{xHTÀrqNŸÃp–/]
+«eÕ©SÛZz¨Ó¥ ©Å•UùZ 8kÖ7vÇwØİ÷Üe‡¶okñ‰±€›€*Ÿ:(˜Kø%@''  ,kD
+0øÈ1Åè :¦N"€Ä®:ŸÉ)sVöÑm\WÎZ˜ÀS6%[½zµ-¥Î
+½T²“&MƒÇÆÂÅ)Å¡X¹h‘m<-§Kš²9+Ë²@Ü“æX5ª#¶)ÃáŒĞ{®§ã#`«æ’Ø$†vùBÚ¶Ô¯‘ãÕÙ„QÂt‰KJ¶Š*6RğZªç†ë]2’F¹¾“h7	[”M[Îeë6­#Luà-P:ÂÊbEÉá†YLı£´Oà,@µ´cã©—@ZïF©úT`//ÇZ÷†œªšÛhw÷‘şt;–ûIXå½{İûš:‡?wß‡Î¥cCûTFØÕaÕÙB—­n9ÿ¯¡‚C¯ÿï oÇon:Y÷¶ÌVÏòz–ñ¬àÉ«Ç˜ı¥Æ¬i`6(21i1S ¡>n| dÔ÷Ú´_“+.Jº@Ÿİ%ŸõÜ•TO4I%sYÌ²AV¬“EŠ@asìIîšeû{4ŞJoÖÉ1&ë³ PÇà¥lIHgV`\*I¸¤K*)…b€ÇêGo(`Tì\¶ò›(«?†’l(…A[˜Ï¢¢_%§¹ÛQ×RûÅŒuà+m“â`«ê¶ÓSõÔw²‡ê§1UEéÈŠ"ÒÂ´ÆBéÌ–A•«vë8W¨³“@HlË*S¶u…Q¶Ó~ÙGRùZ4<e,ŒÊg!–©KtBŒ¥[! ,Z®H‹ÉAÿ÷<_¹e„˜¿¸ÂËUPWğÓ\¼Ù9–è¶hÍy`'ÂË-§¸ÀÊ h"àçÇ>È0‹,å5L4vÚ^ FÙZÃ6?¶gÅwåå ×åhÑc+1_5OğQ.V²ª±{)í+ÕXÁ‚0‹Z:ª)í¢­å²-s‰(lNÿHÚ‚æÿä&ıœã~² ƒì ˜=È:ÔkgÏ~Â0ûò¾ö,ğ›X€y©ıiÓ\ÖÍgC;Ü7šğÿ|`¶L8+8`&™…_zùeû’ÌÉ;¶gâd…¡—dÍš5³“O>ÙN8áxç`)|Q€\´Bî²Ï$¼ÀUZ¦r`”­XÎÚ¶m;prâ,Ğ°Gã¹'°M›6Yß>}ì”sÎ±RtÓÄzu,1\¦Èâ¸ıßÌ^ñç?Ûkÿ|ÍZ´jc†ÃåBŞ˜øãDÉ±‘Cã¤äÔ±ËÃ–¥dŠÑI•6œ˜8ñ©8cÔ¹U›oCÎÌ¡vÈÃÁÀ•7ê4vº.ª_O=õTk8íµ|_D"'Ÿ|Ò&Oä€Û‚
+ÔeàÀ#í„ã·^½{[\½zŠc¤ƒ¨×®ˆ€b9£rˆ£±_6õ”ã)[ª3)¿'W. KÒò«Ó°‘h‹;_|œ•ÀÆU¶g]?3+›öµ–­[¦˜dgÏ¶/&OvÎÎ%#FXZ£VŒ­3©sİºõ]›åêZ²½²LË!¥\±\r23,	GXöe C×ÛÅµEö©tVÕ4W ^jb“‡fUAÄ
+˜åş‡«´Ûºıæ@X?jSèU?ş¸vƒ»BgV½êĞ½7×¦½wğşûû¾Î÷ÿùCë5ôşçŸíùkY€òÀ}î1f«ac=W=`¶ZÓÀ¬ÓEUCÆs! Òi£êQ¤®ã?…	H×C+Ü8¯ÅFÙBßŠùª±J€¤´T5ö+¬ß—ŒçÒSUL°-9°VƒsXšŒ+±„ÜƒÍq}­¥"™ÀÂŸtnÃ¡U
+òP*´´Zµ¹Ï|•@jW:cTJªû\_Ú­µjÅ°¨¨Ğ|"~8ZÉ.õ>Q2ŒwEÈHÎ@É«ôøÖØ%fp¶š·HÆIã¡æV¬˜³Ô%LÙ¯úN6‘¤“Æf0Ãè•Mõ^‹–ÚT–Àb†V®¾+íÒ…eSw=€İHÇÕvÕµ7”1°ÚTÁBz!lÔÈ<›Á-c1=Ë'Æl©¥ Ì&ú³‘<°bKË³¨’0€ÙH‹#±'‰Ğˆå±|ÌÆ8©‹Fw¶¼Øv²`-Ö, )ÉĞ¢"c­	 e³X~,ƒáZÎ2*½à8Ö#±SYå ì÷§b£(ìˆÜ÷Px	LÑãå$ËÉEWsæsRp [Oî¦:H?h¢	ĞŒc d+è3:Èu„“ÆÒ=÷›Ìş°<`ö‡íâíõ,àYÀ³ÀÁj˜=X{Ök×e9ÔXÚ4—uóÙĞ÷“êŸË˜-cB€˜äÚ˜1cœ#ÔºukkÃŸñŸwO_X£G3DŞƒœn|rDpÆÜ~y’1Ğ†SS˜™e¹€ˆ‰èšÉ¹Ì•“R»6Çq]W†&é8Dy9¹Î‘“ã2€ñÚk¯³ûî¿×z÷ëi±Iñ°3‚:¨a_åÁp}1Iå…ã,P¾ÀØÚÍ›[N‰mŠâèíÃ²·ns@m¬Áàp”Â”á’VˆµŠ€•6n°Øöí;lØ°S­~ıÎ¡”ã¦Ä¯½ö$Übë?`€Õ¡=bÉK°©öQ¯ Ô\’„HÿÎ'=WÙL_aŸœôô Š=Ëaüâ$Ç‘ÁØuªl)pÖQ! ®B-U¾B/ÃhKÆ¦öşØ±Î!>ıôÓlçÎ¦~ãhï"Ú®}{×n×GbÁPğœ)ùW¤XÄ²õN0DÀ.ÉÍÁÁ¤o)«şÄV!v±êÄÇ
+œ^5Ñ}ĞKu7WÖŞÀ¬î1íäúUÀ¬öñWµQ‘|A(+ÇX|'g^ç†ÎÑ®ïo?´ÏÕe¯¿ÿù‡ÎÙëğ}{«ÂCûv¦wô¯e:X÷¹ÌVÏÀ#<`¶z6äìšfU!r©ô¹cË2i(×¦¯õ‘Ë˜¸ªã~¯ÇjB"	Ay¬ƒ¾å¡Û.9ŸÔ´TÃÜX•ÏÂ¢Æé¼;]VÆù|Ñ#•1Eaò%°(Š
+U’IÕA×sOBş‰ƒécÑ-²T)9#a·
+ôËÉCÛ¶(Ÿ«o°f9ÙÒ¸-%\ŞÏu¤‹íhÆö¢ÂbKEÆ ##Ç¯Jâ%ğX ¬“#a¨êVÍÏGˆ7A©$¢E˜WÄÄYÀ¤Œƒ²ƒIcg5Ğ7Q[47p‹§ Ø«Å¦usÙ•6´UJ‰æ1üç Tù²‹D¡‘~Kı°U¡—¶R@[µqOd™íñ£CŸÍÂx‰YcãmyCL`‚ÅBPÎÙ•MäÚÁ$V‹ ¶½[…1öGìLàln €EàFHW€îrËÜ™e	ş8‹÷ÇâjášG]]ˆmŠdKÃ »£é§(%F%9Ó5ˆ·îØ’âúŠcUsòI@¦y‹áf‘šƒ‘[JBìiCl@7S.”¶Ân Á0‹aª±yÀl5ŒçêYÀ³€gĞ0{ všWåƒĞ8š ‡9ú«ÚáŞ0ãİ`!3¼Ø™{TÀé Aƒìğ¾}­ ğÙgFÃ~İf½axÒ‰¶háB›
+«vÕªUN®{÷îvÜ±Çº	¹öÍœù5šÏiÄÆ  Ö­›5ø([²x±eÀÆL¸L\|ïı÷­aÿ›¶n±5+W‘"Úzôèaƒ9ÆÒj×²¯g|m7ß|³wŞ¹–‘µÓvìÚjµÒj[Ï½¬uKLÃÉÚ±Í¦OŸˆ;i¶“]èÚµ«qÖ,P˜öj”­_½Î&NœŒeÊmåÊV¯^]«VÇV­\k{h³Œ#Ñ¨ISJ;Z·n^ì³kVÛ´éÓmóÖívŞÏwRåÖB€$ìÑÑ£FáP•ÛiÃ‡ÃD­ãtï”ÀK˜Ø©ÿüç?í˜cF¢5ìâ4Õ°å³ÏZ¯^½¬sçÎ ©»ìÅ^°ö:8&ñºuëa&% ³.]»XY¬³³³lÅŠ6 VN®×d€Û3Î8Ğø[4x?µ­[·Z›¶m­qãÆ&€6–l×*KŒÚ¡C‡ÂbÉ±)S§ØÔ/¦:¦°2Iyä‘ Êı­^İz.óÍ7ß´=°j%mğ-`´œÛ>½û¸c$;!/¼€]^¨GR4âJøñİí{ŸİÍùİ#şs¯jÿŞp®Ø²bÍºï Z	®
+du@«^C›Îá~fİ{ÕC¿ƒ8ç{Uün}*Ëİ»Z{¿]öç¾~çZ?Vê¨ïBßç¤Ÿy%Î­:7¡¢~æÙß=¬ª Êİ¡Âôº÷w{¿×¡¡ã¾ÿ~ïãö~¿÷ñ:gÚ¨§ÌV¿C„îyÀl•ÿsÇïı;Ğ×?ş¾U„ÊĞïoÿıÛï-ÔU]ãÊ²È¦Ïî>†´gÅîT$ŒBõõÓWÈ¹¢%j
+„,Õ"#[4ã¬ÀÌ¸ lKdüR‚,íSû
+‘ä‰gÜ8©ä0£YsIV%pRu8G‹Ø®kÃ9V×.uÀ%:§<ÿÃ¹¶";œø‚€OJwÉ@¹ŒÅÚpÆ$ÉI@URª¸~Ê M¯¥I±X@³““UoÙj^İwÔ9h–à1²C¨Øã>9[¹òùF»s¾R&ei¡Vô»*WìaµSÑ2A©#†VÆRI=¸ë³X,Q|„íf¼õÅúfÅ‘-ôT~LÀr¢Š,¡€ıp\n3Ëó-7ªĞ’"â-®ÍÙ¬<d‘' ˆ-‡ùÉ<i†íR?IÒ
+sÜ"w¡VJÅ˜--€ÉÆ9ZËÌš:é+À÷ÒŠ"+./°’0"¥|ÑØ>‘û@Œf³Ä€sÃã |c£ÂHÈ`XK¿KÏ!zöÑ×€³ã!ıÒ¯üÃ}ÍgxÔŠs	öRĞà|úñ-x/ıø÷îuÕÏÙÔ‘É¦»ÆÓ˜=H:Ók†gÏ~†<`ögÉ;Ä³À¯n Ÿt¸˜æ–n~Y5Õ9?Ÿ1Kœè8+NÏ´ûxÀ±R†j‡Ã-„uú dR´>}úØèÑ£ÑŠÍ|e2¨ğE„;åkÖ¬©-YºÔş>æu°Şh‹‰O´ö€’ı{õ¶N];Û{Ÿ|`[wm³¶õ[ÓäZvÓ-·XËn-<‰úœbóÂ#1ì‚ó­Eç¶pŞûëMµ#ûö¶Äx&ıé°wĞhO°Ë/¿ÊZ´©gK–Ï±·ßKˆb]X1Á$uëÖµã?ÚZ´l  n_M™o/¿ğ/ÂË-95Æm×Œ0H€Ù5›>s,R€^I¡ P'×of^x¡5¯Ÿd;V/¶Ï¾˜i3ìÌs/´C›Àò-A
+ìÅ¥±öğcOÚºUË­m‹¦8%è¸EÇ:¶5’y8U#ÿ4Ò®¿ş:ì6 }8˜-»wÛ\`çœ{®=x0úµËmäÈË@û¢I›·ÄÉ"$Âd½ğ‚­U›¶vı ìwmàuíZ©8vQ8¼q6dÈ`[²d1Àì'¶nÃzkÙ²¥u?¼‡4ÈöÀpúvÑ˜L…vÚégñük0çÂ^nT«å `+4³C‡6ˆ>Mƒİ{×]w; ]¹befîˆ#Ùïˆ~6lø©ÎÉ.ÇÑ•Sî,êrœ=\\î7ıé¾«üs`nİf  @ IDATmè3»«îV½yCº‘õşû äŞŒY}_ùç Ö½>«¨ª­òw×¥/Cõpßë»Ø~d÷ÿ;R—üşæ®³÷ÎÊƒ\™{ ª¨şØÓ±åxŠâ»¬öX4 {`} C8÷œó`Õ)HÀ‚c§ñ^ ‚>«hÇ®ÓŒßeùÑJ.Ê£,~kxÀÁóÑ{Ä»æ`*  î6~§nsu)vŒ-¿ØÛ€ıDÙ³L<oğU×£ÿu=Ç*—Ğ a©†î	©å 5¨—ì :ñO9@C¸¤.ÄnV.íö¹²uŒÜoşxV8]kÑßÔŞ`:`?ÛşcwOÊ ]#”Šç®ëg~ïÒæÖmD>#î;î¾Ş^Î3ê[¹jµcüwêĞÎê×…Í¯Û—Ãˆw ]…ôvTî±«Q­ïZs%…ÊU;UªûyğÎ}HçŞë¨Êk²Ï%_dOLLÉîèU›Ò_-""C‚!yqÏd'=Cù3T‰)Fk £>ë¹-€S¡ùZdU-~¯ızUt\9×–A 2
+EÏ}mJ¼¥c%¹,UÎÑB¤ E«¾Ğk0Š#Ù(”|ï¾ã"IÉ	°dÑ9%ÚC ®@5.>l+G ¥3Y¬M„]Å˜¢ÅËx¢ABZ¶b
+Çñ9''Ïõ9ø,åC$uº°€z\_uT»ÄXMMMv4²…ÀY „¥ÿPL‚0ÙJ·¤X«:/ö¨Ø¼A­ÛÊ&	û•àR×’Tƒ€ê,›0k%ÏDµ¨£€MBşKiŸîUæ<>ô]¥{_øè´y	ë×qe€ÌQĞP%« Ç¹Æ’`Pı#xnJ;7‚:’¯P0:.Ì¶¥g9æl,ÖòÆ@Ï²Xú;’ï‘6ˆ-õ³m9ü.r N£ÉŠTDd +?œØÆ‰qñÎŞùB+æØì¬¿ÊSÚ¯Ø"pxfW Zë]ÊıWLŸ%$Àlæ–£Rå,–`.Ó¶ŠŠxî¤ø]&%TXvVà.^X³ÒòõÑÏùH0¨Ñ6æ• ³Š¢ÒPÄ)<şaå¹¡ I…0îÁ"îa?÷¾îÍ Fo9stïÙò‰ŞQDb'õ	µt÷'…º{Q;tïÒE®_‚ëw&^€}@ ?çé÷¢rt¿èx¡\Ûu¦çWŸé÷¨{ZÇJrCŒïĞ½ï*´şã³ûa§xUò,àYÀ³À¯h˜ıëíYàg[€™«&¦úÓ¦‰¬şªv¸7L„÷˜•‡‘k÷?øéëÜõ0kÕº­íÜn&|ÃSË>z°cÅ^sÍÕvLÌ£lé$šzç­7í°.a‚ö€šeÏ½6Æâë5´SÎ<ÛèÚÍ˜ØæfgØûÇÙú­{½fÖ¹v#ûóÕWX—ãÛ‘gb}[v²Âévûí÷X‡£Ø¡ûÛî-»ì¶nµ>İºØŸ.nmZ¤Ú„ñ3í‘‡^DŞàkİ¡–Í˜=ÎŞ|óC»ù†‡ño`‹/q§Øyœ€sè³/>[`¯½ô±K:váE'YûèµZ¬íÈÌ³Àè82^dlYgŸÍ\dc§Î±gF?k}Z×¶ÌUsì“éßÚúüh;ñÌ?Z—FqØ…gè³ÌÒX{òÅ1öÕçÁ4Şn‘8˜>'C‡k'x‚Kæuá…ç“¼ì6Ø½½™ô‡B™a×\swîy0VûÛüùmÄÅ²¡€à^x	 Ä¡èû~ewß}¯İvë­Ö«O[°hŞÿ±÷pV[Ú÷j÷¦iAiÜ@p‡ (xHˆ'77vãî$$!	 Á-Üİİİ¡šv?ııŸjšÉ¼ß}ß¹™ÜÌ0sÏæw8§ÏÙR»ªvU­g=ëY6ìó¡öè#YóæM,¦T4VˆÚı×ä$›2e¢¡ºuï[Ì8Ğ¶ìÜek7l!s|uíÑËFÒ>hó=Ø[¯JUêõ”9ÊI4Ü~ûV¿A}{ú™g-‘¶îİ»·8ÀvïİmŸûŒv/iOüåq+U:–	Áˆ_Ìƒi‚‘ƒ ŸØÖ$á?:"¯ß¾»Ï¿í­ü¬Şzd•%%èEï—{òÆìo{¸csû}¼Üëõeñ|Uü¹ø]?ı¦\ÿ¶çøÄ¹ Y|÷ôı[ùuæârª:to7	£Uâ_÷B@96JÂÏ‡m”‹EéS: ÅG,+?G*T@ĞÒUÆàŞéKbš\ ˆTXf!„±†¢˜rş¢EÅ•!Û‹€v"I¨¹,lY¬*„Ê+cSÚËÒ'–,FdùrÄ½âhàùtƒ èÈÒ k´¿¤,Ğf£^Ìz…ş$p–²ªù(€GP@¯œ<ùÜ3~@± ‡6pNÎµ²ÒŠúì«¢óvÕmÔıe@ÜÌşÆqh‰{îKÒ=®>`¶øyş÷zùĞb6§î•…3w®—øÀ' ‚Åkw±$Å>Õ¾³B ÑRp¬0NH?45-‹Ç“$‹…$˜dl©d””ªzÓˆˆˆÃá&¹:1ˆ©ê$œ³¤˜ÕoŠ|Ñ¦pópÀP°™€’”€Rc”súğ·öwz¯—Çí+€JZ´º®t`¸æãô	Á$iS¶éÙ„øë~
+Ë¢¢£İqº£5ñüyÖIV¹RE+C”ŒÀQÕ™ê…Ñ’¡E€›ÀÛd' mW•Iß‰I[ÌLUY%™¤¤›ÚÒRSÜßJ\*°M`k$òEb¤úIF “1PÌÜ˜Ø’¼Õ¸ÄX­ß•ÔK ¹ê#pÜ`qÛÖ$÷Œ'r&Ş]#_à·ã:ÎÚl|Z€ÈB¿ ‹pCfíÌpG}0p¾ª/Hƒ7g–Gc?É±Rq¢âØÂáåO†Â”MJ&‚…È¾/`ß‹)—  RÏÒsu2Lî‰9™¹œÏ—²†1T€É…(; 4óG Ç)!h"k„„*ÈEº„\bÒ×tŸ’e
+æ³ê!>¢k1+×€ë—êª¹Û×'Œ6ç.pşEFõGÀN–‘íı¨9a˜/|™˜Êÿ§é¬TØ.û¡¹À&0WkIA˜ï4aíêŞ´]¢ÄÔVU¿w¼HBºÆEJêºeMŸ…òöĞG¿óèO’‡
+¤‡ãÈdÖ}H3ùR
+º¼šû8Ÿ@Ø ú°A+ öoàº¢°"pªûqrJ\­›˜½Z[Æ[.oxkÀ[NxÙ?§^½gõÖÀï«ÛÎ¦¹|jı]ô¥ûN¿juú3fóI†¡ğ2e;~ë­·mÑâe$× ¡àJ 	(n¸±‡p»c3Í;×Şyû;{6 Ü†uí¥d_»ı¶vC¿¾,Øsmô¤©Ö÷®û¬qË¶ûÓ#1%#Ùf-ŸoO¶¦1ñV¿Diôğcöâ7Xõ--:·ä|€ÆYv@©b‹fkŸ½?Ôxà>kXùH?šlƒî} ñ%Í¶YsGÙ·ß¬Ô¢ L¥´gïvöÀC7YBÕXÛ´ê˜Í˜¸Úºvîlí:Õ±Ày¶oï17õW›:yª¥¢¯Ä½”ğ·˜jMlŒàÚ%íÜe6Ã>[{<Óî{ü9ëX;+Ñ°‘ídr}7v:ÚóÖ½MsëĞ¦5í ,Í¹¹À'í/O=i/½ô7kÚ¬‰c=‰9óØcÙÍ7ßâ€Ù}ûÚk¯¾	köQ’wµG†!šr´·ßzÇ?øÅÇ—¶5ëVÚ¬YÓ£ßAª , œ´ò`¨a90*Ì¦ûÉNŸ9m7÷¿ÕJ¡ëkgË]¶xÙj;rüŒµëØÙ/]aU`.?5øAXÉÈPG3§L±+VZùø
+vÿØ»ï¾g•+'ØwŞèK%Í>şdì¢ {øÑÁIÎ(,€u“‡‘ˆNœÆ—¬+À¬ú]±œ@1H«Şz0U?-î±Xh”Åš*–p=ù·ŒY×¡ÿØ.‘ëÊóÇNUttÑıºóß§WÙİ½±Wñ=b ê—Ë ¸R–~ò4x+º€°[}etŠÅŠ¨*J“A+Ğp%	ŠH Ñp€
+DZyĞ dx¨ûKÍ2âC fü È°Â¹xé³êR ,Y´=é—Üó Ğae+§ÅHÓPá®-V®¬e®_ cÑò$sŒ@CÇùÀÏÊ.(*iAÑìÏ1$zq’¢xqé‚´}±”`YjÎ!!B@'NNùĞ),Èr!¶ú¯BŠ`‚©~®Îûò³¼i„À‰xùùø—frÁ:–û/ú‹w>³r
+óã™+I2+tE Ç2„„Â4Ô#—‘z5ÃÊ–)ç€T¤ÒS—Ã¯|ùx€$@(dx`‘»‰„Ášç@.?hin~ûí7€`yÖšùªk×Î ¿.¼^Í”‚”Íy€RE_(YWVV;IÎU Ø%ÀVs›ÀáQE³ÙŒ}›ˆ´g¨çYçn}5Pş<óáúÒU/¸„óW ÛYtÎ7mØ€¼Ñ6BáS¬[—ÎÖ¶	3aI>y’9<ıı\}ˆYZ®lîêÅ`=rô i%Æ§‡.GSÙ²qDªd;æìÖ-[mÄˆÖ¡CkÓ¦U®\™±-Ğ±u™â€<•]ÁôAhºúñ¼‹ñ)ÀVàœ"ÄX>.ÑöìÙoÓ§Ï´vmÛ[§N](.ĞõÈşİÈ2ùZé
+U,şç.ZD‘5ÔQZ*c'	XKud¦‰_®,Cu€{,²w³hÛ|îÕOHÛ"ÁÉ˜Ÿš)à0ĞõÂ¥d+C8°ŸrªOì–3h­YœÆ åø»4sM µ¤F–Œtº¯:÷Â…‹pü.·ªUª!u7m©ùDÌf4íİœĞIyV‹i\H›†âÌ@7V¬ãR¥Jñxáü†1ıdó˜Â`è#N+†ªÒ	)´3]°í^Ú¥ıÌu	7íÉß—Ÿ‘BWr¹H¢‚Î8À=˜Üi°}Å²@¢det ¬,Øá|NF®A€{LLı¡ÀõAÂrbDGá¼D»V€¿˜²±Ì£€ËêÃ®’3¡L™Ø"§…Rÿr:ÆÜ³¤¤Äø–‚ WÖK0‚57‡hÎ¼J7/0{•6Œ·XŞğÖ€·ş¤ğ³RÅzOë­ßUÂg8@/m‚5´Qü…û…ìï f=€$
+iË‡2ôƒ,‘ŒÇU«×²šµë°x.°J•XxG8£M	¹–¢WÚªeK«]«l	º„ÄÕ®YÃª$T¶#‡Ùğ1ã­ç€;¬fıÆ#€Å¼ÏÌZ1ßöİoMKU°æe*Ùı?h¿ûŠUiÓÌâ
+`‹\Ì³ï†¶ Ê¬z»Ö–C"§yÒ¾ò5…åšmG]€=úª=úèS[ÎÇVošm‹­²ı%üµ–[Ğ‹T6>ÂJ•	€Ê¶•‹Ğhıy¹İróMV¯A9Œ‰[·mŸ˜­0Ù¸6À¦õ{OÙäÅì­wŞµ ÁG·ØŒe[ì@Z õx¯5*‹<CÆ)Ø1„5¢³öı„æ›b½;µ¶õëÓdANÃ`È¶¤¤D{Pö9&±’Ÿe’$åFôhÅRíÚ¥›8pØ^~ùUûäãÏ¬^İ†]røğ1Xµµ'ŸxÒ*'T°ÕkVàk’cÍV©Q•vÍ±\Œ™l Ú°¸’6cüXÛè ÌØîV»n}†´k×^[²bµ˜mİ¾£­Û°ÉÊÅW²{n½ÕÂ0:ª7ÆLÛ¾}ÉÁêYçÎ]ì¯O?ã´nyô1×¡ò1šŞÿğ}p5?{è‘"`VŒ”²D‹q‚V8[ "^p™1«¾ç€Púß•÷ßöVªH½µ˜1ûÿfõ3–¢è–Wz8ÿÈöï€â?r¢ßË9¯€ÍEO`0«}tî‰´<£y°ŠCÂbäƒn:SÀ•ˆa˜f0ºòaµeS¡¡°KÆšÃ,Ã°ĞáÌÁıVR€#gÓ1ÚC1ÅfÍâüùdº¥
+*¢^¾°ˆ<ÊÉ€.ÆªoeÙê³@ ¼*i0€­Àœ˜wy<ïá0Ûj«Íƒ³ÁC˜¬?a©r®4@‡‹|§,ì„T@ûzä1äÔøù†"İQŠîbañdæeğ»’Î AH,]ˆc([Ñèå®suıG¿ÅPráeÌş–a¼ñ³˜…0‘ybÑ¢Å¶-óD¢7Dö«Q»®u%Š¢u›vˆ»À>Û6¯³µ+— ~Ø¤é~İu=­R¥J Ğ*°S ïƒ‡lÃú¶uÛ6vßµkw§_‚1(éÂE{Ÿˆ±J{öêeÕG²&Å…x‡  JšH@dcÌüù˜ŸXBBQ}\Xyc†À0wbªiõŸØ¶¡°ó‰¦€ñ)èù<²=S§Ï°UkÖ;i?Æ?İ›Æ—:µk[§Î˜¯KÙ¨‘?X2RwèoíÛ¶±<Î/İYš®¤QĞ«Åxà\Ä.’Ğg¹ÒqeèreËµ˜á»I¥o¿û°·- tW€ëòD1.2ö*Y™!!$<˜Ó6:ºC´Ø¸è©R…ÍkÓ=
+03fœ‹p¹å–şv]®|1QA–~é¼íÚ¾Ö/_k+×oaj#ìY¨|<‘èé¶¾¶•õfn®T®$ÃrìÙT‹âÚš_W­Û`sæÏ·CÇOÙ[ïÄ8‡?Mš°sh›d›0q¢-b½„ê´İ•`­wŸ>h×ws÷.gïömÛmß½NNéÎ·ã¸E–	Psçöí6wÁ\­ÒŞ}zÙ†mÕÊUhØßd-®A£_NsbÍ { {M¨ß½{—-_±Ìõƒ·ß†<SUê%@“»Âñ›ŒB/EM„*¡2DDd!O º+]ª¬9rÂ/ZnË—­}‘º ok­[·$‹õdxmÚ´ÖfÌœŒ¦ıvÇ²-ÀiHÛ«kMR½Zu—HUı[Rls lã~Ğ?Ÿ8i6BWÿœÚEìZç@ÈL³EæÙÊeK ÑÊoÕÚzöìå@WÇê¶:W’›6m²µëÖóÜtŒì§ŸyÆJ“ƒ ›¹U:Éáô3Mbd;ÛõŠ«ï?/0{õµ‰·DŞğÖ€·şÌğ³fízÏí­´´Hd_½´ñ§{]ùÂ}ø}ÀlÚ¦æa¡˜òÁ+¯r_ëÔµ›µ¼¶µÓşR¨›äÄrÙ¹s§;Ö’\«{÷® ,ÒEó°“ØÖ-›mäø‰v2µ4¶Ò º!°ù< :Ó îßaMKW²6Uj#eğ¸µĞ×š÷îfÊT·œí…^³j0gš^×İR’Rìñ±‡cÍV&pšØ{ÆşòäöÔSÏ[ù*¡¶fÓ¯‘Ëì7¿±
+åkc`Š¨²ŠeÇ°„]~ÀæÎÜ`7ßxƒUJ€amÅºí6fâLüÀƒÖ¶i=K>sÌ~³Ü¦.^oï¾ÿu¬[ÎRl¶K6ÚáŒ ë}ËÖ°<ìœóT>á{~öå¨ŸÍ'`¶K[tf«{Á2ÁT˜â¡Ãí¹çAOv ìXA‘vìØQÇ˜}pğCÆ}l/,œ'Ò¾ûî{kÔ¨@ ŒÙÈBÒáU«V½
+¬Ö%6qâx{ñÅç­q“ãÀK€Ya¢“Æüh‡`Éğª‘Bà¡m…1»yû.<>V¡rU›¿`³KÙıwÜn	eÊ ÛpÜ¦NæØ6={övàì£ ²Õ`Õ>úøc.U¡ ù C)À~äA+‰á*Ö©’})¼± àßŸD_²*ˆú+‹AÙËàªF‹{+»©·^aÈbş=)ZH}éŸ²])Ó?é|*Ôßfİ-^~/. ¸€“c7 Áöm;“%Á\ùŠV§VK¨^Yã,[¿y³m?pÈÎ
+Œ¥ï2”†ÁÔ°n]«_§Ì§TÂ*lÿ}¶y×K†ÉÜÃ¼IÛü9ŸÕìOŸóœ]3o¡íİ±Û¢K—´¾·\0‹üÀ¢ÛÍ›·àX9Gâ¼h,×± aéÛŠ¦pàİ»wÃ¦Zæ˜C×÷¹ŞªT A·Ãç®İè†™—Âu
+¸v”5iRßâÕ!äVõ…ÉâË,&º,NŠf0ÜâS/ m,F$0 fƒHJc„±zò¥…)6­êìjÜhD/0ûÇF€,Ñ¢çñQıÇ^ş)è¬»:4fİCûÇï—38)€$”Ëıÿ=Æ¬4˜ÇŒƒ¤Ìüè«òw"àé~ÆƒFMšÙm€l5kÕ,K±_fL¶I?ÿd›6n$r¥&9¯º$’bøiS¤ˆ@Uª?ıø“Óz‰µÇ™_ú ¬†ÜæÂ~ãÍ7È*°²a£F<ÏJ<¥q¸èşŒIOşûïGPs=:äõì¯}g‹¯;~œ9ìÏ{¾ÏÂ2ÃŠ]DŠ'ıwîZ­}òÔ)úÙç¶Ğ-¶T7·èµ) Ù&Mš¢Onß|ı%2G—ì¶ş·Xû6DP(@6ÌÙ¬4ŸÉ‘(ÍYÉ(Ì= ¶t)Ø±°…5>iœ
+æšgˆâa½è¶§ã—_}iÍ›5w2?ÒNÏÍ-`nÅ™,mQiô*Â&€.•ù™è…ë+‚€!I@ Î­j9rä(€ö‡‡\ÌM7ŞL½_[T]8)ƒıslñüöãÏSl÷¾£Ö¦cWó‡QšËz*
+'i®ß¸~=+‰,…ûKî!/'‹d¤ómÎ¼ù¶nãfCZßfÌ™g‘QÑ#äXìSÌİ‘#GÙÉ3§ÜıK¡æ,læ=ûöX’°öïßßæÔ§M™
+P9Çu˜}MrQ%4İ¶e‹-pç_g×ßÔ×:Ã(»rÀméWu¬DdÉ" G¢’‘iëtİº5°‡ÄæÚ3Ïş•„¬Í õ“låŠå”ËÇê×oÎZ«Š[øù{S¶1>‰ÉT#Í0mÊÖ.ka0çZ-®¥Äkö:ukXÇÎíqà^8Ç&OOÿ?oÍ¯i	«5Fõ%”«ï^˜Ú Aö¥m˜G¤+ïèÑcû÷Äñ°¤ËÚk¯½QT íj’a†÷Í—6‡vóoKêKúñ8áCĞVOØ›(?Võ‚…í,‰Xƒqb~ÿÃV•µœœÚ/é>ê£O¨g_›˜½:ÛÅ[*oxkÀ[VxÙ?«f½çõÖÀï©èZ0ê¥M°†^W¾pX@şÆl.áa…,¸}CÂíÕçŸÇH²î=®³k`{x´h‡e Æƒ¸û`Ü½[¶&¬‹æ.™E L›øòe	§Í°ÅFÿ<ÉúÜv‡ÕmÒÜâ£JÑn°;rmê¯Smû¾Ö`¶uÕÚö—gŸ²rëZİ­¬^™ª–0ûó„)€²İ¬	É±.œ»`Ï=ù¬};ìSkÚ0ÅyºíßyÔì{éå×­f½2¶~ë?n:lØ`íÄÁÂpŒ „*¥	ÉW˜bºm]wØV,ÜæX&	U¢0FSmå†$)›l}¯ïg•J•°cûwÚ‚µ;ì|–/úµïY³ª1váÀ&›½b³LöØõhÌ6Kˆeq®ä_„úÛç#~4Ÿì4ëÓ­ƒUÈÊ'$10(ÄûöïCòá- ®JÒÕ0Å8>Ch”3t{ÌîŞ³ÏyøQûè£O¬e‹Ö€A³`íû£3û¦Õ­[Û6l\†îXkØ°Ce ¯8ŒÒhdÊ9Æâ/sfÙŞ½{­:íQ#&9„ÃGÛ¾ƒG-eùŠ	ö+€4I¯E¸~µ*vhOP¨ĞÙÿe•ñ].>Şî¿ÿ‹#Ô2ñìiöÅ0’§Ú A÷ZL\4ıŒ0EBÅ•Ñæ‡îŸôe‘¸Ò+ñBÿ+~ÿw½Uõrıwà,À@ñ÷2ëk¶¸‡ë˜?²]~Z@ûGÎS|,çã\ÿ1«¯®<‰TEÑgÀìÎ;í“O†¢H€båË•·°˜{ÁœÎ¨øüí·mîò•–J8fFc C«ÍMº´ïàÚ½  áçGÛ(úAf^=ŒF«Öm¡¨˜K¢š´KÃòÎ8 f[B­ûiâ(ó%SvÌ©5k×bä´£GòœÜb×÷íkµ`JÓ˜`ä¾–à2yÒØê#`7yì³Ï_µöí:Àˆò”8‚Ñ¿&üQôö`ØÂÆ-_¡¬«>V¯~mú»¯?~Òé/7Á6hn7Şp›ÓKâ~]B3øc˜ŞÒcŞ o€Ô\qÅ^eï´³˜ıãmâfş>0[—obJš©ù66®4c÷1{ïƒìLÖ={"-s7aõ›2q²ı<v¤m„õùÚk¯¹ù¬6±b÷¥¥¦Û˜±ãlÔ¨Q€LJ¬åoO>ù¤c×
+ØRØÿ[o¾í˜mÛµ³kpÒÈaèt=a:Ší¨}´ïœ9slëÖ­ÌëåíŞûîÔÍ±%07—/_áú„Î[–Ğz—ÄŠß"Ñïôí)àQ¡àg ºÌ*eœº— äWˆ)Ù˜ˆ'µ‘ aéDİÜØïzëĞ®- \°É ›–;—é@Ò/JØ¥MÀŸ@[Í§’qpÚ 8¨Ú^ ÔÖıÃŞİH”ÈG}ë¸÷ßP©ÆØ æX±CsYQ2KIH+U ­ÆuiÁ‹-«ò‰¥+Ñ­[¶Ù!Cí¾ûî·.»2÷Ær.’^]L.°¥gÚô_æ3ªØÓÏ¿bQ±€ÀÌ‰€ŞÑQ ’„ñZ/`ÖÃø½uÓ$%¾µ}‡á @
+€ùbÜäiN°?ÌÓH´]ı{^{ı5kÖâëqİu Ô…ô£ö€i
+NSµß€(=æÇmîœ_-†ùü€Ùı°g§Ön£ı*%T´Á¶¨˜’®MÅšíyÎØ:u©«(î†/néK>@Läİ»wÚ?¦ŞCí¦›opŒÙı¬g†3÷ë“Ç­#sËB€ò4$uÄpfu 8+ç@2sÑË¬ÏRS2™úÛİwİØêÁi°G`uèØÆ9øæÍÿ¶ø<4~Káh†¹$Èéà7Î–,Yj:t´;î¸ÃªT©JÙ$+Aò3.úáº¶V‚»“'Œ"Â¨QãÆ8Yk²Qr¼aŸ¡Nf yqŒÈ£'ÑÕÇuT‰’8ƒ-{)%ÕŞ…A¾n ó¨´„¿¡]Ì*$88™)*ù¢ä;
+‘2(^ç¸®xUıçf¯ªæğÆ[ŞğÖÀŸ^^`öO¯bï¼5ğÔ 8Æe¨Éí|Ò—nÓVÌ¿˜5_À5’e ¥öÅW_;ª}§ÎhÄ¶‚Õ`i,Æ•%:£'ƒğç™3`ˆ mÚx@¹>oó·ß{Ü®¿¾·Ó‡ûêû‘Öë–V)„R0X‚aódÊÌ]¾À>fuK•·Ñ¥í1’ˆUl\Çöœ;i‡6]´2,|_}í»¶×uZ®ŒmÛ´İŞxù{á™§¬yãj„•Ú¾G 
+ÿb/¼øì”†vîâA›8i–MŸºÈNHÅ òÁè¨nOşåëŞ³5ÆBº­Y¶ÃV,ŞjÍ›4mR]² Ûsğ¤ùy:ÉÄXZR:úµ>S¹Š•(_}Ü*è´Şg‹ k§X·^7Z}ŠEôÂ.Ãc?Me¡ U½»u´ó V–Îb_m‚Q³jÅr Ö7lÇÎs¸¾°BšÛ.ÇÁbêğ|üØIŒŒ!vÏ=÷Á˜mâ²F:tÄ† ÔŞ{ï}Ö¶mkØKÉ6~üX›1c*àØ)Œj«[' õq€ÛZ¾É6Ñá?Ì(‹³Çüšq±¶mç˜´'ì/}C.İFü0Ú¾ÿò'„S¥‚¿uëÚÖno˜O× wLû½è[În½m€….yéÜ®;cÉßúİĞ×J U‡y	ĞÆlF­ÀH?BÜ¥í«ïŠz¦€U^®—^~w¿ñ•¶Ë %¨ğrÿÀ¬g¯thwØş¿âó¿ÿçÏtåHîçï³ìqùşdØÌœ3{ÿî²í°<@Ò¥‹— i‘‹«‡ …ü9² PëÖï&«U£¦8tØV/]
+k¾]"øo{ÎšÑo&M™h¿ÌûÕJ–³8 ‘[û@n¤¬W$	.¥ÙÎ-;lÆ¤i¶uıF‹)mo|ôš%Ô¬lş°¨vnÚ+{¸c"UI¨b]`Ã·€¡¤0Ş0’m„…§K—.ˆ=g“'qÏşaBZÅ¾SHóàÁƒÑWl ‘a7¯Æ°ÓjÔÄ™KjÁ‚…&½ä„ÊÕ­fº0f›ZcàbNiSÈkQ¸+š„.ô•¿ÌêåfU	ÿ{7/cöï³CÂÄÌÌÄ!Ã4I´G€Í;Ï–,[Á<‚ÄÌ³.Ì~îìé¶dá¯ˆ@Õ´i3¢_·n]úêæ8yÜÍš9ËIÔtëÖİÖ¬Yk7á êØ±“ÛGÇ}@4ˆbu¬˜uîÜY˜ŠĞ35))fh)ó\çÔà‚§2İÏ3Û~ùe¶cÙşùçVºt,ŒH€R€Ù2¥JZã‰ä|‰8ä“Op`æÙM·Üj½ˆè)3U%£R²°ã0?eŸ3§NØ=wİnİañª¯d¾ªL¾$J\Îƒ‘¯13”Ä„Ò~•ƒ8põÒ¥tæ'¤Q`3¦ãxŒ‹Áù™èÊ§1íµW_c­0ˆy®'ÎÇ²Ì¥) §ì©ğ&‡s>Q01ƒ
+‘ĞÚ¡€1YÖ3ÒÄ ¼uë6Ö;³ãÎ~BÎ€ÇbÓ ½P“l+–Î±¹—;‰£§ŸÙ*W«åØà¨"hÊd)æ1${-ğòBây{ûÍ×-ñ†M›:PöÃ¡ŸÙ÷£ÇØµ­ÛZt«‡ÀZXµÁè»¦°ŞÊ İB¸÷êfşÂ6oÁØ®‘öñÇ1†çÀNbÛ)g…òñvß=÷ØĞ?F¿w£5¬ßÀyş+SÂ’SX'L›zƒuìĞÉ­7Ê–”(›áQ²¡¡Ò—Ï´S§O¼—†}äÛ»víX%GÀÁÃvû€AÖ¹Sú§€Ù,€öLÖ‡@ƒ¼¤÷*€üé§Ÿ³
+ñUì)ëUªTp¬Óää,'}LÏµ™³¦Øt˜àÒÖé¥WˆÊ‰v…åË—3M±sgÏÙ‡~„ã"Á²br«}¿bÚ¼ys¤³ª"…0Ój0öÀ±!¹
+mAè«üá;XÃëØ?É¾b9÷@‚¢4‘&¾ô)¥ãÓœ%GFFF}§÷vÄŞ$ÇB¥Êñàu /’Í©)Ùô	Ú/„ÿ~»–qW»:şó³WG;xKá­oxkà¿ª¼ÀìUM{¯ã­ÿW°nÄ¤—6€z]ùÂ}øO ³$J%¤,–ˆ/ì„$ÄŠ1+6²Ú|X¡¦8°Ã-$éV£j‹0z}f]T™x§3¡Õ­:IÆ|Î2r3-–Ä@™§ÎÃäxĞxå‹ª\ÎRO]@}À—pıæ–…a”…ñÃN?m5«VMÈ ‡ö9¾„f§YÙr-0&?c2VËøe oÃ]È[ÙrQV".M·DK:ƒöYºŸU¬Pc(ÆÔEÛ—HÎ‘a™—	ó%ˆä%ËZaH	#EHY‰óÉ¶Œ^æÙ³˜²-×/û¢œaæ	·{Z  xµŠå7tm FPRÚÄÆ9qâ8Fˆ’X‡ây †ãœ!œI&û]„‰×®]Ï±)}` *o×®=°r*FGıc+áËÑ£‡iğs_é°ù9ö¬¬¾4ôfe¼I¯4VšµÍfRJj†e¢ÇV	)%x9yúŒ[Ñû¢)U%X	¸å q${,iáú*fE²úêa¨ÂüY$¦¬Œî§$ÁWùHtF‹zæoÙßöVÕÊåû²—Í"PWÇ_Å÷é¿¢GÂµ»‚–İæîƒ¯¸…DKÉ|?âBL¿†=]àv+,2…KÿuÔèécÖ²ckP¯ÒvÀb&†éÒEì~€…Î];Ù¬9¿ØºÍ›¬rª6~Ò$ô‹_¶ví;Ü*Ëìøö‹o ióìôÑ“vúâI{gè›Vídm«W­A~dœÕªYË6-0RoØ0^Ä›ş “1;fª}úÙ€«Ñ$Ü [ûgç¨SCáÃ(<Âæ;À’D2šX5?.šÆs´jåZî; ÇA#Â}[ø£!kØ|xüqÆ9ãÔèÃx7Š^ÅõæJz5ıG{³¼A¼À,Ãâÿ˜ÍF\Àg (WR©0ùÆO˜dÛwîrÚî>ôÏ¨MŸ<Ş6R‰””èKª={ö´>Èšø3Ç
+˜˜%ıMé†*\@ÜC$‘ìÛï€1Böw¾şúkáBÇº]·~süE“@©Cûö„÷$ì¼¦¿¤½y‡Œä
+úÂ°Ÿ0a‚ıúë\ÛƒäIfV¦Ë$sĞ¯_?’au²‹Iç­r7¡ÌyÒ¿>|Ê' bÎvéÖÆl/çÒ:B€¨¶ûUò¦‹´¹ëÖ¥ã™ QÖ _~ñ¥-Y¾š¤WJt	ÈãxÏ½÷8‡¦BÚW¯ZÜÂ÷ Àg+¶giæ®gÑ­K¹Äıú›¯­C‡¶zõjç\
+f^T”Aß¾ıRhŒ¼OIÀXéå;ö¤ê9ˆy\ vQØ|¡sXM&Ah,ó¥³•+ÂÏ¯d%KèĞ2lÑ¼i6ó×…–‹ÄÑ£O<cñ	5˜™a2ì±<2M™òMùãÅ.€1{	Y€Ã‡Z æİ{ìó¯¿³aß|gMp’FG ÅJH¿"ü¹×@ØÂ>~¾–xñ¡ÿ“mò7+VD*é9ÊšƒSzª­ Ì”?´k§Î6‘¶jÚ¸‰İzóÍDÑÔe¨-@’*ÇÄD•­I“f\ÿ¨#²FIºªW« ú¡E¡=œ	(»oÿ^¤o6¸æğ[;wşLéeH¬Oƒ™[ù¡¹uìÔ-Ø¶HU”t’6ªKº‘µÃ8)1¸²Y—‰ÁæL]ä!k¤Í„Iãl!ŒYEì<ıÌsV)éı.ãZêkg™??ùø@S’©Qç:÷/¿üb¹‡.€øõ˜/¥5{ğàA$;@b¡.€9Ìdæ›ŞÃN?äd™BÈ4&=ı_|-ÿú<kEZµß}7‚{KŒplêÍ0£Å ­]»¦‚Iøæz8‘ALW…Ê”æfİ³ëıÏ[ŞğÖ€·ş{kÀÌş÷Ö¿÷êŞ(ª-ùä€!Şéuå÷:‹äÌK0Æ’1\òY\š¥ÔÀ  $
+ÍòT!“ßé{?KƒQA'–¬ •l^òÄ‡ ĞJ/3==İ‘b*¬½  ²ÀPØ¡Ú
+Ä Áè
+$DÎ¢—É1Á€²’pV
+Ö‰#Á'-Ë¡¹ùò+/Û/>gõ[6³0’føæq'°Qóes0î|ù [‡2úúd@·äKV®z}2İ“¨È“aAdD…Ç
+CI‡dP	ôÊÉE³3 “DE`ÁV˜Ëya…‡a`ˆäG‚g9a=yEÌdTH]`!tÎ‘‹fº‡D%‘Ià\–”à/Ô?B03ˆºÏ…I(+«C«ym\'Æ‹˜HOF•6õåKùXËGÀ˜t×ü `ó1šó:ƒ	µ#¦C#€]¤ãÊ È— Ê•¤‰,Ş âş0†òĞ£Sr.?Ê[ˆñŸŠ‘%:N>‰98o.± EÙ“aE!KàC¨$š¸ê ^ho:í.€ÖPzõ¦\ï@®•{ªk/2š¬Í²21J²³Òëa Ñæ€Ğ¾ô§ûÛ^Éç+ mqOUo—{­1/.êÅìP|¿w\ññ¿ç]ç×Vü^ô×ú¿˜u'):¯ûßİÏå3ó9‹çER£_E‡k×®=! í-®rebraÒ~ƒqèQÒÚvƒñƒÌA¸tc1úÎ›k3 ZZ]ÛÒºvëH±Ä;bõ†}ı•İrkë&–P\YÀØöİ°o¬^Í:–xê¬­Ş²Â>ıöc+S¹(ÔxåŠ•ë“‰í‰Q»È;7Üp£ÎœÌš5ƒ<‹Ò8ûVØgŸ~n5q•”è§Ÿ~Bò+ö­ »L	_xv|aøá¾¬ «²Áû…Ù˜Fñ}>	Y®±kÛv ßòl²à>Á¡CË2îøH—ñÈ9^)ƒËåñ›˜e(ü¿³9åLô'¤<9%ÅÎ&&!;2§!Ò3­[;‰ƒ0Ø’Ò—]µ|!ÒAm?ò‡‘.©—ÂÙc¢c\¢¨¡

@@ -1,0 +1,3031 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  implementation of Robotis Dynamixel 2.0 protocol for controlling servos
+
+  Portions of this code are based on the dynamixel_sdk code:
+  https://github.com/ROBOTIS-GIT/DynamixelSDK
+  which is under the following license:
+
+* Copyright 2017 ROBOTIS CO., LTD.
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
+
+#include "AP_RobotisServo.h"
+
+#if AP_ROBOTISSERVO_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+#include <SRV_Channel/SRV_Channel.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define BROADCAST_ID 0xFE
+#define MAX_ID 0xFC
+
+// DXL protocol common commands
+#define INST_PING          1
+#define INST_READ          2
+#define INST_WRITE         3
+#define INST_REG_WRITE     4
+#define INST_ACTION        5
+#define INST_FACTORY_RESET 6
+#define INST_CLEAR        16
+#define INST_SYNC_WRITE  131
+#define INST_BULK_READ   146
+
+// 2.0 protocol commands
+#define INST_REBOOT       8
+#define INST_STATUS      85
+#define INST_SYNC_READ  130
+#define INST_BULK_WRITE 147
+
+// 2.0 protocol packet offsets
+#define PKT_HEADER0     0
+#define PKT_HEADER1     1
+#define PKT_HEADER2     2
+#define PKT_RESERVED    3
+#define PKT_ID          4
+#define PKT_LENGTH_L    5
+#define PKT_LENGTH_H    6
+#define PKT_INSTRUCTION 7
+#define PKT_ERROR       8
+#define PKT_PARAMETER0  8
+
+/* Macro for Control Table Value */
+#define DXL_MAKEWORD(a, b)  ((uint16_t)(((uint8_t)(((uint64_t)(a)) & 0xff)) | ((uint16_t)((uint8_t)(((uint64_t)(b)) & 0xff))) << 8))
+#define DXL_MAKEDWORD(a, b) ((uint32_t)(((uint16_t)(((uint64_t)(a)) & 0xffff)) | ((uint32_t)((uint16_t)(((uint64_t)(b)) & 0xffff))) << 16))
+#define DXL_LOWORD(l)       ((uint16_t)(((uint64_t)(l)) & 0xffff))
+#define DXL_HIWORD(l)       ((uint16_t)((((uint64_t)(l)) >> 16) & 0xffff))
+#define DXL_LOBYTE(w)       ((uint8_t)(((uint64_t)(w)) & 0xff))
+#define DXL_HIBYTE(w)       ((uint8_t)((((uint64_t)(w)) >> 8) & 0xff))
+
+// register offsets
+#define REG_OPERATING_MODE 11
+#define   OPMODE_CURR_CONTROL    0
+#define   OPMODE_VEL_CONTROL     1
+#define   OPMODE_POS_CONTROL     3
+#define   OPMODE_EXT_POS_CONTROL 4
+
+#define REG_TORQUE_ENABLE  64
+
+#define REG_STATUS_RETURN  68
+#define   STATUS_RETURN_NONE 0
+#define   STATUS_RETURN_READ 1
+#define   STATUS_RETURN_ALL  2
+
+#define REG_GOAL_POSITION 116
+
+// how many times to send servo configure msgs
+#define CONFIGURE_SERVO_COUNT 4
+
+// how many times to send servo detection
+#define DETECT_SERVO_COUNT 4
+
+const AP_Param::GroupInfo AP_RobotisServo::var_info[] = {
+
+    // @Param: POSMIN
+    // @DisplayName: Robotis servo position min
+    // @Description: Position minimum at servo min value. This should be within the position control range of the servos, normally 0 to 4095
+    // @Range: 0 4095
+    // @User: Standard
+    AP_GROUPINFO("POSMIN",  1, AP_RobotisServo, pos_min, 0),
+
+    // @Param: POSMAX
+    // @DisplayName: Robotis servo position max
+    // @Description: Position maximum at servo max value. This should be within the position control range of the servos, normally 0 to 4095
+    // @Range: 0 4095
+    // @User: Standard
+    AP_GROUPINFO("POSMAX",  2, AP_RobotisServo, pos_max, 4095),
+    
+    AP_GROUPEND
+};
+
+// constructor
+AP_RobotisServo::AP_RobotisServo(void)
+{
+    // set defaults from the parameter table
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+void AP_RobotisServo::init(void)
+{
+    AP_SerialManager &serial_manager = AP::serialmanager();
+    port = serial_manager.find_serial(AP_SerialManager::SerialProtocol_Robotis,0);
+    if (port) {
+        baudrate = serial_manager.find_baudrate(AP_SerialManager::SerialProtocol_Robotis, 0);
+        us_per_byte = 10 * 1e6 / baudrate;
+        us_gap = 4 * 1e6 / baudrate;
+    }
+}
+
+/*
+  addStuffing() from Robotis SDK. This pads the packet as required by the protocol
+*/
+void AP_RobotisServo::add_stuffing(uint8_t *packet)
+{
+    int packet_length_in = DXL_MAKEWORD(packet[PKT_LENGTH_L], packet[PKT_LENGTH_H]);
+    int packet_length_out = packet_length_in;
+  
+    if (packet_length_in < 8) {
+        // INSTRUCTION, ADDR_L, ADDR_H, CRC16_L, CRC16_H + FF FF FD
+        return;
+    }
+
+    uint8_t *packet_ptr;
+    uint16_t packet_length_before_crc = packet_length_in - 2;
+    for (uint16_t i = 3; i < packet_length_before_crc; i++) {
+        packet_ptr = &packet[i+PKT_INSTRUCTION-2];
+        if (packet_ptr[0] == 0xFF && packet_ptr[1] == 0xFF && packet_ptr[2] == 0xFD) {
+            packet_length_out++;
+        }
+    }
+  
+    if (packet_length_in == packet_length_out) {
+        // no stuffing required
+        return;
+    }
+  
+    uint16_t out_index  = packet_length_out + 6 - 2;  // last index before crc
+    uint16_t in_index   = packet_length_in + 6 - 2;   // last index before crc
+
+    while (out_index != in_index) {
+        if (packet[in_index] == 0xFD && packet[in_index-1] == 0xFF && packet[in_index-2] == 0xFF) {
+            packet[out_index--] = 0xFD; // byte stuffing
+            if (out_index != in_index) {
+                packet[out_index--] = packet[in_index--]; // FD
+                packet[out_index--] = packet[in_index--]; // FF
+                packet[out_index--] = packet[in_index--]; // FF
+            }
+        } else {
+            packet[out_index--] = packet[in_index--];
+        }
+    }
+
+    packet[PKT_LENGTH_L] = DXL_LOBYTE(packet_length_out);
+    packet[PKT_LENGTH_H] = DXL_HIBYTE(packet_length_out);
+}
+
+/*
+  send a protocol 2.0 packet
+ */
+void AP_RobotisServo::send_packet(uint8_t *txpacket)
+{
+    add_stuffing(txpacket);
+
+    // check max packet length
+    uint16_t total_packet_length = DXL_MAKEWORD(txpacket[PKT_LENGTH_L], txpacket[PKT_LENGTH_H]) + 7;
+
+    // make packet header
+    txpacket[PKT_HEADER0]   = 0xFF;
+    txpacket[PKT_HEADER1]   = 0xFF;
+    txpacket[PKT_HEADER2]   = 0xFD;
+    txpacket[PKT_RESERVED]  = 0x00;
+
+    // add CRC16
+    uint16_t crc = crc_crc16_ibm(0, txpacket, total_packet_length - 2);    // 2: CRC16
+    txpacket[total_packet_length - 2] = DXL_LOBYTE(crc);
+    txpacket[total_packet_length - 1] = DXL_HIBYTE(crc);
+
+    port->write(txpacket, total_packet_length);
+
+    delay_time_us += total_packet_length * us_per_byte + us_gap;
+}
+
+/*
+  use a broadcast ping to find attached servos
+ */
+void AP_RobotisServo::detect_servos(void)
+{
+    uint8_t txpacket[10] {};
+
+    txpacket[PKT_ID] = BROADCAST_ID;
+    txpacket[PKT_LENGTH_L] = 3;
+    txpacket[PKT_LENGTH_H] = 0;
+    txpacket[PKT_INSTRUCTION] = INST_PING;
+
+    send_packet(txpacket);
+
+    // give plenty of time for replies from all servos
+    last_send_us = AP_HAL::micros();
+    delay_time_us += 1000 * us_per_byte;
+}
+
+/*
+  broadcast configure all servos
+ */
+void AP_RobotisServo::configure_servos(void)
+{
+    // disable torque control
+    send_command(BROADCAST_ID, REG_TORQUE_ENABLE, 0, 1);
+
+        // disable replies unless we read
+    send_command(BROADCAST_ID, REG_STATUS_RETURN, STATUS_RETURN_READ, 1);
+
+    // use position control mode
+    send_command(BROADCAST_ID, REG_OPERATING_MODE, OPMODE_POS_CONTROL, 1);
+
+    // enable torque control
+    send_command(BROADCAST_ID, REG_TORQUE_ENABLE, 1, 1);
+}
+
+
+/*
+  send a command to a single servo, changing a register value
+ */
+void AP_RobotisServo::send_command(uint8_t id, uint16_t reg, uint32_t value, uint8_t len)
+{
+    uint8_t txpacket[16] {};
+
+    txpacket[PKT_ID] = id;
+    txpacket[PKT_LENGTH_L] = 5 + len;
+    txpacket[PKT_LENGTH_H] = 0;
+    txpacket[PKT_INSTRUCTION] = INST_WRITE;
+    txpacket[PKT_INSTRUCTION+1] = DXL_LOBYTE(reg);
+    txpacket[PKT_INSTRUCTION+2] = DXL_HIBYTE(reg);
+    memcpy(&txpacket[PKT_INSTRUCTION+3], &value, MIN(len,4));
+
+    send_packet(txpacket);
+}
+
+/*
+  read response bytes
+ */
+void AP_RobotisServo::read_bytes(void)
+{
+    uint32_t n = port->available();
+    if (n == 0 && pktbuf_ofs < PKT_INSTRUCTION) {
+        return;
+    }
+
+    if (n > sizeof(pktbuf) - pktbuf_ofs) {
+        n = sizeof(pktbuf) - pktbuf_ofs;
+    }
+    for (uint8_t i=0; i<n; i++) {
+        pktbuf[pktbuf_ofs++] = port->read();
+    }
+
+    // discard bad leading data. This should be rare
+    while (pktbuf_ofs >= 4 &&
+           (pktbuf[0] != 0xFF || pktbuf[1] != 0xFF || pktbuf[2] != 0xFD || pktbuf[3] != 0x00)) {
+        memmove(pktbuf, &pktbuf[1], pktbuf_ofs-1);
+        pktbuf_ofs--;
+    }
+
+    if (pktbuf_ofs < 10) {
+        // not enough data yet
+        return;
+    }
+
+    const uint16_t total_packet_length = DXL_MAKEWORD(pktbuf[PKT_LENGTH_L], pktbuf[PKT_LENGTH_H]) + PKT_INSTRUCTION;
+    if (total_packet_length > sizeof(pktbuf)) {
+        pktbuf_ofs = 0;
+        return;
+    }
+    if (pktbuf_ofs < total_packet_length) {
+        // more data needed
+        return;
+    }
+
+    // check CRC
+    const uint16_t crc = DXL_MAKEWORD(pktbuf[total_packet_length-2], pktbuf[total_packet_length-1]);
+    const uint16_t calc_crc = crc_crc16_ibm(0, pktbuf, total_packet_length - 2);
+    if (calc_crc != crc) {
+        memmove(pktbuf, &pktbuf[total_packet_length], pktbuf_ofs - total_packet_length);
+        pktbuf_ofs -= total_packet_length;
+        return;
+    }
+
+    // process full packet
+    process_packet(pktbuf, total_packet_length);
+
+    memmove(pktbuf, &pktbuf[total_packet_length], pktbuf_ofs - total_packet_length);
+    pktbuf_ofs -= total_packet_length;
+}
+
+/*
+  process a packet from a servo
+ */
+void AP_RobotisServo::process_packet(const uint8_t *pkt, uint8_t length)
+{
+    uint8_t id = pkt[PKT_ID];
+    if (id > 16 || id < 1) {
+        // discard packets from servos beyond max or min. Note that we
+        // don't allow servo 0, to make mapping to SERVOn_* parameters
+        // easier
+        return;
+    }
+    uint32_t id_mask = (1U<<(id-1));
+    if (!(id_mask & servo_mask)) {
+        // mark the servo as present
+        servo_mask |= id_mask;
+        DEV_PRINTF("Robotis: new servo %u\n", id);
+    }
+}
+
+
+void AP_RobotisServo::update()
+{
+    if (!initialised) {
+        initialised = true;
+        init();
+        last_send_us = AP_HAL::micros();
+        return;
+    }
+    
+    if (port == nullptr) {
+        return;
+    }
+
+    read_bytes();
+
+    uint32_t now = AP_HAL::micros();
+    if (last_send_us != 0 && now - last_send_us < delay_time_us) {
+        // waiting for last send to complete
+        return;
+    }
+
+    if (detection_count < DETECT_SERVO_COUNT) {
+        detection_count++;
+        detect_servos();
+        return;
+    }
+
+    if (servo_mask == 0) {
+        return;
+    }
+
+    if (configured_servos < CONFIGURE_SERVO_COUNT) {
+        configured_servos++;
+        last_send_us = now;
+        configure_servos();
+        return;
+    }
+
+    last_send_us = now;
+    delay_time_us = 0;
+
+    // loop for all 16 channels
+    for (uint8_t i=0; i<NUM_SERVO_CHANNELS; i++) {
+        if (((1U<<i) & servo_mask) == 0) {
+            continue;
+        }
+        SRV_Channel *c = SRV_Channels::srv_channel(i);
+        if (c == nullptr) {
+            continue;
+        }
+        const uint16_t pwm = c->get_output_pwm();
+        const uint16_t min = c->get_output_min();
+        const uint16_t max = c->get_output_max();
+        float v = float(pwm - min) / (max - min);
+        uint32_t value = pos_min + v * (pos_max - pos_min);
+        send_command(i+1, REG_GOAL_POSITION, value, 4);
+    }
+}
+
+#endif  // AP_ROBOTISSERVO_ENABLED
+                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  implementation of Robotis Dynamixel 2.0 protocol for controlling servos
+ */
+
+#pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_ROBOTISSERVO_ENABLED
+#define AP_ROBOTISSERVO_ENABLED BOARD_FLASH_SIZE > 1024
+#endif
+
+#if AP_ROBOTISSERVO_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Param/AP_Param.h>
+
+class AP_RobotisServo {
+public:
+    AP_RobotisServo();
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_RobotisServo);
+
+    static const struct AP_Param::GroupInfo var_info[];
+    
+    void update();
+
+private:
+    AP_HAL::UARTDriver *port;
+    uint32_t baudrate;
+    uint32_t us_per_byte;
+    uint32_t us_gap;
+
+    void init(void);
+    void detect_servos();
+
+    void add_stuffing(uint8_t *packet);
+    void send_packet(uint8_t *txpacket);
+    void read_bytes();
+    void process_packet(const uint8_t *pkt, uint8_t length);
+    void send_command(uint8_t id, uint16_t reg, uint32_t value, uint8_t len);
+    void configure_servos(void);
+
+    // auto-detected mask of available servos, from a broadcast ping
+    uint32_t servo_mask;
+    uint8_t detection_count;
+    uint8_t configured_servos;
+    bool initialised;
+
+    uint8_t pktbuf[64];
+    uint8_t pktbuf_ofs;
+
+    // servo position limits
+    AP_Int32 pos_min;
+    AP_Int32 pos_max;
+
+    uint32_t last_send_us;
+    uint32_t delay_time_us;
+};
+
+#endif  // AP_ROBOTISSERVO_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+ * AP_SBusOut.cpp
+ *
+ *  Created on: Aug 19, 2017
+ *      Author: Mark Whitehorn
+ *
+ * method sbus1_out was ported from ardupilot/modules/PX4Firmware/src/lib/rc/sbus.c
+ * which has the following license:
+ *
+ *   Copyright (c) 2012-2014 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ */
+
+#include "AP_SBusOut_config.h"
+
+#if AP_SBUSOUTPUT_ENABLED
+
+#include "AP_SBusOut.h"
+#include <AP_Math/AP_Math.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+#include <SRV_Channel/SRV_Channel.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define SBUS_DEBUG 0
+
+#define SBUS_BSIZE 25
+#define SBUS_CHANNELS 16
+#define SBUS_MIN 875
+
+const AP_Param::GroupInfo AP_SBusOut::var_info[] = {
+    // @Param: RATE
+    // @DisplayName: SBUS default output rate
+    // @Description: This sets the SBUS output frame rate in Hz.
+    // @Range: 25 250
+    // @User: Advanced
+    // @Units: Hz
+    AP_GROUPINFO("RATE",  1, AP_SBusOut, sbus_rate, 50),
+
+    AP_GROUPEND
+};
+
+
+// constructor
+AP_SBusOut::AP_SBusOut(void)
+{
+    // set defaults from the parameter table
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+/*
+  format a SBUS output frame into a 25 byte buffer
+ */
+void AP_SBusOut::sbus_format_frame(uint16_t *channels, uint8_t num_channels, uint8_t buffer[SBUS_BSIZE])
+{
+    uint8_t index = 1;
+    uint8_t offset = 0;
+
+    memset(buffer, 0, SBUS_BSIZE);
+    buffer[0] = 0x0f;
+
+    /* construct sbus frame representing channels 1 through 16 (max) */
+    const uint8_t nchan = MIN(num_channels, SBUS_CHANNELS);
+    for (unsigned i = 0; i < nchan; ++i) {
+        /*protect from out of bounds values and limit to 11 bits*/
+        const uint16_t pwmval = MAX(channels[i], SBUS_MIN);
+        const uint32_t v1 = uint32_t(pwmval - SBUS_MIN) * 1600U;
+        uint16_t value = uint16_t(v1 / 1000U) + 1;
+        if (value > 0x07ff) {
+            value = 0x07ff;
+        }
+
+#if SBUS_DEBUG
+        static uint16_t lastch9 = 0;
+        if ((i==8) && (pwmval != lastch9)) {
+            lastch9 = pwmval;
+            hal.console->printf("channel 9 pwm: %04d\n", pwmval);
+        }
+#endif
+
+        while (offset >= 8) {
+            ++index;
+            offset -= 8;
+        }
+
+        buffer[index] |= (value << (offset)) & 0xff;
+        buffer[index + 1] |= (value >> (8 - offset)) & 0xff;
+        buffer[index + 2] |= (value >> (16 - offset)) & 0xff;
+        offset += 11;
+    }
+}
+
+/*
+ * build and send sbus1 frame representing first 16 servo channels
+ * input arg is pointer to uart
+ */
+void
+AP_SBusOut::update()
+{
+    if (!initialised) {
+        initialised = true;
+        init();
+    }
+
+    if (sbus1_uart == nullptr) {
+        return;
+    }
+
+    // constrain output rate using sbus_frame_interval
+    static uint32_t last_micros = 0;
+    uint32_t now = AP_HAL::micros();
+    if ((now - last_micros) <= sbus_frame_interval) {
+        return;
+    }
+
+    last_micros = now;
+
+    /* construct sbus frame representing channels 1 through 16 (max) */
+    uint8_t nchan = MIN(NUM_SERVO_CHANNELS, SBUS_CHANNELS);
+    uint16_t channels[SBUS_CHANNELS] {};
+
+    for (unsigned i = 0; i < nchan; ++i) {
+        SRV_Channel *c = SRV_Channels::srv_channel(i);
+        if (c == nullptr) {
+            continue;
+        }
+        channels[i] = c->get_output_pwm();
+    }
+    uint8_t buffer[SBUS_BSIZE];
+    sbus_format_frame(channels, nchan, buffer);
+
+#if SBUS_DEBUG
+    hal.gpio->pinMode(55, HAL_GPIO_OUTPUT);
+    hal.gpio->write(55, 1);
+#endif
+
+    sbus1_uart->write(buffer, sizeof(buffer));
+
+#if SBUS_DEBUG
+    hal.gpio->pinMode(55, HAL_GPIO_OUTPUT);
+    hal.gpio->write(55, 0);
+#endif
+}
+
+void AP_SBusOut::init() {
+    uint16_t rate = sbus_rate.get();
+
+#if SBUS_DEBUG
+    hal.console->printf("AP_SBusOut: init %d Hz\n", rate);
+#endif
+
+    // subtract 500usec from requested frame interval to allow for latency
+    sbus_frame_interval = (1000UL * 1000UL) / rate - 500;
+    // at 100,000 bps, a 300 bit sbus frame takes 3msec to transfer
+    // require a minimum 700usec interframe gap
+    if (sbus_frame_interval < 3700) {
+        sbus_frame_interval = 3700;
+    }
+
+    AP_SerialManager *serial_manager = AP_SerialManager::get_singleton();
+    if (!serial_manager) {
+        return;
+    }
+    sbus1_uart = serial_manager->find_serial(AP_SerialManager::SerialProtocol_Sbus1,0);
+}
+
+#endif  // AP_SBUSOUTPUT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * AP_SBusOut.h
+ *
+ *  Created on: Aug 19, 2017
+ *      Author: Mark Whitehorn
+ */
+
+#pragma once
+
+#include "AP_SBusOut_config.h"
+
+#if AP_SBUSOUTPUT_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Param/AP_Param.h>
+
+class AP_SBusOut {
+public:
+    AP_SBusOut();
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_SBusOut);
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    void update();
+
+    // public format function for use by IOMCU
+    static void sbus_format_frame(uint16_t *channels, uint8_t num_channels, uint8_t buffer[25]);
+
+private:
+
+    AP_HAL::UARTDriver *sbus1_uart;
+
+    void init(void);
+
+    uint16_t sbus_frame_interval;   // microseconds
+
+    AP_Int16 sbus_rate;
+    bool initialised;
+};
+
+#endif  // AP_SBUSOUTPUT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_SBUSOUTPUT_ENABLED
+#define AP_SBUSOUTPUT_ENABLED 1
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ *  main loop scheduler for ArduPilot
+ *  Author: Andrew Tridgell, January 2013
+ *
+ */
+
+#include "AP_Scheduler_config.h"
+
+#if AP_SCHEDULER_ENABLED
+
+#include "AP_Scheduler.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Param/AP_Param.h>
+#include <AP_Vehicle/AP_Vehicle.h>
+#include <AP_Logger/AP_Logger.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
+#include <AP_InternalError/AP_InternalError.h>
+#include <AP_Common/ExpandingString.h>
+#include <AP_HAL/SIMState.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include <SITL/SITL.h>
+#endif
+#include <stdio.h>
+
+#if APM_BUILD_COPTER_OR_HELI || APM_BUILD_TYPE(APM_BUILD_ArduSub)
+#define SCHEDULER_DEFAULT_LOOP_RATE 400
+#else
+#define SCHEDULER_DEFAULT_LOOP_RATE  50
+#endif
+
+#define debug(level, fmt, args...)   do { if ((level) <= _debug.get()) { hal.console->printf(fmt, ##args); }} while (0)
+
+extern const AP_HAL::HAL& hal;
+
+const AP_Param::GroupInfo AP_Scheduler::var_info[] = {
+    // @Param: DEBUG
+    // @DisplayName: Scheduler debug level
+    // @Description: Set to non-zero to enable scheduler debug messages. When set to show "Slips" the scheduler will display a message whenever a scheduled task is delayed due to too much CPU load. When set to ShowOverruns the scheduled will display a message whenever a task takes longer than the limit promised in the task table.
+    // @Values: 0:Disabled,2:ShowSlips,3:ShowOverruns
+    // @User: Advanced
+    AP_GROUPINFO("DEBUG",    0, AP_Scheduler, _debug, 0),
+
+    // @Param: LOOP_RATE
+    // @DisplayName: Scheduling main loop rate
+    // @Description: This controls the rate of the main control loop in Hz. This should only be changed by developers. This only takes effect on restart. Values over 400 are considered highly experimental.
+    // @Values: 50:50Hz,100:100Hz,200:200Hz,250:250Hz,300:300Hz,400:400Hz
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("LOOP_RATE",  1, AP_Scheduler, _loop_rate_hz, SCHEDULER_DEFAULT_LOOP_RATE),
+
+    // @Param: OPTIONS
+    // @DisplayName: Scheduling options
+    // @Description: This controls optional aspects of the scheduler.
+    // @Bitmask: 0:Enable per-task perf info
+    // @User: Advanced
+    AP_GROUPINFO("OPTIONS",  2, AP_Scheduler, _options, 0),
+
+    AP_GROUPEND
+};
+
+// constructor
+AP_Scheduler::AP_Scheduler()
+{
+    if (_singleton) {
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+        AP_HAL::panic("Too many schedulers");
+#endif
+        return;
+    }
+    _singleton = this;
+
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+/*
+ * Get the AP_Scheduler singleton
+ */
+AP_Scheduler *AP_Scheduler::_singleton;
+AP_Scheduler *AP_Scheduler::get_singleton()
+{
+    return _singleton;
+}
+
+// initialise the scheduler
+void AP_Scheduler::init(const AP_Scheduler::Task *tasks, uint8_t num_tasks, uint32_t log_performance_bit)
+{
+    // grab the semaphore before we start anything
+    _rsem.take_blocking();
+
+    // only allow 50 to 2000 Hz
+    if (_loop_rate_hz < 50) {
+        _loop_rate_hz.set(50);
+    } else if (_loop_rate_hz > 2000) {
+        _loop_rate_hz.set(2000);
+    }
+    _last_loop_time_s = 1.0 / _loop_rate_hz;
+
+    _vehicle_tasks = tasks;
+    _num_vehicle_tasks = num_tasks;
+
+#if AP_VEHICLE_ENABLED
+    AP_Vehicle* vehicle = AP::vehicle();
+    if (vehicle != nullptr) {
+        vehicle->get_common_scheduler_tasks(_common_tasks, _num_common_tasks);
+    }
+#endif
+
+    _num_tasks = _num_vehicle_tasks + _num_common_tasks;
+
+   _last_run = NEW_NOTHROW uint16_t[_num_tasks];
+    _tick_counter = 0;
+
+    // setup initial performance counters
+    perf_info.set_loop_rate(get_loop_rate_hz());
+    perf_info.reset();
+
+    if (_options & uint8_t(Options::RECORD_TASK_INFO)) {
+        perf_info.allocate_task_info(_num_tasks);
+    }
+
+    _log_performance_bit = log_performance_bit;
+
+    // sanity check the task lists to ensure the priorities are
+    // never decrease
+    uint8_t old = 0;
+    for (uint8_t i=0; i<_num_common_tasks; i++) {
+        if (_common_tasks[i].priority < old){
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+            break;
+        }
+        old = _common_tasks[i].priority;
+    }
+    old = 0;
+    for (uint8_t i=0; i<_num_vehicle_tasks; i++) {
+        if (_vehicle_tasks[i].priority < old) {
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+            break;
+        }
+        old = _vehicle_tasks[i].priority;
+    }
+}
+
+// one tick has passed
+void AP_Scheduler::tick(void)
+{
+    _tick_counter++;
+    _tick_counter32++;
+}
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+/*
+  fill stack with NaN so we can catch use of uninitialised stack
+  variables in SITL
+ */
+static void fill_nanf_stack(void)
+{
+    float v[1024];
+    fill_nanf(v, ARRAY_SIZE(v));
+}
+#endif
+
+/*
+  run one tick
+  this will run as many scheduler tasks as we can in the specified time
+ */
+void AP_Scheduler::run(uint32_t time_available)
+{
+    uint32_t run_started_usec = AP_HAL::micros();
+    uint32_t now = run_started_usec;
+
+    uint8_t vehicle_tasks_offset = 0;
+    uint8_t common_tasks_offset = 0;
+
+    for (uint8_t i=0; i<_num_tasks; i++) {
+        // determine which of the common task / vehicle task to run
+        bool run_vehicle_task = false;
+        if (vehicle_tasks_offset < _num_vehicle_tasks &&
+            common_tasks_offset < _num_common_tasks) {
+            // still have entries on both lists; compare the
+            // priorities.  In case of a tie the vehicle-specific
+            // entry wins.
+            const Task &vehicle_task = _vehicle_tasks[vehicle_tasks_offset];
+            const Task &common_task = _common_tasks[common_tasks_offset];
+            if (vehicle_task.priority <= common_task.priority) {
+                run_vehicle_task = true;
+            }
+        } else if (vehicle_tasks_offset < _num_vehicle_tasks) {
+            // out of common tasks to run
+            run_vehicle_task = true;
+        } else if (common_tasks_offset < _num_common_tasks) {
+            // out of vehicle tasks to run
+            run_vehicle_task = false;
+        } else {
+            // this is an error; the outside loop should have terminated
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+            break;
+        }
+
+        const AP_Scheduler::Task &task = run_vehicle_task ? _vehicle_tasks[vehicle_tasks_offset] : _common_tasks[common_tasks_offset];
+        if (run_vehicle_task) {
+            vehicle_tasks_offset++;
+        } else {
+            common_tasks_offset++;
+        }
+
+        if (task.priority > MAX_FAST_TASK_PRIORITIES) {
+            const uint16_t dt = _tick_counter - _last_run[i];
+            // we allow 0 to mean loop rate
+            uint32_t interval_ticks = (is_zero(task.rate_hz) ? 1 : _loop_rate_hz / task.rate_hz);
+            if (interval_ticks < 1) {
+                interval_ticks = 1;
+            }
+            if (dt < interval_ticks) {
+                // this task is not yet scheduled to run again
+                continue;
+            }
+            // this task is due to run. Do we have enough time to run it?
+            _task_time_allowed = task.max_time_micros;
+
+            if (dt >= interval_ticks*2) {
+                perf_info.task_slipped(i);
+            }
+
+            if (dt >= interval_ticks*max_task_slowdown) {
+                // we are going beyond the maximum slowdown factor for a
+                // task. This will trigger increasing the time budget
+                task_not_achieved++;
+            }
+
+            if (_task_time_allowed > time_available) {
+                // not enough time to run this task.  Continue loop -
+                // maybe another task will fit into time remaining
+                continue;
+            }
+        } else {
+            _task_time_allowed = get_loop_period_us();
+        }
+
+        // run it
+        _task_time_started = now;
+        hal.util->persistent_data.scheduler_task = i;
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+        fill_nanf_stack();
+#endif
+        task.function();
+        hal.util->persistent_data.scheduler_task = -1;
+
+        // record the tick counter when we ran. This drives
+        // when we next run the event
+        _last_run[i] = _tick_counter;
+
+        // work out how long the event actually took
+        now = AP_HAL::micros();
+        uint32_t time_taken = now - _task_time_started;
+        bool overrun = false;
+        if (time_taken > _task_time_allowed) {
+            overrun = true;
+            // the event overran!
+            debug(3, "Scheduler overrun task[%u-%s] (%u/%u)\n",
+                  (unsigned)i,
+                  task.name,
+                  (unsigned)time_taken,
+                  (unsigned)_task_time_allowed);
+        }
+
+        perf_info.update_task_info(i, time_taken, overrun);
+
+        if (time_taken >= time_available) {
+            /*
+              we are out of time, but we need to keep walking the task
+              table in case there is another fast loop task after this
+              task, plus we need to update the accouting so we can
+              work out if we need to allocate extra time for the loop
+              (lower the loop rate)
+              Just set time_available to zero, which means we will
+              only run fast tasks after this one
+             */
+            time_available = 0;
+        } else {
+            time_available -= time_taken;
+        }
+    }
+
+    // update number of spare microseconds
+    _spare_micros += time_available;
+
+    _spare_ticks++;
+    if (_spare_ticks == 32) {
+        _spare_ticks /= 2;
+        _spare_micros /= 2;
+    }
+}
+
+/*
+  return number of micros until the current task reaches its deadline
+ */
+uint16_t AP_Scheduler::time_available_usec(void) const
+{
+    uint32_t dt = AP_HAL::micros() - _task_time_started;
+    if (dt > _task_time_allowed) {
+        return 0;
+    }
+    return _task_time_allowed - dt;
+}
+
+/*
+  calculate load average as a number from 0 to 1
+ */
+float AP_Scheduler::load_average()
+{
+    // return 1 if filtered main loop rate is 5% below the configured rate
+    if (get_filtered_loop_rate_hz() < get_loop_rate_hz() * 0.95) {
+        return 1.0;
+    }
+    if (_spare_ticks == 0) {
+        return 0.0f;
+    }
+    const uint32_t loop_us = get_loop_period_us();
+    const uint32_t used_time = loop_us - (_spare_micros/_spare_ticks);
+    return constrain_float(used_time / (float)loop_us, 0, 1);
+}
+
+void AP_Scheduler::loop()
+{
+    // wait for an INS sample
+    hal.util->persistent_data.scheduler_task = -3;
+    _rsem.give();
+    AP::ins().wait_for_sample();
+    _rsem.take_blocking();
+    hal.util->persistent_data.scheduler_task = -1;
+
+    const uint32_t sample_time_us = AP_HAL::micros();
+    
+    if (_loop_timer_start_us == 0) {
+        _loop_timer_start_us = sample_time_us;
+        _last_loop_time_s = get_loop_period_s();
+    } else {
+        _last_loop_time_s = (sample_time_us - _loop_timer_start_us) * 1.0e-6;
+    }
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    {
+        /*
+          for testing low CPU conditions we can add an optional delay in SITL
+        */
+        auto *sitl = AP::sitl();
+        uint32_t loop_delay_us = sitl? sitl->loop_delay.get() : 1000U;
+        hal.scheduler->delay_microseconds(loop_delay_us);
+    }
+#endif
+
+    // tell the scheduler one tick has passed
+    tick();
+
+    // run all the tasks that are due to run. Note that we only
+    // have to call this once per loop, as the tasks are scheduled
+    // in multiples of the main loop tick. So if they don't run on
+    // the first call to the scheduler they won't run on a later
+    // call until scheduler.tick() is called again
+    const uint32_t loop_us = get_loop_period_us();
+    uint32_t now = AP_HAL::micros();
+    uint32_t time_available = 0;
+    const uint32_t loop_tick_us = now - sample_time_us;
+    if (loop_tick_us < loop_us) {
+        // get remaining time available for this loop
+        time_available = loop_us - loop_tick_us;
+    }
+
+    // add in extra loop time determined by not achieving scheduler tasks
+    time_available += extra_loop_us;
+
+    // run the tasks
+    run(time_available);
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    // move result of AP_HAL::micros() forward:
+    hal.scheduler->delay_microseconds(1);
+#endif
+
+    if (task_not_achieved > 0) {
+        // add some extra time to the budget
+        extra_loop_us = MIN(extra_loop_us+100U, 5000U);
+        task_not_achieved = 0;
+        task_all_achieved = 0;
+    } else if (extra_loop_us > 0) {
+        task_all_achieved++;
+        if (task_all_achieved > 50) {
+            // we have gone through 50 loops without a task taking too
+            // long. CPU pressure has eased, so drop the extra time we're
+            // giving each loop
+            task_all_achieved = 0;
+            // we are achieving all tasks, slowly lower the extra loop time
+            extra_loop_us = MAX(0U, extra_loop_us-50U);
+        }
+    }
+
+    // check loop time
+    perf_info.check_loop_time(sample_time_us - _loop_timer_start_us);
+        
+    _loop_timer_start_us = sample_time_us;
+
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+    hal.simstate->update();
+#endif
+}
+
+#if HAL_LOGGING_ENABLED
+void AP_Scheduler::update_logging()
+{
+    if (debug_flags()) {
+        perf_info.update_logging();
+    }
+    if (_log_performance_bit != (uint32_t)-1 &&
+        AP::logger().should_log(_log_performance_bit)) {
+        Log_Write_Performance();
+    }
+    perf_info.set_loop_rate(get_loop_rate_hz());
+    perf_info.reset();
+    // dynamically update the per-task perf counter
+    if (!(_options & uint8_t(Options::RECORD_TASK_INFO)) && perf_info.has_task_info()) {
+        perf_info.free_task_info();
+    } else if ((_options & uint8_t(Options::RECORD_TASK_INFO)) && !perf_info.has_task_info()) {
+        perf_info.allocate_task_info(_num_tasks);
+    }
+}
+
+// Write a performance monitoring packet
+void AP_Scheduler::Log_Write_Performance()
+{
+    const AP_HAL::Util::PersistentData &pd = hal.util->persistent_data;
+    struct log_Performance pkt = {
+        LOG_PACKET_HEADER_INIT(LOG_PERFORMANCE_MSG),
+        time_us          : AP_HAL::micros64(),
+        loop_rate        : (uint16_t)(get_filtered_loop_rate_hz() + 0.5f),
+        num_long_running : perf_info.get_num_long_running(),
+        num_loops        : perf_info.get_num_loops(),
+        max_time         : perf_info.get_max_time(),
+        mem_avail        : hal.util->available_memory(),
+        load             : (uint16_t)(load_average() * 1000),
+        internal_error_last_line : AP::internalerror().last_error_line(),
+        internal_errors  : AP::internalerror().errors(),
+        internal_error_count : AP::internalerror().count(),
+        spi_count        : pd.spi_count,
+        i2c_count        : pd.i2c_count,
+        i2c_isr_count    : pd.i2c_isr_count,
+        extra_loop_us    : extra_loop_us,
+    };
+    AP::logger().WriteCriticalBlock(&pkt, sizeof(pkt));
+}
+#endif  // HAL_LOGGING_ENABLED
+
+// display task statistics as text buffer for @SYS/tasks.txt
+void AP_Scheduler::task_info(ExpandingString &str)
+{
+    // a header to allow for machine parsers to determine format
+    str.printf("TasksV2\n");
+
+    // dynamically enable statistics collection
+    if (!(_options & uint8_t(Options::RECORD_TASK_INFO))) {
+        _options.set(_options | uint8_t(Options::RECORD_TASK_INFO));
+        return;
+    }
+
+    if (perf_info.get_task_info(0) == nullptr) {
+        return;
+    }
+
+    // baseline the total time taken by all tasks
+    float total_time = 1.0f;
+    for (uint8_t i = 0; i < _num_tasks + 1; i++) {
+        const AP::PerfInfo::TaskInfo* ti = perf_info.get_task_info(i);
+        if (ti != nullptr && ti->tick_count > 0) {
+            total_time += ti->elapsed_time_us;
+        }
+    }
+
+    uint8_t vehicle_tasks_offset = 0;
+    uint8_t common_tasks_offset = 0;
+
+    for (uint8_t i = 0; i < _num_tasks; i++) {
+        const AP::PerfInfo::TaskInfo* ti = perf_info.get_task_info(i);
+        const char *task_name;
+
+        // determine which of the common task / vehicle task to run
+        bool run_vehicle_task = false;
+        if (vehicle_tasks_offset < _num_vehicle_tasks &&
+            common_tasks_offset < _num_common_tasks) {
+            // still have entries on both lists; compare the
+            // priorities.  In case of a tie the vehicle-specific
+            // entry wins.
+            const Task &vehicle_task = _vehicle_tasks[vehicle_tasks_offset];
+            const Task &common_task = _common_tasks[common_tasks_offset];
+            if (vehicle_task.priority <= common_task.priority) {
+                run_vehicle_task = true;
+            }
+        } else if (vehicle_tasks_offset < _num_vehicle_tasks) {
+            // out of common tasks to run
+            run_vehicle_task = true;
+        } else if (common_tasks_offset < _num_common_tasks) {
+            // out of vehicle tasks to run
+            run_vehicle_task = false;
+        } else {
+            // this is an error; the outside loop should have terminated
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+            return;
+        }
+
+        if (run_vehicle_task) {
+            task_name = _vehicle_tasks[vehicle_tasks_offset++].name;
+        } else {
+            task_name = _common_tasks[common_tasks_offset++].name;
+        }
+
+        ti->print(task_name, total_time, str);
+    }
+}
+
+namespace AP {
+
+AP_Scheduler &scheduler()
+{
+    return *AP_Scheduler::get_singleton();
+}
+
+};
+
+#endif  // AP_SCHEDULER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ *  main loop scheduler for APM
+ *  Author: Andrew Tridgell, January 2013
+ *
+ */
+#pragma once
+
+#include "AP_Scheduler_config.h"
+
+#if AP_SCHEDULER_ENABLED
+
+#include <AP_Param/AP_Param.h>
+#include <AP_HAL/Semaphores.h>
+#include <AP_HAL/Util.h>
+#include <AP_Math/AP_Math.h>
+#include "PerfInfo.h"       // loop perf monitoring
+
+#if AP_SCHEDULER_EXTENDED_TASKINFO_ENABLED
+#define AP_SCHEDULER_NAME_INITIALIZER(_clazz,_name) .name = #_clazz "::" #_name,
+#define AP_FAST_NAME_INITIALIZER(_clazz,_name) .name = #_clazz "::" #_name "*",
+#else
+#define AP_SCHEDULER_NAME_INITIALIZER(_clazz,_name) .name = #_name,
+#define AP_FAST_NAME_INITIALIZER(_clazz,_name) .name = #_name "*",
+#endif
+#define LOOP_RATE 0
+
+/*
+  useful macro for creating scheduler task table
+ */
+#define SCHED_TASK_CLASS(classname, classptr, func, _rate_hz, _max_time_micros, _priority) { \
+    .function = FUNCTOR_BIND(classptr, &classname::func, void),\
+    AP_SCHEDULER_NAME_INITIALIZER(classname, func)\
+    .rate_hz = _rate_hz,\
+    .max_time_micros = _max_time_micros,        \
+    .priority = _priority \
+}
+
+/*
+  useful macro for creating the fastloop task table
+ */
+#define FAST_TASK_CLASS(classname, classptr, func) { \
+    .function = FUNCTOR_BIND(classptr, &classname::func, void),\
+    AP_FAST_NAME_INITIALIZER(classname, func)\
+    .rate_hz = 0,\
+    .max_time_micros = 0,\
+    .priority = AP_Scheduler::FAST_TASK_PRI0 \
+}
+
+/*
+  A task scheduler for APM main loops
+
+  Sketches should call scheduler.init() on startup, then call
+  scheduler.tick() at regular intervals (typically every 10ms).
+
+  To run tasks use scheduler.run(), passing the amount of time that
+  the scheduler is allowed to use before it must return
+ */
+
+class AP_Scheduler
+{
+public:
+    AP_Scheduler();
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Scheduler);
+
+    static AP_Scheduler *get_singleton();
+    static AP_Scheduler *_singleton;
+
+    FUNCTOR_TYPEDEF(task_fn_t, void);
+
+    struct Task {
+        task_fn_t function;
+        const char *name;
+        float rate_hz;
+        uint16_t max_time_micros;
+        uint8_t priority; // task priority
+    };
+
+    enum class Options : uint8_t {
+        RECORD_TASK_INFO = 1 << 0
+    };
+
+    enum FastTaskPriorities {
+        FAST_TASK_PRI0 = 0,
+        FAST_TASK_PRI1 = 1,
+        FAST_TASK_PRI2 = 2,
+        MAX_FAST_TASK_PRIORITIES = 3
+    };
+
+    // initialise scheduler
+    void init(const Task *tasks, uint8_t num_tasks, uint32_t log_performance_bit);
+
+    // called by vehicle's main loop - which should be the only thing
+    // that function does
+    void loop();
+
+    // call to update any logging the scheduler might do; call at 1Hz
+    void update_logging();
+
+    // write out PERF message to logger
+    void Log_Write_Performance();
+
+    // call when one tick has passed
+    void tick(void);
+
+    // return current tick counter
+    uint16_t ticks() const { return _tick_counter; }
+    uint32_t ticks32() const { return _tick_counter32; }
+
+    // run the tasks. Call this once per 'tick'.
+    // time_available is the amount of time available to run
+    // tasks in microseconds
+    void run(uint32_t time_available);
+
+    // return the number of microseconds available for the current task
+    uint16_t time_available_usec(void) const;
+
+    // return debug parameter
+    uint8_t debug_flags(void) { return _debug; }
+
+    // return load average, as a number between 0 and 1. 1 means
+    // 100% load. Calculated from how much spare time we have at the
+    // end of a run()
+    float load_average();
+
+    // get the active main loop rate
+    uint16_t get_loop_rate_hz(void) {
+        if (_active_loop_rate_hz == 0) {
+            _active_loop_rate_hz = _loop_rate_hz;
+        }
+        return _active_loop_rate_hz;
+    }
+    // get the time-allowed-per-loop in microseconds
+    uint32_t get_loop_period_us() {
+        if (_loop_period_us == 0) {
+            _loop_period_us = 1000000UL / _loop_rate_hz;
+        }
+        return _loop_period_us;
+    }
+    // get the time-allowed-per-loop in seconds
+    float get_loop_period_s() {
+        if (is_zero(_loop_period_s)) {
+            _loop_period_s = 1.0f / _loop_rate_hz;
+        }
+        return _loop_period_s;
+    }
+
+    // get the filtered main loop time in seconds
+    float get_filtered_loop_time(void) const {
+        return perf_info.get_filtered_time();
+    }
+
+    // get the filtered active main loop rate
+    float get_filtered_loop_rate_hz() {
+        return perf_info.get_filtered_loop_rate_hz();
+    }
+
+    // get the time in seconds that the last loop took
+    float get_last_loop_time_s(void) const {
+        return _last_loop_time_s;
+    }
+
+    // get the amount of extra time being added on each loop
+    uint32_t get_extra_loop_us(void) const {
+        return extra_loop_us;
+    }
+
+    HAL_Semaphore &get_semaphore(void) { return _rsem; }
+
+    void task_info(ExpandingString &str);
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // loop performance monitoring:
+    AP::PerfInfo perf_info;
+
+private:
+    // used to enable scheduler debugging
+    AP_Int8 _debug;
+
+    // overall scheduling rate in Hz
+    AP_Int16 _loop_rate_hz;
+
+    // loop rate in Hz as set at startup
+    AP_Int16 _active_loop_rate_hz;
+
+    // scheduler options
+    AP_Int8 _options;
+    
+    // calculated loop period in usec
+    uint16_t _loop_period_us;
+
+    // calculated loop period in seconds
+    float _loop_period_s;
+    
+    // list of tasks to run
+    const struct Task *_vehicle_tasks;
+    uint8_t _num_vehicle_tasks;
+
+    // list of common tasks to run
+    const struct Task *_common_tasks;
+    uint8_t _num_common_tasks;
+
+    // total number of tasks in _tasks and _common_tasks list
+    uint8_t _num_tasks;
+
+    // number of 'ticks' that have passed (number of times that
+    // tick() has been called
+    uint16_t _tick_counter;
+    uint32_t _tick_counter32;
+
+    // tick counter at the time we last ran each task
+    uint16_t *_last_run;
+
+    // number of microseconds allowed for the current task
+    uint32_t _task_time_allowed;
+
+    // the time in microseconds when the task started
+    uint32_t _task_time_started;
+
+    // number of spare microseconds accumulated
+    uint32_t _spare_micros;
+
+    // number of ticks that _spare_micros is counted over
+    uint8_t _spare_ticks;
+
+    // start of loop timing
+    uint32_t _loop_timer_start_us;
+
+    // time of last loop in seconds
+    float _last_loop_time_s;
+    
+    // bitmask bit which indicates if we should log PERF message
+    uint32_t _log_performance_bit;
+
+    // maximum task slowdown compared to desired task rate before we
+    // start giving extra time per loop
+    const uint8_t max_task_slowdown = 4;
+
+    // counters to handle dynamically adjusting extra loop time to
+    // cope with low CPU conditions
+    uint32_t task_not_achieved;
+    uint32_t task_all_achieved;
+    
+    // extra time available for each loop - used to dynamically adjust
+    // the loop rate in case we are well over budget
+    uint32_t extra_loop_us;
+
+
+    // semaphore that is held while not waiting for ins samples
+    HAL_Semaphore _rsem;
+};
+
+namespace AP {
+    AP_Scheduler &scheduler();
+};
+
+#endif  // AP_SCHEDULER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                               #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_SCHEDULER_ENABLED
+#define AP_SCHEDULER_ENABLED 1
+#endif
+
+#ifndef AP_SCHEDULER_EXTENDED_TASKINFO_ENABLED
+#define AP_SCHEDULER_EXTENDED_TASKINFO_ENABLED 1
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #include "AP_Scheduler_config.h"
+
+#if AP_SCHEDULER_ENABLED
+
+#include "PerfInfo.h"
+
+#include <AP_Logger/AP_Logger.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_InternalError/AP_InternalError.h>
+#include "AP_Scheduler.h"
+
+extern const AP_HAL::HAL& hal;
+
+//
+//  high level performance monitoring
+//
+//  we measure the main loop time
+//
+
+// reset - reset all records of loop time to zero
+void AP::PerfInfo::reset()
+{
+    loop_count = 0;
+    max_time = 0;
+    min_time = 0;
+    long_running = 0;
+    sigma_time = 0;
+    sigmasquared_time = 0;
+    if (_task_info != nullptr) {
+        memset(_task_info, 0, (_num_tasks) * sizeof(TaskInfo));
+    }
+}
+
+// ignore_loop - ignore this loop from performance measurements (used to reduce false positive when arming)
+void AP::PerfInfo::ignore_this_loop()
+{
+    ignore_loop = true;
+}
+
+// allocate the array of task statistics for use by @SYS/tasks.txt
+void AP::PerfInfo::allocate_task_info(uint8_t num_tasks)
+{
+    _task_info = NEW_NOTHROW TaskInfo[num_tasks];
+    if (_task_info == nullptr) {
+        DEV_PRINTF("Unable to allocate scheduler TaskInfo\n");
+        _num_tasks = 0;
+        return;
+    }
+    _num_tasks = num_tasks;
+}
+
+void AP::PerfInfo::free_task_info()
+{
+    delete[] _task_info;
+    _task_info = nullptr;
+    _num_tasks = 0;
+}
+
+// called after each run of a task to update its statistics based on measurements taken by the scheduler
+void AP::PerfInfo::update_task_info(uint8_t task_index, uint16_t task_time_us, bool overrun)
+{
+    if (_task_info == nullptr) {
+        return;
+    }
+
+    if (task_index >= _num_tasks) {
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        return;
+    }
+    TaskInfo& ti = _task_info[task_index];
+    ti.update(task_time_us, overrun);
+}
+
+void AP::PerfInfo::TaskInfo::update(uint16_t task_time_us, bool overrun)
+{
+    max_time_us = MAX(max_time_us, task_time_us);
+    if (min_time_us == 0) {
+        min_time_us = task_time_us;
+    } else {
+        min_time_us = MIN(min_time_us, task_time_us);
+    }
+    elapsed_time_us += task_time_us;
+    tick_count++;
+    if (overrun) {
+        overrun_count++;
+    }
+}
+
+void AP::PerfInfo::TaskInfo::print(const char* task_name, uint32_t total_time, ExpandingString& str) const
+{
+    uint16_t avg = 0;
+    float pct = 0.0f;
+    if (tick_count > 0) {
+        pct = elapsed_time_us * 100.0f / total_time;
+        avg = MIN(uint16_t(elapsed_time_us / tick_count), 9999);
+    }
+#if AP_SCHEDULER_EXTENDED_TASKINFO_ENABLED
+    const char* fmt = "%-32.32s MIN=%4u MAX=%4u AVG=%4u OVR=%3u SLP=%3u, TOT=%4.1f%%\n";
+#else
+    const char* fmt = "%-16.16s MIN=%4u MAX=%4u AVG=%4u OVR=%3u SLP=%3u, TOT=%4.1f%%\n";
+#endif
+    str.printf(fmt, task_name,
+                unsigned(MIN(min_time_us, 9999)), unsigned(MIN(max_time_us, 9999)), unsigned(avg),
+                unsigned(MIN(overrun_count, 999)), unsigned(MIN(slip_count, 999)), pct);
+}
+
+// check_loop_time - check latest loop time vs min, max and overtime threshold
+void AP::PerfInfo::check_loop_time(uint32_t time_in_micros)
+{
+    loop_count++;
+
+    // exit if this loop should be ignored
+    if (ignore_loop) {
+        ignore_loop = false;
+        return;
+    }
+
+    if( time_in_micros > max_time) {
+        max_time = time_in_micros;
+    }
+    if( min_time == 0 || time_in_micros < min_time) {
+        min_time = time_in_micros;
+    }
+    if (time_in_micros > overtime_threshold_micros) {
+        long_running++;
+    }
+    sigma_time += time_in_micros;
+    sigmasquared_time += time_in_micros * time_in_micros;
+
+    /* we keep a filtered loop time for use as G_Dt which is the
+       predicted time for the next loop. We remove really excessive
+       times from this calculation so as not to throw it off too far
+       in case we get a single long loop
+
+       Note that the time we use here is the time between calls to
+       check_loop_time() not the time from loop start to loop
+       end. This is because we are using the time for time between
+       calls to controllers, which has nothing to do with cpu speed.
+    */
+    const uint32_t now = AP_HAL::micros();
+    const uint32_t loop_time_us = now - last_check_us;
+    last_check_us = now;
+    if (loop_time_us < overtime_threshold_micros + 10000UL) {
+        filtered_loop_time = 0.99f * filtered_loop_time + 0.01f * loop_time_us * 1.0e-6f;
+    }
+}
+
+// get_num_loops: return number of loops used for recording performance
+uint16_t AP::PerfInfo::get_num_loops() const
+{
+    return loop_count;
+}
+
+// get_max_time - return maximum loop time (in microseconds)
+uint32_t AP::PerfInfo::get_max_time() const
+{
+    return max_time;
+}
+
+// get_min_time - return minumum loop time (in microseconds)
+uint32_t AP::PerfInfo::get_min_time() const
+{
+    return min_time;
+}
+
+// get_num_long_running - get number of long running loops
+uint16_t AP::PerfInfo::get_num_long_running() const
+{
+    return long_running;
+}
+
+// get_avg_time - return average loop time (in microseconds)
+uint32_t AP::PerfInfo::get_avg_time() const
+{
+    return (sigma_time / loop_count);
+}
+
+// get_stddev_time - return stddev of average loop time (in us)
+uint32_t AP::PerfInfo::get_stddev_time() const
+{
+    return sqrtf((sigmasquared_time - (sigma_time*sigma_time)/loop_count) / loop_count);
+}
+
+// get_filtered_time - return low pass filtered loop time in seconds
+float AP::PerfInfo::get_filtered_time() const
+{
+    return filtered_loop_time;
+}
+
+// return low pass filtered loop rate in hz
+float AP::PerfInfo::get_filtered_loop_rate_hz() const
+{
+    const float filt_time_s = get_filtered_time();
+    if (filt_time_s <= 0) {
+        return loop_rate_hz;
+    }
+    return 1.0 / filt_time_s;
+}
+
+
+void AP::PerfInfo::update_logging() const
+{
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                    "PERF: %u/%u [%lu:%lu] F=%uHz sd=%lu Ex=%lu",
+                    (unsigned)get_num_long_running(),
+                    (unsigned)get_num_loops(),
+                    (unsigned long)get_max_time(),
+                    (unsigned long)get_min_time(),
+                    (unsigned)(0.5+get_filtered_loop_rate_hz()),
+                    (unsigned long)get_stddev_time(),
+                    (unsigned long)AP::scheduler().get_extra_loop_us());
+}
+
+void AP::PerfInfo::set_loop_rate(uint16_t rate_hz)
+{
+    // allow a 20% overrun before we consider a loop "slow":
+    overtime_threshold_micros = 1000000/rate_hz * 1.2f;
+
+    if (loop_rate_hz != rate_hz) {
+        loop_rate_hz = rate_hz;
+        filtered_loop_time = 1.0f / rate_hz;
+    }
+}
+
+#endif  // AP_SCHEDULER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #pragma once
+
+#include "AP_Scheduler_config.h"
+
+#if AP_SCHEDULER_ENABLED
+
+#include <stdint.h>
+#include <AP_Common/ExpandingString.h>
+
+namespace AP {
+
+class PerfInfo {
+public:
+    PerfInfo() {}
+
+    // per-task timing information
+    struct TaskInfo {
+        uint16_t min_time_us;
+        uint16_t max_time_us;
+        uint32_t elapsed_time_us;
+        uint32_t tick_count;
+        uint16_t slip_count;
+        uint16_t overrun_count;
+
+        void update(uint16_t task_time_us, bool overrun);
+        void print(const char* task_name, uint32_t total_time, ExpandingString& str) const;
+    };
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(PerfInfo);
+
+    void reset();
+    void ignore_this_loop();
+    void check_loop_time(uint32_t time_in_micros);
+    uint16_t get_num_loops() const;
+    uint32_t get_max_time() const;
+    uint32_t get_min_time() const;
+    uint16_t get_num_long_running() const;
+    uint32_t get_avg_time() const;
+    uint32_t get_stddev_time() const;
+    float    get_filtered_time() const;
+    float get_filtered_loop_rate_hz() const;
+    void set_loop_rate(uint16_t rate_hz);
+
+    void update_logging() const;
+
+    // allocate the array of task statistics for use by @SYS/tasks.txt
+    void allocate_task_info(uint8_t num_tasks);
+    void free_task_info();
+    // whether or not we have task info allocated
+    bool has_task_info() { return _task_info != nullptr; }
+    // return a task info
+    const TaskInfo* get_task_info(uint8_t task_index) const {
+        return (_task_info && task_index < _num_tasks) ? &_task_info[task_index] : nullptr;
+    }
+    // called after each run of a task to update its statistics based on measurements taken by the scheduler
+    void update_task_info(uint8_t task_index, uint16_t task_time_us, bool overrun);
+    // record that a task slipped
+    void task_slipped(uint8_t task_index) {
+        if (_task_info && task_index < _num_tasks) {
+            _task_info[task_index].overrun_count++;
+        }
+    }
+
+private:
+    uint16_t loop_rate_hz;
+    uint16_t overtime_threshold_micros;
+    uint16_t loop_count;
+    uint32_t max_time; // in microseconds
+    uint32_t min_time; // in microseconds
+    uint64_t sigma_time;
+    uint64_t sigmasquared_time;
+    uint16_t long_running;
+    uint32_t last_check_us;
+    float filtered_loop_time;
+    bool ignore_loop;
+    // performance monitoring
+    uint8_t _num_tasks;
+    TaskInfo* _task_info;
+};
+
+};
+
+#endif  // AP_SCHEDULER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         //
+// Simple test for the AP_Scheduler interface
+//
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+#include <AP_Scheduler/AP_Scheduler.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_Logger/AP_Logger.h>
+#include <GCS_MAVLink/GCS_Dummy.h>
+#include <stdio.h>
+
+const struct AP_Param::GroupInfo        GCS_MAVLINK_Parameters::var_info[] = {
+    AP_GROUPEND
+};
+GCS_Dummy _gcs;
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+AP_Logger logger;
+
+class SchedTest {
+public:
+    void setup();
+    void loop();
+
+private:
+
+#if HAL_EXTERNAL_AHRS_ENABLED
+    AP_ExternalAHRS eAHRS;
+#endif // HAL_EXTERNAL_AHRS_ENABLED
+    AP_Scheduler scheduler;
+
+    uint32_t ins_counter;
+    uint32_t count_5s;
+    uint32_t count_1s;
+    static const AP_Scheduler::Task scheduler_tasks[];
+
+    void ins_update(void);
+    void one_hz_print(void);
+    void five_second_call(void);
+};
+
+static AP_BoardConfig board_config;
+static SchedTest schedtest;
+
+#define SCHED_TASK(func, _interval_ticks, _max_time_micros, _priority) SCHED_TASK_CLASS(SchedTest, &schedtest, func, _interval_ticks, _max_time_micros, _priority)
+
+/*
+  scheduler table - all regular tasks should be listed here.
+
+  All entries in this table must be ordered by priority.
+
+  This table is interleaved with the table in AP_Vehicle to determine
+  the order in which tasks are run.  Convenience methods SCHED_TASK
+  and SCHED_TASK_CLASS are provided to build entries in this structure:
+
+SCHED_TASK arguments:
+ - name of static function to call
+ - rate (in Hertz) at which the function should be called
+ - expected time (in MicroSeconds) that the function should take to run
+ - priority (0 through 255, lower number meaning higher priority)
+
+SCHED_TASK_CLASS arguments:
+ - class name of method to be called
+ - instance on which to call the method
+ - method to call on that instance
+ - rate (in Hertz) at which the method should be called
+ - expected time (in MicroSeconds) that the method should take to run
+ - priority (0 through 255, lower number meaning higher priority)
+
+ */
+const AP_Scheduler::Task SchedTest::scheduler_tasks[] = {
+    SCHED_TASK(ins_update,             50,   1000, 3),
+    SCHED_TASK(one_hz_print,            1,   1000, 6),
+    SCHED_TASK(five_second_call,      0.2,   1800, 9),
+};
+
+
+void SchedTest::setup(void)
+{
+
+    board_config.init();
+
+    // initialise the scheduler
+    scheduler.init(&scheduler_tasks[0], ARRAY_SIZE(scheduler_tasks), (uint32_t)-1);
+}
+
+void SchedTest::loop(void)
+{
+    // run all tasks
+    scheduler.loop();
+    if (ins_counter == 1000) {
+        bool ok = true;
+        if (count_5s != 4) {
+            ::printf("ERROR: count_5s=%u\n", (unsigned)count_5s);
+            ok = false;
+        }
+        if (count_1s != 20) {
+            ::printf("ERROR: count_1s=%u\n", (unsigned)count_1s);
+            ok = false;
+        }
+        if (!ok) {
+            ::printf("Test FAILED\n");
+            exit(1);
+        } else {
+            ::printf("Test PASSED\n");
+            exit(0);
+        }
+    }
+}
+
+/*
+  update inertial sensor, reading data 
+ */
+void SchedTest::ins_update(void)
+{
+    ins_counter++;
+}
+
+/*
+  print something once a second
+ */
+void SchedTest::one_hz_print(void)
+{
+    hal.console->printf("one_hz: t=%lu\n", (unsigned long)AP_HAL::millis());
+    count_1s++;
+}
+
+/*
+  print something every 5 seconds
+ */
+void SchedTest::five_second_call(void)
+{
+    hal.console->printf("five_seconds: t=%lu ins_counter=%u\n", (unsigned long)AP_HAL::millis(), (unsigned)ins_counter);
+    count_5s++;
+}
+
+/*
+  compatibility with old pde style build
+ */
+void setup(void);
+void loop(void);
+
+void setup(void)
+{
+    schedtest.setup();
+}
+
+void loop(void)
+{
+    schedtest.loop();
+}
+
+AP_HAL_MAIN();
+                                                                                                                                                                                                                                                                                                                                                                  #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_example(
+        use='ap',
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           lua_generated_bindings.cpp
+lua_generated_bindings.h
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_Scripting_config.h"
+
+#if AP_SCRIPTING_ENABLED
+
+#include <AP_Scripting/AP_Scripting.h>
+#include <AP_HAL/AP_HAL.h>
+#include <GCS_MAVLink/GCS.h>
+
+#include "lua_scripts.h"
+
+// ensure that we have a set of stack sizes, and enforce constraints around it
+// except for the minimum size, these are allowed to be defined by the build system
+#undef SCRIPTING_STACK_MIN_SIZE
+#define SCRIPTING_STACK_MIN_SIZE (8 * 1024)
+
+#if !defined(SCRIPTING_STACK_SIZE)
+  #define SCRIPTING_STACK_SIZE (17 * 1024) // Linux experiences stack corruption at ~16.25KB when handed bad scripts
+#endif // !defined(SCRIPTING_STACK_SIZE)
+
+#if !defined(SCRIPTING_STACK_MAX_SIZE)
+  #define SCRIPTING_STACK_MAX_SIZE (64 * 1024)
+#endif // !defined(SCRIPTING_STACK_MAX_SIZE)
+
+#if !defined(SCRIPTING_HEAP_SIZE)
+  #if CONFIG_HAL_BOARD == HAL_BOARD_SITL || CONFIG_HAL_BOARD == HAL_BOARD_LINUX || HAL_MEM_CLASS >= HAL_MEM_CLASS_1000
+    #define SCRIPTING_HEAP_SIZE (200 * 1024)
+  #elif HAL_MEM_CLASS >= HAL_MEM_CLASS_500
+    #define SCRIPTING_HEAP_SIZE (100 * 1024)
+  #else
+    #define SCRIPTING_HEAP_SIZE (43 * 1024)
+  #endif
+#endif // !defined(SCRIPTING_HEAP_SIZE)
+
+static_assert(SCRIPTING_STACK_SIZE >= SCRIPTING_STACK_MIN_SIZE, "Scripting requires a larger minimum stack size");
+static_assert(SCRIPTING_STACK_SIZE <= SCRIPTING_STACK_MAX_SIZE, "Scripting requires a smaller stack size");
+
+#ifndef SCRIPTING_ENABLE_DEFAULT
+#define SCRIPTING_ENABLE_DEFAULT 0
+#endif
+
+#if AP_NETWORKING_ENABLED
+#include <AP_HAL/utility/Socket.h>
+#endif
+
+extern const AP_HAL::HAL& hal;
+
+const AP_Param::GroupInfo AP_Scripting::var_info[] = {
+    // @Param: ENABLE
+    // @DisplayName: Enable Scripting
+    // @Description: Controls if scripting is enabled
+    // @Values: 0:None,1:Lua Scripts
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO_FLAGS("ENABLE", 1, AP_Scripting, _enable, SCRIPTING_ENABLE_DEFAULT, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: VM_I_COUNT
+    // @DisplayName: Scripting Virtual Machine Instruction Count
+    // @Description: The number virtual machine instructions that can be run before considering a script to have taken an excessive amount of time
+    // @Range: 1000 1000000
+    // @Increment: 10000
+    // @User: Advanced
+    AP_GROUPINFO("VM_I_COUNT", 2, AP_Scripting, _script_vm_exec_count, 10000),
+
+    // @Param: HEAP_SIZE
+    // @DisplayName: Scripting Heap Size
+    // @Description: Amount of memory available for scripting
+    // @Range: 1024 1048576
+    // @Increment: 1024
+    // @User: Advanced
+    // @RebootRequired: True
+    AP_GROUPINFO("HEAP_SIZE", 3, AP_Scripting, _script_heap_size, SCRIPTING_HEAP_SIZE),
+
+    // @Param: DEBUG_OPTS
+    // @DisplayName: Scripting Debug Level
+    // @Description: Debugging options
+    // @Bitmask: 0: No Scripts to run message if all scripts have stopped
+    // @Bitmask: 1: Runtime messages for memory usage and execution time
+    // @Bitmask: 2: Suppress logging scripts to dataflash
+    // @Bitmask: 3: log runtime memory usage and execution time
+    // @Bitmask: 4: Disable pre-arm check
+    // @Bitmask: 5: Save CRC of current scripts to loaded and running checksum parameters enabling pre-arm
+    // @User: Advanced
+    AP_GROUPINFO("DEBUG_OPTS", 4, AP_Scripting, _debug_options, 0),
+
+    // @Param: USER1
+    // @DisplayName: Scripting User Parameter1
+    // @Description: General purpose user variable input for scripts
+    // @User: Standard
+    AP_GROUPINFO("USER1", 5, AP_Scripting, _user[0], 0.0),
+
+    // @Param: USER2
+    // @DisplayName: Scripting User Parameter2
+    // @Description: General purpose user variable input for scripts
+    // @User: Standard
+    AP_GROUPINFO("USER2", 6, AP_Scripting, _user[1], 0.0),
+
+    // @Param: USER3
+    // @DisplayName: Scripting User Parameter3
+    // @Description: General purpose user variable input for scripts
+    // @User: Standard
+    AP_GROUPINFO("USER3", 7, AP_Scripting, _user[2], 0.0),
+
+    // @Param: USER4
+    // @DisplayName: Scripting User Parameter4
+    // @Description: General purpose user variable input for scripts
+    // @User: Standard
+    AP_GROUPINFO("USER4", 8, AP_Scripting, _user[3], 0.0),
+
+    // @Param: USER5
+    // @DisplayName: Scripting User Parameter5
+    // @Description: General purpose user variable input for scripts
+    // @User: Standard
+    AP_GROUPINFO("USER5", 10, AP_Scripting, _user[4], 0.0),
+
+    // @Param: USER6
+    // @DisplayName: Scripting User Parameter6
+    // @Description: General purpose user variable input for scripts
+    // @User: Standard
+    AP_GROUPINFO("USER6", 11, AP_Scripting, _user[5], 0.0),
+    
+    // @Param: DIR_DISABLE
+    // @DisplayName: Directory disable
+    // @Description: This will stop scripts being loaded from the given locations
+    // @Bitmask: 0:ROMFS, 1:APM/scripts
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("DIR_DISABLE", 9, AP_Scripting, _dir_disable, 0),
+
+    // @Param: LD_CHECKSUM
+    // @DisplayName: Loaded script checksum
+    // @Description: Required XOR of CRC32 checksum of loaded scripts, vehicle will not arm with incorrect scripts loaded, -1 disables
+    // @User: Advanced
+    AP_GROUPINFO("LD_CHECKSUM", 12, AP_Scripting, _required_loaded_checksum, -1),
+
+    // @Param: RUN_CHECKSUM
+    // @DisplayName: Running script checksum
+    // @Description: Required XOR of CRC32 checksum of running scripts, vehicle will not arm with incorrect scripts running, -1 disables
+    // @User: Advanced
+    AP_GROUPINFO("RUN_CHECKSUM", 13, AP_Scripting, _required_running_checksum, -1),
+
+    // @Param: THD_PRIORITY
+    // @DisplayName: Scripting thread priority
+    // @Description: This sets the priority of the scripting thread. This is normally set to a low priority to prevent scripts from interfering with other parts of the system. Advanced users can change this priority if scripting needs to be prioritised for realtime applications. WARNING: changing this parameter can impact the stability of your flight controller. The scipting thread priority in this parameter is chosen based on a set of system level priorities for other subsystems. It is strongly recommended that you use the lowest priority that is sufficient for your application. Note that all scripts run at the same priority, so if you raise this priority you must carefully audit all lua scripts for behaviour that does not interfere with the operation of the system.
+    // @Values: 0:Normal, 1:IO Priority, 2:Storage Priority, 3:UART Priority, 4:I2C Priority, 5:SPI Priority, 6:Timer Priority, 7:Main Priority, 8:Boost Priority
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("THD_PRIORITY", 14, AP_Scripting, _thd_priority, uint8_t(ThreadPriority::NORMAL)),
+
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+    // @Param: SDEV_EN
+    // @DisplayName: Scripting serial device enable
+    // @Description: Enable scripting serial devices
+    // @Values: 0:Disabled, 1:Enabled
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO_FLAGS("SDEV_EN", 15,  AP_Scripting, _serialdevice.enable, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: SDEV1_PROTO
+    // @DisplayName: Serial protocol of scripting serial device
+    // @Description: Serial protocol of scripting serial device
+    // @CopyFieldsFrom: SERIAL1_PROTOCOL
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("SDEV1_PROTO", 16,  AP_Scripting, _serialdevice.ports[0].state.protocol, -1),
+
+#if AP_SCRIPTING_SERIALDEVICE_NUM_PORTS > 1
+    // @Param: SDEV2_PROTO
+    // @DisplayName: Serial protocol of scripting serial device
+    // @Description: Serial protocol of scripting serial device
+    // @CopyFieldsFrom: SCR_SDEV1_PROTO
+    AP_GROUPINFO("SDEV2_PROTO", 17,  AP_Scripting, _serialdevice.ports[1].state.protocol, -1),
+#endif
+
+#if AP_SCRIPTING_SERIALDEVICE_NUM_PORTS > 2
+    // @Param: SDEV3_PROTO
+    // @DisplayName: Serial protocol of scripting serial device
+    // @Description: Serial protocol of scripting serial device
+    // @CopyFieldsFrom: SCR_SDEV1_PROTO
+    AP_GROUPINFO("SDEV3_PROTO", 18,  AP_Scripting, _serialdevice.ports[2].state.protocol, -1),
+#endif
+#endif // AP_SCRIPTING_SERIALDEVICE_ENABLED
+
+    // WARNING: additional parameters must be listed before SDEV_EN (but have an
+    // index after SDEV3_PROTO) so they are not disabled by it!
+    
+    AP_GROUPEND
+};
+
+AP_Scripting::AP_Scripting() {
+    AP_Param::setup_object_defaults(this, var_info);
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    if (_singleton != nullptr) {
+        AP_HAL::panic("Scripting must be a singleton");
+    }
+#endif // CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    _singleton = this;
+}
+
+void AP_Scripting::init(void) {
+    if (!_enable) {
+        return;
+    }
+
+#if AP_FILESYSTEM_FILE_WRITING_ENABLED
+    if ((_dir_disable & uint16_t(AP_Scripting::SCR_DIR::SCRIPTS)) == 0) {
+        // Only try creating scripts directory if loading from it is enabled
+        const char *dir_name = SCRIPTING_DIRECTORY;
+        if (AP::FS().mkdir(dir_name)) {
+            if (errno != EEXIST) {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Scripting: failed to create (%s)", dir_name);
+            }
+        }
+    }
+#endif
+
+    AP_HAL::Scheduler::priority_base priority = AP_HAL::Scheduler::PRIORITY_SCRIPTING;
+    static const struct {
+        ThreadPriority scr_priority;
+        AP_HAL::Scheduler::priority_base hal_priority;
+    } priority_map[] = {
+        { ThreadPriority::NORMAL, AP_HAL::Scheduler::PRIORITY_SCRIPTING },
+        { ThreadPriority::IO, AP_HAL::Scheduler::PRIORITY_IO },
+        { ThreadPriority::STORAGE, AP_HAL::Scheduler::PRIORITY_STORAGE },
+        { ThreadPriority::UART, AP_HAL::Scheduler::PRIORITY_UART },
+        { ThreadPriority::I2C, AP_HAL::Scheduler::PRIORITY_I2C },
+        { ThreadPriority::SPI, AP_HAL::Scheduler::PRIORITY_SPI },
+        { ThreadPriority::TIMER, AP_HAL::Scheduler::PRIORITY_TIMER },
+        { ThreadPriority::MAIN, AP_HAL::Scheduler::PRIORITY_MAIN },
+        { ThreadPriority::BOOST, AP_HAL::Scheduler::PRIORITY_BOOST },
+    };
+    for (const auto &p : priority_map) {
+        if (p.scr_priority == _thd_priority) {
+            priority = p.hal_priority;
+        }
+    }
+
+    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_Scripting::thread, void),
+                                      "Scripting", SCRIPTING_STACK_SIZE, priority, 0)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Scripting: %s", "failed to start");
+        _thread_failed = true;
+    }
+}
+
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+void AP_Scripting::init_serialdevice_ports(void) {
+    if (!_enable) {
+        return;
+    }
+
+    _serialdevice.init();
+}
+#endif
+
+#if HAL_GCS_ENABLED
+MAV_RESULT AP_Scripting::handle_command_int_packet(const mavlink_command_int_t &packet) {
+    switch ((SCRIPTING_CMD)packet.param1) {
+        case SCRIPTING_CMD_REPL_START:
+        case SCRIPTING_CMD_REPL_STOP:
+            return MAV_RESULT_DENIED;
+
+        case SCRIPTING_CMD_STOP:
+            _restart = false;
+            _stop = true;
+            return MAV_RESULT_ACCEPTED;
+        case SCRIPTING_CMD_STOP_AND_RESTART:
+            _restart = true;
+            _stop = true;
+            return MAV_RESULT_ACCEPTED;
+        case SCRIPTING_CMD_ENUM_END: // cope with MAVLink generator appending to our enum
+            break;
+    }
+
+    return MAV_RESULT_UNSUPPORTED;
+}
+#endif
+
+/*
+  avoid optimisation of the thread function. This avoids nasty traps
+  where setjmp/longjmp does not properly handle save/restore of
+  floating point registers on exceptions. This is an extra protection
+  over the top of the fix in luaD_rawrunprotected() for the same issue
+ */
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
+void AP_Scripting::thread(void) {
+    while (true) {
+        // reset flags
+        _stop = false;
+        _restart = false;
+        _init_failed = false;
+
+        lua_scripts *lua = NEW_NOTHROW lua_scripts(_script_vm_exec_count, _script_heap_size, _debug_options);
+        if (lua == nullptr || !lua->heap_allocated()) {
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "Scripting: %s", "Unable to allocate memory");
+            _init_failed = true;
+        } else {
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+            // clear data in serial buffers that the script wasn't ready to
+            // receive
+            _serialdevice.clear();
+#endif
+            // run won't return while scripting is still active
+            lua->run();
+
+            // only reachable if the lua backend has died for any reason
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "Scripting: %s", "stopped");
+        }
+        delete lua;
+        lua = nullptr;
+
+        // clear allocated i2c devices
+        for (uint8_t i=0; i<SCRIPTING_MAX_NUM_I2C_DEVICE; i++) {
+            delete _i2c_dev[i];
+            _i2c_dev[i] = nullptr;
+        }
+        num_i2c_devices = 0;
+
+        // clear allocated PWM sources
+        for (uint8_t i=0; i<SCRIPTING_MAX_NUM_PWM_SOURCE; i++) {
+            if (_pwm_source[i] != nullptr) {
+                delete _pwm_source[i];
+                _pwm_source[i] = nullptr;
+            }
+        }
+        num_pwm_source = 0;
+
+#if AP_NETWORKING_ENABLED
+        // clear allocated sockets
+        for (uint8_t i=0; i<SCRIPTING_MAX_NUM_NET_SOCKET; i++) {
+            if (_net_sockets[i] != nullptr) {
+                delete _net_sockets[i];
+                _net_sockets[i] = nullptr;
+            }
+        }
+#endif // AP_NETWORKING_ENABLED
+
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+        // clear data in serial buffers that hasn't been transmitted
+        _serialdevice.clear();
+#endif
+        
+        // Clear blocked commands
+        {
+            WITH_SEMAPHORE(mavlink_command_block_list_sem);
+            while (mavlink_command_block_list != nullptr) {
+                command_block_list *next_item = mavlink_command_block_list->next;
+                delete mavlink_command_block_list;
+                mavlink_command_block_list = next_item;
+            }
+        }
+
+        bool cleared = false;
+        while(true) {
+            // 1hz check if we should restart
+            hal.scheduler->delay(1000);
+            if (!enabled()) {
+                // enable must be put to 0 and back to 1 to restart from params
+                cleared = true;
+                continue;
+            }
+            // must be enabled to get this far
+            if (cleared || _restart) {
+                GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "Scripting: %s", "restarted");
+                break;
+            }
+            if ((_debug_options.get() & uint8_t(lua_scripts::DebugLevel::NO_SCRIPTS_TO_RUN)) != 0) {
+                GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "Scripting: %s", "stopped");
+            }
+        }
+    }
+}
+#pragma GCC pop_options
+
+void AP_Scripting::handle_mission_command(const AP_Mission::Mission_Command& cmd_in)
+{
+#if AP_MISSION_ENABLED
+    if (!_enable) {
+        return;
+    }
+
+    if (mission_data == nullptr) {
+        // load buffer
+        mission_data = NEW_NOTHROW ObjectBuffer<struct AP_Scripting::scripting_mission_cmd>(mission_cmd_queue_size);
+        if (mission_data != nullptr && mission_data->get_size() == 0) {
+            delete mission_data;
+            mission_data = nullptr;
+        }
+        if (mission_data == nullptr) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Scripting: %s", "unable to receive mission command");
+            return;
+        }
+    }
+
+    struct scripting_mission_cmd cmd {cmd_in.p1,
+                                      cmd_in.content.scripting.p1,
+                                      cmd_in.content.scripting.p2,
+                                      cmd_in.content.scripting.p3,
+                                      AP_HAL::millis()};
+
+    mission_data->push(cmd);
+#endif
+}
+
+bool AP_Scripting::arming_checks(size_t buflen, char *buffer) const
+{
+    if (!enabled() || ((_debug_options.get() & uint8_t(lua_scripts::DebugLevel::DISABLE_PRE_ARM)) != 0)) {
+        return true;
+    }
+
+    if (_thread_failed) {
+        hal.util->snprintf(buffer, buflen, "Scripting: %s", "failed to start");
+        return false;
+    }
+
+    if (_init_failed) {
+        hal.util->snprintf(buffer, buflen, "Scripting: %s", "out of memory");
+        return false;
+    }
+
+    lua_scripts::get_last_error_semaphore()->take_blocking();
+    const char *error_buf = lua_scripts::get_last_error_message();
+    if (error_buf != nullptr) {
+        hal.util->snprintf(buffer, buflen, "Scripting: %s", error_buf);
+        lua_scripts::get_last_error_semaphore()->give();
+        return false;
+    }
+    lua_scripts::get_last_error_semaphore()->give();
+
+    // Use -1 for disabled, this means we don't have to avoid 0 in the CRC, the sign bit is masked off anyway
+    if (_required_loaded_checksum != -1) {
+        const uint32_t expected_loaded = (uint32_t)_required_loaded_checksum.get() & checksum_param_mask;
+        const uint32_t loaded = lua_scripts::get_loaded_checksum() & checksum_param_mask;
+        if (expected_loaded != loaded) {
+            hal.util->snprintf(buffer, buflen, "Scripting: loaded CRC incorrect want: 0x%x", (unsigned int)loaded);
+            return false;
+        }
+    }
+
+    if (_required_running_checksum != -1) {
+        const uint32_t expected_running = (uint32_t)_required_running_checksum.get() & checksum_param_mask;
+        const uint32_t running = lua_scripts::get_running_checksum() & checksum_param_mask;
+        if (expected_running != running) {
+            hal.util->snprintf(buffer, buflen, "Scripting: running CRC incorrect want: 0x%x", (unsigned int)running);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void AP_Scripting::restart_all()
+{
+    _restart = true;
+    _stop = true;
+}
+
+#if HAL_GCS_ENABLED
+void AP_Scripting::handle_message(const mavlink_message_t &msg, const mavlink_channel_t chan) {
+    if (mavlink_data.rx_buffer == nullptr) {
+        return;
+    }
+
+    struct mavlink_msg data {msg, chan, AP_HAL::millis()};
+
+    WITH_SEMAPHORE(mavlink_data.sem);
+    for (uint16_t i = 0; i < mavlink_data.accept_msg_ids_size; i++) {
+        if (mavlink_data.accept_msg_ids[i] == UINT32_MAX) {
+            return;
+        }
+        if (mavlink_data.accept_msg_ids[i] == msg.msgid) {
+            mavlink_data.rx_buffer->push(data);
+            return;
+        }
+    }
+}
+
+bool AP_Scripting::is_handling_command(uint16_t cmd_id)
+{
+    WITH_SEMAPHORE(mavlink_command_block_list_sem);
+
+    // Look in linked list to see if id is registered
+    if (mavlink_command_block_list != nullptr) {
+        for (command_block_list *item = mavlink_command_block_list; item; item = item->next) {
+            if (item->id == cmd_id) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+#endif // HAL_GCS_ENABLED
+
+// Update called at 1Hz from AP_Vehicle
+void AP_Scripting::update() {
+
+    save_checksum();
+
+}
+
+// Check if DEBUG_OPTS bit has been set to save current checksum values to params
+void AP_Scripting::save_checksum() {
+
+    const uint8_t opts = _debug_options.get();
+    const uint8_t save_bit = uint8_t(lua_scripts::DebugLevel::SAVE_CHECKSUM);
+    if ((opts & save_bit) == 0) {
+        // Bit not set, nothing to do
+        return;
+    }
+
+    // Save two checksum parameters to there current values
+    _required_loaded_checksum.set_and_save(lua_scripts::get_loaded_checksum() & checksum_param_mask);
+    _required_running_checksum.set_and_save(lua_scripts::get_running_checksum() & checksum_param_mask);
+
+    // Un-set debug option bit
+    _debug_options.set_and_save(opts & ~save_bit);
+
+    GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Scripting: %s", "saved checksums");
+
+}
+
+AP_Scripting *AP_Scripting::_singleton = nullptr;
+
+namespace AP {
+    AP_Scripting *scripting() {
+        return AP_Scripting::get_singleton();
+    }
+}
+
+#endif  // AP_SCRIPTING_ENABLED
+                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_Scripting/AP_Scripting_config.h"
+
+#if AP_SCRIPTING_ENABLED
+
+#include <GCS_MAVLink/GCS_config.h>
+#include <AP_Common/AP_Common.h>
+#include <AP_Param/AP_Param.h>
+#include <GCS_MAVLink/GCS_MAVLink.h>
+#include <AP_Mission/AP_Mission.h>
+#include <AP_Filesystem/AP_Filesystem.h>
+#include <AP_HAL/I2CDevice.h>
+#include "AP_Scripting_CANSensor.h"
+#include <AP_Networking/AP_Networking_Config.h>
+
+#ifndef SCRIPTING_MAX_NUM_I2C_DEVICE
+  #define SCRIPTING_MAX_NUM_I2C_DEVICE 4
+#endif
+
+#define SCRIPTING_MAX_NUM_PWM_SOURCE 4
+
+#if AP_NETWORKING_ENABLED
+#ifndef SCRIPTING_MAX_NUM_NET_SOCKET
+#define SCRIPTING_MAX_NUM_NET_SOCKET 50
+#endif
+class SocketAPM;
+#endif
+
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+#include "AP_Scripting_SerialDevice.h"
+#endif
+
+class AP_Scripting
+{
+public:
+    AP_Scripting();
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Scripting);
+
+    void init(void);
+
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+    void init_serialdevice_ports(void);
+#endif
+
+    void update();
+
+    bool enabled(void) const { return _enable != 0; };
+    bool should_run(void) const { return enabled() && !_stop; }
+
+#if HAL_GCS_ENABLED
+    void handle_message(const mavlink_message_t &msg, const mavlink_channel_t chan);
+
+    // Check if command ID is blocked
+    bool is_handling_command(uint16_t cmd_id);
+#endif
+
+    static AP_Scripting * get_singleton(void) { return _singleton; }
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+#if HAL_GCS_ENABLED
+    MAV_RESULT handle_command_int_packet(const mavlink_command_int_t &packet);
+#endif
+
+    void handle_mission_command(const class AP_Mission::Mission_Command& cmd);
+
+    bool arming_checks(size_t buflen, char *buffer) const;
+    
+    void restart_all(void);
+
+   // User parameters for inputs into scripts 
+   AP_Float _user[6];
+
+    enum class SCR_DIR {
+        ROMFS = 1 << 0,
+        SCRIPTS = 1 << 1,
+    };
+    uint16_t get_disabled_dir() { return uint16_t(_dir_disable.get());}
+
+    // the number of and storage for i2c devices
+    uint8_t num_i2c_devices;
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> *_i2c_dev[SCRIPTING_MAX_NUM_I2C_DEVICE];
+
+#if AP_SCRIPTING_CAN_SENSOR_ENABLED
+    // Scripting CAN sensor
+    ScriptingCANSensor *_CAN_dev;
+    ScriptingCANSensor *_CAN_dev2;
+#endif
+
+#if AP_MISSION_ENABLED
+    // mission item buffer
+    static const int mission_cmd_queue_size = 5;
+    struct scripting_mission_cmd {
+        uint16_t p1;
+        float content_p1;
+        float content_p2;
+        float content_p3;
+        uint32_t time_ms;
+    };
+    ObjectBuffer<struct scripting_mission_cmd> * mission_data;
+#endif
+
+    // PWMSource storage
+    uint8_t num_pwm_source;
+    AP_HAL::PWMSource *_pwm_source[SCRIPTING_MAX_NUM_PWM_SOURCE];
+    int get_current_env_ref() { return current_env_ref; }
+    void set_current_env_ref(int ref) { current_env_ref = ref; }
+
+#if AP_NETWORKING_ENABLED
+    // SocketAPM storage
+    SocketAPM *_net_sockets[SCRIPTING_MAX_NUM_NET_SOCKET];
+#endif
+
+    struct mavlink_msg {
+        mavlink_message_t msg;
+        mavlink_channel_t chan;
+        uint32_t timestamp_ms;
+    };
+
+    struct mavlink {
+        ObjectBuffer<struct mavlink_msg> *rx_buffer;
+        uint32_t *accept_msg_ids;
+        uint16_t accept_msg_ids_size;
+        HAL_Semaphore sem;
+    } mavlink_data;
+
+    struct command_block_list {
+        uint16_t id;
+        command_block_list *next;
+    };
+    command_block_list *mavlink_command_block_list;
+    HAL_Semaphore mavlink_command_block_list_sem;
+
+    #if AP_SCRIPTING_SERIALDEVICE_ENABLED
+        AP_Scripting_SerialDevice _serialdevice;
+    #endif
+
+private:
+
+    void thread(void); // main script execution thread
+
+    // Check if DEBUG_OPTS bit has been set to save current checksum values to params
+    void save_checksum();
+
+    // Mask down to 23 bits for comparison with parameters, this the length of the a float mantissa, to deal with the float transport of parameters over MAVLink
+    // The full range of uint32 integers cannot be represented by a float.
+    const uint32_t checksum_param_mask = 0x007FFFFF;
+
+    enum class ThreadPriority : uint8_t {
+        NORMAL = 0,
+        IO = 1,
+        STORAGE = 2,
+        UART = 3,
+        I2C = 4,
+        SPI = 5,
+        TIMER = 6,
+        MAIN = 7,
+        BOOST = 8
+    };
+
+    AP_Int8 _enable;
+    AP_Int32 _script_vm_exec_count;
+    AP_Int32 _script_heap_size;
+    AP_Int8 _debug_options;
+    AP_Int16 _dir_disable;
+    AP_Int32 _required_loaded_checksum;
+    AP_Int32 _required_running_checksum;
+
+    AP_Enum<ThreadPriority> _thd_priority;
+
+    bool _thread_failed; // thread allocation failed
+    bool _init_failed;  // true if memory allocation failed
+    bool _restart; // true if scripts should be restarted
+    bool _stop; // true if scripts should be stopped
+
+    static AP_Scripting *_singleton;
+    int current_env_ref;
+};
+
+namespace AP {
+    AP_Scripting * scripting(void);
+};
+
+#endif // AP_SCRIPTING_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Scripting CANSensor class, for easy scripting CAN support
+ */
+#include "AP_Scripting_CANSensor.h"
+#include <AP_Math/AP_Math.h>
+
+#if AP_SCRIPTING_CAN_SENSOR_ENABLED
+
+// handler for outgoing frames, using uint32
+bool ScriptingCANSensor::write_frame(AP_HAL::CANFrame &out_frame, const uint32_t timeout_us)
+{
+    return CANSensor::write_frame(out_frame, timeout_us);
+};
+
+// handler for incoming frames, add to buffers
+void ScriptingCANSensor::handle_frame(AP_HAL::CANFrame &frame)
+{
+    WITH_SEMAPHORE(sem);
+    if (buffer_list != nullptr) {
+        buffer_list->handle_frame(frame);
+    }
+}
+
+// add a new buffer to this sensor
+ScriptingCANBuffer* ScriptingCANSensor::add_buffer(uint32_t buffer_len)
+{
+    WITH_SEMAPHORE(sem);
+    ScriptingCANBuffer *new_buff = NEW_NOTHROW ScriptingCANBuffer(*this, buffer_len);
+    if (buffer_list == nullptr) {
+        buffer_list = new_buff;
+    } else {
+        buffer_list->add_buffer(new_buff);
+    }
+    return new_buff;
+}
+
+// Call main sensor write method
+bool ScriptingCANBuffer::write_frame(AP_HAL::CANFrame &out_frame, const uint32_t timeout_us)
+{
+    return sensor.write_frame(out_frame, timeout_us);
+};
+
+// read a frame from the buffer
+bool ScriptingCANBuffer::read_frame(AP_HAL::CANFrame &frame)
+{
+    return buffer.pop(frame);
+}
+
+// recursively add frame to buffer
+void ScriptingCANBuffer::handle_frame(AP_HAL::CANFrame &frame)
+{
+    // accept everything if no filters are setup
+    bool accept = num_filters == 0;
+
+    // Check if frame matches any filters
+    for (uint8_t i = 0; i < MIN(num_filters, ARRAY_SIZE(filter)); i++) {
+        if ((frame.id & filter[i].mask) == filter[i].value) {
+            accept = true;
+            break;
+        }
+    }
+
+    WITH_SEMAPHORE(sem);
+
+    // Add to buffer for scripting to read
+    if (accept) {
+        buffer.push(frame);
+    }
+
+    // filtering is not applied to other buffers
+    if (next != nullptr) {
+        next->handle_frame(frame);
+    }
+}
+
+// recursively add new buffer
+void ScriptingCANBuffer::add_buffer(ScriptingCANBuffer* new_buff) {
+    WITH_SEMAPHORE(sem);
+    if (next == nullptr) {
+        next = new_buff;
+        return;
+    }
+    next->add_buffer(new_buff);
+}
+
+// Add a filter, will pass ID's that match value given the mask
+bool ScriptingCANBuffer::add_filter(uint32_t mask, uint32_t value) {
+
+    // Run out of filters
+    if (num_filters >= ARRAY_SIZE(filter)) {
+        return false;
+    }
+
+    // Add to list and increment
+    filter[num_filters].mask = mask;
+    filter[num_filters].value = value & mask;
+    num_filters++;
+    return true;
+}
+
+#endif // AP_SCRIPTING_CAN_SENSOR_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Scripting CANSensor class, for easy scripting CAN support
+ */
+ 
+#pragma once
+
+#include <AP_HAL/AP_HAL.h>
+
+#if defined(HAL_BUILD_AP_PERIPH)
+    // Must have at least two CAN ports on Periph
+    #define AP_SCRIPTING_CAN_SENSOR_ENABLED (HAL_MAX_CAN_PROTOCOL_DRIVERS > 1)
+#else
+    #define AP_SCRIPTING_CAN_SENSOR_ENABLED HAL_MAX_CAN_PROTOCOL_DRIVERS
+#endif
+
+#if AP_SCRIPTING_CAN_SENSOR_ENABLED
+
+#include <AP_CANManager/AP_CANSensor.h>
+
+class ScriptingCANBuffer;
+class ScriptingCANSensor : public CANSensor {
+public:
+
+    ScriptingCANSensor(AP_CAN::Protocol dtype)
+        : CANSensor("Script") {
+        register_driver(dtype);
+    }
+
+    // handler for outgoing frames, using uint32
+    bool write_frame(AP_HAL::CANFrame &out_frame, const uint32_t timeout_us);
+
+    // handler for incoming frames, add to buffers
+    void handle_frame(AP_HAL::CANFrame &frame) override;
+
+    // add a new buffer to this sensor
+    ScriptingCANBuffer* add_buffer(uint32_t buffer_len);
+
+private:
+
+    HAL_Semaphore sem;
+
+    ScriptingCANBuffer *buffer_list;
+
+};
+
+class ScriptingCANBuffer {
+public:
+
+    ScriptingCANBuffer(ScriptingCANSensor &_sensor, uint32_t buffer_size):sensor(_sensor), buffer(buffer_size) {};
+
+    // Call main sensor write method
+    bool write_frame(AP_HAL::CANFrame &out_frame, const uint32_t timeout_us);
+
+    // read a frame from the buffer
+    bool read_frame(AP_HAL::CANFrame &frame);
+
+    // recursively add frame to buffer
+    void handle_frame(AP_HAL::CANFrame &frame);
+
+    // recursively add new buffer
+    void add_buffer(ScriptingCANBuffer* new_buff);
+
+    // Add a filter to this buffer
+    bool add_filter(uint32_t mask, uint32_t value);
+
+private:
+
+    ObjectBuffer<AP_HAL::CANFrame> buffer;
+
+    ScriptingCANSensor &sensor;
+
+    ScriptingCANBuffer *next;
+
+    HAL_Semaphore sem;
+
+    struct {
+        uint32_t mask;
+        uint32_t value;
+    } filter[8];
+    uint8_t num_filters;
+
+};
+
+#endif // AP_SCRIPTING_CAN_SENSOR_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #pragma once
+
+#include "AP_Scripting_config.h"
+#include "AP_Scripting.h"
+
+#include <AP_HAL/UARTDriver.h>
+
+class AP_Scripting_SerialAccess {
+public:
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Scripting_SerialAccess);
+
+    AP_Scripting_SerialAccess() {}
+
+    void begin(uint32_t baud);
+
+    size_t write(uint8_t c);
+    size_t write(const uint8_t *buffer, size_t size);
+
+    int16_t read(void);
+    ssize_t read(uint8_t *buffer, uint16_t count);
+
+    uint32_t available(void);
+
+    void set_flow_control(enum AP_HAL::UARTDriver::flow_control fcs);
+
+    AP_HAL::UARTDriver *stream;
+#if AP_SCRIPTING_ENABLED
+#if AP_SCRIPTING_SERIALDEVICE_ENABLED
+    bool is_device_port;
+#endif
+#endif
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            

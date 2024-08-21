@@ -1,0 +1,3172 @@
+/*
+ * Copyright (c) 2016-2019 UAVCAN Team
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * Contributors: https://github.com/UAVCAN/libcanard/contributors
+ *
+ * Documentation: http://uavcan.org/Implementations/Libcanard
+ */
+
+#include "canard_internals.h"
+#include <string.h>
+
+
+#undef MIN
+#undef MAX
+#define MIN(a, b)   (((a) < (b)) ? (a) : (b))
+#define MAX(a, b)   (((a) > (b)) ? (a) : (b))
+
+
+#define TRANSFER_TIMEOUT_USEC                       2000000U
+#define IFACE_SWITCH_DELAY_USEC                     1000000U
+
+#define TRANSFER_ID_BIT_LEN                         5U
+#define ANON_MSG_DATA_TYPE_ID_BIT_LEN               2U
+
+#define SOURCE_ID_FROM_ID(x)                        ((uint8_t) (((x) >> 0U)  & 0x7FU))
+#define SERVICE_NOT_MSG_FROM_ID(x)                  ((bool)    (((x) >> 7U)  & 0x1U))
+#define REQUEST_NOT_RESPONSE_FROM_ID(x)             ((bool)    (((x) >> 15U) & 0x1U))
+#define DEST_ID_FROM_ID(x)                          ((uint8_t) (((x) >> 8U)  & 0x7FU))
+#define PRIORITY_FROM_ID(x)                         ((uint8_t) (((x) >> 24U) & 0x1FU))
+#define MSG_TYPE_FROM_ID(x)                         ((uint16_t)(((x) >> 8U)  & 0xFFFFU))
+#define SRV_TYPE_FROM_ID(x)                         ((uint8_t) (((x) >> 16U) & 0xFFU))
+
+#define MAKE_TRANSFER_DESCRIPTOR(data_type_id, transfer_type, src_node_id, dst_node_id)             \
+    (((uint32_t)(data_type_id)) | (((uint32_t)(transfer_type)) << 16U) |                            \
+    (((uint32_t)(src_node_id)) << 18U) | (((uint32_t)(dst_node_id)) << 25U))
+
+#define TRANSFER_ID_FROM_TAIL_BYTE(x)               ((uint8_t)((x) & 0x1FU))
+
+// The extra cast to unsigned is needed to squelch warnings from clang-tidy
+#define IS_START_OF_TRANSFER(x)                     ((bool)(((uint32_t)(x) >> 7U) & 0x1U))
+#define IS_END_OF_TRANSFER(x)                       ((bool)(((uint32_t)(x) >> 6U) & 0x1U))
+#define TOGGLE_BIT(x)                               ((bool)(((uint32_t)(x) >> 5U) & 0x1U))
+
+
+
+/*
+ * API functions
+ */
+void canardInit(CanardInstance* out_ins,
+                void* mem_arena,
+                size_t mem_arena_size,
+                CanardOnTransferReception on_reception,
+                CanardShouldAcceptTransfer should_accept,
+                void* user_reference)
+{
+    CANARD_ASSERT(out_ins != NULL);
+
+    /*
+     * Checking memory layout.
+     * This condition is supposed to be true for all 32-bit and smaller platforms.
+     * If your application fails here, make sure it's not built in 64-bit mode.
+     * Refer to the design documentation for more info.
+     */
+    CANARD_ASSERT(CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE >= 5);
+
+    memset(out_ins, 0, sizeof(*out_ins));
+
+    out_ins->node_id = CANARD_BROADCAST_NODE_ID;
+    out_ins->on_reception = on_reception;
+    out_ins->should_accept = should_accept;
+    out_ins->rx_states = NULL;
+    out_ins->tx_queue = NULL;
+    out_ins->user_reference = user_reference;
+#if CANARD_ENABLE_TAO_OPTION
+    out_ins->tao_disabled = false;
+#endif
+    size_t pool_capacity = mem_arena_size / CANARD_MEM_BLOCK_SIZE;
+    if (pool_capacity > 0xFFFFU)
+    {
+        pool_capacity = 0xFFFFU;
+    }
+
+    initPoolAllocator(&out_ins->allocator, mem_arena, (uint16_t)pool_capacity);
+}
+
+void* canardGetUserReference(CanardInstance* ins)
+{
+    CANARD_ASSERT(ins != NULL);
+    return ins->user_reference;
+}
+
+void canardSetLocalNodeID(CanardInstance* ins, uint8_t self_node_id)
+{
+    CANARD_ASSERT(ins != NULL);
+
+    if ((ins->node_id == CANARD_BROADCAST_NODE_ID) &&
+        (self_node_id >= CANARD_MIN_NODE_ID) &&
+        (self_node_id <= CANARD_MAX_NODE_ID))
+    {
+        ins->node_id = self_node_id;
+    }
+    else
+    {
+        CANARD_ASSERT(false);
+    }
+}
+
+uint8_t canardGetLocalNodeID(const CanardInstance* ins)
+{
+    return ins->node_id;
+}
+
+void canardForgetLocalNodeID(CanardInstance* ins) {
+    ins->node_id = CANARD_BROADCAST_NODE_ID;
+}
+
+void canardInitTxTransfer(CanardTxTransfer* transfer)
+{
+    CANARD_ASSERT(transfer != NULL);
+    memset(transfer, 0, sizeof(*transfer));
+}
+
+
+int16_t canardBroadcast(CanardInstance* ins,
+                        uint64_t data_type_signature,
+                        uint16_t data_type_id,
+                        uint8_t* inout_transfer_id,
+                        uint8_t priority,
+                        const void* payload,
+                        uint16_t payload_len
+#if CANARD_ENABLE_DEADLINE
+                        ,uint64_t tx_deadline
+#endif
+#if CANARD_MULTI_IFACE
+                        ,uint8_t iface_mask
+#endif
+#if CANARD_ENABLE_CANFD
+                        ,bool canfd
+#endif
+)
+{
+    // create transfer object
+    CanardTxTransfer transfer_object = {
+        .data_type_signature = data_type_signature,
+        .data_type_id = data_type_id,
+        .inout_transfer_id = inout_transfer_id,
+        .priority = priority,
+        .payload = (uint8_t*)payload,
+        .payload_len = payload_len,
+#if CANARD_ENABLE_DEADLINE
+        .deadline_usec = tx_deadline,
+#endif
+#if CANARD_MULTI_IFACE
+        .iface_mask = iface_mask,
+#endif
+#if CANARD_ENABLE_CANFD
+        .canfd = canfd,
+#endif
+    };
+
+    return canardBroadcastObj(ins, &transfer_object);
+}
+
+int16_t canardBroadcastObj(CanardInstance* ins, CanardTxTransfer* transfer_object)
+{
+    if (transfer_object->payload == NULL && transfer_object->payload_len > 0)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+    if (transfer_object->priority > CANARD_TRANSFER_PRIORITY_LOWEST)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint32_t can_id = 0;
+    uint16_t crc = 0xFFFFU;
+
+    if (canardGetLocalNodeID(ins) == 0)
+    {
+        if (transfer_object->payload_len > 7)
+        {
+            return -CANARD_ERROR_NODE_ID_NOT_SET;
+        }
+
+        static const uint16_t DTIDMask = (1U << ANON_MSG_DATA_TYPE_ID_BIT_LEN) - 1U;
+
+        if ((transfer_object->data_type_id & DTIDMask) != transfer_object->data_type_id)
+        {
+            return -CANARD_ERROR_INVALID_ARGUMENT;
+        }
+
+        // anonymous transfer, random discriminator
+        const uint16_t discriminator = (uint16_t)((crcAdd(0xFFFFU, transfer_object->payload, transfer_object->payload_len)) & 0x7FFEU);
+        can_id = ((uint32_t) transfer_object->priority << 24U) | ((uint32_t) discriminator << 9U) |
+                 ((uint32_t) (transfer_object->data_type_id & DTIDMask) << 8U) | (uint32_t) canardGetLocalNodeID(ins);
+    }
+    else
+    {
+        can_id = ((uint32_t) transfer_object->priority << 24U) | ((uint32_t) transfer_object->data_type_id << 8U) | (uint32_t) canardGetLocalNodeID(ins);
+        crc = calculateCRC(transfer_object);
+    }
+
+    const int16_t result = enqueueTxFrames(ins, can_id, crc, transfer_object);
+
+    if (result > 0) {
+        incrementTransferID(transfer_object->inout_transfer_id);
+    }
+
+    return result;
+}
+
+/*
+  the following FromIdx and ToIdx functions allow for the
+  CanardBufferBlock and CanartRxState structures to have the same size
+  on 32 bit and 64 bit platforms, which allows for easier testing in
+  simulator environments
+ */
+CANARD_INTERNAL CanardBufferBlock *canardBufferFromIdx(CanardPoolAllocator* allocator, canard_buffer_idx_t idx)
+{
+#if CANARD_64_BIT
+    if (idx == CANARD_BUFFER_IDX_NONE) {
+        return NULL;
+    }
+    return (CanardBufferBlock *)(uintptr_t)&((uint8_t *)allocator->arena)[idx-1];
+#else
+    (void)allocator;
+    return (CanardBufferBlock *)idx;
+#endif
+}
+
+CANARD_INTERNAL canard_buffer_idx_t canardBufferToIdx(CanardPoolAllocator* allocator, const CanardBufferBlock *buf)
+{
+#if CANARD_64_BIT
+    if (buf == NULL) {
+        return CANARD_BUFFER_IDX_NONE;
+    }
+    return 1U+((canard_buffer_idx_t)((uint8_t *)buf - (uint8_t *)allocator->arena));
+#else
+    (void)allocator;
+    return (canard_buffer_idx_t)buf;
+#endif
+}
+
+CANARD_INTERNAL CanardRxState *canardRxFromIdx(CanardPoolAllocator* allocator, canard_buffer_idx_t idx)
+{
+#if CANARD_64_BIT
+    if (idx == CANARD_BUFFER_IDX_NONE) {
+        return NULL;
+    }
+    return (CanardRxState *)(uintptr_t)&((uint8_t *)allocator->arena)[idx-1];
+#else
+    (void)allocator;
+    return (CanardRxState *)idx;
+#endif
+}
+
+CANARD_INTERNAL canard_buffer_idx_t canardRxToIdx(CanardPoolAllocator* allocator, const CanardRxState *rx)
+{
+#if CANARD_64_BIT
+    if (rx == NULL) {
+        return CANARD_BUFFER_IDX_NONE;
+    }
+    return 1U+((canard_buffer_idx_t)((uint8_t *)rx - (uint8_t *)allocator->arena));
+#else
+    (void)allocator;
+    return (canard_buffer_idx_t)rx;
+#endif
+}
+
+CANARD_INTERNAL uint16_t calculateCRC(const CanardTxTransfer* transfer_object)
+{
+    uint16_t crc = 0xFFFFU;
+#if CANARD_ENABLE_CANFD
+    if ((transfer_object->payload_len > 7 && !transfer_object->canfd) ||
+        (transfer_object->payload_len > 63 && transfer_object->canfd))
+#else
+    if (transfer_object->payload_len > 7)
+#endif
+    {
+        crc = crcAddSignature(crc, transfer_object->data_type_signature);
+        crc = crcAdd(crc, transfer_object->payload, transfer_object->payload_len);
+#if CANARD_ENABLE_CANFD
+        if (transfer_object->payload_len > 63 && transfer_object->canfd) {
+            uint8_t empty = 0;
+            uint8_t padding = (uint8_t)dlcToDataLength(dataLengthToDlc((uint16_t)((transfer_object->payload_len+2) % 63)+1))-1;
+            padding -= (uint8_t)((transfer_object->payload_len+2) % 63);
+            for (uint8_t i=0; i<padding; i++) {
+                crc = crcAddByte(crc, empty);
+            }
+        }
+#endif
+    }
+    return crc;
+}
+
+int16_t canardRequestOrRespond(CanardInstance* ins,
+                               uint8_t destination_node_id,
+                               uint64_t data_type_signature,
+                               uint8_t data_type_id,
+                               uint8_t* inout_transfer_id,
+                               uint8_t priority,
+                               CanardRequestResponse kind,
+                               const void* payload,
+                               uint16_t payload_len
+#if CANARD_ENABLE_DEADLINE
+                               ,uint64_t tx_deadline
+#endif
+#if CANARD_MULTI_IFACE
+                               ,uint8_t iface_mask
+#endif
+#if CANARD_ENABLE_CANFD
+                               ,bool canfd
+#endif
+)
+{
+    CanardTxTransfer transfer_object = {
+        .data_type_signature = data_type_signature,
+        .data_type_id = data_type_id,
+        .inout_transfer_id = inout_transfer_id,
+        .priority = priority,
+        .transfer_type = kind == CanardRequest ? CanardTransferTypeRequest : CanardTransferTypeResponse,
+        .payload = payload,
+        .payload_len = payload_len,
+#if CANARD_ENABLE_DEADLINE
+        .deadline_usec = tx_deadline,
+#endif
+#if CANARD_MULTI_IFACE
+        .iface_mask = iface_mask,
+#endif
+#if CANARD_ENABLE_CANFD
+        .canfd = canfd,
+#endif
+    };
+    return canardRequestOrRespondObj(ins, destination_node_id, &transfer_object);
+}
+
+int16_t canardRequestOrRespondObj(CanardInstance* ins, uint8_t destination_node_id, CanardTxTransfer* transfer_object)
+{
+    if (transfer_object->payload == NULL && transfer_object->payload_len > 0)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+    if (transfer_object->priority > CANARD_TRANSFER_PRIORITY_LOWEST)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+    if (canardGetLocalNodeID(ins) == 0)
+    {
+        return -CANARD_ERROR_NODE_ID_NOT_SET;
+    }
+
+    const uint32_t can_id = ((uint32_t) transfer_object->priority << 24U) | ((uint32_t) transfer_object->data_type_id << 16U) |
+                            ((uint32_t) transfer_object->transfer_type << 15U) | ((uint32_t) destination_node_id << 8U) |
+                            (1U << 7U) | (uint32_t) canardGetLocalNodeID(ins);
+
+    uint16_t crc = calculateCRC(transfer_object);
+
+
+    const int16_t result = enqueueTxFrames(ins, can_id, crc, transfer_object);
+
+    if (result > 0 && transfer_object->transfer_type == CanardTransferTypeRequest)                      // Response Transfer ID must not be altered
+    {
+        incrementTransferID(transfer_object->inout_transfer_id);
+    }
+
+    return result;
+}
+
+CanardCANFrame* canardPeekTxQueue(const CanardInstance* ins)
+{
+    if (ins->tx_queue == NULL)
+    {
+        return NULL;
+    }
+    return &ins->tx_queue->frame;
+}
+
+void canardPopTxQueue(CanardInstance* ins)
+{
+    CanardTxQueueItem* item = ins->tx_queue;
+    ins->tx_queue = item->next;
+    freeBlock(&ins->allocator, item);
+}
+
+int16_t canardHandleRxFrame(CanardInstance* ins, const CanardCANFrame* frame, uint64_t timestamp_usec)
+{
+    const CanardTransferType transfer_type = extractTransferType(frame->id);
+    const uint8_t destination_node_id = (transfer_type == CanardTransferTypeBroadcast) ?
+                                        (uint8_t)CANARD_BROADCAST_NODE_ID :
+                                        DEST_ID_FROM_ID(frame->id);
+
+    // TODO: This function should maintain statistics of transfer errors and such.
+
+    if ((frame->id & CANARD_CAN_FRAME_EFF) == 0 ||
+        (frame->id & CANARD_CAN_FRAME_RTR) != 0 ||
+        (frame->id & CANARD_CAN_FRAME_ERR) != 0 ||
+        (frame->data_len < 1))
+    {
+        return -CANARD_ERROR_RX_INCOMPATIBLE_PACKET;
+    }
+
+    if (transfer_type != CanardTransferTypeBroadcast &&
+        destination_node_id != canardGetLocalNodeID(ins))
+    {
+        return -CANARD_ERROR_RX_WRONG_ADDRESS;
+    }
+
+    const uint8_t priority = PRIORITY_FROM_ID(frame->id);
+    const uint8_t source_node_id = SOURCE_ID_FROM_ID(frame->id);
+    const uint16_t data_type_id = extractDataType(frame->id);
+    const uint32_t transfer_descriptor =
+            MAKE_TRANSFER_DESCRIPTOR(data_type_id, transfer_type, source_node_id, destination_node_id);
+
+    const uint8_t tail_byte = frame->data[frame->data_len - 1];
+
+    uint64_t data_type_signature = 0;
+    CanardRxState* rx_state = NULL;
+
+    if (IS_START_OF_TRANSFER(tail_byte))
+    {
+
+        if (ins->should_accept(ins, &data_type_signature, data_type_id, transfer_type, source_node_id))
+        {
+            rx_state = traverseRxStates(ins, transfer_descriptor);
+
+            if(rx_state == NULL)
+            {
+                return -CANARD_ERROR_OUT_OF_MEMORY;
+            }
+        }
+        else
+        {
+            return -CANARD_ERROR_RX_NOT_WANTED;
+        }
+    }
+    else
+    {
+        rx_state = findRxState(ins, transfer_descriptor);
+
+        if (rx_state == NULL)
+        {
+            return -CANARD_ERROR_RX_MISSED_START;
+        }
+    }
+
+    CANARD_ASSERT(rx_state != NULL);    // All paths that lead to NULL should be terminated with return above
+
+    // Resolving the state flags:
+    const bool not_initialized = rx_state->timestamp_usec == 0;
+    const bool tid_timed_out = (timestamp_usec - rx_state->timestamp_usec) > TRANSFER_TIMEOUT_USEC;
+    const bool same_iface = frame->iface_id == rx_state->iface_id;
+    const bool first_frame = IS_START_OF_TRANSFER(tail_byte);
+    const bool not_previous_tid =
+        computeTransferIDForwardDistance((uint8_t) rx_state->transfer_id, TRANSFER_ID_FROM_TAIL_BYTE(tail_byte)) > 1;
+    const bool iface_switch_allowed = (timestamp_usec - rx_state->timestamp_usec) > IFACE_SWITCH_DELAY_USEC;
+    const bool non_wrapped_tid = computeTransferIDForwardDistance(TRANSFER_ID_FROM_TAIL_BYTE(tail_byte), (uint8_t) rx_state->transfer_id) < (1 << (TRANSFER_ID_BIT_LEN-1));
+    const bool incomplete_frame = rx_state->buffer_blocks != CANARD_BUFFER_IDX_NONE;
+
+    const bool need_restart =
+            (not_initialized) ||
+            (tid_timed_out) ||
+            (same_iface && first_frame && (not_previous_tid || incomplete_frame)) ||
+            (iface_switch_allowed && first_frame && non_wrapped_tid);
+
+    if (need_restart)
+    {
+        rx_state->transfer_id = TRANSFER_ID_FROM_TAIL_BYTE(tail_byte);
+        rx_state->next_toggle = 0;
+        releaseStatePayload(ins, rx_state);
+        rx_state->iface_id = frame->iface_id;
+        if (!IS_START_OF_TRANSFER(tail_byte))
+        {
+            rx_state->transfer_id++;
+            return -CANARD_ERROR_RX_MISSED_START;
+        }
+    }
+
+    if (frame->iface_id != rx_state->iface_id)
+    {
+        // drop frame if coming from unexpected interface
+        return CANARD_OK;
+    }
+
+    if (IS_START_OF_TRANSFER(tail_byte) && IS_END_OF_TRANSFER(tail_byte)) // single frame transfer
+    {
+        rx_state->timestamp_usec = timestamp_usec;
+        CanardRxTransfer rx_transfer = {
+            .timestamp_usec = timestamp_usec,
+            .payload_head = frame->data,
+            .payload_len = (uint8_t)(frame->data_len - 1U),
+            .data_type_id = data_type_id,
+            .transfer_type = (uint8_t)transfer_type,
+            .transfer_id = TRANSFER_ID_FROM_TAIL_BYTE(tail_byte),
+            .priority = priority,
+            .source_node_id = source_node_id,
+#if CANARD_ENABLE_CANFD
+            .canfd = frame->canfd,
+            .tao = !(frame->canfd || ins->tao_disabled)
+#elif CANARD_ENABLE_TAO_OPTION
+            .tao = !ins->tao_disabled
+#endif
+        };
+
+        ins->on_reception(ins, &rx_transfer);
+
+        prepareForNextTransfer(rx_state);
+        return CANARD_OK;
+    }
+
+    if (TOGGLE_BIT(tail_byte) != rx_state->next_toggle)
+    {
+        return -CANARD_ERROR_RX_WRONG_TOGGLE;
+    }
+
+    if (TRANSFER_ID_FROM_TAIL_BYTE(tail_byte) != rx_state->transfer_id)
+    {
+        return -CANARD_ERROR_RX_UNEXPECTED_TID;
+    }
+
+    if (IS_START_OF_TRANSFER(tail_byte) && !IS_END_OF_TRANSFER(tail_byte))      // Beginning of multi frame transfer
+    {
+        if (frame->data_len <= 3)
+        {
+            return -CANARD_ERROR_RX_SHORT_FRAME;
+        }
+
+        // take off the crc and store the payload
+        rx_state->timestamp_usec = timestamp_usec;
+        rx_state->payload_len = 0;
+        const int16_t ret = bufferBlockPushBytes(&ins->allocator, rx_state, frame->data + 2,
+                                                 (uint8_t) (frame->data_len - 3));
+        if (ret < 0)
+        {
+            releaseStatePayload(ins, rx_state);
+            prepareForNextTransfer(rx_state);
+            return -CANARD_ERROR_OUT_OF_MEMORY;
+        }
+        rx_state->payload_crc = (uint16_t)(((uint16_t) frame->data[0]) | (uint16_t)((uint16_t) frame->data[1] << 8U));
+        rx_state->calculated_crc = crcAddSignature(0xFFFFU, data_type_signature);
+        rx_state->calculated_crc = crcAdd((uint16_t)rx_state->calculated_crc,
+                                          frame->data + 2, (uint8_t)(frame->data_len - 3));
+    }
+    else if (!IS_START_OF_TRANSFER(tail_byte) && !IS_END_OF_TRANSFER(tail_byte))    // Middle of a multi-frame transfer
+    {
+        const int16_t ret = bufferBlockPushBytes(&ins->allocator, rx_state, frame->data,
+                                                 (uint8_t) (frame->data_len - 1));
+        if (ret < 0)
+        {
+            releaseStatePayload(ins, rx_state);
+            prepareForNextTransfer(rx_state);
+            return -CANARD_ERROR_OUT_OF_MEMORY;
+        }
+        rx_state->calculated_crc = crcAdd((uint16_t)rx_state->calculated_crc,
+                                          frame->data, (uint8_t)(frame->data_len - 1));
+    }
+    else                                                                            // End of a multi-frame transfer
+    {
+        const uint8_t frame_payload_size = (uint8_t)(frame->data_len - 1);
+
+        uint8_t tail_offset = 0;
+
+        if (rx_state->payload_len < CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE)
+        {
+            // Copy the beginning of the frame into the head, point the tail pointer to the remainder
+            for (size_t i = rx_state->payload_len;
+                 (i < CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE) && (tail_offset < frame_payload_size);
+                 i++, tail_offset++)
+            {
+                rx_state->buffer_head[i] = frame->data[tail_offset];
+            }
+        }
+        else
+        {
+            // Like above, except that the beginning goes into the last block of the storage
+            CanardBufferBlock* block = canardBufferFromIdx(&ins->allocator, rx_state->buffer_blocks);
+            if (block != NULL)
+            {
+                size_t offset = CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE;    // Payload offset of the first block
+                while (block->next != NULL)
+                {
+                    block = block->next;
+                    offset += CANARD_BUFFER_BLOCK_DATA_SIZE;
+                }
+                CANARD_ASSERT(block != NULL);
+
+                const size_t offset_within_block = rx_state->payload_len - offset;
+                CANARD_ASSERT(offset_within_block <= CANARD_BUFFER_BLOCK_DATA_SIZE);
+
+                for (size_t i = offset_within_block;
+                     (i < CANARD_BUFFER_BLOCK_DATA_SIZE) && (tail_offset < frame_payload_size);
+                     i++, tail_offset++)
+                {
+                    block->data[i] = frame->data[tail_offset];
+                }
+            }
+        }
+
+        CanardRxTransfer rx_transfer = {
+            .timestamp_usec = timestamp_usec,
+            .payload_head = rx_state->buffer_head,
+            .payload_middle = canardBufferFromIdx(&ins->allocator, rx_state->buffer_blocks),
+            .payload_tail = (tail_offset >= frame_payload_size) ? NULL : (&frame->data[tail_offset]),
+            .payload_len = (uint16_t)(rx_state->payload_len + frame_payload_size),
+            .data_type_id = data_type_id,
+            .transfer_type = (uint8_t)transfer_type,
+            .transfer_id = TRANSFER_ID_FROM_TAIL_BYTE(tail_byte),
+            .priority = priority,
+            .source_node_id = source_node_id,
+
+#if CANARD_ENABLE_CANFD
+            .canfd = frame->canfd,
+            .tao = !(frame->canfd || ins->tao_disabled)
+#elif CANARD_ENABLE_TAO_OPTION
+            .tao = !ins->tao_disabled
+#endif
+        };
+
+        rx_state->buffer_blocks = CANARD_BUFFER_IDX_NONE;     // Block list ownership has been transferred to rx_transfer!
+
+        // CRC validation
+        rx_state->calculated_crc = crcAdd((uint16_t)rx_state->calculated_crc, frame->data, frame->data_len - 1U);
+        if (rx_state->calculated_crc == rx_state->payload_crc)
+        {
+            ins->on_reception(ins, &rx_transfer);
+        }
+
+        // Making sure the payload is released even if the application didn't bother with it
+        canardReleaseRxTransferPayload(ins, &rx_transfer);
+        prepareForNextTransfer(rx_state);
+
+        if (rx_state->calculated_crc == rx_state->payload_crc)
+        {
+            return CANARD_OK;
+        }
+        else
+        {
+            return -CANARD_ERROR_RX_BAD_CRC;
+        }
+    }
+
+    rx_state->next_toggle = rx_state->next_toggle ? 0 : 1;
+    return CANARD_OK;
+}
+
+void canardCleanupStaleTransfers(CanardInstance* ins, uint64_t current_time_usec)
+{
+    CanardRxState* prev = ins->rx_states, * state = ins->rx_states;
+
+    while (state != NULL)
+    {
+        if ((current_time_usec - state->timestamp_usec) > TRANSFER_TIMEOUT_USEC)
+        {
+            if (state == ins->rx_states)
+            {
+                releaseStatePayload(ins, state);
+                ins->rx_states = canardRxFromIdx(&ins->allocator, ins->rx_states->next);
+                freeBlock(&ins->allocator, state);
+                state = ins->rx_states;
+                prev = state;
+            }
+            else
+            {
+                releaseStatePayload(ins, state);
+                prev->next = state->next;
+                freeBlock(&ins->allocator, state);
+                state = canardRxFromIdx(&ins->allocator, prev->next);
+            }
+        }
+        else
+        {
+            prev = state;
+            state = canardRxFromIdx(&ins->allocator, state->next);
+        }
+    }
+
+#if CANARD_MULTI_IFACE || CANARD_ENABLE_DEADLINE
+    // remove stale TX transfers
+    CanardTxQueueItem* prev_item = ins->tx_queue, * item = ins->tx_queue;
+    while (item != NULL)
+    {
+#if CANARD_MULTI_IFACE && CANARD_ENABLE_DEADLINE
+        if ((current_time_usec > item->frame.deadline_usec) || item->frame.iface_mask == 0)
+#elif CANARD_MULTI_IFACE
+        if (item->frame.iface_mask == 0)
+#else
+        if (current_time_usec > item->frame.deadline_usec)
+#endif
+        {
+            if (item == ins->tx_queue)
+            {
+                ins->tx_queue = ins->tx_queue->next;
+                freeBlock(&ins->allocator, item);
+                item = ins->tx_queue;
+                prev_item = item;
+            }
+            else
+            {
+                prev_item->next = item->next;
+                freeBlock(&ins->allocator, item);
+                item = prev_item->next;
+            }
+        }
+        else
+        {
+            prev_item = item;
+            item = item->next;
+        }
+    }
+#endif
+}
+
+int16_t canardDecodeScalar(const CanardRxTransfer* transfer,
+                           uint32_t bit_offset,
+                           uint8_t bit_length,
+                           bool value_is_signed,
+                           void* out_value)
+{
+    if (transfer == NULL || out_value == NULL)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (bit_length < 1 || bit_length > 64)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (bit_length == 1 && value_is_signed)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    /*
+     * Reading raw bytes into the temporary storage.
+     * Luckily, C guarantees that every element is aligned at the beginning (lower address) of the union.
+     */
+    union
+    {
+        bool     boolean;       ///< sizeof(bool) is implementation-defined, so it has to be handled separately
+        uint8_t  u8;            ///< Also char
+        int8_t   s8;
+        uint16_t u16;
+        int16_t  s16;
+        uint32_t u32;
+        int32_t  s32;           ///< Also float, possibly double, possibly long double (depends on implementation)
+        uint64_t u64;
+        int64_t  s64;           ///< Also double, possibly float, possibly long double (depends on implementation)
+        uint8_t bytes[8];
+    } storage;
+
+    memset(&storage, 0, sizeof(storage));   // This is important
+
+    const int16_t result = descatterTransferPayload(transfer, bit_offset, bit_length, &storage.bytes[0]);
+    if (result <= 0)
+    {
+        return result;
+    }
+
+    CANARD_ASSERT((result > 0) && (result <= 64) && (result <= bit_length));
+
+    /*
+     * The bit copy algorithm assumes that more significant bits have lower index, so we need to shift some.
+     * Extra most significant bits will be filled with zeroes, which is fine.
+     * Coverity Scan mistakenly believes that the array may be overrun if bit_length == 64; however, this branch will
+     * not be taken if bit_length == 64, because 64 % 8 == 0.
+     */
+    if ((bit_length % 8) != 0)
+    {
+        // coverity[overrun-local]
+        storage.bytes[bit_length / 8U] = (uint8_t)(storage.bytes[bit_length / 8U] >> ((8U - (bit_length % 8U)) & 7U));
+    }
+
+    /*
+     * Determining the closest standard byte length - this will be needed for byte reordering and sign bit extension.
+     */
+    uint8_t std_byte_length = 0;
+    if      (bit_length == 1)   { std_byte_length = sizeof(bool); }
+    else if (bit_length <= 8)   { std_byte_length = 1; }
+    else if (bit_length <= 16)  { std_byte_length = 2; }
+    else if (bit_length <= 32)  { std_byte_length = 4; }
+    else if (bit_length <= 64)  { std_byte_length = 8; }
+    else
+    {
+        CANARD_ASSERT(false);
+        return -CANARD_ERROR_INTERNAL;
+    }
+
+    CANARD_ASSERT((std_byte_length > 0) && (std_byte_length <= 8));
+
+    /*
+     * Flipping the byte order if needed.
+     */
+    if (isBigEndian())
+    {
+        swapByteOrder(&storage.bytes[0], std_byte_length);
+    }
+	
+#if WORD_ADDRESSING_IS_16BITS
+    /*
+     * Copying 8-bit array to 64-bit storage
+     */
+    {
+        uint64_t temp = 0;
+        for(uint16_t i=0; i<std_byte_length; i++)
+        {
+            temp |= (((uint64_t)storage.bytes[i] & 0xFFU) << (8*i));
+        }
+        storage.u64 = temp;
+    }
+#endif
+
+    /*
+     * Extending the sign bit if needed. I miss templates.
+     * Note that we operate on unsigned values in order to avoid undefined behaviors.
+     */
+    if (value_is_signed && (std_byte_length * 8 != bit_length))
+    {
+        if (bit_length <= 8)
+        {
+            if ((storage.u8 & (1U << (bit_length - 1U))) != 0)                           // If the sign bit is set...
+            {
+                storage.u8 |= (uint8_t) 0xFFU & (uint8_t) ~((1U << bit_length) - 1U);   // ...set all bits above it.
+            }
+        }
+        else if (bit_length <= 16)
+        {
+            if ((storage.u16 & (1U << (bit_length - 1U))) != 0)
+            {
+                storage.u16 |= (uint16_t) 0xFFFFU & (uint16_t) ~((1U << bit_length) - 1U);
+            }
+        }
+        else if (bit_length <= 32)
+        {
+            if ((storage.u32 & (((uint32_t) 1) << (bit_length - 1U))) != 0)
+            {
+                storage.u32 |= (uint32_t) 0xFFFFFFFFUL & (uint32_t) ~((((uint32_t) 1) << bit_length) - 1U);
+            }
+        }
+        else if (bit_length < 64)   // Strictly less, this is not a typo
+        {
+            if ((storage.u64 & (((uint64_t) 1) << (bit_length - 1U))) != 0)
+            {
+                storage.u64 |= (uint64_t) 0xFFFFFFFFFFFFFFFFULL & (uint64_t) ~((((uint64_t) 1) << bit_length) - 1U);
+            }
+        }
+        else
+        {
+            CANARD_ASSERT(false);
+            return -CANARD_ERROR_INTERNAL;
+        }
+    }
+
+    /*
+     * Copying the result out.
+     */
+    if (value_is_signed)
+    {
+        if      (bit_length <= 8)   { *( (int8_t*) out_value) = storage.s8;  }
+        else if (bit_length <= 16)  { *((int16_t*) out_value) = storage.s16; }
+        else if (bit_length <= 32)  { *((int32_t*) out_value) = storage.s32; }
+        else if (bit_length <= 64)  { *((int64_t*) out_value) = storage.s64; }
+        else
+        {
+            CANARD_ASSERT(false);
+            return -CANARD_ERROR_INTERNAL;
+        }
+    }
+    else
+    {
+        if      (bit_length == 1)   { *(    (bool*) out_value) = storage.boolean; }
+        else if (bit_length <= 8)   { *( (uint8_t*) out_value) = storage.u8;  }
+        else if (bit_length <= 16)  { *((uint16_t*) out_value) = storage.u16; }
+        else if (bit_length <= 32)  { *((uint32_t*) out_value) = storage.u32; }
+        else if (bit_length <= 64)  { *((uint64_t*) out_value) = storage.u64; }
+        else
+        {
+            CANARD_ASSERT(false);
+            return -CANARD_ERROR_INTERNAL;
+        }
+    }
+
+    CANARD_ASSERT(result <= bit_length);
+    CANARD_ASSERT(result > 0);
+    return result;
+}
+
+void canardEncodeScalar(void* destination,
+                        uint32_t bit_offset,
+                        uint8_t bit_length,
+                        const void* value)
+{
+    /*
+     * This function can only fail due to invalid arguments, so it was decided to make it return void,
+     * and in the case of bad arguments try the best effort or just trigger an CANARD_ASSERTion failure.
+     * Maybe not the best solution, but it simplifies the API.
+     */
+    CANARD_ASSERT(destination != NULL);
+    CANARD_ASSERT(value != NULL);
+
+    if (bit_length > 64)
+    {
+        CANARD_ASSERT(false);
+        bit_length = 64;
+    }
+
+    if (bit_length < 1)
+    {
+        CANARD_ASSERT(false);
+        bit_length = 1;
+    }
+
+    /*
+     * Preparing the data in the temporary storage.
+     */
+    union
+    {
+        bool     boolean;
+        uint8_t  u8;
+        uint16_t u16;
+        uint32_t u32;
+        uint64_t u64;
+        uint8_t bytes[8];
+    } storage;
+
+    memset(&storage, 0, sizeof(storage));
+
+    uint8_t std_byte_length = 0;
+
+    // Extra most significant bits can be safely ignored here.
+    if      (bit_length == 1)   { std_byte_length = sizeof(bool);   storage.boolean = (*((bool*) value) != 0); }
+    else if (bit_length <= 8)   { std_byte_length = 1;              storage.u8  = *((uint8_t*) value);  }
+    else if (bit_length <= 16)  { std_byte_length = 2;              storage.u16 = *((uint16_t*) value); }
+    else if (bit_length <= 32)  { std_byte_length = 4;              storage.u32 = *((uint32_t*) value); }
+    else if (bit_length <= 64)  { std_byte_length = 8;              storage.u64 = *((uint64_t*) value); }
+    else
+    {
+        CANARD_ASSERT(false);
+    }
+
+    CANARD_ASSERT(std_byte_length > 0);
+	
+#if WORD_ADDRESSING_IS_16BITS
+    /*
+     * Copying 64-bit storage to 8-bit array
+     */
+    {
+        uint64_t temp = storage.u64;
+        for(uint16_t i=0; i<std_byte_length; i++)
+        {
+            storage.bytes[i] = (temp >> (8*i)) & 0xFFU;
+        }
+    }
+#endif
+
+    if (isBigEndian())
+    {
+        swapByteOrder(&storage.bytes[0], std_byte_length);
+    }
+
+    /*
+     * The bit copy algorithm assumes that more significant bits have lower index, so we need to shift some.
+     * Extra least significant bits will be filled with zeroes, which is fine.
+     * Extra most significant bits will be discarded here.
+     * Coverity Scan mistakenly believes that the array may be overrun if bit_length == 64; however, this branch will
+     * not be taken if bit_length == 64, because 64 % 8 == 0.
+     */
+    if ((bit_length % 8) != 0)
+    {
+        // coverity[overrun-local]
+        storage.bytes[bit_length / 8U] = (uint8_t)(storage.bytes[bit_length / 8U] << ((8U - (bit_length % 8U)) & 7U));
+    }
+
+    /*
+     * Now, the storage contains properly serialized scalar. Copying it out.
+     */
+    copyBitArray(&storage.bytes[0], 0, bit_length, (uint8_t*) destination, bit_offset);
+}
+
+void canardReleaseRxTransferPayload(CanardInstance* ins, CanardRxTransfer* transfer)
+{
+    while (transfer->payload_middle != NULL)
+    {
+        CanardBufferBlock* const temp = transfer->payload_middle->next;
+        freeBlock(&ins->allocator, transfer->payload_middle);
+        transfer->payload_middle = temp;
+    }
+
+    transfer->payload_middle = NULL;
+    transfer->payload_head = NULL;
+    transfer->payload_tail = NULL;
+    transfer->payload_len = 0;
+}
+
+CanardPoolAllocatorStatistics canardGetPoolAllocatorStatistics(CanardInstance* ins)
+{
+    return ins->allocator.statistics;
+}
+
+uint16_t canardConvertNativeFloatToFloat16(float value)
+{
+    CANARD_ASSERT(sizeof(float) == CANARD_SIZEOF_FLOAT);
+
+    union FP32
+    {
+        uint32_t u;
+        float f;
+    };
+
+    const union FP32 f32inf = { 255UL << 23U };
+    const union FP32 f16inf = { 31UL << 23U };
+    const union FP32 magic = { 15UL << 23U };
+    const uint32_t sign_mask = 0x80000000UL;
+    const uint32_t round_mask = 0xFFFFF000UL;
+
+    union FP32 in;
+    in.f = value;
+    uint32_t sign = in.u & sign_mask;
+    in.u ^= sign;
+
+    uint16_t out = 0;
+
+    if (in.u >= f32inf.u)
+    {
+        out = (in.u > f32inf.u) ? (uint16_t)0x7FFFU : (uint16_t)0x7C00U;
+    }
+    else
+    {
+        in.u &= round_mask;
+        in.f *= magic.f;
+        in.u -= round_mask;
+        if (in.u > f16inf.u)
+        {
+            in.u = f16inf.u;
+        }
+        out = (uint16_t)(in.u >> 13U);
+    }
+
+    out |= (uint16_t)(sign >> 16U);
+
+    return out;
+}
+
+float canardConvertFloat16ToNativeFloat(uint16_t value)
+{
+    CANARD_ASSERT(sizeof(float) == CANARD_SIZEOF_FLOAT);
+
+    union FP32
+    {
+        uint32_t u;
+        float f;
+    };
+
+    const union FP32 magic = { (254UL - 15UL) << 23U };
+    const union FP32 was_inf_nan = { (127UL + 16UL) << 23U };
+    union FP32 out;
+
+    out.u = (value & 0x7FFFU) << 13U;
+    out.f *= magic.f;
+    if (out.f >= was_inf_nan.f)
+    {
+        out.u |= 255UL << 23U;
+    }
+    out.u |= (value & 0x8000UL) << 16U;
+
+    return out.f;
+}
+
+/*
+ * Internal (static functions)
+ */
+CANARD_INTERNAL int16_t computeTransferIDForwardDistance(uint8_t a, uint8_t b)
+{
+    int16_t d = (int16_t)(a - b);
+    if (d < 0)
+    {
+        d = (int16_t)(d + (int16_t)(1U << TRANSFER_ID_BIT_LEN));
+    }
+    return d;
+}
+
+CANARD_INTERNAL void incrementTransferID(uint8_t* transfer_id)
+{
+    CANARD_ASSERT(transfer_id != NULL);
+
+    (*transfer_id)++;
+    if (*transfer_id >= 32)
+    {
+        *transfer_id = 0;
+    }
+}
+
+CANARD_INTERNAL uint16_t dlcToDataLength(uint16_t dlc) {
+    /*
+    Data Length Code      9  10  11  12  13  14  15
+    Number of data bytes 12  16  20  24  32  48  64
+    */
+    if (dlc <= 8) {
+        return dlc;
+    } else if (dlc == 9) {
+        return 12;
+    } else if (dlc == 10) {
+        return 16;
+    } else if (dlc == 11) {
+        return 20;
+    } else if (dlc == 12) {
+        return 24;
+    } else if (dlc == 13) {
+        return 32;
+    } else if (dlc == 14) {
+        return 48;
+    }
+    return 64;
+}
+
+CANARD_INTERNAL uint16_t dataLengthToDlc(uint16_t data_length) {
+    if (data_length <= 8) {
+        return data_length;
+    } else if (data_length <= 12) {
+        return 9;
+    } else if (data_length <= 16) {
+        return 10;
+    } else if (data_length <= 20) {
+        return 11;
+    } else if (data_length <= 24) {
+        return 12;
+    } else if (data_length <= 32) {
+        return 13;
+    } else if (data_length <= 48) {
+        return 14;
+    }
+    return 15;
+}
+
+CANARD_INTERNAL int16_t enqueueTxFrames(CanardInstance* ins,
+                                        uint32_t can_id,
+                                        uint16_t crc,
+                                        CanardTxTransfer* transfer
+)
+{
+    CANARD_ASSERT(ins != NULL);
+    CANARD_ASSERT((can_id & CANARD_CAN_EXT_ID_MASK) == can_id);            // Flags must be cleared
+
+    if (transfer->inout_transfer_id == NULL)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    if ((transfer->payload_len > 0) && (transfer->payload == NULL))
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    int16_t result = 0;
+#if CANARD_ENABLE_CANFD
+    uint8_t frame_max_data_len = transfer->canfd ? CANARD_CANFD_FRAME_MAX_DATA_LEN:CANARD_CAN_FRAME_MAX_DATA_LEN;
+#else
+    uint8_t frame_max_data_len = CANARD_CAN_FRAME_MAX_DATA_LEN;
+#endif
+    if (transfer->payload_len < frame_max_data_len)                        // Single frame transfer
+    {
+        CanardTxQueueItem* queue_item = createTxItem(&ins->allocator);
+        if (queue_item == NULL)
+        {
+            return -CANARD_ERROR_OUT_OF_MEMORY;
+        }
+
+        memcpy(queue_item->frame.data, transfer->payload, transfer->payload_len);
+
+        transfer->payload_len = dlcToDataLength(dataLengthToDlc(transfer->payload_len+1))-1;
+        queue_item->frame.data_len = (uint8_t)(transfer->payload_len + 1);
+        queue_item->frame.data[transfer->payload_len] = (uint8_t)(0xC0U | (*transfer->inout_transfer_id & 31U));
+        queue_item->frame.id = can_id | CANARD_CAN_FRAME_EFF;
+#if CANARD_ENABLE_DEADLINE
+        queue_item->frame.deadline_usec = transfer->deadline_usec;
+#endif
+#if CANARD_MULTI_IFACE
+        queue_item->frame.iface_mask = transfer->iface_mask;
+#endif
+#if CANARD_ENABLE_CANFD
+        queue_item->frame.canfd = transfer->canfd;
+#endif
+        pushTxQueue(ins, queue_item);
+        result++;
+    }
+    else                                                                    // Multi frame transfer
+    {
+        uint16_t data_index = 0;
+        uint8_t toggle = 0;
+        uint8_t sot_eot = 0x80;
+
+        CanardTxQueueItem* queue_item = NULL;
+
+        while (transfer->payload_len - data_index != 0)
+        {
+            queue_item = createTxItem(&ins->allocator);
+            if (queue_item == NULL)
+            {
+                CANARD_ASSERT(false);
+                return -CANARD_ERROR_OUT_OF_MEMORY;          // TODO: Purge all frames enqueued so far
+            }
+
+            uint16_t i = 0;
+            if (data_index == 0)
+            {
+                // add crc
+                queue_item->frame.data[0] = (uint8_t) (crc);
+                queue_item->frame.data[1] = (uint8_t) (crc >> 8U);
+                i = 2;
+            }
+            else
+            {
+                i = 0;
+            }
+
+            for (; i < (frame_max_data_len - 1) && data_index < transfer->payload_len; i++, data_index++)
+            {
+                queue_item->frame.data[i] = transfer->payload[data_index];
+            }
+            // tail byte
+            sot_eot = (data_index == transfer->payload_len) ? (uint8_t)0x40 : sot_eot;
+            
+            i = dlcToDataLength(dataLengthToDlc(i+1))-1;
+            queue_item->frame.data[i] = (uint8_t)(sot_eot | ((uint32_t)toggle << 5U) | ((uint32_t)*transfer->inout_transfer_id & 31U));
+            queue_item->frame.id = can_id | CANARD_CAN_FRAME_EFF;
+            queue_item->frame.data_len = (uint8_t)(i + 1);
+#if CANARD_ENABLE_DEADLINE
+            queue_item->frame.deadline_usec = transfer->deadline_usec;
+#endif
+#if CANARD_MULTI_IFACE
+            queue_item->frame.iface_mask = transfer->iface_mask;
+#endif
+#if CANARD_ENABLE_CANFD
+            queue_item->frame.canfd = transfer->canfd;
+#endif
+            pushTxQueue(ins, queue_item);
+
+            result++;
+            toggle ^= 1;
+            sot_eot = 0;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Puts frame on on the TX queue. Higher priority placed first
+ */
+CANARD_INTERNAL void pushTxQueue(CanardInstance* ins, CanardTxQueueItem* item)
+{
+    CANARD_ASSERT(ins != NULL);
+    CANARD_ASSERT(item->frame.data_len > 0);       // UAVCAN doesn't allow zero-payload frames
+
+    if (ins->tx_queue == NULL)
+    {
+        ins->tx_queue = item;
+        return;
+    }
+
+    CanardTxQueueItem* queue = ins->tx_queue;
+    CanardTxQueueItem* previous = ins->tx_queue;
+
+    while (queue != NULL)
+    {
+        if (isPriorityHigher(queue->frame.id, item->frame.id)) // lower number wins
+        {
+            if (queue == ins->tx_queue)
+            {
+                item->next = queue;
+                ins->tx_queue = item;
+            }
+            else
+            {
+                previous->next = item;
+                item->next = queue;
+            }
+            return;
+        }
+        else
+        {
+            if (queue->next == NULL)
+            {
+                queue->next = item;
+                return;
+            }
+            else
+            {
+                previous = queue;
+                queue = queue->next;
+            }
+        }
+    }
+}
+
+/**
+ * Creates new tx queue item from allocator
+ */
+CANARD_INTERNAL CanardTxQueueItem* createTxItem(CanardPoolAllocator* allocator)
+{
+    CanardTxQueueItem* item = (CanardTxQueueItem*) allocateBlock(allocator);
+    if (item == NULL)
+    {
+        return NULL;
+    }
+    memset(item, 0, sizeof(*item));
+    return item;
+}
+
+/**
+ * Returns true if priority of rhs is higher than id
+ */
+CANARD_INTERNAL bool isPriorityHigher(uint32_t rhs, uint32_t id)
+{
+    const uint32_t clean_id = id & CANARD_CAN_EXT_ID_MASK;
+    const uint32_t rhs_clean_id = rhs & CANARD_CAN_EXT_ID_MASK;
+
+    /*
+     * STD vs EXT - if 11 most significant bits are the same, EXT loses.
+     */
+    const bool ext = (id & CANARD_CAN_FRAME_EFF) != 0;
+    const bool rhs_ext = (rhs & CANARD_CAN_FRAME_EFF) != 0;
+    if (ext != rhs_ext)
+    {
+        uint32_t arb11 = ext ? (clean_id >> 18U) : clean_id;
+        uint32_t rhs_arb11 = rhs_ext ? (rhs_clean_id >> 18U) : rhs_clean_id;
+        if (arb11 != rhs_arb11)
+        {
+            return arb11 < rhs_arb11;
+        }
+        else
+        {
+            return rhs_ext;
+        }
+    }
+
+    /*
+     * RTR vs Data frame - if frame identifiers and frame types are the same, RTR loses.
+     */
+    const bool rtr = (id & CANARD_CAN_FRAME_RTR) != 0;
+    const bool rhs_rtr = (rhs & CANARD_CAN_FRAME_RTR) != 0;
+    if (clean_id == rhs_clean_id && rtr != rhs_rtr)
+    {
+        return rhs_rtr;
+    }
+
+    /*
+     * Plain ID arbitration - greater value loses.
+     */
+    return clean_id < rhs_clean_id;
+}
+
+/**
+ * preps the rx state for the next transfer. does not delete the state
+ */
+CANARD_INTERNAL void prepareForNextTransfer(CanardRxState* state)
+{
+    CANARD_ASSERT(state->buffer_blocks == CANARD_BUFFER_IDX_NONE);
+    state->transfer_id++;
+    state->payload_len = 0;
+    state->next_toggle = 0;
+}
+
+/**
+ * returns data type from id
+ */
+uint16_t extractDataType(uint32_t id)
+{
+    if (extractTransferType(id) == CanardTransferTypeBroadcast)
+    {
+        uint16_t dtid = MSG_TYPE_FROM_ID(id);
+        if (SOURCE_ID_FROM_ID(id) == CANARD_BROADCAST_NODE_ID)
+        {
+            dtid &= (1U << ANON_MSG_DATA_TYPE_ID_BIT_LEN) - 1U;
+        }
+        return dtid;
+    }
+    else
+    {
+        return (uint16_t) SRV_TYPE_FROM_ID(id);
+    }
+}
+
+/**
+ * returns transfer type from id
+ */
+CanardTransferType extractTransferType(uint32_t id)
+{
+    const bool is_service = SERVICE_NOT_MSG_FROM_ID(id);
+    if (!is_service)
+    {
+        return CanardTransferTypeBroadcast;
+    }
+    else if (REQUEST_NOT_RESPONSE_FROM_ID(id) == 1)
+    {
+        return CanardTransferTypeRequest;
+    }
+    else
+    {
+        return CanardTransferTypeResponse;
+    }
+}
+
+/*
+ *  CanardRxState functions
+ */
+
+/**
+ * Traverses the list of CanardRxState's and returns a pointer to the CanardRxState
+ * with either the Id or a new one at the end
+ */
+CANARD_INTERNAL CanardRxState* traverseRxStates(CanardInstance* ins, uint32_t transfer_descriptor)
+{
+    CanardRxState* states = ins->rx_states;
+
+    if (states == NULL) // initialize CanardRxStates
+    {
+        states = createRxState(&ins->allocator, transfer_descriptor);
+
+        if(states == NULL)
+        {
+            return NULL;
+        }
+
+        ins->rx_states = states;
+        return states;
+    }
+
+    states = findRxState(ins, transfer_descriptor);
+    if (states != NULL)
+    {
+        return states;
+    }
+    else
+    {
+        return prependRxState(ins, transfer_descriptor);
+    }
+}
+
+/**
+ * returns pointer to the rx state of transfer descriptor or null if not found
+ */
+CANARD_INTERNAL CanardRxState* findRxState(CanardInstance *ins, uint32_t transfer_descriptor)
+{
+    CanardRxState *state = ins->rx_states;
+    while (state != NULL)
+    {
+        if (state->dtid_tt_snid_dnid == transfer_descriptor)
+        {
+            return state;
+        }
+        state = canardRxFromIdx(&ins->allocator, state->next);
+    }
+    return NULL;
+}
+
+/**
+ * prepends rx state to the canard instance rx_states
+ */
+CANARD_INTERNAL CanardRxState* prependRxState(CanardInstance* ins, uint32_t transfer_descriptor)
+{
+    CanardRxState* state = createRxState(&ins->allocator, transfer_descriptor);
+
+    if(state == NULL)
+    {
+        return NULL;
+    }
+
+    state->next = canardRxToIdx(&ins->allocator, ins->rx_states);
+    ins->rx_states = state;
+    return state;
+}
+
+CANARD_INTERNAL CanardRxState* createRxState(CanardPoolAllocator* allocator, uint32_t transfer_descriptor)
+{
+    CanardRxState init = {
+        .next = CANARD_BUFFER_IDX_NONE,
+        .buffer_blocks = CANARD_BUFFER_IDX_NONE,
+        .dtid_tt_snid_dnid = transfer_descriptor
+    };
+
+    CanardRxState* state = (CanardRxState*) allocateBlock(allocator);
+    if (state == NULL)
+    {
+        return NULL;
+    }
+    memcpy(state, &init, sizeof(*state));
+
+    return state;
+}
+
+CANARD_INTERNAL uint64_t releaseStatePayload(CanardInstance* ins, CanardRxState* rxstate)
+{
+    while (rxstate->buffer_blocks != CANARD_BUFFER_IDX_NONE)
+    {
+        CanardBufferBlock* block = canardBufferFromIdx(&ins->allocator, rxstate->buffer_blocks);
+        CanardBufferBlock* const temp = block->next;
+        freeBlock(&ins->allocator, block);
+        rxstate->buffer_blocks = canardBufferToIdx(&ins->allocator, temp);
+    }
+    rxstate->payload_len = 0;
+    return CANARD_OK;
+}
+
+/*
+ *  CanardBufferBlock functions
+ */
+
+/**
+ * pushes data into the rx state. Fills the buffer head, then appends data to buffer blocks
+ */
+CANARD_INTERNAL int16_t bufferBlockPushBytes(CanardPoolAllocator* allocator,
+                                             CanardRxState* state,
+                                             const uint8_t* data,
+                                             uint8_t data_len)
+{
+    uint16_t data_index = 0;
+
+    // if head is not full, add data to head
+    if ((CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE - state->payload_len) > 0)
+    {
+        for (uint16_t i = (uint16_t)state->payload_len;
+             i < CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE && data_index < data_len;
+             i++, data_index++)
+        {
+            state->buffer_head[i] = data[data_index];
+        }
+        if (data_index >= data_len)
+        {
+            state->payload_len =
+                (uint16_t)(state->payload_len + data_len) & ((1U << CANARD_TRANSFER_PAYLOAD_LEN_BITS) - 1U);
+            return 1;
+        }
+    } // head is full.
+
+    uint16_t index_at_nth_block =
+        (uint16_t)(((state->payload_len) - CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE) % CANARD_BUFFER_BLOCK_DATA_SIZE);
+
+    // get to current block
+    CanardBufferBlock* block = NULL;
+
+    // buffer blocks uninitialized
+    if (state->buffer_blocks == CANARD_BUFFER_IDX_NONE)
+    {
+        block = createBufferBlock(allocator);
+        state->buffer_blocks = canardBufferToIdx(allocator, block);
+        if (block == NULL)
+        {
+            return -CANARD_ERROR_OUT_OF_MEMORY;
+        }
+
+        index_at_nth_block = 0;
+    }
+    else
+    {
+        uint16_t nth_block = 1;
+
+        // get to block
+        block = canardBufferFromIdx(allocator, state->buffer_blocks);
+        while (block->next != NULL)
+        {
+            nth_block++;
+            block = block->next;
+        }
+
+        const uint16_t num_buffer_blocks =
+            (uint16_t) (((((uint32_t)state->payload_len + data_len) - CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE) /
+                         CANARD_BUFFER_BLOCK_DATA_SIZE) + 1U);
+
+        if (num_buffer_blocks > nth_block && index_at_nth_block == 0)
+        {
+            block->next = createBufferBlock(allocator);
+            if (block->next == NULL)
+            {
+                return -CANARD_ERROR_OUT_OF_MEMORY;
+            }
+            block = block->next;
+        }
+    }
+
+    // add data to current block until it becomes full, add new block if necessary
+    while (data_index < data_len)
+    {
+        for (uint16_t i = index_at_nth_block;
+             i < CANARD_BUFFER_BLOCK_DATA_SIZE && data_index < data_len;
+             i++, data_index++)
+        {
+            block->data[i] = data[data_index];
+        }
+
+        if (data_index < data_len)
+        {
+            block->next = createBufferBlock(allocator);
+            if (block->next == NULL)
+            {
+                return -CANARD_ERROR_OUT_OF_MEMORY;
+            }
+            block = block->next;
+            index_at_nth_block = 0;
+        }
+    }
+
+    state->payload_len = (uint16_t)(state->payload_len + data_len) & ((1U << CANARD_TRANSFER_PAYLOAD_LEN_BITS) - 1U);
+
+    return 1;
+}
+
+CANARD_INTERNAL CanardBufferBlock* createBufferBlock(CanardPoolAllocator* allocator)
+{
+    CanardBufferBlock* block = (CanardBufferBlock*) allocateBlock(allocator);
+    if (block == NULL)
+    {
+        return NULL;
+    }
+    block->next = NULL;
+    return block;
+}
+
+/**
+ * Bit array copy routine, originally developed by Ben Dyer for Libuavcan. Thanks Ben.
+ */
+void copyBitArray(const uint8_t* src, uint32_t src_offset, uint32_t src_len,
+                        uint8_t* dst, uint32_t dst_offset)
+{
+    CANARD_ASSERT(src_len > 0U);
+
+    // Normalizing inputs
+    src += src_offset / 8U;
+    dst += dst_offset / 8U;
+
+    src_offset %= 8U;
+    dst_offset %= 8U;
+
+    const size_t last_bit = src_offset + src_len;
+    while (last_bit - src_offset)
+    {
+        const uint8_t src_bit_offset = (uint8_t)(src_offset % 8U);
+        const uint8_t dst_bit_offset = (uint8_t)(dst_offset % 8U);
+
+        const uint8_t max_offset = MAX(src_bit_offset, dst_bit_offset);
+        const uint32_t copy_bits = (uint32_t)MIN(last_bit - src_offset, 8U - max_offset);
+
+#if WORD_ADDRESSING_IS_16BITS
+        /*
+         * (uint8_t) same as (uint16_t)
+         * Mask 0xFF must be used
+         */
+        const uint8_t write_mask = (uint8_t)((uint8_t)((0xFF00U >> copy_bits)&0xFF) >> dst_bit_offset)&0xFF;
+        const uint8_t src_data = (uint8_t)(((uint32_t)src[src_offset / 8U] << src_bit_offset) >> dst_bit_offset)&0xFF;
+
+        dst[dst_offset / 8U] =
+            (uint8_t)(((uint32_t)dst[dst_offset / 8U] & (uint32_t)~write_mask) | (uint32_t)(src_data & write_mask))&0xFF;
+#else
+        const uint8_t write_mask = (uint8_t)((uint8_t)(0xFF00U >> copy_bits) >> dst_bit_offset);
+        const uint8_t src_data = (uint8_t)(((uint32_t)src[src_offset / 8U] << src_bit_offset) >> dst_bit_offset);
+
+        dst[dst_offset / 8U] =
+            (uint8_t)(((uint32_t)dst[dst_offset / 8U] & (uint32_t)~write_mask) | (uint32_t)(src_data & write_mask));
+#endif
+
+        src_offset += copy_bits;
+        dst_offset += copy_bits;
+    }
+}
+
+CANARD_INTERNAL int16_t descatterTransferPayload(const CanardRxTransfer* transfer,
+                                                 uint32_t bit_offset,
+                                                 uint8_t bit_length,
+                                                 void* output)
+{
+    CANARD_ASSERT(transfer != 0);
+
+    if (bit_offset >= transfer->payload_len * 8)
+    {
+        return 0;       // Out of range, reading zero bits
+    }
+
+    if (bit_offset + bit_length > transfer->payload_len * 8)
+    {
+        bit_length = (uint8_t)(transfer->payload_len * 8U - bit_offset);
+    }
+
+    CANARD_ASSERT(bit_length > 0);
+
+    if ((transfer->payload_middle != NULL) || (transfer->payload_tail != NULL)) // Multi frame
+    {
+        /*
+         * This part is hideously complicated and probably should be redesigned.
+         * The objective here is to copy the requested number of bits from scattered storage into the temporary
+         * local storage. We go through great pains to ensure that all corner cases are handled correctly.
+         */
+        uint32_t input_bit_offset = bit_offset;
+        uint8_t output_bit_offset = 0;
+        uint8_t remaining_bit_length = bit_length;
+
+        // Reading head
+        if (input_bit_offset < CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE * 8)
+        {
+            const uint8_t amount = (uint8_t)MIN(remaining_bit_length,
+                                                CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE * 8U - input_bit_offset);
+
+            copyBitArray(&transfer->payload_head[0], input_bit_offset, amount, (uint8_t*) output, 0);
+
+            input_bit_offset += amount;
+            output_bit_offset = (uint8_t)(output_bit_offset + amount);
+            remaining_bit_length = (uint8_t)(remaining_bit_length - amount);
+        }
+
+        // Reading middle
+        uint32_t remaining_bits = (uint32_t)(transfer->payload_len * 8U - CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE * 8U);
+        uint32_t block_bit_offset = CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE * 8U;
+        const CanardBufferBlock* block = transfer->payload_middle;
+
+        while ((block != NULL) && (remaining_bit_length > 0))
+        {
+            CANARD_ASSERT(remaining_bits > 0);
+            const uint32_t block_end_bit_offset = block_bit_offset + MIN(CANARD_BUFFER_BLOCK_DATA_SIZE * 8,
+                                                                         remaining_bits);
+
+            // Perform copy if we've reached the requested offset, otherwise jump over this block and try next
+            if (block_end_bit_offset > input_bit_offset)
+            {
+                const uint8_t amount = (uint8_t) MIN(remaining_bit_length, block_end_bit_offset - input_bit_offset);
+
+                CANARD_ASSERT(input_bit_offset >= block_bit_offset);
+                const uint32_t bit_offset_within_block = input_bit_offset - block_bit_offset;
+
+                copyBitArray(&block->data[0], bit_offset_within_block, amount, (uint8_t*) output, output_bit_offset);
+
+                input_bit_offset += amount;
+                output_bit_offset = (uint8_t)(output_bit_offset + amount);
+                remaining_bit_length = (uint8_t)(remaining_bit_length - amount);
+            }
+
+            CANARD_ASSERT(block_end_bit_offset > block_bit_offset);
+            remaining_bits -= block_end_bit_offset - block_bit_offset;
+            block_bit_offset = block_end_bit_offset;
+            block = block->next;
+        }
+
+        CANARD_ASSERT(remaining_bit_length <= remaining_bits);
+
+        // Reading tail
+        if ((transfer->payload_tail != NULL) && (remaining_bit_length > 0))
+        {
+            CANARD_ASSERT(input_bit_offset >= block_bit_offset);
+            const uint32_t offset = input_bit_offset - block_bit_offset;
+
+            copyBitArray(&transfer->payload_tail[0], offset, remaining_bit_length, (uint8_t*) output,
+                         output_bit_offset);
+
+            input_bit_offset += remaining_bit_length;
+            output_bit_offset = (uint8_t)(output_bit_offset + remaining_bit_length);
+            remaining_bit_length = 0;
+        }
+
+        CANARD_ASSERT(input_bit_offset <= transfer->payload_len * 8);
+        CANARD_ASSERT(output_bit_offset <= 64);
+        CANARD_ASSERT(remaining_bit_length == 0);
+    }
+    else                                                                    // Single frame
+    {
+        copyBitArray(&transfer->payload_head[0], bit_offset, bit_length, (uint8_t*) output, 0);
+    }
+
+    return bit_length;
+}
+
+CANARD_INTERNAL bool isBigEndian(void)
+{
+#if defined(BYTE_ORDER) && defined(BIG_ENDIAN)
+    return BYTE_ORDER == BIG_ENDIAN;                // Some compilers offer this neat shortcut
+#else
+    union
+    {
+#if WORD_ADDRESSING_IS_16BITS
+        /*
+         * with 16-bit memory addressing u8b[0]=u16a, u8b[1]=NOTHING
+         */
+        uint32_t a;
+        uint16_t b[2];
+#else
+        uint16_t a;
+        uint8_t b[2];
+#endif
+    } u;
+    u.a = 1;
+    return u.b[1] == 1;                             // Some don't...
+#endif
+}
+
+CANARD_INTERNAL void swapByteOrder(void* data, unsigned size)
+{
+    CANARD_ASSERT(data != NULL);
+
+    uint8_t* const bytes = (uint8_t*) data;
+
+    size_t fwd = 0;
+    size_t rev = size - 1;
+
+    while (fwd < rev)
+    {
+        const uint8_t x = bytes[fwd];
+        bytes[fwd] = bytes[rev];
+        bytes[rev] = x;
+        fwd++;
+        rev--;
+    }
+}
+
+/*
+ * CRC functions
+ */
+CANARD_INTERNAL uint16_t crcAddByte(uint16_t crc_val, uint8_t byte)
+{
+    crc_val ^= (uint16_t) ((uint16_t) (byte) << 8U);
+    for (uint8_t j = 0; j < 8; j++)
+    {
+        if (crc_val & 0x8000U)
+        {
+            crc_val = (uint16_t) ((uint16_t) (crc_val << 1U) ^ 0x1021U);
+        }
+        else
+        {
+            crc_val = (uint16_t) (crc_val << 1U);
+        }
+    }
+    return crc_val;
+}
+
+CANARD_INTERNAL uint16_t crcAddSignature(uint16_t crc_val, uint64_t data_type_signature)
+{
+    for (uint16_t shift_val = 0; shift_val < 64; shift_val = (uint16_t)(shift_val + 8U))
+    {
+        crc_val = crcAddByte(crc_val, (uint8_t) (data_type_signature >> shift_val));
+    }
+    return crc_val;
+}
+
+CANARD_INTERNAL uint16_t crcAdd(uint16_t crc_val, const uint8_t* bytes, size_t len)
+{
+    while (len--)
+    {
+        crc_val = crcAddByte(crc_val, *bytes++);
+    }
+    return crc_val;
+}
+
+/*
+ *  Pool Allocator functions
+ */
+CANARD_INTERNAL void initPoolAllocator(CanardPoolAllocator* allocator,
+                                       void* buf,
+                                       uint16_t buf_len)
+{
+    size_t current_index = 0;
+    CanardPoolAllocatorBlock *abuf = buf;
+    allocator->arena = buf;
+    CanardPoolAllocatorBlock** current_block = &(allocator->free_list);
+    while (current_index < buf_len)
+    {
+        *current_block = &abuf[current_index];
+        current_block = &((*current_block)->next);
+        current_index++;
+    }
+    *current_block = NULL;
+
+    allocator->statistics.capacity_blocks = buf_len;
+    allocator->statistics.current_usage_blocks = 0;
+    allocator->statistics.peak_usage_blocks = 0;
+    // user should initialize semaphore after the canardInit
+    // or at first call of canard_allocate_sem_take
+    allocator->semaphore = NULL;
+}
+
+CANARD_INTERNAL void* allocateBlock(CanardPoolAllocator* allocator)
+{
+#if CANARD_ALLOCATE_SEM
+    canard_allocate_sem_take(allocator);
+#endif
+    // Check if there are any blocks available in the free list.
+    if (allocator->free_list == NULL)
+    {
+#if CANARD_ALLOCATE_SEM
+        canard_allocate_sem_give(allocator);
+#endif
+        return NULL;
+    }
+
+    // Take first available block and prepares next block for use.
+    void* result = allocator->free_list;
+    allocator->free_list = allocator->free_list->next;
+
+    // Update statistics
+    allocator->statistics.current_usage_blocks++;
+    if (allocator->statistics.peak_usage_blocks < allocator->statistics.current_usage_blocks)
+    {
+        allocator->statistics.peak_usage_blocks = allocator->statistics.current_usage_blocks;
+    }
+#if CANARD_ALLOCATE_SEM
+    canard_allocate_sem_give(allocator);
+#endif
+    return result;
+}
+
+CANARD_INTERNAL void freeBlock(CanardPoolAllocator* allocator, void* p)
+{
+#if CANARD_ALLOCATE_SEM
+    canard_allocate_sem_take(allocator);
+#endif
+    CanardPoolAllocatorBlock* block = (CanardPoolAllocatorBlock*) p;
+
+    block->next = allocator->free_list;
+    allocator->free_list = block;
+
+    CANARD_ASSERT(allocator->statistics.current_usage_blocks > 0);
+    allocator->statistics.current_usage_blocks--;
+#if CANARD_ALLOCATE_SEM
+    canard_allocate_sem_give(allocator);
+#endif
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+ * Copyright (c) 2016-2019 UAVCAN Team
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * Contributors: https://github.com/UAVCAN/libcanard/contributors
+ *
+ * Documentation: http://uavcan.org/Implementations/Libcanard
+ */
+
+#ifndef CANARD_H
+#define CANARD_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <assert.h>
+
+/// Build configuration header. Use it to provide your overrides.
+#if defined(CANARD_ENABLE_CUSTOM_BUILD_CONFIG) && CANARD_ENABLE_CUSTOM_BUILD_CONFIG
+# include "canard_build_config.h"
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// Libcanard version. API will be backwards compatible within the same major version.
+#define CANARD_VERSION_MAJOR                        0
+#define CANARD_VERSION_MINOR                        2
+
+
+#ifndef CANARD_ENABLE_CANFD
+#define CANARD_ENABLE_CANFD                         0
+#endif
+
+#ifndef CANARD_MULTI_IFACE
+#define CANARD_MULTI_IFACE                          0
+#endif
+
+#ifndef CANARD_ENABLE_DEADLINE
+#define CANARD_ENABLE_DEADLINE                      0
+#endif
+
+#ifndef CANARD_ENABLE_TAO_OPTION
+#if CANARD_ENABLE_CANFD
+#define CANARD_ENABLE_TAO_OPTION                    1
+#else
+#define CANARD_ENABLE_TAO_OPTION                    0
+#endif
+#endif
+
+/// By default this macro resolves to the standard assert(). The user can redefine this if necessary.
+#ifndef CANARD_ASSERT
+#ifdef CANARD_ENABLE_ASSERTS
+# define CANARD_ASSERT(x) assert(x)
+#else
+# define CANARD_ASSERT(x)
+#endif
+#endif // CANARD_ASSERT
+
+#define CANARD_GLUE(a, b)           CANARD_GLUE_IMPL_(a, b)
+#define CANARD_GLUE_IMPL_(a, b)     a##b
+
+/// By default this macro expands to static_assert if supported by the language (C11, C++11, or newer).
+/// The user can redefine this if necessary.
+#ifndef CANARD_STATIC_ASSERT
+# if (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)) ||\
+     (defined(__cplusplus) && (__cplusplus >= 201103L))
+#  define CANARD_STATIC_ASSERT(...) static_assert(__VA_ARGS__)
+# else
+#  define CANARD_STATIC_ASSERT(x, ...) typedef char CANARD_GLUE(_static_assertion_, __LINE__)[(x) ? 1 : -1]
+# endif
+#endif
+
+#ifndef CANARD_ALLOCATE_SEM
+#define CANARD_ALLOCATE_SEM 0
+#endif
+/// Error code definitions; inverse of these values may be returned from API calls.
+#define CANARD_OK                                      0
+// Value 1 is omitted intentionally, since -1 is often used in 3rd party code
+#define CANARD_ERROR_INVALID_ARGUMENT                  2
+#define CANARD_ERROR_OUT_OF_MEMORY                     3
+#define CANARD_ERROR_NODE_ID_NOT_SET                   4
+#define CANARD_ERROR_INTERNAL                          9
+#define CANARD_ERROR_RX_INCOMPATIBLE_PACKET            10
+#define CANARD_ERROR_RX_WRONG_ADDRESS                  11
+#define CANARD_ERROR_RX_NOT_WANTED                     12
+#define CANARD_ERROR_RX_MISSED_START                   13
+#define CANARD_ERROR_RX_WRONG_TOGGLE                   14
+#define CANARD_ERROR_RX_UNEXPECTED_TID                 15
+#define CANARD_ERROR_RX_SHORT_FRAME                    16
+#define CANARD_ERROR_RX_BAD_CRC                        17
+
+/// The size of a memory block in bytes.
+#if CANARD_ENABLE_CANFD
+#define CANARD_MEM_BLOCK_SIZE                       128U
+#elif CANARD_ENABLE_DEADLINE
+#define CANARD_MEM_BLOCK_SIZE                       40U
+#else
+#define CANARD_MEM_BLOCK_SIZE                       32U
+#endif
+
+#define CANARD_CAN_FRAME_MAX_DATA_LEN               8U
+#if CANARD_ENABLE_CANFD
+#define CANARD_CANFD_FRAME_MAX_DATA_LEN             64U
+#endif
+
+/// Node ID values. Refer to the specification for more info.
+#define CANARD_BROADCAST_NODE_ID                    0
+#define CANARD_MIN_NODE_ID                          1
+#define CANARD_MAX_NODE_ID                          127
+
+/// Refer to the type CanardRxTransfer
+#define CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE      (CANARD_MEM_BLOCK_SIZE - offsetof(CanardRxState, buffer_head))
+
+/// Refer to the type CanardBufferBlock
+#define CANARD_BUFFER_BLOCK_DATA_SIZE               (CANARD_MEM_BLOCK_SIZE - offsetof(CanardBufferBlock, data))
+
+/// Refer to canardCleanupStaleTransfers() for details.
+#define CANARD_RECOMMENDED_STALE_TRANSFER_CLEANUP_INTERVAL_USEC     1000000U
+
+/// Transfer priority definitions
+#define CANARD_TRANSFER_PRIORITY_HIGHEST            0
+#define CANARD_TRANSFER_PRIORITY_HIGH               8
+#define CANARD_TRANSFER_PRIORITY_MEDIUM             16
+#define CANARD_TRANSFER_PRIORITY_LOW                24
+#define CANARD_TRANSFER_PRIORITY_LOWEST             31
+
+/// Related to CanardCANFrame
+#define CANARD_CAN_EXT_ID_MASK                      0x1FFFFFFFU
+#define CANARD_CAN_STD_ID_MASK                      0x000007FFU
+#define CANARD_CAN_FRAME_EFF                        (1UL << 31U)         ///< Extended frame format
+#define CANARD_CAN_FRAME_RTR                        (1UL << 30U)         ///< Remote transmission (not used by UAVCAN)
+#define CANARD_CAN_FRAME_ERR                        (1UL << 29U)         ///< Error frame (not used by UAVCAN)
+
+#define CANARD_TRANSFER_PAYLOAD_LEN_BITS            10U
+#define CANARD_MAX_TRANSFER_PAYLOAD_LEN             ((1U << CANARD_TRANSFER_PAYLOAD_LEN_BITS) - 1U)
+
+#ifndef CANARD_64_BIT
+#ifdef __WORDSIZE
+#define CANARD_64_BIT (__WORDSIZE == 64)
+#else
+#define CANARD_64_BIT 0
+#endif
+#endif
+
+/*
+  canard_buffer_idx_t is used to avoid pointers in data structures
+  that have to have the same size on both 32 bit and 64 bit
+  platforms. It is an index into mem_arena passed to canardInit
+  treated as a uint8_t array
+
+  A value of CANARD_BUFFER_IDX_NONE means a NULL pointer
+ */
+#if CANARD_64_BIT
+typedef uint32_t canard_buffer_idx_t;
+#define CANARD_BUFFER_IDX_NONE 0U
+#else
+typedef void* canard_buffer_idx_t;
+#define CANARD_BUFFER_IDX_NONE NULL
+#endif
+
+
+    
+/**
+ * This data type holds a standard CAN 2.0B data frame with 29-bit ID.
+ */
+typedef struct
+{
+    /**
+     * Refer to the following definitions:
+     *  - CANARD_CAN_FRAME_EFF
+     *  - CANARD_CAN_FRAME_RTR
+     *  - CANARD_CAN_FRAME_ERR
+     */
+    uint32_t id;
+#if CANARD_ENABLE_DEADLINE
+    uint64_t deadline_usec;
+#endif
+#if CANARD_ENABLE_CANFD
+    uint8_t data[CANARD_CANFD_FRAME_MAX_DATA_LEN];
+#else
+    uint8_t data[CANARD_CAN_FRAME_MAX_DATA_LEN];
+#endif
+    uint8_t data_len;
+    uint8_t iface_id;
+#if CANARD_MULTI_IFACE
+    uint8_t iface_mask;
+#endif
+#if CANARD_ENABLE_CANFD
+    bool canfd;
+#endif
+} CanardCANFrame;
+
+/**
+ * Transfer types are defined by the UAVCAN specification.
+ */
+typedef enum
+{
+    CanardTransferTypeResponse  = 0,
+    CanardTransferTypeRequest   = 1,
+    CanardTransferTypeBroadcast = 2
+} CanardTransferType;
+
+/**
+ * Types of service transfers. These are not applicable to message transfers.
+ */
+typedef enum
+{
+    CanardResponse,
+    CanardRequest
+} CanardRequestResponse;
+
+/*
+ * Forward declarations.
+ */
+typedef struct CanardInstance CanardInstance;
+typedef struct CanardRxTransfer CanardRxTransfer;
+typedef struct CanardRxState CanardRxState;
+typedef struct CanardTxQueueItem CanardTxQueueItem;
+
+/**
+ * This struture provides information about encoded dronecan frame that needs
+ * to be put on the wire.
+ * 
+ * In case of broadcast or request pointer to the Transfer ID should point to a persistent variable
+ * (e.g. static or heap allocated, not on the stack); it will be updated by the library after every transmission. 
+ * The Transfer ID value cannot be shared between transfers that have different descriptors!
+ * More on this in the transport layer specification.
+ * 
+ * For the case of response, the pointer to the Transfer ID is treated as const and generally points to transfer id
+ * in CanardRxTransfer structure.
+ * 
+ */
+typedef struct {
+    CanardTransferType transfer_type; ///< Type of transfer: CanardTransferTypeBroadcast, CanardTransferTypeRequest, CanardTransferTypeResponse
+    uint64_t data_type_signature; ///< Signature of the message/service
+    uint16_t data_type_id; ///< ID of the message/service
+    uint8_t* inout_transfer_id; ///< Transfer ID reference
+    uint8_t priority; ///< Priority of the transfer
+    const uint8_t* payload; ///< Pointer to the payload
+    uint16_t payload_len; ///< Length of the payload
+#if CANARD_ENABLE_CANFD
+    bool canfd; ///< True if CAN FD is enabled
+#endif
+#if CANARD_ENABLE_DEADLINE
+    uint64_t deadline_usec; ///< Deadline in microseconds
+#endif
+#if CANARD_MULTI_IFACE
+    uint8_t iface_mask; ///< Bitmask of interfaces to send the transfer on
+#endif
+#if CANARD_ENABLE_TAO_OPTION
+    bool tao; ///< True if tail array optimization is enabled
+#endif
+} CanardTxTransfer;
+
+struct CanardTxQueueItem
+{
+    CanardTxQueueItem* next;
+    CanardCANFrame frame;
+};
+CANARD_STATIC_ASSERT(sizeof(CanardTxQueueItem) <= CANARD_MEM_BLOCK_SIZE, "Unexpected memory block size");
+/**
+ * The application must implement this function and supply a pointer to it to the library during initialization.
+ * The library calls this function to determine whether the transfer should be received.
+ *
+ * If the application returns true, the value pointed to by 'out_data_type_signature' must be initialized with the
+ * correct data type signature, otherwise transfer reception will fail with CRC mismatch error. Please refer to the
+ * specification for more details about data type signatures. Signature for any data type can be obtained in many
+ * ways; for example, using the command line tool distributed with Libcanard (see the repository).
+ */
+typedef bool (* CanardShouldAcceptTransfer)(const CanardInstance* ins,          ///< Library instance
+                                            uint64_t* out_data_type_signature,  ///< Must be set by the application!
+                                            uint16_t data_type_id,              ///< Refer to the specification
+                                            CanardTransferType transfer_type,   ///< Refer to CanardTransferType
+                                            uint8_t source_node_id);            ///< Source node ID or Broadcast (0)
+
+/**
+ * This function will be invoked by the library every time a transfer is successfully received.
+ * If the application needs to send another transfer from this callback, it is highly recommended
+ * to call canardReleaseRxTransferPayload() first, so that the memory that was used for the block
+ * buffer can be released and re-used by the TX queue.
+ */
+typedef void (* CanardOnTransferReception)(CanardInstance* ins,                 ///< Library instance
+                                           CanardRxTransfer* transfer);         ///< Ptr to temporary transfer object
+
+/**
+ * INTERNAL DEFINITION, DO NOT USE DIRECTLY.
+ * A memory block used in the memory block allocator.
+ */
+typedef union CanardPoolAllocatorBlock_u
+{
+    char bytes[CANARD_MEM_BLOCK_SIZE];
+    union CanardPoolAllocatorBlock_u* next;
+} CanardPoolAllocatorBlock;
+
+/**
+ * This structure provides usage statistics of the memory pool allocator.
+ * This data helps to evaluate whether the allocated memory is sufficient for the application.
+ */
+typedef struct
+{
+    uint16_t capacity_blocks;               ///< Pool capacity in number of blocks
+    uint16_t current_usage_blocks;          ///< Number of blocks that are currently allocated by the library
+    uint16_t peak_usage_blocks;             ///< Maximum number of blocks used since initialization
+} CanardPoolAllocatorStatistics;
+
+/**
+ * INTERNAL DEFINITION, DO NOT USE DIRECTLY.
+ * Buffer block for received data.
+ */
+typedef struct CanardBufferBlock
+{
+    struct CanardBufferBlock* next;
+    uint8_t data[];
+} CanardBufferBlock;
+
+/**
+ * INTERNAL DEFINITION, DO NOT USE DIRECTLY.
+ */
+typedef struct
+{
+    // user should initialize semaphore after the canardInit
+    // or at first call of canard_allocate_sem_take
+    void *semaphore;
+    CanardPoolAllocatorBlock* free_list;
+    CanardPoolAllocatorStatistics statistics;
+    void *arena;
+} CanardPoolAllocator;
+
+
+/**
+ * INTERNAL DEFINITION, DO NOT USE DIRECTLY.
+ */
+struct CanardRxState
+{
+    canard_buffer_idx_t next;
+    canard_buffer_idx_t buffer_blocks;
+
+    uint64_t timestamp_usec;
+
+    const uint32_t dtid_tt_snid_dnid;
+
+    // We're using plain 'unsigned' here, because C99 doesn't permit explicit field type specification
+    unsigned calculated_crc : 16;
+    unsigned payload_len    : CANARD_TRANSFER_PAYLOAD_LEN_BITS;
+    unsigned transfer_id    : 5;
+    unsigned next_toggle    : 1;    // 16+10+5+1 = 32, aligned.
+
+    uint16_t payload_crc;
+    uint8_t  iface_id;
+    uint8_t buffer_head[];
+};
+CANARD_STATIC_ASSERT(offsetof(CanardRxState, buffer_head) <= 27, "Invalid memory layout");
+CANARD_STATIC_ASSERT(CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE >= 5, "Invalid memory layout");
+
+/**
+ * This is the core structure that keeps all of the states and allocated resources of the library instance.
+ * The application should never access any of the fields directly! Instead, API functions should be used.
+ */
+struct CanardInstance
+{
+    uint8_t node_id;                                ///< Local node ID; may be zero if the node is anonymous
+
+    CanardShouldAcceptTransfer should_accept;       ///< Function to decide whether the application wants this transfer
+    CanardOnTransferReception on_reception;         ///< Function the library calls after RX transfer is complete
+
+    CanardPoolAllocator allocator;                  ///< Pool allocator
+
+    CanardRxState* rx_states;                       ///< RX transfer states
+    CanardTxQueueItem* tx_queue;                    ///< TX frames awaiting transmission
+
+    void* user_reference;                           ///< User pointer that can link this instance with other objects
+
+#if CANARD_ENABLE_TAO_OPTION
+    bool tao_disabled;                              ///< True if TAO is disabled
+#endif
+};
+
+/**
+ * This structure represents a received transfer for the application.
+ * An instance of it is passed to the application via callback when the library receives a new transfer.
+ * Pointers to the structure and all its fields are invalidated after the callback returns.
+ */
+struct CanardRxTransfer
+{
+    /**
+     * Timestamp at which the first frame of this transfer was received.
+     */
+    uint64_t timestamp_usec;
+
+    /**
+     * Payload is scattered across three storages:
+     *  - Head points to CanardRxState.buffer_head (length of which is up to CANARD_PAYLOAD_HEAD_SIZE), or to the
+     *    payload field (possibly with offset) of the last received CAN frame.
+     *
+     *  - Middle is located in the linked list of dynamic blocks (only for multi-frame transfers).
+     *
+     *  - Tail points to the payload field (possibly with offset) of the last received CAN frame
+     *    (only for multi-frame transfers).
+     *
+     * The tail offset depends on how much data of the last frame was accommodated in the last allocated block.
+     *
+     * For single-frame transfers, middle and tail will be NULL, and the head will point at first byte
+     * of the payload of the CAN frame.
+     *
+     * In simple cases it should be possible to get data directly from the head and/or tail pointers.
+     * Otherwise it is advised to use canardDecodeScalar().
+     */
+    const uint8_t* payload_head;            ///< Always valid, i.e. not NULL.
+                                            ///< For multi frame transfers, the maximum size is defined in the constant
+                                            ///< CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE.
+                                            ///< For single-frame transfers, the size is defined in the
+                                            ///< field payload_len.
+    CanardBufferBlock* payload_middle;      ///< May be NULL if the buffer was not needed. Always NULL for single-frame
+                                            ///< transfers.
+    const uint8_t* payload_tail;            ///< Last bytes of multi-frame transfers. Always NULL for single-frame
+                                            ///< transfers.
+    uint16_t payload_len;                   ///< Effective length of the payload in bytes.
+
+    /**
+     * These fields identify the transfer for the application.
+     */
+    uint16_t data_type_id;                  ///< 0 to 255 for services, 0 to 65535 for messages
+    uint8_t transfer_type;                  ///< See CanardTransferType
+    uint8_t transfer_id;                    ///< 0 to 31
+    uint8_t priority;                       ///< 0 to 31
+    uint8_t source_node_id;                 ///< 1 to 127, or 0 if the source is anonymous
+#if CANARD_ENABLE_TAO_OPTION
+    bool tao;
+#endif
+#if CANARD_ENABLE_CANFD
+    bool canfd;                             ///< frame canfd
+#endif
+};
+
+/**
+ * Initializes a library instance.
+ * Local node ID will be set to zero, i.e. the node will be anonymous.
+ *
+ * Typically, size of the memory pool should not be less than 1K, although it depends on the application. The
+ * recommended way to detect the required pool size is to measure the peak pool usage after a stress-test. Refer to
+ * the function canardGetPoolAllocatorStatistics().
+ */
+void canardInit(CanardInstance* out_ins,                    ///< Uninitialized library instance
+                void* mem_arena,                            ///< Raw memory chunk used for dynamic allocation
+                size_t mem_arena_size,                      ///< Size of the above, in bytes
+                CanardOnTransferReception on_reception,     ///< Callback, see CanardOnTransferReception
+                CanardShouldAcceptTransfer should_accept,   ///< Callback, see CanardShouldAcceptTransfer
+                void* user_reference);                      ///< Optional pointer for user's convenience, can be NULL
+
+/**
+ * Returns the value of the user pointer.
+ * The user pointer is configured once during initialization.
+ * It can be used to store references to any user-specific data, or to link the instance object with C++ objects.
+ */
+void* canardGetUserReference(CanardInstance* ins);
+
+/**
+ * Assigns a new node ID value to the current node.
+ * Node ID can be assigned only once.
+ */
+void canardSetLocalNodeID(CanardInstance* ins,
+                          uint8_t self_node_id);
+
+/**
+ * Returns node ID of the local node.
+ * Returns zero (broadcast) if the node ID is not set, i.e. if the local node is anonymous.
+ */
+uint8_t canardGetLocalNodeID(const CanardInstance* ins);
+
+/**
+ * Forgets the current node ID value so that a new Node ID can be assigned.
+ */
+void canardForgetLocalNodeID(CanardInstance* ins);
+
+/**
+ * Initialise TX transfer object.
+ * Should be called at least once before using transfer object to send transmissions.
+*/
+void canardInitTxTransfer(CanardTxTransfer* transfer);
+
+/**
+ * Sends a broadcast transfer.
+ * If the node is in passive mode, only single frame transfers will be allowed (they will be transmitted as anonymous).
+ *
+ * For anonymous transfers, maximum data type ID (CanardTxTransfer::data_type_id) is limited to 3 (see specification for details).
+ *
+ * Please refer to the specification for more details about data type signatures (CanardTxTransfer::data_type_signature). Signature for 
+ * any data type can be obtained in many ways; for example, using the generated code generated using dronecan_dsdlc (see the repository).
+ *
+ * Use CanardTxTransfer structure to pass the transfer parameters. The structure is initialized by the
+ * canardInitTxTransfer() function.
+ * 
+ * Pointer to the Transfer ID (CanardTxTransfer::inout_transfer_id) should point to a persistent variable
+ * (e.g. static or heap allocated, not on the stack); it will be updated by the library after every transmission. 
+ * The Transfer ID value cannot be shared between transfers that have different descriptors!
+ * More on this in the transport layer specification.
+ *
+ * Returns the number of frames enqueued, or negative error code.
+ */
+
+int16_t canardBroadcastObj(CanardInstance* ins,            ///< Library instance
+                           CanardTxTransfer* transfer      ///< Transfer object
+                          );
+
+// Legacy API, try to avoid using it, as this will not be extended with new features
+int16_t canardBroadcast(CanardInstance* ins,            ///< Library instance
+                        uint64_t data_type_signature,   ///< See above
+                        uint16_t data_type_id,          ///< Refer to the specification
+                        uint8_t* inout_transfer_id,     ///< Pointer to a persistent variable containing the transfer ID
+                        uint8_t priority,               ///< Refer to definitions CANARD_TRANSFER_PRIORITY_*
+                        const void* payload,            ///< Transfer payload
+                        uint16_t payload_len            ///< Length of the above, in bytes
+#if CANARD_ENABLE_DEADLINE
+                        ,uint64_t tx_deadline           ///< Transmission deadline, microseconds
+#endif
+#if CANARD_MULTI_IFACE
+                        ,uint8_t iface_mask               ///< Bitmask of interfaces to transmit on
+#endif
+#if CANARD_ENABLE_CANFD
+                        ,bool canfd                      ///< Is the frame canfd
+#endif
+                        );
+/**
+ * Sends a request or a response transfer.
+ * Fails if the node is in passive mode.
+ *
+ * Please refer to the specification for more details about data type signatures (CanardTxTransfer::data_type_signature). Signature for 
+ * any data type can be obtained in many ways; for example, using the generated code generated using dronecan_dsdlc (see the repository).
+ *
+ * Pointer to the Transfer ID (CanardTxTransfer::inout_transfer_id) should point to a persistent variable
+ * (e.g. static or heap allocated, not on the stack); it will be updated by the library after every request.
+ * The Transfer ID value cannot be shared between requests that have different descriptors!
+ * More on this in the transport layer specification.
+ *
+ * For Response transfers, the pointer to the Transfer ID(CanardTxTransfer::inout_transfer_id) will be treated as const (i.e. read-only),
+ * and normally it should point to the transfer_id field of the structure CanardRxTransfer.
+ *
+ * Returns the number of frames enqueued, or negative error code.
+ */
+
+int16_t canardRequestOrRespondObj(CanardInstance* ins,             ///< Library instance
+                                  uint8_t destination_node_id,     ///< Node ID of the server/client
+                                  CanardTxTransfer* transfer       ///< Transfer object
+                                );
+// Legacy API, try to avoid using it, as this will not be extended with new features
+int16_t canardRequestOrRespond(CanardInstance* ins,             ///< Library instance
+                               uint8_t destination_node_id,     ///< Node ID of the server/client
+                               uint64_t data_type_signature,    ///< See above
+                               uint8_t data_type_id,            ///< Refer to the specification
+                               uint8_t* inout_transfer_id,      ///< Pointer to a persistent variable with transfer ID
+                               uint8_t priority,                ///< Refer to definitions CANARD_TRANSFER_PRIORITY_*
+                               CanardRequestResponse kind,      ///< Refer to CanardRequestResponse
+                               const void* payload,             ///< Transfer payload
+                               uint16_t payload_len             ///< Length of the above, in bytes
+#if CANARD_ENABLE_DEADLINE
+                               ,uint64_t tx_deadline            ///< Transmission deadline, microseconds
+#endif
+#if CANARD_MULTI_IFACE
+                               ,uint8_t iface_mask               ///< Bitmask of interfaces to transmit on
+#endif
+#if CANARD_ENABLE_CANFD
+                                ,bool canfd                     ///< Is the frame canfd
+#endif
+                            );
+/**
+ * Returns a pointer to the top priority frame in the TX queue.
+ * Returns NULL if the TX queue is empty.
+ * The application will call this function after canardBroadcast() or canardRequestOrRespond() to transmit generated
+ * frames over the CAN bus.
+ */
+CanardCANFrame* canardPeekTxQueue(const CanardInstance* ins);
+
+/**
+ * Returns the timeout for the frame on top of TX queue.
+ * Returns zero if the TX queue is empty.
+ * The application will call this function after canardPeekTxQueue() to determine when to call canardPopTxQueue(), if
+ * the frame is not transmitted.
+ */
+#if CANARD_ENABLE_DEADLINE
+uint64_t canardPeekTxQueueDeadline(const CanardInstance* ins);
+#endif
+/**
+ * Removes the top priority frame from the TX queue.
+ * The application will call this function after canardPeekTxQueue() once the obtained frame has been processed.
+ * Calling canardBroadcast() or canardRequestOrRespond() between canardPeekTxQueue() and canardPopTxQueue()
+ * is NOT allowed, because it may change the frame at the top of the TX queue.
+ */
+void canardPopTxQueue(CanardInstance* ins);
+
+/**
+ * Processes a received CAN frame with a timestamp.
+ * The application will call this function when it receives a new frame from the CAN bus.
+ *
+ * Return value will report any errors in decoding packets.
+ */
+int16_t canardHandleRxFrame(CanardInstance* ins,
+                            const CanardCANFrame* frame,
+                            uint64_t timestamp_usec);
+
+/**
+ * Traverses the list of transfers and removes those that were last updated more than timeout_usec microseconds ago.
+ * This function must be invoked by the application periodically, about once a second.
+ * Also refer to the constant CANARD_RECOMMENDED_STALE_TRANSFER_CLEANUP_INTERVAL_USEC.
+ */
+void canardCleanupStaleTransfers(CanardInstance* ins,
+                                 uint64_t current_time_usec);
+
+/**
+ * This function can be used to extract values from received UAVCAN transfers. It decodes a scalar value -
+ * boolean, integer, character, or floating point - from the specified bit position in the RX transfer buffer.
+ * Simple single-frame transfers can also be parsed manually.
+ *
+ * Returns the number of bits successfully decoded, which may be less than requested if operation ran out of
+ * buffer boundaries, or negated error code, such as invalid argument.
+ *
+ * Caveat:  This function works correctly only on platforms that use two's complement signed integer representation.
+ *          I am not aware of any modern microarchitecture that uses anything else than two's complement, so it should
+ *          not affect portability in any way.
+ *
+ * The type of value pointed to by 'out_value' is defined as follows:
+ *
+ *  | bit_length | value_is_signed | out_value points to                      |
+ *  |------------|-----------------|------------------------------------------|
+ *  | 1          | false           | bool (may be incompatible with uint8_t!) |
+ *  | 1          | true            | N/A                                      |
+ *  | [2, 8]     | false           | uint8_t, or char                         |
+ *  | [2, 8]     | true            | int8_t, or char                          |
+ *  | [9, 16]    | false           | uint16_t                                 |
+ *  | [9, 16]    | true            | int16_t                                  |
+ *  | [17, 32]   | false           | uint32_t                                 |
+ *  | [17, 32]   | true            | int32_t, or 32-bit float                 |
+ *  | [33, 64]   | false           | uint64_t                                 |
+ *  | [33, 64]   | true            | int64_t, or 64-bit float                 |
+ */
+int16_t canardDecodeScalar(const CanardRxTransfer* transfer,    ///< The RX transfer where the data will be copied from
+                           uint32_t bit_offset,                 ///< Offset, in bits, from the beginning of the transfer
+                           uint8_t bit_length,                  ///< Length of the value, in bits; see the table
+                           bool value_is_signed,                ///< True if the value can be negative; see the table
+                           void* out_value);                    ///< Pointer to the output storage; see the table
+
+/**
+ * This function can be used to encode values for later transmission in a UAVCAN transfer. It encodes a scalar value -
+ * boolean, integer, character, or floating point - and puts it to the specified bit position in the specified
+ * contiguous buffer.
+ * Simple single-frame transfers can also be encoded manually.
+ *
+ * Caveat:  This function works correctly only on platforms that use two's complement signed integer representation.
+ *          I am not aware of any modern microarchitecture that uses anything else than two's complement, so it should
+ *          not affect portability in any way.
+ *
+ * The type of value pointed to by 'value' is defined as follows:
+ *
+ *  | bit_length | value points to                          |
+ *  |------------|------------------------------------------|
+ *  | 1          | bool (may be incompatible with uint8_t!) |
+ *  | [2, 8]     | uint8_t, int8_t, or char                 |
+ *  | [9, 16]    | uint16_t, int16_t                        |
+ *  | [17, 32]   | uint32_t, int32_t, or 32-bit float       |
+ *  | [33, 64]   | uint64_t, int64_t, or 64-bit float       |
+ */
+void canardEncodeScalar(void* destination,      ///< Destination buffer where the result will be stored
+                        uint32_t bit_offset,    ///< Offset, in bits, from the beginning of the destination buffer
+                        uint8_t bit_length,     ///< Length of the value, in bits; see the table
+                        const void* value);     ///< Pointer to the value; see the table
+
+/**
+ * This function can be invoked by the application to release pool blocks that are used
+ * to store the payload of the transfer.
+ *
+ * If the application needs to send new transfers from the transfer reception callback, this function should be
+ * invoked right before calling canardBroadcast() or canardRequestOrRespond(). Not releasing the buffers before
+ * transmission may cause higher peak usage of the memory pool.
+ *
+ * If the application didn't call this function before returning from the callback, the library will do that,
+ * so it is guaranteed that the memory will not leak.
+ */
+void canardReleaseRxTransferPayload(CanardInstance* ins,
+                                    CanardRxTransfer* transfer);
+
+/**
+ * Returns a copy of the pool allocator usage statistics.
+ * Refer to the type CanardPoolAllocatorStatistics.
+ * Use this function to determine worst case memory needs of your application.
+ */
+CanardPoolAllocatorStatistics canardGetPoolAllocatorStatistics(CanardInstance* ins);
+
+/**
+ * Float16 marshaling helpers.
+ * These functions convert between the native float and 16-bit float.
+ * It is assumed that the native float is IEEE 754 single precision float, otherwise results will be unpredictable.
+ * Vast majority of modern computers and microcontrollers use IEEE 754, so this limitation should not affect
+ * portability.
+ */
+uint16_t canardConvertNativeFloatToFloat16(float value);
+float canardConvertFloat16ToNativeFloat(uint16_t value);
+
+uint16_t extractDataType(uint32_t id);
+CanardTransferType extractTransferType(uint32_t id);
+
+/// Abort the build if the current platform is not supported.
+#if CANARD_ENABLE_CANFD
+CANARD_STATIC_ASSERT(((uint32_t)CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE) < 128,
+                     "Please define CANARD_64_BIT=1 for 64 bit builds");
+#else
+CANARD_STATIC_ASSERT(((uint32_t)CANARD_MULTIFRAME_RX_PAYLOAD_HEAD_SIZE) < 32,
+                     "Please define CANARD_64_BIT=1 for 64 bit builds");
+#endif
+
+#if CANARD_ALLOCATE_SEM
+// user implemented functions for taking and freeing semaphores
+void canard_allocate_sem_take(CanardPoolAllocator *allocator);
+void canard_allocate_sem_give(CanardPoolAllocator *allocator);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+                               /*
+ * Copyright (c) 2022 Siddharth B Purohit, CubePilot Pty Ltd
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ */
+
+#include <stdint.h>
+
+namespace Canard {
+
+/// @brief Base class for message callbacks.
+template <typename msgtype>
+class Callback {
+public:
+    virtual ~Callback() = default;
+    virtual void operator()(const CanardRxTransfer& transfer, const msgtype& msg) = 0;
+};
+
+/// @brief Static callback class.
+/// @tparam msgtype type of message handled by the callback
+template <typename msgtype>
+class StaticCallback : public Callback<msgtype> {
+public:
+    /// @brief constructor
+    /// @param _cb callback function
+    StaticCallback(void (*_cb)(const CanardRxTransfer& transfer, const msgtype& msg)) : cb(_cb) {}
+
+    void operator()(const CanardRxTransfer& transfer, const msgtype& msg) override {
+        cb(transfer, msg);
+    }
+private:
+    void (*cb)(const CanardRxTransfer& transfer, const msgtype& msg);
+};
+
+/// @brief allocate a static callback object using new
+/// @tparam msgtype 
+/// @param cb callback function
+/// @return StaticCallback object
+template <typename msgtype>
+StaticCallback<msgtype> *allocate_static_callback(void (*cb)(const CanardRxTransfer& transfer, const msgtype& msg)) {
+    return allocate<StaticCallback<msgtype>>(cb);
+}
+
+/// @brief Object callback class.
+/// @tparam T type of object to call the callback on
+/// @tparam msgtype type of message handled by the callback
+template <typename T, typename msgtype>
+class ObjCallback : public Callback<msgtype> {
+public:
+    /// @brief Constructor
+    /// @param _obj object to call the callback on
+    /// @param _cb callback member function
+    ObjCallback(T* _obj, void (T::*_cb)(const CanardRxTransfer& transfer, const msgtype& msg)) : obj(_obj), cb(_cb) {}
+
+    void operator()(const CanardRxTransfer& transfer, const msgtype& msg) override {
+        if (obj != nullptr) {
+            (obj->*cb)(transfer, msg);
+        }
+    }
+private:
+    T *obj;
+    void (T::*cb)(const CanardRxTransfer& transfer, const msgtype& msg);
+};
+
+/// @brief allocate an object callback object using new
+/// @tparam T type of object to call the callback on
+/// @tparam msgtype type of message handled by the callback
+/// @param obj object to call the callback on
+/// @param cb callback member function
+/// @return ObjCallback object
+template <typename T, typename msgtype>
+ObjCallback<T, msgtype>* allocate_obj_callback(T* obj, void (T::*cb)(const CanardRxTransfer& transfer, const msgtype& msg)) {
+    return allocate<ObjCallback<T, msgtype>>(obj, cb);
+}
+
+/// @brief Argument callback class.
+/// @tparam T type of object to pass to the callback
+/// @tparam msgtype type of message handled by the callback
+template <typename T, typename msgtype>
+class ArgCallback : public Callback<msgtype> {
+public:
+    /// @brief Constructor
+    /// @param _arg argument to pass to the callback
+    /// @param _cb callback function
+    ArgCallback(T* _arg, void (*_cb)(T* arg, const CanardRxTransfer& transfer, const msgtype& msg)) : cb(_cb), arg(_arg) {}
+
+    void operator()(const CanardRxTransfer& transfer, const msgtype& msg) override {
+        cb(arg, transfer, msg);
+    }
+private:
+    void (*cb)(T* arg, const CanardRxTransfer& transfer, const msgtype& msg);
+    T* arg;
+};
+
+/// @brief allocate an argument callback object using new
+/// @tparam T type of object to pass to the callback
+/// @tparam msgtype type of message handled by the callback
+/// @param arg argument to pass to the callback
+/// @param cb callback function
+/// @return ArgCallback object
+template <typename T, typename msgtype>
+ArgCallback<T, msgtype>* allocate_arg_callback(T* arg, void (*cb)(T* arg, const CanardRxTransfer& transfer, const msgtype& msg)) {
+    return allocate<ArgCallback<T, msgtype>>(arg, cb);
+}
+
+} // namespace Canard
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (c) 2022 Siddharth B Purohit, CubePilot Pty Ltd
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ */
+
+#include "helpers.h"
+
+/// @brief Broadcast message interface.
+/// @param MSGTYPE message type name
+/// @param MSG_ID message id
+/// @param MSG_SIGNATURE message signature
+/// @param MSG_MAX_SIZE maximum message size
+#if CANARD_ENABLE_CANFD || CANARD_ENABLE_TAO_OPTION
+#define BROADCAST_MESSAGE_CXX_IFACE(MSGTYPE, MSG_ID, MSG_SIGNATURE, MSG_MAX_SIZE) \
+    class MSGTYPE##_cxx_iface { \
+    public: \
+        typedef MSGTYPE msgtype; \
+        static constexpr uint32_t (*encode)(msgtype*, uint8_t*, bool) = MSGTYPE##_encode; \
+        static constexpr bool (*decode)(const CanardRxTransfer* transfer, msgtype*) = MSGTYPE##_decode; \
+        static constexpr uint16_t ID = MSG_ID; \
+        static constexpr uint64_t SIGNATURE = MSG_SIGNATURE; \
+        static constexpr uint16_t MAX_SIZE = MSG_MAX_SIZE; \
+    };
+#else
+#define BROADCAST_MESSAGE_CXX_IFACE(MSGTYPE, MSG_ID, MSG_SIGNATURE, MSG_MAX_SIZE) \
+    class MSGTYPE##_cxx_iface { \
+    public: \
+        typedef MSGTYPE msgtype; \
+        static constexpr uint32_t (*encode)(msgtype*, uint8_t*) = MSGTYPE##_encode; \
+        static constexpr bool (*decode)(const CanardRxTransfer* transfer, msgtype*) = MSGTYPE##_decode; \
+        static constexpr uint16_t ID = MSG_ID; \
+        static constexpr uint64_t SIGNATURE = MSG_SIGNATURE; \
+        static constexpr uint16_t MAX_SIZE = MSG_MAX_SIZE; \
+    };
+#endif
+
+#if CANARD_ENABLE_CANFD || CANARD_ENABLE_TAO_OPTION
+#define SERVICE_MESSAGE_CXX_IFACE(SVCTYPE, SVC_ID, SVC_SIGNATURE, SVC_REQUEST_MAX_SIZE, SVC_RESPONSE_MAX_SIZE) \
+    class SVCTYPE##_cxx_iface { \
+    public: \
+        typedef SVCTYPE##Request reqtype; \
+        typedef SVCTYPE##Response rsptype; \
+        static constexpr uint32_t (*req_encode)(reqtype*, uint8_t*, bool) = SVCTYPE##Request_encode; \
+        static constexpr uint32_t (*rsp_encode)(rsptype*, uint8_t*, bool) = SVCTYPE##Response_encode; \
+        static constexpr bool (*req_decode)(const CanardRxTransfer* transfer, reqtype*) = SVCTYPE##Request_decode; \
+        static constexpr bool (*rsp_decode)(const CanardRxTransfer* transfer, rsptype*) = SVCTYPE##Response_decode; \
+        static constexpr uint16_t ID = SVC_ID; \
+        static constexpr uint64_t SIGNATURE = SVC_SIGNATURE; \
+        static constexpr uint16_t REQ_MAX_SIZE = SVC_REQUEST_MAX_SIZE; \
+        static constexpr uint16_t RSP_MAX_SIZE = SVC_RESPONSE_MAX_SIZE; \
+    };
+#else
+/// @brief Service message interface.
+/// @param SVCTYPE message type name
+/// @param SVC_ID message id
+/// @param SVC_SIGNATURE message signature
+/// @param SVC_REQUEST_MAX_SIZE maximum request size
+/// @param SVC_RESPONSE_MAX_SIZE maximum response size
+#define SERVICE_MESSAGE_CXX_IFACE(SVCTYPE, SVC_ID, SVC_SIGNATURE, SVC_REQUEST_MAX_SIZE, SVC_RESPONSE_MAX_SIZE) \
+    class SVCTYPE##_cxx_iface { \
+    public: \
+        typedef SVCTYPE##Request reqtype; \
+        typedef SVCTYPE##Response rsptype; \
+        static constexpr uint32_t (*req_encode)(reqtype*, uint8_t*) = SVCTYPE##Request_encode; \
+        static constexpr uint32_t (*rsp_encode)(rsptype*, uint8_t*) = SVCTYPE##Response_encode; \
+        static constexpr bool (*req_decode)(const CanardRxTransfer* transfer, reqtype*) = SVCTYPE##Request_decode; \
+        static constexpr bool (*rsp_decode)(const CanardRxTransfer* transfer, rsptype*) = SVCTYPE##Response_decode; \
+        static constexpr uint16_t ID = SVC_ID; \
+        static constexpr uint64_t SIGNATURE = SVC_SIGNATURE; \
+        static constexpr uint16_t REQ_MAX_SIZE = SVC_REQUEST_MAX_SIZE; \
+        static constexpr uint16_t RSP_MAX_SIZE = SVC_RESPONSE_MAX_SIZE; \
+    };
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright (c) 2022 Siddharth B Purohit, CubePilot Pty Ltd
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <canard.h>
+#include "helpers.h"
+
+#ifndef CANARD_NUM_HANDLERS
+#define CANARD_NUM_HANDLERS 3
+#endif
+
+namespace Canard {
+ 
+/// @brief HandlerList to register all handled message types.
+class HandlerList {
+public:
+    /// @brief HandlerList Constructor
+    /// @param _transfer_type Type of transfer: CanardTransferTypeBroadcast, CanardTransferTypeRequest, CanardTransferTypeResponse
+    /// @param _msgid ID of the message/service
+    /// @param _signature Signature of the message/service
+    /// @param _index Index of the handler list
+    HandlerList(CanardTransferType _transfer_type, uint16_t _msgid, uint64_t _signature, uint8_t _index) NOINLINE_FUNC :
+    index(_index) {
+        if (index >= CANARD_NUM_HANDLERS) {
+            return;
+        }
+#ifdef WITH_SEMAPHORE
+        WITH_SEMAPHORE(sem[index]);
+#endif
+        next = head[index];
+        head[index] = this;
+        msgid = _msgid;
+        signature = _signature;
+        transfer_type = _transfer_type;
+    }
+
+    /// @brief delete copy constructor and assignment operator
+    HandlerList(const HandlerList&) = delete;
+
+    // destructor, remove the entry from the singly-linked list
+    virtual ~HandlerList() NOINLINE_FUNC {
+#ifdef WITH_SEMAPHORE
+        WITH_SEMAPHORE(sem[index]);
+#endif
+        HandlerList* entry = head[index];
+        if (entry == this) {
+            head[index] = next;
+            return;
+        }
+        while (entry != nullptr) {
+            if (entry->next == this) {
+                entry->next = next;
+                return;
+            }
+            entry = entry->next;
+        }
+    }
+
+    /// @brief accept a message if it is handled by this handler list
+    /// @param index Index of the handler list
+    /// @param msgid ID of the message/service
+    /// @param[out] signature Signature of the message/service
+    /// @return true if the message is handled by this handler list
+    static bool accept_message(uint8_t index, uint16_t msgid, uint64_t &signature) NOINLINE_FUNC
+    {
+#ifdef WITH_SEMAPHORE
+        WITH_SEMAPHORE(sem[index]);
+#endif
+        HandlerList* entry = head[index];
+        while (entry != nullptr) {
+            if (entry->msgid == msgid) {
+                signature = entry->signature;
+                return true;
+            }
+            entry = entry->next;
+        }
+        return false;
+    }
+
+    /// @brief handle a message if it is handled by this handler list
+    /// @param index Index of the handler list
+    /// @param transfer transfer object of the request
+    static void handle_message(uint8_t index, const CanardRxTransfer& transfer) NOINLINE_FUNC
+    {
+#ifdef WITH_SEMAPHORE
+        WITH_SEMAPHORE(sem[index]);
+#endif
+        HandlerList* entry = head[index];
+        while (entry != nullptr) {
+            if (transfer.data_type_id == entry->msgid &&
+                entry->transfer_type == transfer.transfer_type) {
+                entry->handle_message(transfer);
+                return;
+            }
+            entry = entry->next;
+        }
+    }
+
+    /// @brief Method to handle a message implemented by the derived class
+    /// @param transfer transfer object of the request
+    virtual void handle_message(const CanardRxTransfer& transfer) = 0;
+
+protected:
+    uint8_t index;
+    HandlerList* next;
+
+private:
+    static HandlerList* head[CANARD_NUM_HANDLERS];
+#ifdef WITH_SEMAPHORE
+    static Canard::Semaphore sem[CANARD_NUM_HANDLERS];
+#endif
+    uint16_t msgid;
+    uint64_t signature;
+    CanardTransferType transfer_type;
+};
+
+} // namespace Canard
+
+#define DEFINE_HANDLER_LIST_HEADS() Canard::HandlerList* Canard::HandlerList::head[CANARD_NUM_HANDLERS] = {}
+#define DEFINE_HANDLER_LIST_SEMAPHORES() Canard::Semaphore Canard::HandlerList::sem[CANARD_NUM_HANDLERS] = {}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#ifdef USE_USER_HELPERS
+#include "canard_helpers_user.h"
+#endif
+
+#ifndef NOINLINE_FUNC
+#define NOINLINE_FUNC __attribute__((noinline))
+#endif
+
+// define malloc and free
+#ifndef CANARD_MALLOC
+#include <stdlib.h>
+#include <new>
+#include <cstring>
+#define CANARD_MALLOC malloc
+#define CANARD_FREE free
+#endif
+
+namespace Canard {
+template<typename T, typename ...Args>
+T* allocate(Args...args) {
+    auto ret = CANARD_MALLOC(sizeof(T));
+    if (ret == nullptr) {
+        return nullptr;
+    }
+    memset(ret, 0, sizeof(T));
+    return new(ret) T(args...);
+}
+
+template<typename T>
+void deallocate(T* ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    ptr->~T();
+    CANARD_FREE(ptr);
+}
+
+}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright (c) 2022 Siddharth B Purohit, CubePilot Pty Ltd
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ */
+
+#pragma once
+#include <stdint.h>
+#include <canard.h>
+#include "handler_list.h"
+
+#ifndef CANARD_IFACE_ALL
+#define CANARD_IFACE_ALL 0xFF
+#endif
+
+namespace Canard {
+
+struct Transfer {
+    CanardTransferType transfer_type; ///< Type of transfer: CanardTransferTypeBroadcast, CanardTransferTypeRequest, CanardTransferTypeResponse
+    uint64_t data_type_signature; ///< Signature of the message/service
+    uint16_t data_type_id; ///< ID of the message/service
+    uint8_t* inout_transfer_id; ///< Transfer ID reference
+    uint8_t priority; ///< Priority of the transfer
+    const void* payload; ///< Pointer to the payload
+    uint32_t payload_len; ///< Length of the payload
+    uint8_t iface_mask; ///< Bitmask of interfaces to send the transfer on
+    bool canfd; ///< true if the transfer is CAN FD
+    uint32_t timeout_ms; ///< timeout in ms
+};
+
+/// @brief Interface class for Canard, its purpose is to provide a common interface for all interfaces
+class Interface {
+public:
+    /// @brief Interface constructor
+    /// @param _index index of the interface, used to identify which HandlerList to use
+    /// @param _canfd true if the interface is CAN FD
+    Interface(uint8_t _index, bool _canfd = false) :
+        index(_index),
+        canfd(_canfd)
+    {}
+
+    /// @brief Interface destructor
+    virtual ~Interface() {}
+
+    /// @brief broadcast message
+    /// @param bcast_transfer transfer to broadcast
+    /// @return true if broadcast was added to the queue
+    virtual bool broadcast(const Transfer &bcast_transfer) = 0;
+
+    /// @brief request message from
+    /// @param destination_node_id
+    /// @param req_transfer
+    /// @return true if request was added to the queue
+    virtual bool request(uint8_t destination_node_id, const Transfer &req_transfer) = 0;
+
+    /// @brief respond to a request
+    /// @param destination_node_id
+    /// @param res_transfer
+    /// @return true if response was added to the queue
+    virtual bool respond(uint8_t destination_node_id, const Transfer &res_transfer) = 0;
+
+    /// @brief check if the interface is CAN FD
+    /// @return true if the interface is CAN FD
+    bool is_canfd() const { return canfd; }
+
+    /// @brief get the node ID of the interface
+    /// @return returns anonymous node ID 0 if not implemented
+    virtual uint8_t get_node_id() const = 0;
+
+    /// @brief get the index of the interface
+    /// @return 
+    uint8_t get_index() const { return index; }
+
+    /// @brief set canfd mode
+    /// @param _canfd true if the interface is CAN FD
+    void set_canfd(bool _canfd) { canfd = _canfd; }
+
+protected:
+    /// @brief forward accept_message call to indexed HandlerList
+    /// @param msgid ID of the message/service
+    /// @param[out] signature signature of message/service
+    /// @return true if the message/service is accepted
+    inline bool accept_message(uint16_t msgid, uint64_t &signature) {
+        return HandlerList::accept_message(index, msgid, signature);
+  

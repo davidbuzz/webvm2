@@ -1,0 +1,2544 @@
+//----------------------------------------------------------------------------------
+// low level driver for the Beken BK2425 radio on SPI
+// Note: Under ChiBios the knowledge of which pins are which is not in the driver.
+// But ultimately comes from hwdef.dat
+//----------------------------------------------------------------------------------
+
+#pragma once
+
+#include "AP_Radio_config.h"
+
+#if AP_RADIO_BK2425_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+
+#define SUPPORT_BK_DEBUG_PINS 0 // 0=UART6 is for GPS, 1=UART6 is debug gpio
+#define TX_SPEED 250u // Default transmit speed in kilobits per second.
+
+/** Channel hopping parameters. Values are in MHz from 2400Mhz. */
+enum CHANNEL_MHZ_e {
+    CHANNEL_MIN_PHYSICAL = 0, ///< Minimum physical channel that is possible
+    CHANNEL_MAX_PHYSICAL = 83, ///< Maximum physical channel that is possible
+    CHANNEL_FCC_LOW = 10, ///< Minimum physical channel that will pass the FCC tests
+    CHANNEL_FCC_HIGH = 72, ///< Maximum physical channel that will pass the FCC tests
+    CHANNEL_FCC_MID = 41, ///< A representative physical channel
+};
+
+enum {
+    CHANNEL_COUNT_LOGICAL = 16, ///< The maximum number of entries in each frequency table
+    CHANNEL_BASE_TABLE = 0, ///< The table used for non wifi boards
+    CHANNEL_SAFE_TABLE = 3, ///< A table that will receive packets even if wrong
+    CHANNEL_NUM_TABLES = 6, ///< The number of tables
+    CHANNEL_COUNT_TEST = 16, ///< The number of test mode tables
+};
+
+
+// ----------------------------------------------------------------------------
+// Packet format definition
+// ----------------------------------------------------------------------------
+
+/** The type of packets being sent between controller and drone */
+enum BK_PKT_TYPE_E {
+    BK_PKT_TYPE_INVALID      = 0,    ///< Invalid packet from empty packets or bad CRC
+    BK_PKT_TYPE_CTRL_FOUND   = 0x10, ///< (Tx->Drone) User control - known receiver
+    BK_PKT_TYPE_CTRL_LOST    = 0x11, ///< (Tx->Drone) User control - unknown receiver
+    BK_PKT_TYPE_BIND_AUTO    = 0x12, ///< (Tx->Drone) Tell drones this tx is broadcasting
+    BK_PKT_TYPE_TELEMETRY    = 0x13, ///< (Drone->Tx) Send telemetry to tx
+    BK_PKT_TYPE_DFU          = 0x14, ///< (Drone->Tx) Send new firmware to tx
+    BK_PKT_TYPE_BIND_MANUAL  = 0x15, ///< (Tx->Drone) Tell drones this tx is broadcasting
+    BK_PKT_TYPE_TUNE         = 0x16, ///< (Drone->Tx) Send musical tune to tx
+};
+typedef uint8_t BK_PKT_TYPE;
+
+/** A bitset of the buttons on this controller. */
+enum button_bits {
+    BUTTON_NONE           = 0x00, ///< No buttons are held
+    BUTTON_RIGHT          = 0x01, ///< SW1 = The right button (mode)
+    BUTTON_LEFT           = 0x02, ///< SW2 = The left button (launch/land)
+    BUTTON_MIDDLE         = 0x04, ///< SW3 = The middle button (GPS)
+    BUTTON_LEFT_SHOULDER  = 0x08, ///< SW4 = The left shoulder button (stunt)
+    BUTTON_RIGHT_SHOULDER = 0x10, ///< SW5 = The right shoulder button (video)
+    BUTTON_POWER          = 0x20, ///< SW6 = The top button (POWER)
+};
+
+/** The type of info being sent in control packets */
+enum BK_INFO_TYPE_E {
+    BK_INFO_MIN = 1,
+    BK_INFO_FW_VER = 1,
+    BK_INFO_DFU_RX = 2,
+    BK_INFO_FW_CRC_LO = 3,
+    BK_INFO_FW_CRC_HI = 4,
+    BK_INFO_FW_YM = 5,
+    BK_INFO_FW_DAY = 6,
+    BK_INFO_MODEL = 7,
+    BK_INFO_PPS = 8,
+    BK_INFO_BATTERY = 9,
+    BK_INFO_COUNTDOWN = 10,
+    BK_INFO_HOPPING0 = 11,
+    BK_INFO_HOPPING1 = 12,
+    BK_INFO_DRONEID0 = 13,
+    BK_INFO_DRONEID1 = 14,
+    BK_INFO_MAX
+};
+typedef uint8_t BK_INFO_TYPE;
+
+/** Data for packets that are not droneid packets
+	Onair order = little-endian */
+typedef struct packetDataDeviceCtrl_s {
+    uint8_t roll; ///< 2: Low 8 bits of the roll joystick
+    uint8_t pitch; ///< 3: Low 8 bits of the pitch joystick
+    uint8_t throttle; ///< 4: Low 8 bits of the throttle joystick
+    uint8_t yaw; ///< 5: Low 8 bits of the yaw joystick
+    uint8_t msb; ///< 6: High 2 bits of roll (7..6), pitch (5..4), throttle (3..2), yaw (1..0)
+    uint8_t buttons_held; ///< 7: The buttons
+    uint8_t buttons_toggled; ///< 8: The buttons
+    uint8_t data_type; ///< 9: Type of extra data being sent
+    uint8_t data_value_lo; ///< 10: Value of extra data being sent
+    uint8_t data_value_hi; ///< 11: Value of extra data being sent
+} packetDataDeviceCtrl;
+
+enum { SZ_ADDRESS = 5 }; ///< Size of address for transmission packets (40 bits)
+enum { SZ_CRC_GUID = 4 }; ///< Size of UUID for drone (32 bits)
+enum { SZ_DFU = 16 }; ///< Size of DFU packets
+
+/** Data for packets that are binding packets
+	Onair order = little-endian */
+typedef struct packetDataDeviceBind_s {
+    uint8_t bind_address[SZ_ADDRESS]; ///< The address being used by control packets
+    uint8_t hopping; ///< The hopping table in use for this connection
+    uint8_t droneid[SZ_CRC_GUID]; ///<
+} packetDataDeviceBind;
+
+/** Data structure for data packet transmitted from device (controller) to host (drone) */
+typedef struct packetDataDevice_s {
+    BK_PKT_TYPE packetType; ///< 0: The packet type
+    uint8_t channel; ///< 1: Next channel I will broadcast on
+    union packetDataDevice_u { ///< The variant part of the packets
+        packetDataDeviceCtrl ctrl; ///< Control packets
+        packetDataDeviceBind bind; ///< Binding packets
+    } u;
+} packetFormatRx;
+
+/** Data structure for data packet transmitted from host (drone) to device (controller) */
+typedef struct packetDataDrone_s {
+    BK_PKT_TYPE packetType; ///< 0: The packet type
+    uint8_t channel; ///< 1: Next channel I will broadcast on
+    uint8_t pps; ///< 2: Packets per second the drone received
+    uint8_t flags; ///< 3: Flags
+    uint8_t droneid[SZ_CRC_GUID]; ///< 4...7: CRC of the drone
+    uint8_t flight_mode; ///< 8:
+    uint8_t wifi; ///< 9: Wifi channel + 24 * tx power.
+    uint8_t note_adjust; ///< 10: note adjust for the tx buzzer (should this be sent so often?)
+    uint8_t hopping; ///< 11: The adapative hopping byte we want to use
+} packetFormatTx;
+
+typedef struct packetDataDfu_s {
+    BK_PKT_TYPE packetType; ///< 0: The packet type
+    uint8_t channel; ///< 1: Next channel I will broadcast on
+    uint8_t address_lo; ///< 2:
+    uint8_t address_hi; ///< 3:
+    uint8_t data[SZ_DFU]; ///< 4...19:
+} packetFormatDfu;
+
+
+// ----------------------------------------------------------------------------
+// BK2425 chip definition
+// ----------------------------------------------------------------------------
+
+
+//----------------------------------------------------------------------------------
+/** SPI register commands for the BK2425 and nrf24L01+ chips */
+typedef enum {
+    // General commands
+    BK_REG_MASK        = 0x1F,  // The range of registers that can be read and written
+    BK_READ_REG        = 0x00,  // Define read command to register (0..1F)
+    BK_WRITE_REG       = 0x20,  // Define write command to register (0..1F)
+    BK_ACTIVATE_CMD	   = 0x50,
+    BK_R_RX_PL_WID_CMD = 0x60,
+    BK_RD_RX_PLOAD     = 0x61,  // Define RX payload register address
+    BK_WR_TX_PLOAD     = 0xA0,  // Define TX payload register address
+    BK_W_ACK_PAYLOAD_CMD = 0xA8, // (nrf: +pipe 0..7)
+    BK_W_TX_PAYLOAD_NOACK_CMD = 0xB0,
+    BK_FLUSH_TX        = 0xE1,  // Define flush TX register command
+    BK_FLUSH_RX        = 0xE2,  // Define flush RX register command
+    BK_REUSE_TX_PL     = 0xE3,  // Define reuse TX payload register command
+    BK_NOP             = 0xFF,  // Define No Operation, might be used to read status register
+
+    // BK2425 bank 0 register addresses
+    BK_CONFIG          = 0x00,  // 'Config' register address
+    BK_EN_AA           = 0x01,  // 'Enable Auto Acknowledgment' register address
+    BK_EN_RXADDR       = 0x02,  // 'Enabled RX addresses' register address
+    BK_SETUP_AW        = 0x03,  // 'Setup address width' register address
+    BK_SETUP_RETR      = 0x04,  // 'Setup Auto. Retrans' register address
+    BK_RF_CH           = 0x05,  // 'RF channel' register address
+    BK_RF_SETUP        = 0x06,  // 'RF setup' register address
+    BK_STATUS          = 0x07,  // 'Status' register address
+    BK_OBSERVE_TX      = 0x08,  // 'Observe TX' register address (lost packets, retransmitted packets on this frequency)
+    BK_CD              = 0x09,  // 'Carrier Detect' register address
+    BK_RX_ADDR_P0      = 0x0A,  // 'RX address pipe0' register address (5 bytes)
+    BK_RX_ADDR_P1      = 0x0B,  // 'RX address pipe1' register address (5 bytes)
+    BK_RX_ADDR_P2      = 0x0C,  // 'RX address pipe2' register address (1 byte)
+    BK_RX_ADDR_P3      = 0x0D,  // 'RX address pipe3' register address (1 byte)
+    BK_RX_ADDR_P4      = 0x0E,  // 'RX address pipe4' register address (1 byte)
+    BK_RX_ADDR_P5      = 0x0F,  // 'RX address pipe5' register address (1 byte)
+    BK_TX_ADDR         = 0x10,  // 'TX address' register address (5 bytes)
+    BK_RX_PW_P0        = 0x11,  // 'RX payload width, pipe0' register address
+    BK_RX_PW_P1        = 0x12,  // 'RX payload width, pipe1' register address
+    BK_RX_PW_P2        = 0x13,  // 'RX payload width, pipe2' register address
+    BK_RX_PW_P3        = 0x14,  // 'RX payload width, pipe3' register address
+    BK_RX_PW_P4        = 0x15,  // 'RX payload width, pipe4' register address
+    BK_RX_PW_P5        = 0x16,  // 'RX payload width, pipe5' register address
+    BK_FIFO_STATUS     = 0x17,  // 'FIFO Status Register' register address
+    BK_DYNPD           = 0x1c,  // 'Enable dynamic payload length' register address
+    BK_FEATURE         = 0x1d,  // 'Feature' register address
+    BK_PAYLOAD_WIDTH   = 0x1f,  // 'payload length of 256 bytes modes register address
+
+    // BK2425 bank 1 register addresses
+    BK2425_R1_4      = 0x04,
+    BK2425_R1_5      = 0x05,
+    BK2425_R1_WHOAMI = 0x08, // Register to read that contains the chip id
+    BK2425_R1_12     = 0x0C, // PLL speed 120 or 130us
+    BK2425_R1_13     = 0x0D,
+    BK2425_R1_14     = 0x0E,
+} BK_SPI_CMD;
+
+//----------------------------------------------------------------------------------
+// Chip Status Byte
+//----------------------------------------------------------------------------------
+
+enum {
+    BK_CHIP_ID_BK2425 = 0x63, // The expected value of reading BK2425_R1_WHOAMI
+};
+
+// Meanings of the BK_STATUS register
+enum {
+    BK_STATUS_RBANK = 0x80, // Register bank 1 is in use
+    BK_STATUS_RX_DR = 0x40, // Data ready
+    BK_STATUS_TX_DS = 0x20, // Data sent
+    BK_STATUS_MAX_RT = 0x10, // Max retries failed
+    BK_STATUS_RX_MASK = 0x0E, // Mask for the receptions bit
+    BK_STATUS_RX_EMPTY = 0x0E,
+    BK_STATUS_RX_P_5 = 0x0A, // Data pipe 5 has some data ready
+    BK_STATUS_RX_P_4 = 0x08, // Data pipe 4 has some data ready
+    BK_STATUS_RX_P_3 = 0x06, // Data pipe 3 has some data ready
+    BK_STATUS_RX_P_2 = 0x04, // Data pipe 2 has some data ready
+    BK_STATUS_RX_P_1 = 0x02, // Data pipe 1 has some data ready
+    BK_STATUS_RX_P_0 = 0x00, // Data pipe 0 has some data ready
+    BK_STATUS_TX_FULL = 0x01 // Tx buffer full
+};
+
+// Meanings of the FIFO_STATUS register
+enum {
+    BK_FIFO_STATUS_TX_REUSE = 0x40,
+    BK_FIFO_STATUS_TX_FULL  = 0x20,
+    BK_FIFO_STATUS_TX_EMPTY = 0x10,
+    BK_FIFO_STATUS_RX_FULL  = 0x02,
+    BK_FIFO_STATUS_RX_EMPTY = 0x01
+};
+
+// Meanings of the BK_CONFIG register
+enum {
+    BK_CONFIG_MASK_RX_DR = 0x40,  // Mask interrupt caused by RX_DR
+    BK_CONFIG_MASK_TX_DS = 0x20,  // Mask interrupt caused by TX_DS
+    BK_CONFIG_MASK_MAX_RT = 0x10, // Mask interrupt caused by MAX_RT
+    BK_CONFIG_EN_CRC = 0x08,      // Enable CRC. Forced high if one of the bits in the EN_AA is high
+    BK_CONFIG_CRCO = 0x04,        // CRC encoding scheme (0=8 bits, 1=16 bits)
+    BK_CONFIG_PWR_UP = 0x02,      // POWER UP
+    BK_CONFIG_PRIM_RX = 0x01,     // Receive/transmit
+};
+
+enum {
+    BK_FEATURE_EN_DPL = 0x04,     //
+    BK_FEATURE_EN_ACK_PAY = 0x02, //
+    BK_FEATURE_EN_DYN_ACK = 0x01, //
+};
+
+// (Lets make it one radio interface for both projects)
+
+/** The baud rate of the GFSK modulation */
+typedef enum ITX_SPEED_e {
+    ITX_250,  ///< 250kbps (slowest but furthest range)
+    ITX_1000, ///< 1000kbps (balanced)
+    ITX_2000, ///< 2000kbps (fastest hence least congested)
+    ITX_CARRIER, ///< 0kbps (constant carrier wave)
+    ITX_MAX
+} ITX_SPEED;
+
+enum {
+    PACKET_LENGTH_RX_CTRL = 12,
+    PACKET_LENGTH_RX_BIND = 12,
+    PACKET_LENGTH_RX_MAX  = 12,
+    PACKET_LENGTH_TX_TELEMETRY = 12,
+    PACKET_LENGTH_TX_DFU = 20,
+    PACKET_LENGTH_TX_MAX = 20,
+};
+
+// Note that bank 1 registers 0...8 are MSB first; others are LSB first
+
+#define PLL_SPEED { BK2425_R1_12, 0x00,0x12,0x73,0x05 } // 0x00127305ul, // PLL locking time 130us compatible with nRF24L01;
+
+// In the array Bank1_Reg0_13[],all the register values are the byte reversed!
+enum {
+    IREG1_4,
+    IREG1_5,
+    IREG1_12,
+    IREG1_13,
+    IREG1_4A,
+    IREG_MAX
+};
+
+#define BK_MAX_PACKET_LEN 32 // max value is 32 bytes
+#define BK_RCV_TIMEOUT 30
+
+//----------------------------------------------------------------------------------
+// Translate output power into a number
+// must match up with the table RegPower[]
+#define OUTPUT_POWER_REG6_0 0 // -25dB
+#define OUTPUT_POWER_REG6_1 0 // -18dB
+#define OUTPUT_POWER_REG6_2 1 // -18dB
+#define OUTPUT_POWER_REG6_3 1 // -12dB
+#define OUTPUT_POWER_REG6_4 1 // -12dB
+#define OUTPUT_POWER_REG6_5 2 //  -7dB
+#define OUTPUT_POWER_REG6_6 3 //  -1dB
+#define OUTPUT_POWER_REG6_7 3 //  +4dB
+
+// Register 4 in bank 1 only applies to Beken chip
+#define OUTPUT_POWER_REG4_0 0 // -25dB
+#define OUTPUT_POWER_REG4_1 3 // -18dB
+#define OUTPUT_POWER_REG4_2 0 // -18dB
+#define OUTPUT_POWER_REG4_3 3 // -12dB
+#define OUTPUT_POWER_REG4_4 2 // -12dB
+#define OUTPUT_POWER_REG4_5 0 //  -7dB
+#define OUTPUT_POWER_REG4_6 0 //  -1dB
+#define OUTPUT_POWER_REG4_7 7 //  +4dB
+
+// Generic support
+#define TOKENPASTE(x, y) x ## y
+#define TOKENPASTE2(x, y) TOKENPASTE(x, y)
+// The default register values that are for the default power setting
+#define DEFAULT_OUTPUT_REG6 TOKENPASTE2(OUTPUT_POWER_REG6_,DEFAULT_OUTPUT_POWER)
+#define DEFAULT_OUTPUT_REG4 TOKENPASTE2(OUTPUT_POWER_REG4_,DEFAULT_OUTPUT_POWER)
+
+/** Parameters used by the fcc pretests */
+typedef struct FccParams_s {
+    uint8_t fcc_mode; ///< The value (0..6) last set by the user that we are using. Non-zero iff we are sending test signals
+    bool scan_mode; ///< true for scanning, false for fixed frequencies
+    bool CW_mode; ///< true for carrier wave, false for packets
+    bool disable_crc_mode; ///< false for CRCs enabled, true for CRCs ignored on reception
+    uint8_t scan_count; ///< In scan mode, packet count before incrementing scan
+    uint8_t channel; ///< Current frequency 8..70
+    uint8_t power; ///< Current power 1..8
+    bool disable_crc; ///< true=crc is physically disabled
+    uint8_t factory_mode; ///< factory test mode 0..8
+    bool enable_cd; ///< enable carrier detect
+    bool last_cd; ///< last carrier detect on a packet received
+} FccParams;
+
+typedef enum BkRadioMode_e {
+    BKRADIO_SLEEP,
+    BKRADIO_IDLE,
+    BKRADIO_TX,
+    BKRADIO_RX,
+    BKRADIO_STANDBY1, // Not visible to the code yet
+    BKRADIO_STANDBY2, // Not visible to the code yet
+} BkRadioMode;
+
+//----------------------------------------------------------------------------------
+// BEKEN driver class
+class Radio_Beken
+{
+public:
+    // Generic functions
+    Radio_Beken(AP_HAL::OwnPtr<AP_HAL::SPIDevice> _dev);
+    bool lock_bus(void)
+    {
+        dev->get_semaphore()->take_blocking();
+        return true;
+    }
+    void unlock_bus(void)
+    {
+        dev->get_semaphore()->give();
+    }
+
+    // Raw SPI access functions
+    void ReadRegisterMulti(uint8_t address, uint8_t *data, uint8_t len);
+    void WriteRegisterMulti(uint8_t address, const uint8_t *data, uint8_t len);
+
+    // Low-level Beken functions
+    uint8_t ReadStatus(void);
+    uint8_t ReadReg(uint8_t reg);
+    uint8_t Strobe(uint8_t address);
+    void SetRBank(uint8_t bank);
+    void WriteReg(uint8_t address, uint8_t data);
+    void WriteRegisterMultiBank1(uint8_t address, const uint8_t *data, uint8_t len);
+
+    // High-level Beken functions
+    void SetPower(uint8_t power);
+    void SetChannel(uint8_t channel); // Sets the physical channel
+    void SetCwMode(uint8_t cw);
+    void SetCrcMode(uint8_t disable_crc); // non-zero means crc is ignored
+    void SetFactoryMode(uint8_t factory);
+    bool Reset(void);
+    void SwitchToRxMode(void);
+    void SwitchToTxMode(void);
+    void SwitchToIdleMode(void);
+    void SwitchToSleepMode(void);
+    void InitBank0Registers(ITX_SPEED spd);
+    void InitBank1Registers(ITX_SPEED spd);
+    void SetAddresses(const uint8_t* txaddr); // Set the rx and tx addresses
+    bool ClearAckOverflow(void);
+    bool SendPacket(uint8_t type, const uint8_t* pbuf, uint8_t len);
+    void DelayCE(void);
+    void DumpRegisters(void);
+    bool WasTxMode(void);
+    bool WasRxMode(void);
+    void ResetAddress(void);
+    void EnableCarrierDetect(bool bEnable);
+    bool CarrierDetect(void);
+
+    // Visible public variables (naughty)
+    volatile uint8_t bkReady; // initialised in AP_Radio_bk2425.h radio_init() at the very end. Similar to a semaphore.
+    static ITX_SPEED gTxSpeed;
+    FccParams fcc;
+    packetFormatTx pktDataTx; // Packet data to send (telemetry)
+    packetFormatDfu pktDataDfu; // Packet data to send (DFU)
+    uint8_t TX_Address[5]; // For sending telemetry and DFU
+
+private:
+    AP_HAL::OwnPtr<AP_HAL::SPIDevice> dev;
+    uint8_t bFreshData; // Have we received a packet since we last processed one
+    uint32_t numTxPackets;
+    packetFormatRx pktDataRx; // Last valid packet that has been received
+    packetFormatRx pktDataRecv; // Packet data in process of being received
+    uint8_t lastTxChannel; // 0..CHANNEL_COUNT_LOGICAL
+    uint8_t RX0_Address[5]; // The data address
+    uint8_t RX1_Address[5]; // The fixed binding address
+    BkRadioMode bkMode;
+};
+
+#endif  // AP_RADIO_BK2425_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+  low level driver for the TI CC2500 radio on SPI
+
+  With thanks to betaflight
+*/
+
+#include "driver_cc2500.h"
+#include <utility>
+
+#pragma GCC optimize("O0")
+
+extern const AP_HAL::HAL& hal;
+
+// constructor
+Radio_CC2500::Radio_CC2500(AP_HAL::OwnPtr<AP_HAL::SPIDevice> _dev) :
+    dev(std::move(_dev))
+{}
+
+void Radio_CC2500::ReadFifo(uint8_t *dpbuffer, uint8_t len)
+{
+    (void)dev->read_registers(CC2500_3F_RXFIFO | CC2500_READ_BURST, dpbuffer, len);
+}
+
+void Radio_CC2500::WriteFifo(const uint8_t *dpbuffer, uint8_t len)
+{
+    WriteRegisterMulti(CC2500_3F_TXFIFO | CC2500_WRITE_BURST, dpbuffer, len);
+}
+
+void Radio_CC2500::ReadRegisterMulti(uint8_t address, uint8_t *data, uint8_t length)
+{
+    (void)dev->read_registers(address, data, length);
+}
+
+void Radio_CC2500::WriteRegisterMulti(uint8_t address, const uint8_t *data, uint8_t length)
+{
+    uint8_t buf[length+1];
+    buf[0] = address;
+    memcpy(&buf[1], data, length);
+    dev->transfer(buf, length+1, nullptr, 0);
+}
+
+uint8_t Radio_CC2500::ReadReg(uint8_t reg)
+{
+    uint8_t ret = 0;
+    (void)dev->read_registers(reg | CC2500_READ_SINGLE, &ret, 1);
+    return ret;
+}
+
+uint8_t Radio_CC2500::Strobe(uint8_t address)
+{
+    uint8_t status=0;
+    (void)dev->transfer(&address, 1, &status, 1);
+    return status;
+}
+
+void Radio_CC2500::WriteReg(uint8_t address, uint8_t data)
+{
+    (void)dev->write_register(address, data);
+}
+
+void Radio_CC2500::SetPower(uint8_t power)
+{
+    const uint8_t patable[8] = {
+        0xC6, // -12dbm
+        0x97, // -10dbm
+        0x6E, // -8dbm
+        0x7F, // -6dbm
+        0xA9, // -4dbm
+        0xBB, // -2dbm
+        0xFE, // 0dbm
+        0xFF  // 1.5dbm
+    };
+    if (power > 7) {
+        power = 7;
+    }
+    if (power != last_power) {
+        WriteReg(CC2500_3E_PATABLE, patable[power]);
+        last_power = power;
+    }
+}
+
+bool Radio_CC2500::Reset(void)
+{
+    Strobe(CC2500_SRES);
+    hal.scheduler->delay_microseconds(1000);
+    // CC2500_SetTxRxMode(TXRX_OFF);
+    // RX_EN_off;//off tx
+    // TX_EN_off;//off rx
+    return ReadReg(CC2500_0E_FREQ1) == 0xC4; // check if reset
+}
+
+/*
+  write register with up to 5 retries
+ */
+void Radio_CC2500::WriteRegCheck(uint8_t address, uint8_t data)
+{
+    uint8_t tries=5;
+    while (--tries) {
+        dev->write_register(address, data);
+        uint8_t v = ReadReg(address);
+        if (v == data) {
+            break;
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+  low level driver for the TI CC2500 radio on SPI
+
+  With thanks to betaflight
+*/
+
+#pragma once
+
+#include <AP_HAL/AP_HAL.h>
+
+enum {
+    CC2500_00_IOCFG2 = 0x00,   // GDO2 output pin configuration
+    CC2500_01_IOCFG1 = 0x01,   // GDO1 output pin configuration
+    CC2500_02_IOCFG0 = 0x02,   // GDO0 output pin configuration
+    CC2500_03_FIFOTHR = 0x03,  // RX FIFO and TX FIFO thresholds
+    CC2500_04_SYNC1 = 0x04,    // Sync word, high byte
+    CC2500_05_SYNC0 = 0x05,    // Sync word, low byte
+    CC2500_06_PKTLEN = 0x06,   // Packet length
+    CC2500_07_PKTCTRL1 = 0x07, // Packet automation control
+    CC2500_08_PKTCTRL0 = 0x08, // Packet automation control
+    CC2500_09_ADDR = 0x09,     // Device address
+    CC2500_0A_CHANNR = 0x0A,   // Channel number
+    CC2500_0B_FSCTRL1 = 0x0B,  // Frequency synthesizer control
+    CC2500_0C_FSCTRL0 = 0x0C,  // Frequency synthesizer control
+    CC2500_0D_FREQ2 = 0x0D,    // Frequency control word, high byte
+    CC2500_0E_FREQ1 = 0x0E,    // Frequency control word, middle byte
+    CC2500_0F_FREQ0 = 0x0F,    // Frequency control word, low byte
+    CC2500_10_MDMCFG4 = 0x10,  // Modem configuration
+    CC2500_11_MDMCFG3 = 0x11,  // Modem configuration
+    CC2500_12_MDMCFG2 = 0x12,  // Modem configuration
+    CC2500_13_MDMCFG1 = 0x13,  // Modem configuration
+    CC2500_14_MDMCFG0 = 0x14,  // Modem configuration
+    CC2500_15_DEVIATN = 0x15,  // Modem deviation setting
+    CC2500_16_MCSM2 = 0x16,    // Main Radio Cntrl State Machine config
+    CC2500_17_MCSM1 = 0x17,    // Main Radio Cntrl State Machine config
+    CC2500_18_MCSM0 = 0x18,    // Main Radio Cntrl State Machine config
+    CC2500_19_FOCCFG = 0x19,   // Frequency Offset Compensation config
+    CC2500_1A_BSCFG = 0x1A,    // Bit Synchronization configuration
+    CC2500_1B_AGCCTRL2 = 0x1B, // AGC control
+    CC2500_1C_AGCCTRL1 = 0x1C, // AGC control
+    CC2500_1D_AGCCTRL0 = 0x1D, // AGC control
+    CC2500_1E_WOREVT1 = 0x1E,  // High byte Event 0 timeout
+    CC2500_1F_WOREVT0 = 0x1F,  // Low byte Event 0 timeout
+    CC2500_20_WORCTRL = 0x20,  // Wake On Radio control
+    CC2500_21_FREND1 = 0x21,   // Front end RX configuration
+    CC2500_22_FREND0 = 0x22,   // Front end TX configuration
+    CC2500_23_FSCAL3 = 0x23,   // Frequency synthesizer calibration
+    CC2500_24_FSCAL2 = 0x24,   // Frequency synthesizer calibration
+    CC2500_25_FSCAL1 = 0x25,   // Frequency synthesizer calibration
+    CC2500_26_FSCAL0 = 0x26,   // Frequency synthesizer calibration
+    CC2500_27_RCCTRL1 = 0x27,  // RC oscillator configuration
+    CC2500_28_RCCTRL0 = 0x28,  // RC oscillator configuration
+    CC2500_29_FSTEST = 0x29,   // Frequency synthesizer cal control
+    CC2500_2A_PTEST = 0x2A,    // Production test
+    CC2500_2B_AGCTEST = 0x2B,  // AGC test
+    CC2500_2C_TEST2 = 0x2C,    // Various test settings
+    CC2500_2D_TEST1 = 0x2D,    // Various test settings
+    CC2500_2E_TEST0 = 0x2E,    // Various test settings
+
+    // Status registers
+    CC2500_30_PARTNUM = 0x30,    // Part number
+    CC2500_31_VERSION = 0x31,    // Current version number
+    CC2500_32_FREQEST = 0x32,    // Frequency offset estimate
+    CC2500_33_LQI = 0x33,        // Demodulator estimate for link quality
+    CC2500_34_RSSI = 0x34,       // Received signal strength indication
+    CC2500_35_MARCSTATE = 0x35,  // Control state machine state
+    CC2500_36_WORTIME1 = 0x36,   // High byte of WOR timer
+    CC2500_37_WORTIME0 = 0x37,   // Low byte of WOR timer
+    CC2500_38_PKTSTATUS = 0x38,  // Current GDOx status and packet status
+    CC2500_39_VCO_VC_DAC = 0x39, // Current setting from PLL cal module
+    CC2500_3A_TXBYTES = 0x3A,    // Underflow and # of bytes in TXFIFO
+    CC2500_3B_RXBYTES = 0x3B,    // Overflow and # of bytes in RXFIFO
+
+    // Multi byte memory locations
+    CC2500_3E_PATABLE = 0x3E,
+    CC2500_3F_TXFIFO = 0x3F,
+    CC2500_3F_RXFIFO = 0x3F
+};
+
+// Definitions for burst/single access to registers
+#define CC2500_WRITE_SINGLE 0x00
+#define CC2500_WRITE_BURST 0x40
+#define CC2500_READ_SINGLE 0x80
+#define CC2500_READ_BURST 0xC0
+
+// Strobe commands
+#define CC2500_SRES 0x30 // Reset chip.
+#define CC2500_SFSTXON                                                         \
+    0x31 // Enable and calibrate frequency synthesizer (if MCSM0.FS_AUTOCAL=1).
+// If in RX/TX: Go to a wait state where only the synthesizer is
+// running (for quick RX / TX turnaround).
+#define CC2500_SXOFF 0x32 // Turn off crystal oscillator.
+#define CC2500_SCAL 0x33  // Calibrate frequency synthesizer and turn it off
+// (enables quick start).
+#define CC2500_SRX                                                             \
+    0x34 // Enable RX. Perform calibration first if coming from IDLE and
+// MCSM0.FS_AUTOCAL=1.
+#define CC2500_STX                                                             \
+    0x35 // In IDLE state: Enable TX. Perform calibration first if
+// MCSM0.FS_AUTOCAL=1. If in RX state and CCA is enabled:
+// Only go to TX if channel is clear.
+#define CC2500_SIDLE                                                           \
+    0x36 // Exit RX / TX, turn off frequency synthesizer and exit
+// Wake-On-Radio mode if applicable.
+#define CC2500_SAFC 0x37 // Perform AFC adjustment of the frequency synthesizer
+#define CC2500_SWOR 0x38 // Start automatic RX polling sequence (Wake-on-Radio)
+#define CC2500_SPWD 0x39 // Enter power down mode when CSn goes high.
+#define CC2500_SFRX 0x3A // Flush the RX FIFO buffer.
+#define CC2500_SFTX 0x3B // Flush the TX FIFO buffer.
+#define CC2500_SWORRST 0x3C // Reset real time clock.
+#define CC2500_SNOP                                                            \
+    0x3D // No operation. May be used to pad strobe commands to two
+// bytes for simpler software.
+//----------------------------------------------------------------------------------
+// Chip Status Byte
+//----------------------------------------------------------------------------------
+
+// Bit fields in the chip status byte
+#define CC2500_STATUS_CHIP_RDYn_BM 0x80
+#define CC2500_STATUS_STATE_BM 0x70
+#define CC2500_STATUS_FIFO_BYTES_AVAILABLE_BM 0x0F
+
+// Chip states
+#define CC2500_STATE_IDLE 0x00
+#define CC2500_STATE_RX 0x10
+#define CC2500_STATE_TX 0x20
+#define CC2500_STATE_FSTXON 0x30
+#define CC2500_STATE_CALIBRATE 0x40
+#define CC2500_STATE_SETTLING 0x50
+#define CC2500_STATE_RX_OVERFLOW 0x60
+#define CC2500_STATE_TX_UNDERFLOW 0x70
+
+//----------------------------------------------------------------------------------
+// Other register bit fields
+//----------------------------------------------------------------------------------
+#define CC2500_LQI_CRC_OK_BM 0x80
+#define CC2500_LQI_EST_BM 0x7F
+
+// CC2500 driver class
+class Radio_CC2500
+{
+public:
+    Radio_CC2500(AP_HAL::OwnPtr<AP_HAL::SPIDevice> _dev);
+
+    void ReadFifo(uint8_t *dpbuffer, uint8_t len);
+    void WriteFifo(const uint8_t *dpbuffer, uint8_t len);
+
+    void ReadRegisterMulti(uint8_t address, uint8_t *data, uint8_t length);
+    void WriteRegisterMulti(uint8_t address, const uint8_t *data, uint8_t length);
+
+    uint8_t ReadReg(uint8_t reg);
+    uint8_t Strobe(uint8_t address);
+    void WriteReg(uint8_t address, uint8_t data);
+    void WriteRegCheck(uint8_t address, uint8_t data);
+    void SetPower(uint8_t power);
+    bool Reset(void);
+
+    bool lock_bus(void)
+    {
+        if (!dev) {
+            return false;
+        }
+        dev->get_semaphore()->take_blocking();
+        return true;
+    }
+    void unlock_bus(void)
+    {
+        dev->get_semaphore()->give();
+    }
+
+private:
+    AP_HAL::OwnPtr<AP_HAL::SPIDevice> dev;
+    uint8_t last_power;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #pragma once
+
+#include "AP_RangeFinder_config.h"
+
+#if AP_RANGEFINDER_LWI2C_ENABLED
+
+#include "AP_RangeFinder.h"
+#include "AP_RangeFinder_Backend.h"
+
+#include <AP_HAL/I2CDevice.h>
+
+#define NUM_SF20_DATA_STREAMS 1
+
+class AP_RangeFinder_LightWareI2C : public AP_RangeFinder_Backend
+{
+
+public:
+    // static detection function
+    static AP_RangeFinder_Backend *detect(RangeFinder::RangeFinder_State &_state,
+                                          AP_RangeFinder_Params &_params,
+                                          AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev);
+
+    // update state
+    void update(void) override;
+
+protected:
+
+    virtual MAV_DISTANCE_SENSOR _get_mav_distance_sensor_type() const override
+    {
+        return MAV_DISTANCE_SENSOR_LASER;
+    }
+
+private:
+
+    uint16_t sf20_stream_val[NUM_SF20_DATA_STREAMS];
+    int currentStreamSequenceIndex = 0;
+
+    // constructor
+    AP_RangeFinder_LightWareI2C(RangeFinder::RangeFinder_State &_state,
+                                AP_RangeFinder_Params &_params,
+                                AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev);
+
+    bool write_bytes(uint8_t *write_buf_u8, uint32_t len_u8);
+    void sf20_disable_address_tagging();
+    bool sf20_send_and_expect(const char* send, const char* expected_reply);
+    bool sf20_set_lost_signal_confirmations();
+    void sf20_get_version(const char* send_msg, const char *reply_prefix, char reply[5]);
+    bool sf20_wait_on_reply(uint8_t *rx_two_bytes);
+    bool init();
+    bool legacy_init();
+    bool sf20_init();
+    void sf20_init_streamRecovery();
+    void legacy_timer();
+    void sf20_timer();
+
+    // get a reading
+    bool legacy_get_reading(float &reading_m);
+    bool sf20_get_reading(float &reading_m);
+    bool sf20_parse_stream(uint8_t *stream_buf,
+                           size_t *p_num_processed_chars,
+                           const char *string_identifier,
+                           uint16_t &val);
+    void data_log(uint16_t *val);
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> _dev;
+};
+
+#endif  // AP_RANGEFINDER_LWI2C_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_RangeFinder_LightWareSerial.h"
+
+#if AP_RANGEFINDER_LIGHTWARE_SERIAL_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <ctype.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define LIGHTWARE_DIST_MAX_CM           10000
+#define LIGHTWARE_OUT_OF_RANGE_ADD_CM   100
+
+// read - return last value measured by sensor
+bool AP_RangeFinder_LightWareSerial::get_reading(float &reading_m)
+{
+    if (uart == nullptr) {
+        return false;
+    }
+
+    float sum = 0;              // sum of all readings taken
+    uint16_t valid_count = 0;   // number of valid readings
+    uint16_t invalid_count = 0; // number of invalid readings
+
+    // max distance the sensor can reliably measure - read from parameters
+    const int16_t distance_cm_max = max_distance_cm();
+
+    // read any available lines from the lidar
+    for (auto i=0; i<8192; i++) {
+        uint8_t c;
+        if (!uart->read(c)) {
+            break;
+        }
+        // use legacy protocol
+        if (protocol_state == ProtocolState::UNKNOWN || protocol_state == ProtocolState::LEGACY) {
+            if (c == '\r') {
+                linebuf[linebuf_len] = 0;
+                const float dist = strtof(linebuf, nullptr);
+                if (!is_negative(dist) && !is_lost_signal_distance(dist * 100, distance_cm_max)) {
+                    sum += dist;
+                    valid_count++;
+                    // if still determining protocol update legacy valid count
+                    if (protocol_state == ProtocolState::UNKNOWN) {
+                        legacy_valid_count++;
+                    }
+                } else {
+                    invalid_count++;
+                }
+                linebuf_len = 0;
+            } else if (isdigit(c) || c == '.' || c == '-') {
+                linebuf[linebuf_len++] = c;
+                if (linebuf_len == sizeof(linebuf)) {
+                    // too long, discard the line
+                    linebuf_len = 0;
+                }
+            }
+        }
+
+        // use binary protocol
+        if (protocol_state == ProtocolState::UNKNOWN || protocol_state == ProtocolState::BINARY) {
+            bool msb_set = BIT_IS_SET(c, 7);
+            if (msb_set) {
+                // received the high byte
+                high_byte = c;
+                high_byte_received = true;
+            } else {
+                // received the low byte which should be second
+                if (high_byte_received) {
+                    const int16_t dist = (high_byte & 0x7f) << 7 | (c & 0x7f);
+                    if (dist >= 0 && !is_lost_signal_distance(dist, distance_cm_max)) {
+                        sum += dist * 0.01f;
+                        valid_count++;
+                        // if still determining protocol update binary valid count
+                        if (protocol_state == ProtocolState::UNKNOWN) {
+                            binary_valid_count++;
+                        }
+                    } else {
+                        invalid_count++;
+                    }
+                }
+                high_byte_received = false;
+            }
+        }
+    }
+
+    // protocol set after 10 successful reads
+    if (protocol_state == ProtocolState::UNKNOWN) {
+        if (binary_valid_count > 10) {
+            protocol_state = ProtocolState::BINARY;
+        } else if (legacy_valid_count > 10) {
+            protocol_state = ProtocolState::LEGACY;
+        }
+    }
+
+    uint32_t now = AP_HAL::millis();
+    if (last_init_ms == 0 ||
+        (now - last_init_ms > 1000 &&
+         now - state.last_reading_ms > 1000)) {
+        // send enough serial transitions to trigger LW20 into serial
+        // mode. It starts in dual I2C/serial mode, and wants to see
+        // enough transitions to switch into serial mode.
+        uart->write("www\r\n");
+        last_init_ms = now;
+    } else {
+        uart->write('d');
+    }
+
+    // return average of all valid readings
+    if (valid_count > 0) {
+        reading_m = sum / valid_count;
+        no_signal = false;
+        return true;
+    }
+
+    // all readings were invalid so return out-of-range-high value
+    if (invalid_count > 0) {
+        reading_m = MIN(MAX(LIGHTWARE_DIST_MAX_CM, distance_cm_max + LIGHTWARE_OUT_OF_RANGE_ADD_CM), UINT16_MAX) * 0.01f;
+        no_signal = true;
+        return true;
+    }
+
+    // no readings so return false
+    return false;
+}
+
+// check to see if distance returned by the LiDAR is a known lost-signal distance flag
+bool AP_RangeFinder_LightWareSerial::is_lost_signal_distance(int16_t distance_cm, int16_t distance_cm_max)
+{
+    if (distance_cm < distance_cm_max + LIGHTWARE_OUT_OF_RANGE_ADD_CM) {
+        // in-range
+        return false;
+    }
+    const int16_t bad_distances[] { 13000, 16000, 23000, 25000 };
+    for (const auto bad_distance_cm : bad_distances) {
+        if (distance_cm == bad_distance_cm) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #pragma once
+
+#include "AP_RangeFinder_config.h"
+
+#if AP_RANGEFINDER_LIGHTWARE_SERIAL_ENABLED
+
+#include "AP_RangeFinder.h"
+#include "AP_RangeFinder_Backend_Serial.h"
+
+class AP_RangeFinder_LightWareSerial : public AP_RangeFinder_Backend_Serial
+{
+
+public:
+
+    static AP_RangeFinder_Backend_Serial *create(
+        RangeFinder::RangeFinder_State &_state,
+        AP_RangeFinder_Params &_params) {
+        return NEW_NOTHROW AP_RangeFinder_LightWareSerial(_state, _params);
+    }
+
+protected:
+
+    using AP_RangeFinder_Backend_Serial::AP_RangeFinder_Backend_Serial;
+
+    MAV_DISTANCE_SENSOR _get_mav_distance_sensor_type() const override {
+        return MAV_DISTANCE_SENSOR_LASER;
+    }
+
+    int8_t get_signal_quality_pct() const override {
+        return no_signal ? RangeFinder::SIGNAL_QUALITY_MIN : RangeFinder::SIGNAL_QUALITY_MAX;
+    }
+
+private:
+    // get a reading
+    bool get_reading(float &reading_m) override;
+    bool is_lost_signal_distance(int16_t distance_cm, int16_t distance_cm_max);
+
+    char linebuf[10];           // legacy protocol buffer
+    uint8_t linebuf_len;        // legacy protocol buffer length
+    uint32_t last_init_ms;      // init time used to switch lw20 to serial mode
+    uint8_t high_byte;          // binary protocol high byte
+    bool high_byte_received;    // true if high byte has been received
+
+    // automatic protocol decision variables
+    enum class ProtocolState {
+        UNKNOWN,    // the protocol used is not yet known
+        LEGACY,     // legacy protocol, distances are sent as strings
+        BINARY      // binary protocol, distances are sent using two bytes
+    } protocol_state;
+    uint8_t legacy_valid_count;
+    uint8_t binary_valid_count;
+
+    bool no_signal = false;
+};
+
+#endif  // AP_RANGEFINDER_LIGHTWARE_SERIAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        # ExternalNav / Optical flow source switching
+
+Switches between AHRS/EKF sources based on the pilot's source selection switch or using an automatic source selection algorithm
+This script is intended to help vehicles automatically switch between ExternalNav and optical flow
+
+## Parmeter Descriptions
+
+-- ESRC_EXTN_THRESH : ExternalNav innovation threshold
+-- ESRC_EXTN_QUAL : ExternalNav quality threshold
+-- ESRC_FLOW_THRESH : OpticalFlow innovation threshold
+-- ESRC_FLOW_QUAL : OpticalFlow quality threshold
+-- ESRC_RNGFND_MAX : Rangefinder altitude threshold (in meters)
+
+## How to use
+
+Configure a downward facing lidar with a range of at least 5m
+Set RCx_OPTION = 90 (EKF Pos Source) to select the source (low=ExternalNav, middle=opticalflow, high=Not Used)
+Set RCx_OPTION = 300 (Scripting1).  When this switch is pulled high, the source will be automatically selected
+Set SRC_ENABLE = 1 (enable scripting)
+Set EK3_SRCn_ parameters so that ExternalNav is the primary source, opticalflow is secondary
+
+  - EK3_SRC1_POSXY = 6 (ExternalNav)
+  - EK3_SRC1_VELXY = 6 (ExternalNav)
+  - EK3_SRC1_VELZ  = 6 (ExternalNav)
+  - EK3_SRC1_POSZ  = 6 (ExternalNav) or 1 (Baro)
+  - EK3_SRC1_YAW   = 6 (ExternalNav) or 1 (Compass)
+  - EK3_SRC2_POSXY = 0 (None)
+  - EK3_SRC2_VELXY = 5 (OpticalFlow)
+  - EK3_SRC2_VELZ  = 0 (None)
+  - EK3_SRC2_POSZ  = 1 (Baro)
+  - EK3_SRC2_YAW   = 1 (Compass)
+  - EK3_SRC_OPTIONS = 0 (Do not fuse all velocities)
+
+When the 2nd auxiliary switch (300/Scripting1) is pulled high automatic source selection is used based on the following criteria:
+
+  - ESRC_EXTN_THRESH holds the threshold for ExternalNav innovation threshold (around 0.3 is a good choice)
+  - ESRC_EXTN_QUAL holds the ExternalNav quality threshold (about 10 is a good choice)
+  - ESRC_FLOW_QUAL holds the optical flow quality threshold (about 50 is a good choice)
+  - ESRC_FLOW_THRESH holds the threshold for optical flow innovations (about 0.15 is a good choice)
+  - ESRC_RNGFND_MAX holds the threshold (in meters) for rangefinder altitude
+
+  - If ExternalNav's quality is above ESRC_EXTN_QUAL and innovations are below ESRC_EXTN_THRESH, ExternalNav is used
+  - Optical flow is used if the above is not true and:
+
+    - Quality is above ESRC_FLOW_QUAL
+    - Innovations are below ESRC_FLOW_THRESH
+    - Rangefinder distance is below ESRC_RNGFND_MAX
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   --[[
+script to prevent terrain impact in LOITER mode while flying copters in steep terrain
+--]]
+
+local PARAM_TABLE_KEY = 84
+local PARAM_TABLE_PREFIX = "TERR_BRK_"
+
+local MODE_LOITER = 5
+local MODE_BRAKE = 17
+
+local MAV_SEVERITY = {EMERGENCY=0, ALERT=1, CRITICAL=2, ERROR=3, WARNING=4, NOTICE=5, INFO=6, DEBUG=7}
+
+-- add a parameter and bind it to a variable
+function bind_add_param(name, idx, default_value)
+   assert(param:add_param(PARAM_TABLE_KEY, idx, name, default_value), string.format('could not add param %s', name))
+   return Parameter(PARAM_TABLE_PREFIX .. name)
+end
+
+-- setup script specific parameters
+assert(param:add_table(PARAM_TABLE_KEY, PARAM_TABLE_PREFIX, 14), 'could not add param table')
+
+--[[
+  // @Param: TERR_BRK_ENABLE
+  // @DisplayName: terrain brake enable
+  // @Description: terrain brake enable
+  // @Values: 0:Disabled,1:Enabled
+  // @User: Standard
+--]]
+local TERR_BRK_ENABLE = bind_add_param('ENABLE', 1, 1)
+
+--[[
+  // @Param: TERR_BRK_ALT
+  // @DisplayName: terrain brake altitude
+  // @Description: terrain brake altitude. The altitude above the ground below which BRAKE mode will be engaged if in LOITER mode.
+  // @Range: 1 100
+  // @Units: m
+  // @User: Standard
+--]]
+local TERR_BRK_ALT = bind_add_param('ALT', 2, 30)
+
+--[[
+  // @Param: TERR_BRK_HDIST
+  // @DisplayName: terrain brake home distance
+  // @Description: terrain brake home distance. The distance from home where the auto BRAKE will be enabled. When within this distance of home the script will not activate
+  // @Range: 0 1000
+  // @Units: m
+  // @User: Standard
+--]]
+local TERR_BRK_HDIST = bind_add_param('HDIST', 3, 100)
+
+--[[
+  // @Param: TERR_BRK_SPD
+  // @DisplayName: terrain brake speed threshold
+  // @Description: terrain brake speed threshold. Don't trigger BRAKE if both horizontal speed and descent rate are below this threshold. By setting this to a small value this can be used to allow the user to climb up to a safe altitude in LOITER mode. A value of 0.5 is recommended if you want to use LOITER to recover from an emergency terrain BRAKE mode change.
+  // @Range: 0 5
+  // @Units: m/s
+  // @User: Standard
+--]]
+local TERR_BRK_SPD = bind_add_param('SPD', 4, 0)
+
+local function sq(x)
+   return x*x
+end
+
+local function run_checks()
+   if TERR_BRK_ENABLE:get() ~= 1 then
+      return
+   end
+   if not arming:is_armed() then
+      return
+   end
+   if vehicle:get_mode() ~= MODE_LOITER then
+      return
+   end
+
+   if not ahrs:home_is_set() then
+      return
+   end
+   local home = ahrs:get_home()
+   local pos = ahrs:get_location()
+   if not pos then
+      return
+   end
+   local home_dist = pos:get_distance(home)
+   if home_dist <= TERR_BRK_HDIST:get() then
+      return
+   end
+
+   --[[
+      get height above terrain with extrapolation
+   --]]
+   local hagl = terrain:height_above_terrain(true)
+   if hagl >= TERR_BRK_ALT:get() then
+      return
+   end
+
+   --[[
+      allow for climbing in LOITER mode if enabled
+   --]]
+   if TERR_BRK_SPD:get() > 0 then
+      local spd = ahrs:get_velocity_NED()
+      if spd ~= nil then
+         local hspd = math.sqrt(sq(spd:x())+sq(spd:y()))
+         local drate = spd:z()
+         if hspd < TERR_BRK_SPD:get() and drate < TERR_BRK_SPD:get() then
+            return
+         end
+      end
+   end
+
+   if vehicle:set_mode(MODE_BRAKE) then
+      gcs:send_text(MAV_SEVERITY.EMERGENCY, string.format("Terrain %.1fm - BRAKE", hagl))
+   end
+end
+
+--[[
+   main update function, called at 1Hz
+--]]
+function update()
+   run_checks()
+   return update, 100
+end
+
+if TERR_BRK_ENABLE:get() == 1 then
+   gcs:send_text(MAV_SEVERITY.INFO, string.format("Loaded Loiter/Brake checker"))
+end
+
+-- start running update loop
+return update, 1000
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                      # Lua REPL
+
+This script implements an interactive REPL (read-evaluate-print-loop) for the
+Lua scripting engine accessible over serial, with line editing, history, and
+output formatting.
+
+The script can also act as a client for QGroundControl's MAVLink Console
+functionality (within the Analyze view), subject to limitations detailed
+below.
+
+### Basic Usage
+* Configure a serial port (e.g. `SERIALn_PROTOCOL`) to protocol 28 (Scripting).
+    * By default the first such port is used; this can be adjusted in the script
+      text.
+    * `SERIAL6` is the alternate USB serial port on Cube Orange, and convenient
+      for bench testing. CAN and network serial ports will also work.
+* Load the `repl.lua` script onto the autopilot.
+* Connect a terminal emulator to the port and enter Lua statements/expressions
+  at the `> ` prompt, then press Enter to execute. Results and errors will be
+  printed back.
+    * A `>> ` prompt indicates that more input is needed to complete the
+      statement.
+    * You can use the arrow keys to edit the current and previous inputs.
+    * Press ESC twice to clear the input and any incomplete statement then
+      return to an empty prompt.
+
+### Autopilot Connection
+* On Linux a convenient command is e.g. `minicom -w -D /dev/ttyACM1 -b 115200`,
+  assuming you have the minicom terminal emulator installed.
+* Any terminal emulator on any platform should work; see notes below about
+  control codes and other configuration.
+
+### SITL Connection
+* Start SITL with a command like `Tools/autotest/sim_vehicle.py -A --serialN=tcp:9995:wait` to allow connection to the selected serial port.
+* Connect a terminal emulator to localhost TCP port 9995
+    * On Linux a convenient command is `stty -icanon -echo -icrnl && netcat localhost 9995`.
+    * Note that you must execute `reset` to turn echo back on once disconnected.
+    * Scripting must be restarted after a TCP reconnection.
+
+### MAVLink Connection
+* Requires at least Ardupilot 4.6.
+* Set the port in the script text to `nil` to enable.
+* In addition to `repl.lua`, copy the `mavport.lua` file and `MAVLink` directory
+  from `AP_Scripting/modules` to `APM/SCRIPTS/MODULES` on your autopilot.
+* The ESC key is not supported; cause a syntax error to reset the prompt.
+* The experience over a radio link might be sub-par due to lack of any sort of
+  packet loss tracking or retransmission.
+
+### Notes and Limitations
+* Statements like `local x = 3` create a variable which immediately goes out of
+  scope once evaluated. Names must be global to survive to the next prompt.
+* There is currently no facility for installing periodic update callbacks.
+* While theoretically impossible to accidentally crash the autopilot software,
+  certain scripting APIs can cause damage to you or your vehicle if used
+  improperly. Use extreme caution with an armed vehicle!
+* The script expects Enter to be `\r`, `\r\n`, or `\n`. It prints `\r\n` for a
+  new line, and uses ANSI cursor control codes for line editing and history.
+  Check your terminal configuration if Enter doesn't work or you see garbage
+  characters. Lines longer than the terminal width likely won't edit properly.
+* Evaluating complex statements or printing complex results can cause an
+  `exceeded time limit` error, stopping the script and losing variables and
+  history. Increasing the vehicle's `SCR_VM_I_COUNT` parameter reduces the
+  chance of this occurring.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    --[[
+   parameter reversion utility. This helps with manual tuning
+   in-flight by giving a way to instantly revert parameters to the startup parameters
+--]]
+
+---@diagnostic disable: param-type-mismatch
+
+
+local MAV_SEVERITY = {EMERGENCY=0, ALERT=1, CRITICAL=2, ERROR=3, WARNING=4, NOTICE=5, INFO=6, DEBUG=7}
+
+local PARAM_TABLE_KEY = 31
+local PARAM_TABLE_PREFIX = "PREV_"
+
+local UPDATE_RATE_HZ = 4
+
+-- bind a parameter to a variable, old syntax to support older firmware
+function bind_param(name)
+   local p = Parameter()
+   if not p:init(name) then
+      return nil
+   end
+   return p
+end
+
+-- add a parameter and bind it to a variable
+function bind_add_param(name, idx, default_value)
+   assert(param:add_param(PARAM_TABLE_KEY, idx, name, default_value), string.format('could not add param %s', name))
+   local p = bind_param(PARAM_TABLE_PREFIX .. name)
+   assert(p, string.format("count not find parameter %s", name))
+   return p
+end
+
+-- setup script specific parameters
+assert(param:add_table(PARAM_TABLE_KEY, PARAM_TABLE_PREFIX, 5), 'could not add param table')
+
+--[[
+  // @Param: PREV_ENABLE
+  // @DisplayName: parameter reversion enable
+  // @Description: Enable parameter reversion system
+  // @Values: 0:Disabled,1:Enabled
+  // @User: Standard
+--]]
+local PREV_ENABLE      = bind_add_param('ENABLE',         1, 0)
+
+--[[
+  // @Param: PREV_RC_FUNC
+  // @DisplayName: param reversion RC function
+  // @Description: RCn_OPTION number to used to trigger parameter reversion
+  // @User: Standard
+--]]
+local PREV_RC_FUNC     = bind_add_param('RC_FUNC',       2, 300)
+
+-- params dictionary indexed by name
+local params = {}
+local param_saved = {}
+local param_count = 0
+
+local ATC_prefixes = { "ATC", "Q_A" }
+local PSC_prefixes = { "PSC", "Q_P" }
+local PID_prefixes = { "_RAT_RLL_", "_RAT_PIT_", "_RAT_YAW_" }
+local PID_suffixes = { "FF", "P", "I", "D", "D_FF", "PDMX", "NEF", "NTF", "IMAX", "FLTD", "FLTE", "FLTT", "SMAX" }
+local angle_axes = { "RLL", "PIT", "YAW" }
+local rate_limit_axes = { "R", "P", "Y"}
+local PSC_types = { "ACCZ", "VELZ", "POSZ", "VELXY", "POSXY" }
+local OTHER_PARAMS = { "INS_GYRO_FILTER", "INS_ACCEL_FILTER", "PTCH2SRV_TCONST", "RLL2SRV_TCONST" }
+
+-- TECS params
+TECS_PARAMS = { "TECS_APPR_SMAX", "TECS_CLMB_MAX", "TECS_FLARE_HGT", "TECS_HDEM_TCONST", "TECS_HGT_OMEGA", "TECS_INTEG_GAIN", "TECS_LAND_ARSPD", "TECS_LAND_DAMP", "TECS_LAND_IGAIN", "TECS_LAND_PDAMP", "TECS_LAND_PMAX", "TECS_LAND_SINK", "TECS_LAND_SPDWGT", "TECS_LAND_SRC", "TECS_LAND_TCONST", "TECS_LAND_TDAMP", "TECS_LAND_THR", "TECS_OPTIONS", "TECS_PITCH_MAX", "TECS_PITCH_MIN", "TECS_PTCH_DAMP", "TECS_PTCH_FF_K", "TECS_PTCH_FF_V0", "TECS_RLL2THR", "TECS_SINK_MAX", "TECS_SINK_MIN", "TECS_SPDWEIGHT", "TECS_SPD_OMEGA", "TECS_SYNAIRSPEED", "TECS_THR_DAMP", "TECS_TIME_CONST", "TECS_TKOFF_IGAIN", "TECS_VERT_ACC" }
+
+
+if PREV_ENABLE:get() == 0 then
+   return
+end
+
+local function add_param(pname)
+   local p = bind_param(pname)
+   if p then
+      params[pname] = p
+      param_saved[pname] = p:get()
+      param_count = param_count + 1
+      -- gcs:send_text(MAV_SEVERITY.INFO, string.format("Added %s", pname))
+   end
+end
+
+-- add rate PIDs
+for _, atc in ipairs(ATC_prefixes) do
+   for _, prefix in ipairs(PID_prefixes) do
+      for _, suffix in ipairs(PID_suffixes) do
+         add_param(atc .. prefix .. suffix)
+      end
+   end
+end
+
+-- add angle Ps
+for _, atc in ipairs(ATC_prefixes) do
+   for _, axis in ipairs(angle_axes) do
+      add_param(atc .. "_ANG_" .. axis .. "_P" )
+   end
+end
+
+-- add angular rate limits
+for _, atc in ipairs(ATC_prefixes) do
+   for _, axis in ipairs(rate_limit_axes) do
+      add_param(atc .. "_RATE_" .. axis .. "_MAX")
+   end
+end
+
+-- add fixed wing tuning
+for _, suffix in ipairs(PID_suffixes) do
+   add_param("RLL_RATE_" .. suffix)
+   add_param("PTCH_RATE_" .. suffix)
+   add_param("YAW_RATE_" .. suffix)
+end
+
+-- add PSC tuning
+for _, psc in ipairs(PSC_prefixes) do
+   for _, ptype in ipairs(PSC_types) do
+      for _, suffix in ipairs(PID_suffixes) do
+         add_param(psc .. "_" .. ptype .. "_" .. suffix)
+      end
+   end
+end
+
+-- add in TECS parameters
+for _, p in ipairs(TECS_PARAMS) do
+   add_param(p)
+end
+
+-- add in other parameters
+for _, p in ipairs(OTHER_PARAMS) do
+   add_param(p)
+end
+
+
+local function revert_parameters()
+   local count = 0
+   for pname, p in pairs(params) do
+      local v1 = p:get()
+      local v2 = param_saved[pname]
+      if v1 ~= v2 then
+         p:set_and_save(param_saved[pname])
+         count = count + 1
+      end
+   end
+   return count
+end
+
+gcs:send_text(MAV_SEVERITY.INFO, string.format("Stored %u parameters", param_count))
+
+local done_revert = false
+
+-- main update function
+function update()
+   local sw_pos = rc:get_aux_cached(PREV_RC_FUNC:get())
+   if not sw_pos then
+      return
+   end
+   if sw_pos == 2 and not done_revert then
+      done_revert = true
+      count = revert_parameters()
+      gcs:send_text(MAV_SEVERITY.INFO, string.format("Reverted %u parameters", count))
+      return
+   end
+   if sw_pos == 0 then
+      done_revert = false
+   end
+end
+
+-- wrapper around update(). This calls update() at 10Hz,
+-- and if update faults then an error is displayed, but the script is not
+-- stopped
+function protected_wrapper()
+  local success, err = pcall(update)
+  if not success then
+     gcs:send_text(MAV_SEVERITY.EMERGENCY, "Internal Error: " .. err)
+     -- when we fault we run the update function again after 1s, slowing it
+     -- down a bit so we don't flood the console with errors
+     --return protected_wrapper, 1000
+     return
+  end
+  return protected_wrapper, 1000/UPDATE_RATE_HZ
+end
+
+-- start running update loop
+return protected_wrapper()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      # Parameter Revert
+
+This script implements a easy parameter reversion system to help with
+manual in-flight tuning. It allows you to do a wide range of manual
+tuning while flying and if you get in trouble (eg. an oscillation)
+then you can use a switch to instantly revert all the parameter
+changes to the values from startup.
+
+# Parameters
+
+The script adds 2 parameters to control it's behaviour. The parameters
+are:
+
+## PREV_ENABLE
+
+this must be set to 1 to enable the script
+
+## PREV_RC_FUNC
+
+The RCz_OPTIONS scripting function binding to be used for this script.
+Default RCz_OPTIONS binding is 300 (scripting1).
+
+# Operation
+
+Install the script in the APM/SCRIPTS folder on your microSD (you can
+use mavFTP for that). Then reboot and re-fetch parameters. You will
+find you now have PREV_ENABLE and PREV_RC_FUNC parameters.
+
+Set PREV_ENABLE to 1 and set PREV_RC_FUNC to an available RC
+option. You would typically use 300 if not used by another
+script. Then set RCn_OPTION for your chosen R/C channel to revert
+parameter to the PREV_RC_FUNC value (eg. 300).
+
+Now reboot to start the script. To test it try changing one of the
+covered parameter values while on the ground, then trigger the
+reversion with your R/C switch. Then fetch your parameters and you
+will see it has been reverted. You will see a message "Reverted N
+parameters" in the messages tab when this happens.
+
+# Covered Parameters
+
+The script covers the following parameters on quadplanes:
+
+ - Q_A_RAT_RLL_*
+ - Q_A_RAT_PIT_*
+ - Q_A_RAT_YAW_*
+ - Q_A_ANG_RLL_P
+ - Q_A_ANG_PIT_P
+ - Q_A_ANG_YAW_P
+ - Q_A_RATE_*_MAX
+ - Q_P_ACCZ_*
+ - Q_P_VELZ_*
+ - Q_P_POSZ_*
+ - Q_P_VELXY_*
+ - Q_P_POSXY_*
+
+The script covers the following parameters on copters:
+
+ - ATC_RAT_RLL_*
+ - ATC_RAT_PIT_*
+ - ATC_RAT_YAW_*
+ - ATC_ANG_RLL_P
+ - ATC_ANG_PIT_P
+ - ATC_ANG_YAW_P
+ - ATC_RATE_*_MAX
+ - PSC_ACCZ_*
+ - PSC_VELZ_*
+ - PSC_POSZ_*
+ - PSC_VELXY_*
+ - PSC_POSXY_*
+
+For fixed wing the following parameters are covered:
+
+ - RLL_RATE_*
+ - PTCH_RATE_*
+ - RLL2SRV_TCONST
+ - PTCH2SRV_TCONST
+ - all TECS parameters
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       -- runcam_on_arm.lua: start and stop video recording on arm/disarm
+--
+-- ArduPilot can turn a RUNCAM on and off with a TX switch if you set
+-- its function to 78:RunCamControl. This script uses
+-- `rc:run_aux_function()' to start and stop the camera without human
+-- intervention or a separate RC channel.
+--
+-- An interesting aspect of this script is variable rescheduling
+-- time. RUNCAM serial protocol controls the camera by simulating a
+-- button press both to start and stop recording--it's the same
+-- button. If you send commands faster than the camera can process
+-- them, it can ignore a command and interpret the next one as the
+-- opposite of what you intend, e.g., you may lose a button press to
+-- stop recording, and the camera keeps rolling; when you're ready to
+-- start recording again, the camera interprets your button press as a
+-- command to stop recording. To address this, AP has a special
+-- parameter, `CAM_RC_BTN_DELAY'. I use this parameter as the
+-- rescheduling delay after a button press. But between button
+-- presses, I want the script to be responsive and start recording as
+-- soon as the vehicle arms, so there I use a shorter delay.
+
+
+
+-- constants
+local RC_OPTION = {RunCamControl=78}
+local AuxSwitchPos = {LOW=0, MIDDLE=1, HIGH=2}
+local MAV_SEVERITY = {EMERGENCY=0, ALERT=1, CRITICAL=2, ERROR=3, WARNING=4, NOTICE=5, INFO=6, DEBUG=7}
+
+-- configuration
+local DELAY_LONG = param:get("CAM_RC_BTN_DELAY")
+if not DELAY_LONG then
+   gcs:send_text(MAV_SEVERITY.ERROR, "CAM_RC_* parameters missing; camera autoarming unavailable")
+   return
+end
+local DELAY_SHORT = DELAY_LONG / 3
+
+
+gcs:send_text(MAV_SEVERITY.NOTICE, "Arming controls RUNCAM recording")
+
+
+-- state
+local prev_armed = false
+
+function update()
+   local is_armed = arming:is_armed()
+
+   local delay = DELAY_SHORT
+   if is_armed ~= prev_armed then
+      -- a state transition has occurred
+      if is_armed then
+         gcs:send_text(MAV_SEVERITY.INFO, "RUNCAM on")
+         rc:run_aux_function(RC_OPTION.RunCamControl, AuxSwitchPos.HIGH)
+      else
+         gcs:send_text(MAV_SEVERITY.INFO, "RUNCAM off")
+         rc:run_aux_function(RC_OPTION.RunCamControl, AuxSwitchPos.LOW)
+      end
+      delay = DELAY_LONG
+   end
+
+   prev_armed = is_armed
+
+   return update, delay
+end
+
+return update()
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 -- mount-djirs2-driver.lua: DJIRS2 mount/gimbal driver
+-- luacheck: only 0
+
+--[[
+  How to use
+    Connect gimbal to autopilot's CAN1 port or CAN2 port
+    If connected to CAN1, set CAN_D1_PROTOCOL = 10 (Scripting), CAN_P1_DRIVER = 1 (First driver)
+    If connected to CAN2, set CAN_D2_PROTOCOL = 10 (Scripting), CAN_P2_DRIVER = 2 (Second driver)
+    Set SCR_ENABLE = 1 to enable scripting
+    Set SCR_HEAP_SIZE = 120000 (or higher)
+    Set MNT1_TYPE = 9 (Scripting) to enable the mount/gimbal scripting driver
+    Reboot the autopilot
+    Copy this script to the autopilot's SD card in the APM/scripts directory and reboot the autopilot
+    set DJIR_DEBUG to 1 to display parsing and errors stats at 5sec.  Set to 2 to display gimbal angles
+ 
+  The following sources were used as a reference during the development of this script
+    Constant Robotics DJIR SDK: https://github.com/ConstantRobotics/DJIR_SDK
+    Ceinem's ROS node for DJI RS2: https://github.com/ceinem/dji_rs2_ros_controller
+
+  CAN format
+    packet's data segment holds up to 8 serial bytes.  These should be extracted and sent to the serial packet parser
+    the CAN packets will never hold the contents of more than one serial packet
+
+    the external caller (e.g. this script) must send CAN frames with frameId = 0x223
+    gimbal will reply with frameId = 0x222
+
+  Serial Packet format
+     byte      description     notes
+     0         header          AA
+     1~2       Ver/Length      bits 0~9 are length of entire frame, LSB first. bits 10~15 are version number
+     3         CmdType         bits 0~4 are Reply type, 0=No Reply required, 1=Can reply or not after data sent, 2~31=Reply is required after data sent
+                               bit 5 is Frame type, 0=Command frame, 1=Reply Frame
+                               bits 6~7 reserved (0 by default)
+     4         ENC             bits 0~4 length of supplementary bytes when encrypting
+                               bits 5~7 Encryption type, 0=Unencrypted, 1=AES256 encyrption
+     5~7       RES             reserved
+     8~9       SEQ             sequence number.  increments with each packet
+     10~11     CRC-16          frame header check
+     12~n      Data            Data segment Start
+       12        CmdSet        Data segment Command set
+       13        CmdID         Data segment Command code
+       14~n      Data content  Data content
+     n+1       CRC-32          frame check (the entire frame)
+
+  Used CmdSet and CmdId
+     0x0E, 0x00: Handheld Gimbal Position Control
+       Command frame bytes
+        0~1: yaw angle * 10, int16, -1800 to +1800
+        2~3: roll angle * 10, int16, -300 to +300
+        4~5: pitch angle * 10, int16, -560 to +1460
+        6: ctrl_byte, uint8
+              bit0 = 0:relative control, 1:absolute control
+              bit1 = 0:yaw axis valid, 1:invalid
+              bit2 = 0:roll axis valid, 1:invalid
+              bit3 = 0:pitch axis valid, 1:invalid
+              bit4~7 = reserved, must be zero
+        7: time for action, uint8_t, unit: 0.1s.  e.g. if 20, gimbal will rotate to the position desired within 2sec
+      Reply frame bytes
+        0: return code, uint8_t
+
+     0x0E, 0x02: Obtain the angle information of handheld gimbal, including joint angle and attitude angle
+       Command frame bytes
+        0: ctrl_byte, uint8_t, 0x00:No operation, 0x01:angle of handlheld gimbal, 0x02:joint angle of handheld gimbal
+      Reply frame bytes
+        0: return code, uint8_t
+        1: data_type, uint8_t, 0x00:Data is not ready, 0x01:attitude angle, 0x02:joint angle
+        2~3: yaw angle * 10, int16, -1800 to +1800
+        4~5: roll angle * 10, int16, -300 to +300
+        6~7: pitch angle * 10, int16, -560 to +1460
+
+
+--]]
+
+---@diagnostic disable: cast-local-type
+
+
+-- global definitions
+local INIT_INTERVAL_MS = 3000           -- attempt to initialise the gimbal at this interval
+local UPDATE_INTERVAL_MS = 1            -- update interval in millis
+local REPLY_TIMEOUT_MS = 100            -- timeout waiting for reply after 0.1 sec
+local REQUEST_ATTITUDE_INTERVAL_MS = 100-- request attitude at 10hz
+local SET_ATTITUDE_INTERVAL_MS = 100    -- set attitude at 10hz
+local MOUNT_INSTANCE = 0                -- always control the first mount/gimbal
+local SEND_FRAMEID = 0x223              -- send CAN messages with this frame id
+local RECEIVE_FRAMEID = 0x222           -- receive CAN messages with this frame id
+local MAV_SEVERITY = {EMERGENCY=0, ALERT=1, CRITICAL=2, ERROR=3, WARNING=4, NOTICE=5, INFO=6, DEBUG=7}
+
+-- parameters
+local PARAM_TABLE_KEY = 38
+assert(param:add_table(PARAM_TABLE_KEY, "DJIR_", 2), "could not add param table")
+assert(param:add_param(PARAM_TABLE_KEY, 1, "DEBUG", 0), "could not add DJIR_DEBUG param")
+assert(param:add_param(PARAM_TABLE_KEY, 2, "UPSIDEDOWN", 0), "could not add DJIR_UPSIDEDOWN param")
+
+--[[
+  // @Param: DJIR_DEBUG
+  // @DisplayName: DJIRS2 debug
+  // @Description: Enable DJIRS2 debug
+  // @Values: 0:Disabled,1:Enabled,2:Enabled with attitude reporting
+  // @User: Advanced
+--]]
+local DJIR_DEBUG = Parameter("DJIR_DEBUG")              -- debug level. 0:disabled 1:enabled 2:enabled with attitude reporting
+
+--[[
+  // @Param: DJIR_UPSIDEDOWN
+  // @DisplayName: DJIRS2 upside down
+  // @Description: DJIRS2 upside down
+  // @Values: 0:Right side up,1:Upside down
+  // @User: Standard
+--]]
+local DJIR_UPSIDEDOWN = Parameter("DJIR_UPSIDEDOWN")    -- 0:rightsideup, 1:upsidedown
+
+-- bind parameters to variables
+local CAN_P1_DRIVER = Parameter("CAN_P1_DRIVER")        -- If using CAN1, should be 1:First driver
+local CAN_P1_BITRATE = Parameter("CAN_P1_BITRATE")      -- If using CAN1, should be 1000000
+local CAN_D1_PROTOCOL = Parameter("CAN_D1_PROTOCOL")    -- If using CAN1, should be 10:Scripting
+local CAN_P2_DRIVER = Parameter("CAN_P2_DRIVER")        -- If using CAN2, should be 2:Second driver
+local CAN_P2_BITRATE = Parameter("CAN_P2_BITRATE")      -- If using CAN2, should be 1000000
+local CAN_D2_PROTOCOL = Parameter("CAN_D2_PROTOCOL")    -- If using CAN2, should be 10:Scripting
+local MNT1_TYPE = Parameter("MNT1_TYPE")                -- should be 9:Scripting
+
+-- message definitions
+local HEADER = 0xAA
+local RETURN_CODE = {SUCCESS=0x00, PARSE_ERROR=0x01, EXECUTION_FAILED=0x02, UNDEFINED=0xFF}
+local ATTITUDE_PACKET_LEN = {LEGACY=24, LATEST=26}      -- attitude packet expected length.  Legacy must be less than latest
+local POSITION_CONTROL_PACKET_LEN = {LEGACY=17, LATEST=19}  -- position control packet expected length.  Legacy must be less than latest
+local SPEED_CONTROL_PACKET_LEN = {LEGACY=17, LATEST=19} -- speed control packet expected length.  Legacy must be less than latest
+
+-- parsing state definitions
+local PARSE_STATE_WAITING_FOR_HEADER        = 0
+local PARSE_STATE_WAITING_FOR_VERLENGTH     = 1
+local PARSE_STATE_WAITING_FOR_DATA          = 2
+
+-- other parsing definitions
+local CAN_PACKET_LENGTH_MAX = 8         -- CAN packet maximum length
+local SERIAL_PACKET_LENGTH_MAX = 32     -- serial packet maximum length.  used to sanity check length of incoming messages
+local SERIAL_PACKET_LENGTH_MIN = 16     -- serial packet minimum length.  used to sanity check sends
+
+-- local variables and definitions
+local driver                            -- CAN bus
+local initialised = false               -- true once connection to gimbal has been initialised
+local parse_state = PARSE_STATE_WAITING_FOR_HEADER  -- parse state
+local parse_length = 0                  -- incoming message's packet length
+local parse_buff = {}                   -- message buffer holding roll, pitch and yaw angles from gimbal
+local parse_bytes_recv = 0              -- message buffer length.  count of the number of bytes received in the message so far
+local last_send_seq = 0                 -- last sequence number sent
+local last_req_attitude_ms = 0          -- system time of last request for attitude
+local last_set_attitude_ms = 0          -- system time of last set attitude call
+local REPLY_TYPE = {NONE=0, ATTITUDE=1, POSITION_CONTROL=2, SPEED_CONTROL=3} -- enum of expected reply types
+local expected_reply = REPLY_TYPE.NONE  -- currently expected reply type
+local expected_reply_ms = 0             -- system time that reply is first expected.  used for timeouts
+
+-- parsing status reporting variables
+local last_print_ms = 0                 -- system time that debug output was last printed
+local bytes_read = 0                    -- number of bytes read from gimbal
+local bytes_written = 0                 -- number of bytes written to gimbal
+local bytes_error = 0                   -- number of bytes read that could not be parsed
+local msg_ignored = 0                   -- number of ignored messages (because frame id does not match)
+local write_fails = 0                   -- number of times write failed
+local execute_fails = 0                 -- number of times that gimbal was unable to execute the command
+local reply_timeouts = 0                -- number of timeouts waiting for replies
+
+local crc16_lookup = {
+    0x0000, 0xc0c1, 0xc181, 0x0140, 0xc301, 0x03c0, 0x0280, 0xc241,
+    0xc601, 0x06c0, 0x0780, 0xc741, 0x0500, 0xc5c1, 0xc481, 0x0440,
+    0xcc01, 0x0cc0, 0x0d80, 0xcd41, 0x0f00, 0xcfc1, 0xce81, 0x0e40,
+    0x0a00, 0xcac1, 0xcb81, 0x0b40, 0xc901, 0x09c0, 0x0880, 0xc841,
+    0xd801, 0x18c0, 0x1980, 0xd941, 0x1b00, 0xdbc1, 0xda81, 0x1a40,
+    0x1e00, 0xdec1, 0xdf81, 0x1f40, 0xdd01, 0x1dc0, 0x1c80, 0xdc41,
+    0x1400, 0xd4c1, 0xd581, 0x1540, 0xd701, 0x17c0, 0x1680, 0xd641,
+    0xd201, 0x12c0, 0x1380, 0xd341, 0x1100, 0xd1c1, 0xd081, 0x1040,
+    0xf001, 0x30c0, 0x3180, 0xf141, 0x3300, 0xf3c1, 0xf281, 0x3240,
+    0x3600, 0xf6c1, 0xf781, 0x3740, 0xf501, 0x35c0, 0x3480, 0xf441,
+    0x3c00, 0xfcc1, 0xfd81, 0x3d40, 0xff01, 0x3fc0, 0x3e80, 0xfe41,
+    0xfa01, 0x3ac0, 0x3b80, 0xfb41, 0x3900, 0xf9c1, 0xf881, 0x3840,
+    0x2800, 0xe8c1, 0xe981, 0x2940, 0xeb01, 0x2bc0, 0x2a80, 0xea41,
+    0xee01, 0x2ec0, 0x2f80, 0xef41, 0x2d00, 0xedc1, 0xec81, 0x2c40,
+    0xe401, 0x24c0, 0x2580, 0xe541, 0x2700, 0xe7c1, 0xe681, 0x2640,
+    0x2200, 0xe2c1, 0xe381, 0x2340, 0xe101, 0x21c0, 0x2080, 0xe041,
+    0xa001, 0x60c0, 0x6180, 0xa141, 0x6300, 0xa3c1, 0xa281, 0x6240,
+    0x6600, 0xa6c1, 0xa781, 0x6740, 0xa501, 0x65c0, 0x6480, 0xa441,
+    0x6c00, 0xacc1, 0xad81, 0x6d40, 0xaf01, 0x6fc0, 0x6e80, 0xae41,
+    0xaa01, 0x6ac0, 0x6b80, 0xab41, 0x6900, 0xa9c1, 0xa881, 0x6840,
+    0x7800, 0xb8c1, 0xb981, 0x7940, 0xbb01, 0x7bc0, 0x7a80, 0xba41,
+    0xbe01, 0x7ec0, 0x7f80, 0xbf41, 0x7d00, 0xbdc1, 0xbc81, 0x7c40,
+    0xb401, 0x74c0, 0x7580, 0xb541, 0x7700, 0xb7c1, 0xb681, 0x7640,
+    0x7200, 0xb2c1, 0xb381, 0x7340, 0xb101, 0x71c0, 0x7080, 0xb041,
+    0x5000, 0x90c1, 0x9181, 0x5140, 0x9301, 0x53c0, 0x5280, 0x9241,
+    0x9601, 0x56c0, 0x5780, 0x9741, 0x5500, 0x95c1, 0x9481, 0x5440,
+    0x9c01, 0x5cc0, 0x5d80, 0x9d41, 0x5f00, 0x9fc1, 0x9e81, 0x5e40,
+    0x5a00, 0x9ac1, 0x9b81, 0x5b40, 0x9901, 0x59c0, 0x5880, 0x9841,
+    0x8801, 0x48c0, 0x4980, 0x8941, 0x4b00, 0x8bc1, 0x8a81, 0x4a40,
+    0x4e00, 0x8ec1, 0x8f81, 0x4f40, 0x8d01, 0x4dc0, 0x4c80, 0x8c41,
+    0x4400, 0x84c1, 0x8581, 0x4540, 0x8701, 0x47c0, 0x4680, 0x8641,
+    0x8201, 0x42c0, 0x4380, 0x8341, 0x4100, 0x81c1, 0x8081, 0x4040
+}
+
+local crc32_lookup = {
+    0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
+    0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
+    0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+    0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9, 0xfa0f3d63, 0x8d080df5,
+    0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172, 0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
+    0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+    0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423, 0xcfba9599, 0xb8bda50f,
+    0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924, 0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d,
+    0x76dc4190, 0x01db7106, 0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+    0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
+    0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e, 0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457,
+    0x65b0d9c6, 0x12b7e950, 0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+    0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb,
+    0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0, 0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9,
+    0x5005713c, 0x270241aa, 0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+    0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad,
+    0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a, 0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683,
+    0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+    0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb, 0x196c3671, 0x6e6b06e7,
+    0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc, 0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
+    0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+    0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55, 0x316e8eef, 0x4669be79,
+    0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236, 0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f,
+    0xc5ba3bbe, 0xb2bd0b28, 0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+    0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
+    0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38, 0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21,
+    0x86d3d2d4, 0xf1d4e242, 0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+    0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45,
+    0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2, 0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db,
+    0xaed16a4a, 0xd9d65adc, 0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+    0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf,
+    0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
+}
+
+-- calculate crc16 for a series of bytes
+-- byte_array should be a table of uint8 values
+-- start_byte should be the first byte to start from (using 1 indexing) or left as nil to default to the first byte
+-- num_bytes should be the number of bytes to process or left as nil to use the entire message
+function calc_crc16(byte_array, start_byte, num_bytes)
+  start_byte = start_byte or 1
+  num_bytes = num_bytes or #byte_array - start_byte + 1
+  local crc = 0x3AA3
+  for i = start_byte, num_bytes do
+    local b = byte_array[i] & 0xFF
+    local crc16_lookup_index = ((crc ~ b) % 256) + 1
+    local lookup_val = crc16_lookup[crc16_lookup_index]
+    crc = ((crc >> 8) & 0xFF) ~ lookup_val
+  end
+  return crc
+end
+
+-- calculate crc32 for a series of bytes
+-- byte_array should be a table of uint8 values
+-- start_byte should be the first byte to start from (using 1 indexing) or left as nil to default to the first byte
+-- num_bytes should be the number of bytes to process or left as nil to use the entire message
+function calc_crc32(byte_array, start_byte, num_bytes)
+  start_byte = start_byte or 1
+  num_bytes = num_bytes or #byte_array - start_byte + 1
+  local crc = 0x3AA3
+  for i = start_byte, num_bytes do
+    local b = byte_array[i] & 0xFF
+    local crc32_lookup_index = (((crc ~ b) & 0xff) + 1)
+    local lookup_val = crc32_lookup[crc32_lookup_index]
+    crc = ((crc >> 8) & 0x00FFFFFF) ~ lookup_val
+  end
+  return crc
+end
+
+-- get lowbyte of a number
+function lowbyte(num)
+  return num & 0xFF
+end
+
+-- get highbyte of a number
+function highbyte(num)
+  return (num >> 8) & 0xFF
+end
+
+-- get int16 from two bytes
+function int16_value(hbyte, lbyte)
+  local uret = uint16_value(hbyte, lbyte)
+  if uret <= 0x8000 then
+    return uret
+  else
+    return uret - 0x10000
+  end
+end
+
+-- get uint16 from two bytes
+function uint16_value(hbyte, lbyte)
+  return ((hbyte & 0xFF) << 8) | (lbyte & 0xFF)
+end
+
+-- get uint32 from four bytes
+function uint32_value(byte3, byte2, byte1, byte0)
+  return (((byte3 & 0xFF) << 24) | ((byte# Makefile for installing Lua
+# See doc/readme.html for installation and customization instructions.
+
+# == CHANGE THE SETTINGS BELOW TO SUIT YOUR ENVIRONMENT =======================
+
+# Your platform. See PLATS for possible values.
+PLAT= none
+
+# Where to install. The installation starts in the src and doc directories,
+# so take care if INSTALL_TOP is not an absolute path. See the local target.
+# You may want to make INSTALL_LMOD and INSTALL_CMOD consistent with
+# LUA_ROOT, LUA_LDIR, and LUA_CDIR in luaconf.h.
+INSTALL_TOP= /usr/local
+INSTALL_BIN= $(INSTALL_TOP)/bin
+INSTALL_INC= $(INSTALL_TOP)/include
+INSTALL_LIB= $(INSTALL_TOP)/lib
+INSTALL_MAN= $(INSTALL_TOP)/man/man1
+INSTALL_LMOD= $(INSTALL_TOP)/share/lua/$V
+INSTALL_CMOD= $(INSTALL_TOP)/lib/lua/$V
+
+# How to install. If your install program does not support "-p", then
+# you may have to run ranlib on the installed liblua.a.
+INSTALL= install -p
+INSTALL_EXEC= $(INSTALL) -m 0755
+INSTALL_DATA= $(INSTALL) -m 0644
+#
+# If you don't have "install" you can use "cp" instead.
+# INSTALL= cp -p
+# INSTALL_EXEC= $(INSTALL)
+# INSTALL_DATA= $(INSTALL)
+
+# Other utilities.
+MKDIR= mkdir -p
+RM= rm -f
+
+# == END OF USER SETTINGS -- NO NEED TO CHANGE ANYTHING BELOW THIS LINE =======
+
+# Convenience platforms targets.
+PLATS= aix bsd c89 freebsd generic linux macosx mingw posix solaris
+
+# What to install.
+TO_BIN= lua luac
+TO_INC= lua.h luaconf.h lualib.h lauxlib.h lua.hpp
+TO_LIB= liblua.a
+TO_MAN= lua.1 luac.1
+
+# Lua version and release.
+V= 5.3
+R= $V.4
+
+# Targets start here.
+all:	$(PLAT)
+
+$(PLATS) clean:
+	cd src && $(MAKE) $@
+
+test:	dummy
+	src/lua -v
+
+install: dummy
+	cd src && $(MKDIR) $(INSTALL_BIN) $(INSTALL_INC) $(INSTALL_LIB) $(INSTALL_MAN) $(INSTALL_LMOD) $(INSTALL_CMOD)
+	cd src && $(INSTALL_EXEC) $(TO_BIN) $(INSTALL_BIN)
+	cd src && $(INSTALL_DATA) $(TO_INC) $(INSTALL_INC)
+	cd src && $(INSTALL_DATA) $(TO_LIB) $(INSTALL_LIB)
+	cd doc && $(INSTALL_DATA) $(TO_MAN) $(INSTALL_MAN)
+
+uninstall:
+	cd src && cd $(INSTALL_BIN) && $(RM) $(TO_BIN)
+	cd src && cd $(INSTALL_INC) && $(RM) $(TO_INC)
+	cd src && cd $(INSTALL_LIB) && $(RM) $(TO_LIB)
+	cd doc && cd $(INSTALL_MAN) && $(RM) $(TO_MAN)
+
+local:
+	$(MAKE) install INSTALL_TOP=../install
+
+none:
+	@echo "Please do 'make PLATFORM' where PLATFORM is one of these:"
+	@echo "   $(PLATS)"
+	@echo "See doc/readme.html for complete instructions."
+
+# make may get confused with test/ and install/
+dummy:
+
+# echo config parameters
+echo:
+	@cd src && $(MAKE) -s echo
+	@echo "PLAT= $(PLAT)"
+	@echo "V= $V"
+	@echo "R= $R"
+	@echo "TO_BIN= $(TO_BIN)"
+	@echo "TO_INC= $(TO_INC)"
+	@echo "TO_LIB= $(TO_LIB)"
+	@echo "TO_MAN= $(TO_MAN)"
+	@echo "INSTALL_TOP= $(INSTALL_TOP)"
+	@echo "INSTALL_BIN= $(INSTALL_BIN)"
+	@echo "INSTALL_INC= $(INSTALL_INC)"
+	@echo "INSTALL_LIB= $(INSTALL_LIB)"
+	@echo "INSTALL_MAN= $(INSTALL_MAN)"
+	@echo "INSTALL_LMOD= $(INSTALL_LMOD)"
+	@echo "INSTALL_CMOD= $(INSTALL_CMOD)"
+	@echo "INSTALL_EXEC= $(INSTALL_EXEC)"
+	@echo "INSTALL_DATA= $(INSTALL_DATA)"
+
+# echo pkg-config data
+pc:
+	@echo "version=$R"
+	@echo "prefix=$(INSTALL_TOP)"
+	@echo "libdir=$(INSTALL_LIB)"
+	@echo "includedir=$(INSTALL_INC)"
+
+# list targets that do not create files (but not all makes understand .PHONY)
+.PHONY: all $(PLATS) clean test install local none dummy echo pecho lecho
+
+# (end of Makefile)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
+This is Lua 5.3.5, released on 26 Jun 2018.
+
+For installation instructions, license details, and
+further information about Lua, see doc/readme.html.
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+<HEAD>
+<TITLE>Lua 5.3 Reference Manual - contents</TITLE>
+<LINK REL="stylesheet" TYPE="text/css" HREF="lua.css">
+<LINK REL="stylesheet" TYPE="text/css" HREF="index.css">
+<META HTTP-EQUIV="content-type" CONTENT="text/html; charset=iso-8859-1">
+</HEAD>
+
+<BODY>
+
+<H1>
+<A HREF="http://www.lua.org/"><IMG SRC="logo.gif" ALT="Lua"></A>
+Lua 5.3 Reference Manual
+</H1>
+
+<P>
+The reference manual is the official definition of the Lua language.
+<BR>
+For a complete introduction to Lua programming, see the book
+<A HREF="http://www.lua.org/pil/">Programming in Lua</A>.
+
+<DIV CLASS="menubar">
+<A HREF="manual.html">start</A>
+&middot;
+<A HREF="#contents">contents</A>
+&middot;
+<A HREF="#index">index</A>
+&middot;
+<A HREF="http://www.lua.org/manual/">other versions</A>
+</DIV>
+
+<P>
+<SMALL>
+Copyright &copy; 2015&ndash;2018 Lua.org, PUC-Rio.
+Freely available under the terms of the
+<A HREF="http://www.lua.org/license.html">Lua license</A>.
+</SMALL>
+
+<H2><A NAME="contents">Contents</A></H2>
+<UL CLASS="contents menubar">
+<LI><A HREF="manual.html">1 &ndash; Introduction</A>
+<P>
+<LI><A HREF="manual.html#2">2 &ndash; Basic Concepts</A>
+<UL>
+<LI><A HREF="manual.html#2.1">2.1 &ndash; Values and Types</A>
+<LI><A HREF="manual.html#2.2">2.2 &ndash; Environments and the Global Environment</A>
+<LI><A HREF="manual.html#2.3">2.3 &ndash; Error Handling</A>
+<LI><A HREF="manual.html#2.4">2.4 &ndash; Metatables and Metamethods</A>
+<LI><A HREF="manual.html#2.5">2.5 &ndash; Garbage Collection</A>
+<UL>
+<LI><A HREF="manual.html#2.5.1">2.5.1 &ndash; Garbage-Collection Metamethods</A>
+<LI><A HREF="manual.html#2.5.2">2.5.2 &ndash; Weak Tables</A>
+</UL>
+<LI><A HREF="manual.html#2.6">2.6 &ndash; Coroutines</A>
+</UL>
+<P>
+<LI><A HREF="manual.html#3">3 &ndash; The Language</A>
+<UL>
+<LI><A HREF="manual.html#3.1">3.1 &ndash; Lexical Conventions</A>
+<LI><A HREF="manual.html#3.2">3.2 &ndash; Variables</A>
+<LI><A HREF="manual.html#3.3">3.3 &ndash; Statements</A>
+<UL>
+<LI><A HREF="manual.html#3.3.1">3.3.1 &ndash; Blocks</A>
+<LI><A HREF="manual.html#3.3.2">3.3.2 &ndash; Chunks</A>
+<LI><A HREF="manual.html#3.3.3">3.3.3 &ndash; Assignment</A>
+<LI><A HREF="manual.html#3.3.4">3.3.4 &ndash; Control Structures</A>
+<LI><A HREF="manual.html#3.3.5">3.3.5 &ndash; For Statement</A>
+<LI><A HREF="manual.html#3.3.6">3.3.6 &ndash; Function Calls as Statements</A>
+<LI><A HREF="manual.html#3.3.7">3.3.7 &ndash; Local Declarations</A>
+</UL>
+<LI><A HREF="manual.html#3.4">3.4 &ndash; Expressions</A>
+<UL>
+<LI><A HREF="manual.html#3.4.1">3.4.1 &ndash; Arithmetic Operators</A>
+<LI><A HREF="manual.html#3.4.2">3.4.2 &ndash; Bitwise Operators</A>
+<LI><A HREF="manual.html#3.4.3">3.4.3 &ndash; Coercions and Conversions</A>
+<LI><A HREF="manual.html#3.4.4">3.4.4 &ndash; Relational Operators</A>
+<LI><A HREF="manual.html#3.4.5">3.4.5 &ndash; Logical Operators</A>
+<LI><A HREF="manual.html#3.4.6">3.4.6 &ndash; Concatenation</A>
+<LI><A HREF="manual.html#3.4.7">3.4.7 &ndash; The Length Operator</A>
+<LI><A HREF="manual.html#3.4.8">3.4.8 &ndash; Precedence</A>
+<LI><A HREF="manual.html#3.4.9">3.4.9 &ndash; Table Constructors</A>
+<LI><A HREF="manual.html#3.4.10">3.4.10 &ndash; Function Calls</A>
+<LI><A HREF="manual.html#3.4.11">3.4.11 &ndash; Function Definitions</A>
+</UL>
+<LI><A HREF="manual.html#3.5">3.5 &ndash; Visibility Rules</A>
+</UL>
+<P>
+<LI><A HREF="manual.html#4">4 &ndash; The Application Program Interface</A>
+<UL>
+<LI><A HREF="manual.html#4.1">4.1 &ndash; The Stack</A>
+<LI><A HREF="manual.html#4.2">4.2 &ndash; Stack Size</A>
+<LI><A HREF="manual.html#4.3">4.3 &ndash; Valid and Acceptable Indices</A>
+<LI><A HREF="manual.html#4.4">4.4 &ndash; C Closures</A>
+<LI><A HREF="manual.html#4.5">4.5 &ndash; Registry</A>
+<LI><A HREF="manual.html#4.6">4.6 &ndash; Error Handling in C</A>
+<LI><A HREF="manual.html#4.7">4.7 &ndash; Handling Yields in C</A>
+<LI><A HREF="manual.html#4.8">4.8 &ndash; Functions and Types</A>
+<LI><A HREF="manual.html#4.9">4.9 &ndash; The Debug Interface</A>
+</UL>
+<P>
+<LI><A HREF="manual.html#5">5 &ndash; The Auxiliary Library</A>
+<UL>
+<LI><A HREF="manual.html#5.1">5.1 &ndash; Functions and Types</A>
+</UL>
+<P>
+<LI><A HREF="manual.html#6">6 &ndash; Standard Libraries</A>
+<UL>
+<LI><A HREF="manual.html#6.1">6.1 &ndash; Basic Functions</A>
+<LI><A HREF="manual.html#6.2">6.2 &ndash; Coroutine Manipulation</A>
+<LI><A HREF="manual.html#6.3">6.3 &ndash; Modules</A>
+<LI><A HREF="manual.html#6.4">6.4 &ndash; String Manipulation</A>
+<UL>
+<LI><A HREF="manual.html#6.4.1">6.4.1 &ndash; Patterns</A>
+<LI><A HREF="manual.html#6.4.2">6.4.2 &ndash; Format Strings for Pack and Unpack</A>
+</UL>
+<LI><A HREF="manual.html#6.5">6.5 &ndash; UTF-8 Support</A>
+<LI><A HREF="manual.html#6.6">6.6 &ndash; Table Manipulation</A>
+<LI><A HREF="manual.html#6.7">6.7 &ndash; Mathematical Functions</A>
+<LI><A HREF="manual.html#6.8">6.8 &ndash; Input and Output Facilities</A>
+<LI><A HREF="manual.html#6.9">6.9 &ndash; Operating System Facilities</A>
+<LI><A HREF="manual.html#6.10">6.10 &ndash; The Debug Library</A>
+</UL>
+<P>
+<LI><A HREF="manual.html#7">7 &ndash; Lua Standalone</A>
+<P>
+<LI><A HREF="manual.html#8">8 &ndash; Incompatibilities with the Previous Version</A>
+<UL>
+<LI><A HREF="manual.html#8.1">8.1 &ndash; Changes in the Language</A>
+<LI><A HREF="manual.html#8.2">8.2 &ndash; Changes in the Libraries</A>
+<LI><A HREF="manual.html#8.3">8.3 &ndash; Changes in the API</A>
+</UL>
+<P>
+<LI><A HREF="manual.html#9">9 &ndash; The Complete Syntax of Lua</A>
+</UL>
+
+<H2><A NAME="index">Index</A></H2>
+<TABLE CLASS="menubar" WIDTH="100%">
+<TR>
+<TD>
+<H3><A NAME="functions">Lua functions</A></H3>
+<P>
+<A HREF="manual.html#6.1">basic</A><BR>
+<A HREF="manual.html#pdf-_G">_G</A><BR>
+<A HREF="manual.html#pdf-_VERSION">_VERSION</A><BR>
+<A HREF="manual.html#pdf-assert">assert</A><BR>
+<A HREF="manual.html#pdf-collectgarbage">collectgarbage</A><BR>
+<A HREF="manual.html#pdf-dofile">dofile</A><BR>
+<A HREF="manual.html#pdf-error">error</A><BR>
+<A HREF="manual.html#pdf-getmetatable">getmetatable</A><BR>
+<A HREF="manual.html#pdf-ipairs">ipairs</A><BR>
+<A HREF="manual.html#pdf-load">load</A><BR>
+<A HREF="manual.html#pdf-loadfile">loadfile</A><BR>
+<A HREF="manual.html#pdf-next">next</A><BR>
+<A HREF="manual.html#pdf-pairs">pairs</A><BR>
+<A HREF="manual.html#pdf-pcall">pcall</A><BR>
+<A HREF="manual.html#pdf-print">print</A><BR>
+<A HREF="manual.html#pdf-rawequal">rawequal</A><BR>
+<A HREF="manual.html#pdf-rawget">rawget</A><BR>
+<A HREF="manual.html#pdf-rawlen">rawlen</A><BR>
+<A HREF="manual.html#pdf-rawset">rawset</A><BR>
+<A HREF="manual.html#pdf-require">require</A><BR>
+<A HREF="manual.html#pdf-select">select</A><BR>
+<A HREF="manual.html#pdf-setmetatable">setmetatable</A><BR>
+<A HREF="manual.html#pdf-tonumber">tonumber</A><BR>
+<A HREF="manual.html#pdf-tostring">tostring</A><BR>
+<A HREF="manual.html#pdf-type">type</A><BR>
+<A HREF="manual.html#pdf-xpcall">xpcall</A><BR>
+
+<P>
+<A HREF="manual.html#6.2">coroutine</A><BR>
+<A HREF="manual.html#pdf-coroutine.create">coroutine.create</A><BR>
+<A HREF="manual.html#pdf-coroutine.isyieldable">coroutine.isyieldable</A><BR>
+<A HREF="manual.html#pdf-coroutine.resume">coroutine.resume</A><BR>
+<A HREF="manual.html#pdf-coroutine.running">coroutine.running</A><BR>
+<A HREF="manual.html#pdf-coroutine.status">coroutine.status</A><BR>
+<A HREF="manual.html#pdf-coroutine.wrap">coroutine.wrap</A><BR>
+<A HREF="manual.html#pdf-coroutine.yield">coroutine.yield</A><BR>
+
+<P>
+<A HREF="manual.html#6.10">debug</A><BR>
+<A HREF="manual.html#pdf-debug.debug">debug.debug</A><BR>
+<A HREF="manual.html#pdf-debug.gethook">debug.gethook</A><BR>
+<A HREF="manual.html#pdf-debug.getinfo">debug.getinfo</A><BR>
+<A HREF="manual.html#pdf-debug.getlocal">debug.getlocal</A><BR>
+<A HREF="manual.html#pdf-debug.getmetatable">debug.getmetatable</A><BR>
+<A HREF="manual.html#pdf-debug.getregistry">debug.getregistry</A><BR>
+<A HREF="manual.html#pdf-debug.getupvalue">debug.getupvalue</A><BR>
+<A HREF="manual.html#pdf-debug.getuservalue">debug.getuservalue</A><BR>
+<A HREF="manual.html#pdf-debug.sethook">debug.sethook</A><BR>
+<A HREF="manual.html#pdf-debug.setlocal">debug.setlocal</A><BR>
+<A HREF="manual.html#pdf-debug.setmetatable">debug.setmetatable</A><BR>
+<A HREF="manual.html#pdf-debug.setupvalue">debug.setupvalue</A><BR>
+<A HREF="manual.html#pdf-debug.setuservalue">debug.setuservalue</A><BR>
+<A HREF="manual.html#pdf-debug.traceback">debug.traceback</A><BR>
+<A HREF="manual.html#pdf-debug.upvalueid">debug.upvalueid</A><BR>
+<A HREF="manual.html#pdf-debug.upvaluejoin">debug.upvaluejoin</A><BR>
+
+<P>
+<A HREF="manual.html#6.8">io</A><BR>
+<A HREF="manual.html#pdf-io.close">io.close</A><BR>
+<A HREF="manual.html#pdf-io.flush">io.flush</A><BR>
+<A HREF="manual.html#pdf-io.input">io.input</A><BR>
+<A HREF="manual.html#pdf-io.lines">io.lines</A><BR>
+<A HREF="manual.html#pdf-io.open">io.open</A><BR>
+<A HREF="manual.html#pdf-io.output">io.output</A><BR>
+<A HREF="manual.html#pdf-io.popen">io.popen</A><BR>
+<A HREF="manual.html#pdf-io.read">io.read</A><BR>
+<A HREF="manual.html#pdf-io.stderr">io.stderr</A><BR>
+<A HREF="manual.html#pdf-io.stdin">io.stdin</A><BR>
+<A HREF="manual.html#pdf-io.stdout">io.stdout</A><BR>
+<A HREF="manual.html#pdf-io.tmpfile">io.tmpfile</A><BR>
+<A HREF="manual.html#pdf-io.type">io.type</A><BR>
+<A HREF="manual.html#pdf-io.write">io.write</A><BR>
+
+<A HREF="manual.html#pdf-file:close">file:close</A><BR>
+<A HREF="manual.html#pdf-file:flush">file:flush</A><BR>
+<A HREF="manual.html#pdf-file:lines">file:lines</A><BR>
+<A HREF="manual.html#pdf-file:read">file:read</A><BR>
+<A HREF="manual.html#pdf-file:seek">file:seek</A><BR>
+<A HREF="manual.html#pdf-file:setvbuf">file:setvbuf</A><BR>
+<A HREF="manual.html#pdf-file:write">file:write</A><BR>
+
+</TD>
+<TD>
+<H3>&nbsp;</H3>
+<P>
+<A HREF="manual.html#6.7">math</A><BR>
+<A HREF="manual.html#pdf-math.abs">math.abs</A><BR>
+<A HREF="manual.html#pdf-math.acos">math.acos</A><BR>
+<A HREF="manual.html#pdf-math.asin">math.asin</A><BR>
+<A HREF="manual.html#pdf-math.atan">math.atan</A><BR>
+<A HREF="manual.html#pdf-math.ceil">math.ceil</A><BR>
+<A HREF="manual.html#pdf-math.cos">math.cos</A><BR>
+<A HREF="manual.html#pdf-math.deg">math.deg</A><BR>
+<A HREF="manual.html#pdf-math.exp">math.exp</A><BR>
+<A HREF="manual.html#pdf-math.floor">math.floor</A><BR>
+<A HREF="manual.html#pdf-math.fmod">math.fmod</A><BR>
+<A HREF="manual.html#pdf-math.huge">math.huge</A><BR>
+<A HREF="manual.html#pdf-math.log">math.log</A><BR>
+<A HREF="manual.html#pdf-math.max">math.max</A><BR>
+<A HREF="manual.html#pdf-math.maxinteger">math.maxinteger</A><BR>
+<A HREF="manual.html#pdf-math.min">math.min</A><BR>
+<A HREF="manual.html#pdf-math.mininteger">math.mininteger</A><BR>
+<A HREF="manual.html#pdf-math.modf">math.modf</A><BR>
+<A HREF="manual.html#pdf-math.pi">math.pi</A><BR>
+<A HREF="manual.html#pdf-math.rad">math.rad</A><BR>
+<A HREF="manual.html#pdf-math.random">math.random</A><BR>
+<A HREF="manual.html#pdf-math.randomseed">math.randomseed</A><BR>
+<A HREF="manual.html#pdf-math.sin">math.sin</A><BR>
+<A HREF="manual.html#pdf-math.sqrt">math.sqrt</A><BR>
+<A HREF="manual.html#pdf-math.tan">math.tan</A><BR>
+<A HREF="manual.html#pdf-math.tointeger">math.tointeger</A><BR>
+<A HREF="manual.html#pdf-math.type">math.type</A><BR>
+<A HREF="manual.html#pdf-math.ult">math.ult</A><BR>
+
+<P>
+<A HREF="manual.html#6.9">os</A><BR>
+<A HREF="manual.html#pdf-os.clock">os.clock</A><BR>
+<A HREF="manual.html#pdf-os.date">os.date</A><BR>
+<A HREF="manual.html#pdf-os.difftime">os.difftime</A><BR>
+<A HREF="manual.html#pdf-os.execute">os.execute</A><BR>
+<A HREF="manual.html#pdf-os.exit">os.exit</A><BR>
+<A HREF="manual.html#pdf-os.getenv">os.getenv</A><BR>
+<A HREF="manual.html#pdf-os.remove">os.remove</A><BR>
+<A HREF="manual.html#pdf-os.rename">os.rename</A><BR>
+<A HREF="manual.html#pdf-os.setlocale">os.setlocale</A><BR>
+<A HREF="manual.html#pdf-os.time">os.time</A><BR>
+<A HREF="manual.html#pdf-os.tmpname">os.tmpname</A><BR>
+
+<P>
+<A HREF="manual.html#6.3">package</A><BR>
+<A HREF="manual.html#pdf-package.config">package.config</A><BR>
+<A HREF="manual.html#pdf-package.cpath">package.cpath</A><BR>
+<A HREF="manual.html#pdf-package.loaded">package.loaded</A><BR>
+<A HREF="manual.html#pdf-package.loadlib">package.loadlib</A><BR>
+<A HREF="manual.html#pdf-package.path">package.path</A><BR>
+<A HREF="manual.html#pdf-package.preload">package.preload</A><BR>
+<A HREF="manual.html#pdf-package.searchers">package.searchers</A><BR>
+<A HREF="manual.html#pdf-package.searchpath">package.searchpath</A><BR>
+
+<P>
+<A HREF="manual.html#6.4">string</A><BR>
+<A HREF="manual.html#pdf-string.byte">string.byte</A><BR>
+<A HREF="manual.html#pdf-string.char">string.char</A><BR>
+<A HREF="manual.html#pdf-string.dump">string.dump</A><BR>
+<A HREF="manual.html#pdf-string.find">string.find</A><BR>
+<A HREF="manual.html#pdf-string.format">string.format</A><BR>
+<A HREF="manual.html#pdf-string.gmatch">string.gmatch</A><BR>
+<A HREF="manual.html#pdf-string.gsub">string.gsub</A><BR>
+<A HREF="manual.html#pdf-string.len">string.len</A><BR>
+<A HREF="manual.html#pdf-string.lower">string.lower</A><BR>
+<A HREF="manual.html#pdf-string.match">string.match</A><BR>
+<A HREF="manual.html#pdf-string.pack">string.pack</A><BR>
+<A HREF="manual.html#pdf-string.packsize">string.packsize</A><BR>
+<A HREF="manual.html#pdf-string.rep">string.rep</A><BR>
+<A HREF="manual.html#pdf-string.reverse">string.reverse</A><BR>
+<A HREF="manual.html#pdf-string.sub">string.sub</A><BR>
+<A HREF="manual.html#pdf-string.unpack">string.unpack</A><BR>
+<A HREF="manual.html#pdf-string.upper">string.upper</A><BR>
+
+<P>
+<A HREF="manual.html#6.6">table</A><BR>
+<A HREF="manual.html#pdf-table.concat">table.concat</A><BR>
+<A HREF="manual.html#pdf-table.insert">table.insert</A><BR>
+<A HREF="manual.html#pdf-table.move">table.move</A><BR>
+<A HREF="manual.html#pdf-table.pack">table.pack</A><BR>
+<A HREF="manual.html#pdf-table.remove">table.remove</A><BR>
+<A HREF="manual.html#pdf-table.sort">table.sort</A><BR>
+<A HREF="manual.html#pdf-table.unpack">table.unpack</A><BR>
+
+<P>
+<A HREF="manual.html#6.5">utf8</A><BR>
+<A HREF="manual.html#pdf-utf8.char">utf8.char</A><BR>
+<A HREF="manual.html#pdf-utf8.charpattern">utf8.charpattern</A><BR>
+<A HREF="manual.html#pdf-utf8.codepoint">utf8.codepoint</A><BR>
+<A HREF="manual.html#pdf-utf8.codes">utf8.codes</A><BR>
+<A HREF="manual.html#pdf-utf8.len">utf8.len</A><BR>
+<A HREF="manual.html#pdf-utf8.offset">utf8.offset</A><BR>
+
+<H3><A NAME="env">environment<BR>variables</A></H3>
+<P>
+<A HREF="manual.html#pdf-LUA_CPATH">LUA_CPATH</A><BR>
+<A HREF="manual.html#pdf-LUA_CPATH_5_3">LUA_CPATH_5_3</A><BR>
+<A HREF="manual.html#pdf-LUA_INIT">LUA_INIT</A><BR>
+<A HREF="manual.html#pdf-LUA_INIT_5_3">LUA_INIT_5_3</A><BR>
+<A HREF="manual.html#pdf-LUA_PATH">LUA_PATH</A><BR>
+<A HREF="manual.html#pdf-LUA_PATH_5_3">LUA_PATH_5_3</A><BR>
+
+</TD>
+<TD>
+<H3><A NAME="api">C API</A></H3>
+<P>
+<A HREF="manual.html#lua_Alloc">lua_Alloc</A><BR>
+<A HREF="manual.html#lua_CFunction">lua_CFunction</A><BR>
+<A HREF="manual.html#lua_Debug">lua_Debug</A><BR>
+<A HREF="manual.html#lua_Hook">lua_Hook</A><BR>
+<A HREF="manual.html#lua_Integer">lua_Integer</A><BR>
+<A HREF="manual.html#lua_KContext">lua_KContext</A><BR>
+<A HREF="manual.html#lua_KFunction">lua_KFunction</A><BR>
+<A HREF="manual.html#lua_Number">lua_Number</A><BR>
+<A HREF="manual.html#lua_Reader">lua_Reader</A><BR>
+<A HREF="manual.html#lua_State">lua_State</A><BR>
+<A HREF="manual.html#lua_Unsigned">lua_Unsigned</A><BR>
+<A HREF="manual.html#lua_Writer">lua_Writer</A><BR>
+
+<P>
+<A HREF="manual.html#lua_absindex">lua_absindex</A><BR>
+<A HREF="manual.html#lua_arith">lua_arith</A><BR>
+<A HREF="manual.html#lua_atpanic">lua_atpanic</A><BR>
+<A HREF="manual.html#lua_call">lua_call</A><BR>
+<A HREF="manual.html#lua_callk">lua_callk</A><BR>
+<A HREF="manual.html#lua_checkstack">lua_checkstack</A><BR>
+<A HREF="manual.html#lua_close">lua_close</A><BR>
+<A HREF="manual.html#lua_compare">lua_compare</A><BR>
+<A HREF="manual.html#lua_concat">lua_concat</A><BR>
+<A HREF="manual.html#lua_copy">lua_copy</A><BR>
+<A HREF="manual.html#lua_createtable">lua_createtable</A><BR>
+<A HREF="manual.html#lua_dump">lua_dump</A><BR>
+<A HREF="manual.html#lua_error">lua_error</A><BR>
+<A HREF="manual.html#lua_gc">lua_gc</A><BR>
+<A HREF="manual.html#lua_getallocf">lua_getallocf</A><BR>
+<A HREF="manual.html#lua_getextraspace">lua_getextraspace</A><BR>
+<A HREF="manual.html#lua_getfield">lua_getfield</A><BR>
+<A HREF="manual.html#lua_getglobal">lua_getglobal</A><BR>
+<A HREF="manual.html#lua_gethook">lua_gethook</A><BR>
+<A HREF="manual.html#lua_gethookcount">lua_gethookcount</A><BR>
+<A HREF="manual.html#lua_gethookmask">lua_gethookmask</A><BR>
+<A HREF="manual.html#lua_geti">lua_geti</A><BR>
+<A HREF="manual.html#lua_getinfo">lua_getinfo</A><BR>
+<A HREF="manual.html#lua_getlocal">lua_getlocal</A><BR>
+<A HREF="manual.html#lua_getmetatable">lua_getmetatable</A><BR>
+<A HREF="manual.html#lua_getstack">lua_getstack</A><BR>
+<A HREF="manual.html#lua_gettable">lua_gettable</A><BR>
+<A HREF="manual.html#lua_gettop">lua_gettop</A><BR>
+<A HREF="manual.html#lua_getupvalue">lua_getupvalue</A><BR>
+<A HREF="manual.html#lua_getuservalue">lua_getuservalue</A><BR>
+<A HREF="manual.html#lua_insert">lua_insert</A><BR>
+<A HREF="manual.html#lua_isboolean">lua_isboolean</A><BR>
+<A HREF="manual.html#lua_iscfunction">lua_iscfunction</A><BR>
+<A HREF="manual.html#lua_isfunction">lua_isfunction</A><BR>
+<A HREF="manual.html#lua_isinteger">lua_isinteger</A><BR>
+<A HREF="manual.html#lua_islightuserdata">lua_islightuserdata</A><BR>
+<A HREF="manual.html#lua_isnil">lua_isnil</A><BR>
+<A HREF="manual.html#lua_isnone">lua_isnone</A><BR>
+<A HREF="manual.html#lua_isnoneornil">lua_isnoneornil</A><BR>
+<A HREF="manual.html#lua_isnumber">lua_isnumber</A><BR>
+<A HREF="manual.html#lua_isstring">lua_isstring</A><BR>
+<A HREF="manual.html#lua_istable">lua_istable</A><BR>
+<A HREF="manual.html#lua_isthread">lua_isthread</A><BR>
+<A HREF="manual.html#lua_isuserdata">lua_isuserdata</A><BR>
+<A HREF="manual.html#lua_isyieldable">lua_isyieldable</A><BR>
+<A HREF="manual.html#lua_len">lua_len</A><BR>
+<A HREF="manual.html#lua_load">lua_load</A><BR>
+<A HREF="manual.html#lua_newstate">lua_newstate</A><BR>
+<A HREF="manual.html#lua_newtable">lua_newtable</A><BR>
+<A HREF="manual.html#lua_newthread">lua_newthread</A><BR>
+<A HREF="manual.html#lua_newuserdata">lua_newuserdata</A><BR>
+<A HREF="manual.html#lua_next">lua_next</A><BR>
+<A HREF="manual.html#lua_numbertointeger">lua_numbertointeger</A><BR>
+<A HREF="manual.html#lua_pcall">lua_pcall</A><BR>
+<A HREF="manual.html#lua_pcallk">lua_pcallk</A><BR>
+<A HREF="manual.html#lua_pop">lua_pop</A><BR>
+<A HREF="manual.html#lua_pushboolean">lua_pushboolean</A><BR>
+<A HREF="manual.html#lua_pushcclosure">lua_pushcclosure</A><BR>
+<A HREF="manual.html#lua_pushcfunction">lua_pushcfunction</A><BR>
+<A HREF="manual.html#lua_pushfstring">lua_pushfstring</A><BR>
+<A HREF="manual.html#lua_pushglobaltable">lua_pushglobaltable</A><BR>
+<A HREF="manual.html#lua_pushinteger">lua_pushinteger</A><BR>
+<A HREF="manual.html#lua_pushlightuserdata">lua_pushlightuserdata</A><BR>
+<A HREF="manual.html#lua_pushliteral">lua_pushliteral</A><BR>
+<A HREF="manual.html#lua_pushlstring">lua_pushlstring</A><BR>
+<A HREF="manual.html#lua_pushnil">lua_pushnil</A><BR>
+<A HREF="manual.html#lua_pushnumber">lua_pushnumber</A><BR>
+<A HREF="manual.html#lua_pushstring">lua_pushstring</A><BR>
+<A HREF="manual.html#lua_pushthread">lua_pushthread</A><BR>
+<A HREF="manual.html#lua_pushvalue">lua_pushvalue</A><BR>
+<A HREF="manual.html#lua_pushvfstring">lua_pushvfstring</A><BR>
+<A HREF="manual.html#lua_rawequal">lua_rawequal</A><BR>
+<A HREF="manual.html#lua_rawget">lua_rawget</A><BR>
+<A HREF="manual.html#lua_rawgeti">lua_rawgeti</A><BR>
+<A HREF="manual.html#lua_rawgetp">lua_rawgetp</A><BR>
+<A HREF="manual.html#lua_rawlen">lua_rawlen</A><BR>
+<A HREF="manual.html#lua_rawset">lua_rawset</A><BR>
+<A HREF="manual.html#lua_rawseti">lua_rawseti</A><BR>
+<A HREF="manual.html#lua_rawsetp">lua_rawsetp</A><BR>
+<A HREF="manual.html#lua_register">lua_register</A><BR>
+<A HREF="manual.html#lua_remove">lua_remove</A><BR>
+<A HREF="manual.html#lua_replace">lua_replace</A><BR>
+<A HREF="manual.html#lua_resume">lua_resume</A><BR>
+<A HREF="manual.html#lua_rotate">lua_rotate</A><BR>
+<A HREF="manual.html#lua_setallocf">lua_setallocf</A><BR>
+<A HREF="manual.html#lua_setfield">lua_setfield</A><BR>
+<A HREF="manual.html#lua_setglobal">lua_setglobal</A><BR>
+<A HREF="manual.html#lua_sethook">lua_sethook</A><BR>
+<A HREF="manual.html#lua_seti">lua_seti</A><BR>
+<A HREF="manual.html#lua_setlocal">lua_setlocal</A><BR>
+<A HREF="manual.html#lua_setmetatable">lua_setmetatable</A><BR>
+<A HREF="manual.html#lua_settable">lua_settable</A><BR>
+<A HREF="manual.html#lua_settop">lua_settop</A><BR>
+<A HREF="manual.html#lua_setupvalue">lua_setupvalue</A><BR>
+<A HREF="manual.html#lua_setuservalue">lua_setuservalue</A><BR>
+<A HREF="manual.html#lua_status">lua_status</A><BR>
+<A HREF="manual.html#lua_stringtonumber">lua_stringtonumber</A><BR>
+<A HREF="manual.html#lua_toboolean">lua_toboolean</A><BR>
+<A HREF="manual.html#lua_tocfunction">lua_tocfunction</A><BR>
+<A HREF="manual.html#lua_tointeger">lua_tointeger</A><BR>
+<A HREF="manual.html#lua_tointegerx">lua_tointegerx</A><BR>
+<A HREF="manual.html#lua_tolstring">lua_tolstring</A><BR>
+<A HREF="manual.html#lua_tonumber">lua_tonumber</A><BR>
+<A HREF="manual.html#lua_tonumberx">lua_tonumberx</A><BR>
+<A HREF="manual.html#lua_topointer">lua_topointer</A><BR>
+<A HREF="manual.html#lua_tostring">lua_tostring</A><BR>
+<A HREF="manual.html#lua_tothread">lua_tothread</A><BR>
+<A HREF="manual.html#lua_touserdata">lua_touserdata</A><BR>
+<A HREF="manual.html#lua_type">lua_type</A><BR>
+<A HREF="manual.html#lua_typename">lua_typename</A><BR>
+<A HREF="manual.html#lua_upvalueid">lua_upvalueid</A><BR>
+<A HREF="manual.html#lua_upvalueindex">lua_upvalueindex</A><BR>
+<A HREF="manual.html#lua_upvaluejoin">lua_upvaluejoin</A><BR>
+<A HREF="manual.html#lua_version">lua_version</A><BR>
+<A HREF="manual.html#lua_xmove">lua_xmove</A><BR>
+<A HREF="manual.html#lua_yield">lua_yield</A><BR>
+<A HREF="manual.html#lua_yieldk">lua_yieldk</A><BR>
+
+</TD>
+<TD>
+<H3><A NAME="auxlib">auxiliary library</A></H3>
+<P>
+<A HREF="manual.html#luaL_Buffer">luaL_Buffer</A><BR>
+<A HREF="manual.html#luaL_Reg">luaL_Reg</A><BR>
+<A HREF="manual.html#luaL_Stream">luaL_Stream</A><BR>
+
+<P>
+<A HREF="manual.html#luaL_addchar">luaL_addchar</A><BR>
+<A HREF="manual.html#luaL_addlstring">luaL_addlstring</A><BR>
+<A HREF="manual.html#luaL_addsize">luaL_addsize</A><BR>
+<A HREF="manual.html#luaL_addstring">luaL_addstring</A><BR>
+<A HREF="manual.html#luaL_addvalue">luaL_addvalue</A><BR>
+<A HREF="manual.html#luaL_argcheck">luaL_argcheck</A><BR>
+<A HREF="manual.html#luaL_argerror">luaL_argerror</A><BR>
+<A HREF="manual.html#luaL_buffinit">luaL_buffinit</A><BR>
+<A HREF="manual.html#luaL_buffinitsize">luaL_buffinitsize</A><BR>
+<A HREF="manual.html#luaL_callmeta">luaL_callmeta</A><BR>
+<A HREF="manual.html#luaL_checkany">luaL_checkany</A><BR>
+<A HREF="manual.html#luaL_checkinteger">luaL_checkinteger</A><BR>
+<A HREF="manual.html#luaL_checklstring">luaL_checklstring</A><BR>
+<A HREF="manual.html#luaL_checknumber">luaL_checknumber</A><BR>
+<A HREF="manual.html#luaL_checkoption">luaL_checkoption</A><BR>
+<A HREF="manual.html#luaL_checkstack">luaL_checkstack</A><BR>
+<A HREF="manual.html#luaL_checkstring">luaL_checkstring</A><BR>
+<A HREF="manual.html#luaL_checktype">luaL_checktype</A><BR>
+<A HREF="manual.html#luaL_checkudata">luaL_checkudata</A><BR>
+<A HREF="manual.html#luaL_checkversion">luaL_checkversion</A><BR>
+<A HREF="manual.html#luaL_dofile">luaL_dofile</A><BR>
+<A HREF="manual.html#luaL_dostring">luaL_dostring</A><BR>
+<A HREF="manual.html#luaL_error">luaL_error</A><BR>
+<A HREF="manual.html#luaL_execresult">luaL_execresult</A><BR>
+<A HREF="manual.html#luaL_fileresult">luaL_fileresult</A><BR>
+<A HREF="manual.html#luaL_getmetafield">luaL_getmetafield</A><BR>
+<A HREF="manual.html#luaL_getmetatable">luaL_getmetatable</A><BR>
+<A HREF="manual.html#luaL_getsubtable">luaL_getsubtable</A><BR>
+<A HREF="manual.html#luaL_gsub">luaL_gsub</A><BR>
+<A HREF="manual.html#luaL_len">luaL_len</A><BR>
+<A HREF="manual.html#luaL_loadbuffer">luaL_loadbuffer</A><BR>
+<A HREF="manual.html#luaL_loadbufferx">luaL_loadbufferx</A><BR>
+<A HREF="manual.html#luaL_loadfile">luaL_loadfile</A><BR>
+<A HREF="manual.html#luaL_loadfilex">luaL_loadfilex</A><BR>
+<A HREF="manual.html#luaL_loadstring">luaL_loadstring</A><BR>
+<A HREF="manual.html#luaL_newlib">luaL_newlib</A><BR>
+<A HREF="manual.html#luaL_newlibtable">luaL_newlibtable</A><BR>
+<A HREF="manual.html#luaL_newmetatable">luaL_newmetatable</A><BR>
+<A HREF="manual.html#luaL_newstate">luaL_newstate</A><BR>
+<A HREF="manual.html#luaL_openlibs">luaL_openlibs</A><BR>
+<A HREF="manual.html#luaL_opt">luaL_opt</A><BR>
+<A HREF="manual.html#luaL_optinteger">luaL_optinteger</A><BR>
+<A HREF="manual.html#luaL_optlstring">luaL_optlstring</A><BR>
+<A HREF="manual.html#luaL_optnumber">luaL_optnumber</A><BR>
+<A HREF="manual.html#luaL_optstring">luaL_optstring</A><BR>
+<A HREF="manual.html#luaL_prepbuffer">luaL_prepbuffer</A><BR>
+<A HREF="manual.html#luaL_prepbuffsize">luaL_prepbuffsize</A><BR>
+<A HREF="manual.html#luaL_pushresult">luaL_pushresult</A><BR>
+<A HREF="manual.html#luaL_pushresultsize">luaL_pushresultsize</A><BR>
+<A HREF="manual.html#luaL_ref">luaL_ref</A><BR>
+<A HREF="manual.html#luaL_requiref">luaL_requiref</A><BR>
+<A HREF="manual.html#luaL_setfuncs">luaL_setfuncs</A><BR>
+<A HREF="manual.html#luaL_setmetatable">luaL_setmetatable</A><BR>
+<A HREF="manual.html#luaL_testudata">luaL_testudata</A><BR>
+<A HREF="manual.html#luaL_tolstring">luaL_tolstring</A><BR>
+<A HREF="manual.html#luaL_traceback">luaL_traceback</A><BR>
+<A HREF="manual.html#luaL_typename">luaL_typename</A><BR>
+<A HREF="manual.html#luaL_unref">luaL_unref</A><BR>
+<A HREF="manual.html#luaL_where">luaL_where</A><BR>
+
+<H3><A NAME="library">standard library</A></H3>
+<P>
+<A HREF="manual.html#pdf-luaopen_base">luaopen_base</A><BR>
+<A HREF="manual.html#pdf-luaopen_coroutine">luaopen_coroutine</A><BR>
+<A HREF="manual.html#pdf-luaopen_debug">luaopen_debug</A><BR>
+<A HREF="manual.html#pdf-luaopen_io">luaopen_io</A><BR>
+<A HREF="manual.html#pdf-luaopen_math">luaopen_math</A><BR>
+<A HREF="manual.html#pdf-luaopen_os">luaopen_os</A><BR>
+<A HREF="manual.html#pdf-luaopen_package">luaopen_package</A><BR>
+<A HREF="manual.html#pdf-luaopen_string">luaopen_string</A><BR>
+<A HREF="manual.html#pdf-luaopen_table">luaopen_table</A><BR>
+<A HREF="manual.html#pdf-luaopen_utf8">luaopen_utf8</A><BR>
+
+<H3><A NAME="constants">constants</A></H3>
+<P>
+<A HREF="manual.html#pdf-LUA_ERRERR">LUA_ERRERR</A><BR>
+<A HREF="manual.html#pdf-LUA_ERRFILE">LUA_ERRFILE</A><BR>
+<A HREF="manual.html#pdf-LUA_ERRGCMM">LUA_ERRGCMM</A><BR>
+<A HREF="manual.html#pdf-LUA_ERRMEM">LUA_ERRMEM</A><BR>
+<A HREF="manual.html#pdf-LUA_ERRRUN">LUA_ERRRUN</A><BR>
+<A HREF="manual.html#pdf-LUA_ERRSYNTAX">LUA_ERRSYNTAX</A><BR>
+<A HREF="manual.html#pdf-LUA_HOOKCALL">LUA_HOOKCALL</A><BR>
+<A HREF="manual.html#pdf-LUA_HOOKCOUNT">LUA_HOOKCOUNT</A><BR>
+<A HREF="manual.html#pdf-LUA_HOOKLINE">LUA_HOOKLINE</A><BR>
+<A HREF="manual.html#pdf-LUA_HOOKRET">LUA_HOOKRET</A><BR>
+<A HREF="manual.html#pdf-LUA_HOOKTAILCALL">LUA_HOOKTAILCALL</A><BR>
+<A HREF="manual.html#pdf-LUA_MASKCALL">LUA_MASKCALL</A><BR>
+<A HREF="manual.html#pdf-LUA_MASKCOUNT">LUA_MASKCOUNT</A><BR>
+<A HREF="manual.html#pdf-LUA_MASKLINE">LUA_MASKLINE</A><BR>
+<A HREF="manual.html#pdf-LUA_MASKRET">LUA_MASKRET</A><BR>
+<A HREF="manual.html#pdf-LUA_MAXINTEGER">LUA_MAXINTEGER</A><BR>
+<A HREF="manual.html#pdf-LUA_MININTEGER">LUA_MININTEGER</A><BR>
+<A HREF="manual.html#pdf-LUA_MINSTACK">LUA_MINSTACK</A><BR>
+<A HREF="manual.html#pdf-LUA_MULTRET">LUA_MULTRET</A><BR>
+<A HREF="manual.html#pdf-LUA_NOREF">LUA_NOREF</A><BR>
+<A HREF="manual.html#pdf-LUA_OK">LUA_OK</A><BR>
+<A HREF="manual.html#pdf-LUA_OPADD">LUA_OPADD</A><BR>
+<A HREF="manual.html#pdf-LUA_OPBAND">LUA_OPBAND</A><BR>
+<A HREF="manual.html#pdf-LUA_OPBNOT">LUA_OPBNOT</A><BR>
+<A HREF="manual.html#pdf-LUA_OPBOR">LUA_OPBOR</A><BR>
+<A HREF="manual.html#pdf-LUA_OPBXOR">LUA_OPBXOR</A><BR>
+<A HREF="manual.html#pdf-LUA_OPDIV">LUA_OPDIV</A><BR>
+<A HREF="manual.html#pdf-LUA_OPEQ">LUA_OPEQ</A><BR>
+<A HREF="manual.html#pdf-LUA_OPIDIV">LUA_OPIDIV</A><BR>
+<A HREF="manual.html#pdf-LUA_OPLE">LUA_OPLE</A><BR>
+<A HREF="manual.html#pdf-LUA_OPLT">LUA_OPLT</A><BR>
+<A HREF="manual.html#pdf-LUA_OPMOD">LUA_OPMOD</A><BR>
+<A HREF="manual.html#pdf-LUA_OPMUL">LUA_OPMUL</A><BR>
+<A HREF="manual.html#pdf-LUA_OPPOW">LUA_OPPOW</A><BR>
+<A HREF="manual.html#pdf-LUA_OPSHL">LUA_OPSHL</A><BR>
+<A HREF="manual.html#pdf-LUA_OPSHR">LUA_OPSHR</A><BR>
+<A HREF="manual.html#pdf-LUA_OP

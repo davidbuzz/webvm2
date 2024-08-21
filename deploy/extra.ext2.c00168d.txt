@@ -1,0 +1,1647 @@
+   /// CRC extra byte not found for provided `messageId` type.
+    /// - messageId: Id of message type.
+    case crcExtraNotFound(messageId: UInt8)
+    
+    /// Packet finalization process failed due to `message` absence.
+    case messageNotSet
+}
+
+extension PackError {
+    
+    /// Textual representation used when written to the output stream.
+    public var description: String {
+        switch self {
+        case .valueSizeOutOfBounds:
+            return "PackError.valueSizeOutOfBounds"
+        case .invalidValueLength:
+            return "PackError.invalidValueLength"
+        case .invalidStringEncoding:
+            return "PackError.invalidStringEncoding"
+        case .crcExtraNotFound:
+            return "PackError.crcExtraNotFound"
+        case .messageNotSet:
+            return "PackError.messageNotSet"
+        }
+    }
+    
+    /// Debug textual representation used when written to the output stream, which
+    /// includes all associated values and their labels.
+    public var debugDescription: String {
+        switch self {
+        case let .valueSizeOutOfBounds(offset, size, upperBound):
+            return "PackError.valueSizeOutOfBounds(offset: \(offset), size: \(size), upperBound: \(upperBound))"
+        case let .invalidValueLength(offset, providedValueLength, allowedLength):
+            return "PackError.invalidValueLength(offset: \(offset), providedValueLength: \(providedValueLength), allowedLength: \(allowedLength))"
+        case let .invalidStringEncoding(offset, string):
+            return "PackError.invalidStringEncoding(offset: \(offset), string: \(string))"
+        case let .crcExtraNotFound(messageId):
+            return "PackError.crcExtraNotFound(messageId: \(messageId))"
+        case .messageNotSet:
+            return "PackError.messageNotSet"
+        }
+    }
+}
+
+// MARK: - Delegate protocol
+
+/// Alternative way to receive parsed Messages, finalized packet's data and all
+/// errors is to implement this protocol and set as `MAVLink`'s delegate.
+public protocol MAVLinkDelegate: class {
+    
+    /// Called when MAVLink packet is successfully received, payload length
+    /// and CRC checks are passed.
+    ///
+    /// - parameter packet:  Completely received `Packet`.
+    /// - parameter channel: Channel on which `packet` was received.
+    /// - parameter link:    `MAVLink` object that handled `packet`.
+    func didReceive(packet: Packet, on channel: Channel, via link: MAVLink)
+    
+    /// Packet receiving failed due to `InvalidPayloadLength` or `BadCRC` error.
+    ///
+    /// - parameter packet:    Partially received `Packet`.
+    /// - parameter error:     Error that  occurred while receiving `data`
+    /// (`InvalidPayloadLength` or `BadCRC` error).
+    /// - parameter channel:   Channel on which `packet` was received.
+    /// - parameter link:      `MAVLink` object that received `data`.
+    func didFailToReceive(packet: Packet?, with error: MAVLinkError, on channel: Channel, via link: MAVLink)
+    
+    /// Called when received data was successfully parsed into appropriate
+    /// `message` structure.
+    ///
+    /// - parameter message: Successfully parsed `Message`.
+    /// - parameter packet:  Completely received `Packet`.
+    /// - parameter channel: Channel on which `message` was received.
+    /// - parameter link:    `MAVLink` object that handled `packet`.
+    func didParse(message: Message, from packet: Packet, on channel: Channel, via link: MAVLink)
+    
+    /// Called when `packet` completely received but `MAVLink` was not able to
+    /// finish `Message` processing due to unknown `messageId` or type validation
+    /// errors.
+    ///
+    /// - parameter packet:  Completely received `Packet`.
+    /// - parameter error:   Error that  occurred while parsing `packet`'s
+    /// payload into `Message`.
+    /// - parameter channel: Channel on which `message` was received.
+    /// - parameter link:    `MAVLink` object that handled `packet`.
+    func didFailToParseMessage(from packet: Packet, with error: MAVLinkError, on channel: Channel, via link: MAVLink)
+    
+    /// Called when message is finalized and ready for sending to aircraft.
+    ///
+    /// - parameter message: Message to be sent.
+    /// - parameter data:    Compiled data that represents `message`.
+    /// - parameter channel: Channel on which `message` should be sent.
+    /// - parameter link:    `MAVLink` object that handled `message`.
+    func didFinalize(message: Message, from packet: Packet, to data: Data, on channel: Channel, in link: MAVLink)
+}
+
+// MARK: - Classes implementations
+
+/// Main MAVLink class, performs `Packet` receiving, recognition, validation,
+/// `Message` structure creation and `Message` packing, finalizing for sending.
+/// Also returns errors through delegation if any errors occurred.
+/// - warning: Supports only 1.0 version of the MAVlink wire protocol.
+public class MAVLink {
+    
+    /// States for the parsing state machine.
+    enum ParseState {
+        case uninit
+        case idle
+        case gotStx
+        case gotSequence
+        case gotLength
+        case gotSystemId
+        case gotComponentId
+        case gotMessageId
+        case gotPayload
+        case gotCRC1
+        case gotBadCRC1
+    }
+    
+    enum Framing: UInt8 {
+        case incomplete = 0
+        case ok = 1
+        case badCRC = 2
+    }
+    
+    /// Storage for MAVLink parsed packets count, states and errors statistics.
+    class Status {
+        
+        /// Number of received packets
+        var packetReceived: Framing = .incomplete
+        
+        /// Number of parse errors
+        var parseError: UInt8 = 0
+        
+        /// Parsing state machine
+        var parseState: ParseState = .uninit
+        
+        /// Sequence number of the last received packet
+        var currentRxSeq: UInt8 = 0
+        
+        /// Sequence number of the last sent packet
+        var currentTxSeq: UInt8 = 0
+        
+        /// Received packets
+        var packetRxSuccessCount: UInt16 = 0
+        
+        /// Number of packet drops
+        var packetRxDropCount: UInt16 = 0
+    }
+    
+    /// MAVLink Packets and States buffers
+    let channelBuffers = (0 ..< Channel.max).map({ _ in Packet() })
+    let channelStatuses = (0 ..< Channel.max).map({ _ in Status() })
+    
+    /// Object to pass received packets, messages, errors, finalized data to.
+    public weak var delegate: MAVLinkDelegate?
+    
+    /// Enable this option to check the length of each message. This allows
+    /// invalid messages to be caught much sooner. Use it if the transmission
+    /// medium is prone to missing (or extra) characters (e.g. a radio that
+    /// fades in and out). Use only if the channel will contain message
+    /// types listed in the headers.
+    public var checkMessageLength = true
+    
+    /// Use one extra CRC that is added to the message CRC to detect mismatches
+    /// in the message specifications. This is to prevent that two devices using
+    /// different message versions incorrectly decode a message with the same
+    /// length. Defined as `let` as we support only the latest version (1.0) of
+    /// the MAVLink wire protocol.
+    public let crcExtra = true
+    
+    public init() { }
+    
+    /// This is a convenience function which handles the complete MAVLink
+    /// parsing. The function will parse one byte at a time and return the
+    /// complete packet once it could be successfully decoded. Checksum and
+    /// other failures will be delegated to `delegate`.
+    ///
+    /// - parameter char:    The char to parse.
+    /// - parameter channel: Id of the current channel. This allows to parse
+    /// different channels with this function. A channel is not a physical
+    /// message channel like a serial port, but a logic partition of the
+    /// communication streams in this case.
+    ///
+    /// - returns: Returns `nil` if packet could be decoded at the moment,
+    /// the `Packet` structure else.
+    public func parse(char: UInt8, channel: Channel) -> Packet? {
+        
+        /// Function to check if current char is Stx byte. If current char is
+        /// STX, modifies current rxpack and status.
+        func handleSTX(char: UInt8, rxpack: Packet, status: Status) {
+            if char == Packet.Constant.packetStx {
+                rxpack.length = 0
+                rxpack.channel = channel
+                rxpack.magic = char
+                rxpack.checksum.start()
+                status.parseState = .gotStx
+            }
+        }
+        
+        let rxpack = channelBuffers[Int(channel)]
+        let status = channelStatuses[Int(channel)]
+        
+        status.packetReceived = .incomplete
+        
+        switch status.parseState {
+        case .uninit, .idle:
+            handleSTX(char: char, rxpack: rxpack, status: status)
+            
+        case .gotStx:
+            rxpack.length = char
+            rxpack.payload.count = 0
+            rxpack.checksum.accumulate(char)
+            status.parseState = .gotLength
+            
+        case .gotLength:
+            rxpack.sequence = char
+            rxpack.checksum.accumulate(char)
+            status.parseState = .gotSequence
+            
+        case .gotSequence:
+            rxpack.systemId = char
+            rxpack.checksum.accumulate(char)
+            status.parseState = .gotSystemId
+            
+        case .gotSystemId:
+            rxpack.componentId = char
+            rxpack.checksum.accumulate(char)
+            status.parseState = .gotComponentId
+            
+        case .gotComponentId:
+            // Check Message length if `checkMessageLength` enabled and
+            // `messageLengths` contains proper id. If `messageLengths` does not
+            // contain info for current messageId, parsing will fail later on CRC check.
+            if checkMessageLength {
+                let messageLength = messageLengths[char] ?? 0
+                if rxpack.length != messageLength {
+                    status.parseError += 1
+                    status.parseState = .idle
+                    let error = ParseError.invalidPayloadLength(messageId: char, receivedLength: rxpack.length, expectedLength: messageLength)
+                    delegate?.didFailToReceive(packet: nil, with: error, on: channel, via: self)
+                    break
+                }
+            }
+            
+            rxpack.messageId = char
+            rxpack.checksum.accumulate(char)
+            
+            if rxpack.length == 0 {
+                status.parseState = .gotPayload
+            } else {
+                status.parseState = .gotMessageId
+            }
+            
+        case .gotMessageId:
+            rxpack.payload.append(char)
+            rxpack.checksum.accumulate(char)
+            
+            if rxpack.payload.count == Int(rxpack.length) {
+                status.parseState = .gotPayload
+            }
+            
+        case .gotPayload:
+            if crcExtra && (messageCRCsExtra[rxpack.messageId] != nil) {
+                rxpack.checksum.accumulate(messageCRCsExtra[rxpack.messageId]!)
+            }
+            
+            rxpack.payload.append(char)
+            
+            if char != rxpack.checksum.lowByte {
+                status.parseState = .gotBadCRC1
+                fallthrough
+            } else {
+                status.parseState = .gotCRC1
+            }
+            
+        case .gotCRC1, .gotBadCRC1:
+            if (status.parseState == .gotBadCRC1) || (char != rxpack.checksum.highByte) {
+                status.parseError += 1
+                status.packetReceived = .badCRC
+                
+                let error = messageIdToClass[rxpack.messageId] == nil ? ParseError.unknownMessageId(messageId: rxpack.messageId) : ParseError.badCRC(messageId: rxpack.messageId)
+                delegate?.didFailToReceive(packet: Packet(packet: rxpack), with: error, on: channel, via: self)
+                handleSTX(char: char, rxpack: rxpack, status: status)
+            } else {
+                // Successfully got message
+                rxpack.payload.append(char)
+                status.packetReceived = .ok
+            }
+            status.parseState = .idle
+        }
+        
+        defer {
+            // Сollect stat here
+            
+            status.parseError = 0
+        }
+        
+        // If a packet has been successfully received
+        guard status.packetReceived == .ok else {
+            return nil
+        }
+        
+        // Copy and delegate received packet
+        let packet = Packet(packet: rxpack)
+        delegate?.didReceive(packet: packet, on: channel, via: self)
+        
+        status.currentRxSeq = rxpack.sequence
+        // Initial condition: If no packet has been received so far, drop count is undefined
+        if status.packetRxSuccessCount == 0 {
+            status.packetRxDropCount = 0
+        }
+        // Count this packet as received
+        status.packetRxSuccessCount = status.packetRxSuccessCount &+ 1
+        
+        // Try to create appropriate Message structure, delegate results
+        guard let messageClass = messageIdToClass[packet.messageId] else {
+            let error = ParseError.unknownMessageId(messageId: rxpack.messageId)
+            delegate?.didFailToParseMessage(from: packet, with: error, on: channel, via: self)
+            return packet
+        }
+        
+        do {
+            packet.message = try messageClass.init(data: rxpack.payload)
+            delegate?.didParse(message: packet.message!, from: packet, on: channel, via: self)
+        } catch {
+            delegate?.didFailToParseMessage(from: packet, with: error as! MAVLinkError, on: channel, via: self)
+            return packet
+        }
+        
+        return packet
+    }
+    
+    /// Parse new portion of data, then call `messageHandler` if new message
+    /// is available.
+    ///
+    /// - parameter data:           Data to be parsed.
+    /// - parameter channel:        Id of the current channel. This allows to
+    /// parse different channels with this function. A channel is not a physical
+    /// message channel like a serial port, but a logic partition of the
+    /// communication streams in this case.
+    /// - parameter messageHandler: The message handler to call when the
+    /// provided data is enough to complete message parsing. Unless you have
+    /// provided a custom delegate, this parameter must not be `nil`, because
+    /// there is no other way to retrieve the parsed message and packet.
+    public func parse(data: Data, channel: Channel, messageHandler: ((Message, Packet) -> Void)? = nil) {
+        data.forEach { byte in
+            if let packet = parse(char: byte, channel: channel), let message = packet.message, let messageHandler = messageHandler {
+                messageHandler(message, packet)
+            }
+        }
+    }
+    
+    /// Prepare `message` bytes for sending, pass to `delegate` for further
+    /// processing and increase sequence counter.
+    ///
+    /// - parameter message:     Message to be compiled into bytes and sent.
+    /// - parameter systemId:    Id of the sending (this) system.
+    /// - parameter componentId: Id of the sending component.
+    /// - parameter channel:     Id of the current channel.
+    ///
+    /// - throws: Throws `PackError`.
+    public func dispatch(message: Message, systemId: UInt8, componentId: UInt8, channel: Channel) throws {
+        let channelStatus = channelStatuses[Int(channel)]
+        let packet = Packet(message: message, systemId: systemId, componentId: componentId, channel: channel)
+        let data = try packet.finalize(sequence: channelStatus.currentTxSeq)
+        delegate?.didFinalize(message: message, from: packet, to: data, on: channel, in: self)
+        channelStatus.currentTxSeq = channelStatus.currentTxSeq &+ 1
+    }
+}
+
+/// MAVLink Packet structure to store received data that is not full message yet.
+/// Contains additional to Message info like channel, system id, component id
+/// and raw payload data, etc. Also used to store and transfer received data of
+/// unknown or corrupted Messages.
+/// [More details](https://mavlink.io/en).
+public class Packet {
+    
+    /// MAVlink Packet constants
+    struct Constant {
+        
+        /// Maximum packets payload length
+        static let maxPayloadLength = UInt8.max
+        
+        static let numberOfChecksumBytes = 2
+        
+        /// Length of core header (of the comm. layer): message length
+        /// (1 byte) + message sequence (1 byte) + message system id (1 byte) +
+        /// message component id (1 byte) + message type id (1 byte).
+        static let coreHeaderLength = 5
+        
+        /// Length of all header bytes, including core and checksum
+        static let numberOfHeaderBytes = Constant.numberOfChecksumBytes + Constant.coreHeaderLength + 1
+        
+        /// Packet start sign. Indicates the start of a new packet. v1.0.
+        static let packetStx: UInt8 = 0xFE
+    }
+    
+    /// Channel on which packet was received
+    public internal(set) var channel: UInt8 = 0
+    
+    /// Sent at the end of packet
+    public internal(set) var checksum = Checksum()
+    
+    /// Protocol magic marker (PacketStx value)
+    public internal(set) var magic: UInt8 = 0
+    
+    /// Length of payload
+    public internal(set) var length: UInt8 = 0
+    
+    /// Sequence of packet
+    public internal(set) var sequence: UInt8 = 0
+    
+    /// Id of message sender system/aircraft
+    public internal(set) var systemId: UInt8 = 0
+    
+    /// Id of the message sender component
+    public internal(set) var componentId: UInt8 = 0
+    
+    /// Id of message type in payload
+    public internal(set) var messageId: UInt8 = 0
+    
+    /// Message bytes
+    public internal(set) var payload = Data(capacity: Int(Constant.maxPayloadLength) + Constant.numberOfChecksumBytes)
+    
+    /// Received Message structure if available
+    public internal(set) var message: Message?
+    
+    /// Initialize copy of provided Packet.
+    ///
+    /// - parameter packet: Packet to copy
+    init(packet: Packet) {
+        channel = packet.channel
+        checksum = packet.checksum
+        magic = packet.magic
+        length = packet.length
+        sequence = packet.sequence
+        systemId = packet.systemId
+        componentId = packet.componentId
+        messageId = packet.messageId
+        payload = packet.payload
+        message = packet.message
+    }
+    
+    /// Initialize packet with provided `message` for sending.
+    ///
+    /// - parameter message:     Message to send.
+    /// - parameter systemId:    Id of the sending (this) system.
+    /// - parameter componentId: Id of the sending component.
+    /// - parameter channel:     Id of the current channel.
+    init(message: Message, systemId: UInt8, componentId: UInt8, channel: Channel) {
+        self.magic = Constant.packetStx
+        self.systemId = systemId
+        self.componentId = componentId
+        self.messageId = type(of: message).id
+        self.length = type(of: message).payloadLength
+        self.message = message
+        self.channel = channel
+    }
+    
+    init() { }
+    
+    /// Finalize a MAVLink packet with sequence assignment. Returns data that
+    /// could be sent to the aircraft. This function calculates the checksum and
+    /// sets length and aircraft id correctly. It assumes that the packet is
+    /// already correctly initialized with appropriate `message`, `length`,
+    /// `systemId`, `componentId`.
+    /// Could be used to send packets without `MAVLink` object, in this case you
+    /// should take care of `sequence` counter manually.
+    ///
+    /// - parameter sequence: Each channel counts up its send sequence. It allows
+    /// to detect packet loss.
+    ///
+    /// - throws: Throws `PackError`.
+    ///
+    /// - returns: Data
+    public func finalize(sequence: UInt8) throws -> Data {
+        guard let message = message else {
+            throw PackError.messageNotSet
+        }
+        
+        guard let crcExtra = messageCRCsExtra[messageId] else {
+            throw PackError.crcExtraNotFound(messageId: type(of: message).id)
+        }
+        
+        self.sequence = sequence
+        
+        let coreHeader = [length, sequence, systemId, componentId, messageId]
+        let header = [Constant.packetStx] + coreHeader
+        let payload = try message.pack()
+        
+        checksum.start()
+        checksum.accumulate(coreHeader)
+        checksum.accumulate(payload)
+        checksum.accumulate(crcExtra)
+        
+        let checksumBytes = [checksum.lowByte, checksum.highByte]
+        var packetData = Data(capacity: payload.count + Constant.numberOfHeaderBytes)
+        packetData.append(header, count: header.count)
+        packetData.append(payload)
+        packetData.append(checksumBytes, count: checksumBytes.count)
+        
+        return packetData
+    }
+}
+
+/// Struct for storing and calculating checksum.
+public struct Checksum {
+    
+    struct Constants {
+        static let x25InitCRCValue: UInt16 = 0xFFFF
+    }
+    
+    public var lowByte: UInt8 {
+        return UInt8(truncatingIfNeeded: value)
+    }
+    
+    public var highByte: UInt8 {
+        return UInt8(truncatingIfNeeded: value >> 8)
+    }
+    
+    public private(set) var value: UInt16 = 0
+    
+    init() {
+        start()
+    }
+    
+    /// Initialize the buffer for the MCRF4XX CRC.
+    mutating func start() {
+        value = Constants.x25InitCRCValue
+    }
+    
+    /// Accumulate the MCRF4XX CRC by adding one char at a time. The checksum
+    /// function adds the hash of one char at a time to the 16 bit checksum
+    /// `value` (`UInt16`).
+    ///
+    /// - parameter char: New char to hash
+    mutating func accumulate(_ char: UInt8) {
+        var tmp: UInt8 = char ^ UInt8(truncatingIfNeeded: value)
+        tmp ^= (tmp << 4)
+        value = (UInt16(value) >> 8) ^ (UInt16(tmp) << 8) ^ (UInt16(tmp) << 3) ^ (UInt16(tmp) >> 4)
+    }
+    
+    /// Accumulate the MCRF4XX CRC by adding `buffer` bytes.
+    ///
+    /// - parameter buffer: Sequence of bytes to hash
+    mutating func accumulate<T: Sequence>(_ buffer: T) where T.Iterator.Element == UInt8 {
+        buffer.forEach { accumulate($0) }
+    }
+}
+
+// MARK: - CF independent host system byte order determination
+
+public enum ByteOrder: UInt32 {
+    case unknown
+    case littleEndian
+    case bigEndian
+}
+
+public func hostByteOrder() -> ByteOrder {
+    var bigAndLittleEndian: UInt32 = (ByteOrder.bigEndian.rawValue << 24) | ByteOrder.littleEndian.rawValue
+    
+    let firstByte: UInt8 = withUnsafePointer(to: &bigAndLittleEndian) { numberPointer in
+        let bufferPointer = numberPointer.withMemoryRebound(to: UInt8.self, capacity: 4) { pointer in
+            return UnsafeBufferPointer(start: pointer, count: 4)
+        }
+        return bufferPointer[0]
+    }
+    
+    return ByteOrder(rawValue: UInt32(firstByte)) ?? .unknown
+}
+
+// MARK: - Data extensions
+
+protocol MAVLinkNumber { }
+
+extension UInt8: MAVLinkNumber { }
+
+extension Int8: MAVLinkNumber { }
+
+extension UInt16: MAVLinkNumber { }
+
+extension Int16: MAVLinkNumber { }
+
+extension UInt32: MAVLinkNumber { }
+
+extension Int32: MAVLinkNumber { }
+
+extension UInt64: MAVLinkNumber { }
+
+extension Int64: MAVLinkNumber { }
+
+extension Float: MAVLinkNumber { }
+
+extension Double: MAVLinkNumber { }
+
+/// Methods for getting properly typed field values from received data.
+extension Data {
+    
+    /// Returns number value (integer or floating point) from receiver's data.
+    ///
+    /// - parameter offset: Offset in receiver's bytes.
+    /// - parameter byteOrder: Current system endianness.
+    ///
+    /// - throws: Throws `ParseError`.
+    ///
+    /// - returns: Returns `MAVLinkNumber` (UInt8, Int8, UInt16, Int16, UInt32,
+    /// Int32, UInt64, Int64, Float, Double).
+    func number<T: MAVLinkNumber>(at offset: Data.Index, byteOrder: ByteOrder = hostByteOrder()) throws -> T {
+        let size = MemoryLayout<T>.stride
+        let range: Range<Int> = offset ..< offset + size
+        
+        guard range.upperBound <= count else {
+            throw ParseError.valueSizeOutOfBounds(offset: offset, size: size, upperBound: count)
+        }
+        
+        var bytes = subdata(in: range)
+        if byteOrder != .littleEndian {
+            bytes.reverse()
+        }
+        
+        return bytes.withUnsafeBytes { $0.pointee }
+    }
+    
+    /// Returns typed array from receiver's data.
+    ///
+    /// - parameter offset:   Offset in receiver's bytes.
+    /// - parameter capacity: Expected number of elements in array.
+    ///
+    /// - throws: Throws `ParseError`.
+    ///
+    /// - returns: `Array<T>`
+    func array<T: MAVLinkNumber>(at offset: Data.Index, capacity: Int) throws -> [T] {
+        var offset = offset
+        var array = [T]()
+        
+        for _ in 0 ..< capacity {
+            array.append(try number(at: offset))
+            offset += MemoryLayout<T>.stride
+        }
+        
+        return array
+    }
+    
+    /// Returns ASCII String from receiver's data.
+    ///
+    /// - parameter offset: Offset in receiver's bytes.
+    /// - parameter length: Expected length of string to read.
+    ///
+    /// - throws: Throws `ParseError`.
+    ///
+    /// - returns: `String`
+    func string(at offset: Data.Index, length: Int) throws -> String {
+        let range: Range<Int> = offset ..< offset + length
+        
+        guard range.upperBound <= count else {
+            throw ParseError.valueSizeOutOfBounds(offset: offset, size: length, upperBound: count)
+        }
+        
+        let bytes = subdata(in: range)
+        let emptySubSequence = Data.SubSequence(capacity: 0)
+        let firstSubSequence = bytes.split(separator: 0x0, maxSplits: 1, omittingEmptySubsequences: false).first ?? emptySubSequence
+        
+        guard let string = String(bytes: firstSubSequence, encoding: .ascii) else {
+            throw ParseError.invalidStringEncoding(offset: offset, length: length)
+        }
+        
+        return string
+    }
+    
+    /// Returns proper typed `Enumeration` subtype value from data or throws
+    /// `ParserEnumError` or `ParseError` error.
+    ///
+    /// - parameter offset: Offset in receiver's bytes.
+    ///
+    /// - throws: Throws `ParserEnumError`, `ParseError`.
+    ///
+    /// - returns: Properly typed `Enumeration` subtype value.
+    func enumeration<T: Enumeration>(at offset: Data.Index) throws -> T where T.RawValue: MAVLinkNumber {
+        let rawValue: T.RawValue = try number(at: offset)
+        
+        guard let enumerationCase = T(rawValue: rawValue) else {
+            throw ParseEnumError.unknownValue(enumType: T.self, rawValue: rawValue, valueOffset: offset)
+        }
+        
+        return enumerationCase
+    }
+
+    /// Returns a bitmask that is based on enumeration field. Throws ParseError.
+    ///
+    /// - parameter offset: Offset in receiver's bytes.
+    ///
+    /// - throws: Throws `ParseError`.
+    ///
+    /// - returns: Bitmask subtype value.
+    func bitmask<T: MAVLinkBitmask>(at offset: Data.Index) throws -> T where T.RawValue: MAVLinkNumber {
+        let rawValue: T.RawValue = try number(at: offset)
+        return T(rawValue: rawValue)
+    }
+}
+
+/// Methods for filling `Data` with properly formatted field values.
+extension Data {
+    
+    /// Sets properly swapped `number` bytes starting from `offset` in
+    /// receiver's bytes.
+    ///
+    /// - warning: Supports only version 1.0 of MAVLink wire protocol
+    /// (little-endian byte order).
+    ///
+    /// - parameter number: Number value to set.
+    /// - parameter offset: Offset in receiver's bytes.
+    /// - parameter byteOrder: Current system endianness.
+    ///
+    /// - throws: Throws `PackError`.
+    mutating func set<T: MAVLinkNumber>(_ number: T, at offset: Data.Index, byteOrder: ByteOrder = hostByteOrder()) throws {
+        let size = MemoryLayout<T>.stride
+        let range = offset ..< offset + size
+        
+        guard range.endIndex <= count else {
+            throw PackError.valueSizeOutOfBounds(offset: offset, size: size, upperBound: count)
+        }
+        
+        var number = number
+        var bytes: Data = withUnsafePointer(to: &number) { numberPointer in
+            let bufferPointer = numberPointer.withMemoryRebound(to: UInt8.self, capacity: size) { pointer in
+                return UnsafeBufferPointer(start: pointer, count: size)
+            }
+            return Data(bufferPointer)
+        }
+        
+        if byteOrder != .littleEndian {
+            bytes.reverse()
+        }
+        
+        replaceSubrange(range, with: bytes)
+    }
+    
+    /// Sets `array` of `MAVLinkNumber` values at `offset` with `capacity` validation.
+    ///
+    /// - parameter array:    Array of values to set.
+    /// - parameter offset:   Offset in receiver's bytes.
+    /// - parameter capacity: Maximum allowed count of elements in `array`.
+    ///
+    /// - throws: Throws `PackError`.
+    mutating func set<T: MAVLinkNumber>(_ array: [T], at offset: Data.Index, capacity: Int) throws {
+        guard array.count <= capacity else {
+            throw PackError.invalidValueLength(offset: offset, providedValueLength: array.count, allowedLength: capacity)
+        }
+        
+        let elementSize = MemoryLayout<T>.stride
+        let arraySize = elementSize * array.count
+        
+        guard offset + arraySize <= count else {
+            throw PackError.valueSizeOutOfBounds(offset: offset, size: arraySize, upperBound: count)
+        }
+        
+        for (index, item) in array.enumerated() {
+            try set(item, at: offset + index * elementSize)
+        }
+    }
+    
+    /// Sets correctly encoded `string` value at `offset` limited to `length` or
+    /// throws `PackError`.
+    ///
+    /// - precondition: `string` value must be ASCII compatible.
+    ///
+    /// - parameter string: Value to set.
+    /// - parameter offset: Offset in receiver's bytes.
+    /// - parameter length: Maximum allowed length of `string`.
+    ///
+    /// - throws: Throws `PackError`.
+    mutating func set(_ string: String, at offset: Data.Index, length: Int) throws {
+        var bytes = string.data(using: .ascii) ?? Data()
+        
+        if bytes.isEmpty && string.unicodeScalars.count > 0 {
+            throw PackError.invalidStringEncoding(offset: offset, string: string)
+        }
+        
+        // Add optional null-termination if provided string is shorter than
+        // expectedlength
+        if bytes.count < length {
+            bytes.append(0x0)
+        }
+        
+        let asciiCharacters = bytes.withUnsafeBytes { Array(UnsafeBufferPointer<UInt8>(start: $0, count: bytes.count)) }
+        try set(asciiCharacters, at: offset, capacity: length)
+    }
+    
+    /// Sets correctly formatted `enumeration` raw value at `offset` or throws
+    /// `PackError`.
+    ///
+    /// - parameter enumeration: Value to set.
+    /// - parameter offset:      Offset in receiver's bytes.
+    ///
+    /// - throws: Throws `PackError`.
+    mutating func set<T: Enumeration>(_ enumeration: T, at offset: Data.Index) throws where T.RawValue: MAVLinkNumber {
+        try set(enumeration.rawValue, at: offset)
+    }
+
+    /// Sets correctly formatted `bitmask` raw value at `offset` or throws
+    /// `PackError`.
+    ///
+    /// - parameter enumeration: Value to set.
+    /// - parameter offset:      Offset in receiver's bytes.
+    ///
+    /// - throws: Throws `PackError`.
+    mutating func set<T: MAVLinkBitmask>(_ enumeration: T, at offset: Data.Index) throws where T.RawValue: MAVLinkNumber {
+        try set(enumeration.rawValue, at: offset)
+    }
+}
+
+// MARK: - Additional MAVLink service info
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       ## MAVLink Communication in Swift
+
+This folder contains Swift files used to generate MAVLink Swift Library.
+
+Generated code allows to decode and encode MAVLink Messages into/from specially auto-generated Swift structs and enums according to specific MAVLink XML definition file. It was built from the ground up in Swift utilizing type safety, generics, throwing and other language features to make library more reliable.
+
+Current Swift implementation supports only first version of MAVLink protocol.
+
+## Features
+
+- [x] Swift 3.0 Implementation
+- [x] Message Decoding and Encoding Support
+- [x] Payload Length and CRC Extra Checks
+- [x] Strongly Typed Messages and Enums
+- [x] Precise Parsing Error Reporting
+- [x] Rich Metadata Information
+- [x] Inline Documentation
+
+## Requirements
+
+- Swift 3.0.1
+- Python 2+
+
+## Generating Platform-specific Source Files
+
+To generate MAVLink Swift Library for specific flight controller or specific firmware version you need to follow [this](https://github.com/ArduPilot/mavlink#generating-language-specific-source-files) instructions.
+
+## Installation
+
+MAVLink Swift Library doesn't contain any external dependencies.
+
+#### Manually
+1. Download all files from `Sources` subfolder
+2. Drop downloaded files into your project
+3. Congratulations!  
+
+#### Swift Package Manager (From Pre-generated Repository)
+You can use Swift Package Manager to install MAVLink Swift Library by adding it to your `Package.swift` file:
+
+```swift
+import PackageDescription
+
+let package = Package(
+    name: "GCS",
+    dependencies: [.Package(url: "https://github.com/modnovolyk/MAVLinkSwift", majorVersion: 0)]
+)
+```
+
+```
+$ swift build
+```
+
+Tested with swift build --version: 3.0.2 (swiftpm-11750)
+
+## Usage Example
+
+```swift
+import Foundation
+import MAVLink
+
+let data = Data(bytes: [0xFE, 0x1C, 0x00, 0x01, 0x01, 0x1E, 0x7E, 0x19, 0x01, 0x00, 0x64, 0x6A, 0x8E, 0xBD, 0xB2, 0x0D, 0xDF, 0x3C, 0x5B, 0xD7, 0x8E, 0x3F, 0xEA, 0xC2, 0xAA, 0xBC, 0x56, 0x96, 0x15, 0x3C, 0x51, 0x30, 0xDA, 0x3A, 0x12, 0xAB])
+
+let mavLink = MAVLink()
+
+mavLink.parse(data: data, channel: 0) { message, _ in
+    print(message.debugDescription)
+}
+```
+
+Output:
+
+```
+ATTITUDE: The attitude in the aeronautical frame (right-handed, Z-down, X-front, Y-right).
+Fields:
+	timeBootMs = 72062 : Timestamp (milliseconds since system boot)
+	roll = -0.0695389 : Roll angle (rad, -pi..+pi)
+	pitch = 0.0272282 : Pitch angle (rad, -pi..+pi)
+	yaw = 1.11595 : Yaw angle (rad, -pi..+pi)
+	rollspeed = -0.0208449 : Roll angular speed (rad/s)
+	pitchspeed = 0.00913008 : Pitch angular speed (rad/s)
+	yawspeed = 0.00166465 : Yaw angular speed (rad/s)
+```
+
+## Testing
+
+`Tests` folder includes XCode project that you should run to tests generated Swift code. Before running tests you need to execute `./ardugen.sh` script to generate Swift and C code into right subfolders. C code is used to compare output results and ensure that Swift implementation interprets data in the same way. `ardugen.sh` uses `ardupilotmega.xml` definition file from `Tests/MAVLinkTests/Testdata`.
+
+Unit tests cover conversion of raw data to/from Swift types. Also there are several integration tests that compare work of Swift code and C implementation on real-world tlog file.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              # Xcode
+.DS_Store
+build/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+*.xcworkspace
+!default.xcworkspace
+xcuserdata
+profile
+*.moved-aside
+DerivedData
+.idea/
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        // !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 46;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0F030A351DBED65F00A8D783 /* flight.tlog in Resources */ = {isa = PBXBuildFile; fileRef = 0F030A321DBED65F00A8D783 /* flight.tlog */; };
+		0F0B054B1DA65D8E00BCF0EB /* DataExtensionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F0B054A1DA65D8E00BCF0EB /* DataExtensionsTests.swift */; };
+		0F15A4011DC4B83400914AD9 /* CompareWithCImpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F15A4001DC4B83400914AD9 /* CompareWithCImpTests.swift */; };
+		0F5882AE1DC3C2B00015D834 /* Delegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F5882AD1DC3C2B00015D834 /* Delegate.swift */; };
+		0F6B01C81DEB6F7300991E41 /* ActuatorControlTargetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00B71DEB6F7200991E41 /* ActuatorControlTargetCommonMsg.swift */; };
+		0F6B01C91DEB6F7300991E41 /* ADSBAltitudeTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00B81DEB6F7200991E41 /* ADSBAltitudeTypeCommonEnum.swift */; };
+		0F6B01CA1DEB6F7300991E41 /* ADSBEmitterTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00B91DEB6F7200991E41 /* ADSBEmitterTypeCommonEnum.swift */; };
+		0F6B01CB1DEB6F7300991E41 /* ADSBFlagsCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00BA1DEB6F7200991E41 /* ADSBFlagsCommonEnum.swift */; };
+		0F6B01CC1DEB6F7300991E41 /* ADSBVehicleCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00BB1DEB6F7200991E41 /* ADSBVehicleCommonMsg.swift */; };
+		0F6B01CD1DEB6F7300991E41 /* Ahrs2ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00BC1DEB6F7200991E41 /* Ahrs2ArdupilotmegaMsg.swift */; };
+		0F6B01CE1DEB6F7300991E41 /* Ahrs3ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00BD1DEB6F7200991E41 /* Ahrs3ArdupilotmegaMsg.swift */; };
+		0F6B01CF1DEB6F7300991E41 /* AhrsArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00BE1DEB6F7200991E41 /* AhrsArdupilotmegaMsg.swift */; };
+		0F6B01D01DEB6F7300991E41 /* AirspeedAutocalArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00BF1DEB6F7200991E41 /* AirspeedAutocalArdupilotmegaMsg.swift */; };
+		0F6B01D11DEB6F7300991E41 /* AltitudeCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C01DEB6F7200991E41 /* AltitudeCommonMsg.swift */; };
+		0F6B01D21DEB6F7300991E41 /* ApAdcArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C11DEB6F7200991E41 /* ApAdcArdupilotmegaMsg.swift */; };
+		0F6B01D31DEB6F7300991E41 /* AttitudeCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C21DEB6F7200991E41 /* AttitudeCommonMsg.swift */; };
+		0F6B01D41DEB6F7300991E41 /* AttitudeQuaternionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C31DEB6F7200991E41 /* AttitudeQuaternionCommonMsg.swift */; };
+		0F6B01D51DEB6F7300991E41 /* AttitudeQuaternionCovCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C41DEB6F7200991E41 /* AttitudeQuaternionCovCommonMsg.swift */; };
+		0F6B01D61DEB6F7300991E41 /* AttitudeTargetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C51DEB6F7200991E41 /* AttitudeTargetCommonMsg.swift */; };
+		0F6B01D71DEB6F7300991E41 /* AttPosMocapCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C61DEB6F7200991E41 /* AttPosMocapCommonMsg.swift */; };
+		0F6B01D81DEB6F7300991E41 /* AuthKeyCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C71DEB6F7200991E41 /* AuthKeyCommonMsg.swift */; };
+		0F6B01D91DEB6F7300991E41 /* AutopilotVersionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C81DEB6F7200991E41 /* AutopilotVersionCommonMsg.swift */; };
+		0F6B01DA1DEB6F7300991E41 /* AutopilotVersionRequestArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00C91DEB6F7200991E41 /* AutopilotVersionRequestArdupilotmegaMsg.swift */; };
+		0F6B01DB1DEB6F7300991E41 /* Battery2ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00CA1DEB6F7200991E41 /* Battery2ArdupilotmegaMsg.swift */; };
+		0F6B01DC1DEB6F7300991E41 /* BatteryStatusCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00CB1DEB6F7200991E41 /* BatteryStatusCommonMsg.swift */; };
+		0F6B01DD1DEB6F7300991E41 /* CameraFeedbackArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00CC1DEB6F7200991E41 /* CameraFeedbackArdupilotmegaMsg.swift */; };
+		0F6B01DE1DEB6F7300991E41 /* CameraFeedbackFlagsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00CD1DEB6F7200991E41 /* CameraFeedbackFlagsArdupilotmegaEnum.swift */; };
+		0F6B01DF1DEB6F7300991E41 /* CameraStatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00CE1DEB6F7200991E41 /* CameraStatusArdupilotmegaMsg.swift */; };
+		0F6B01E01DEB6F7300991E41 /* CameraStatusTypesArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00CF1DEB6F7200991E41 /* CameraStatusTypesArdupilotmegaEnum.swift */; };
+		0F6B01E11DEB6F7300991E41 /* CameraTriggerCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D01DEB6F7200991E41 /* CameraTriggerCommonMsg.swift */; };
+		0F6B01E21DEB6F7300991E41 /* ChangeOperatorControlAckCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D11DEB6F7200991E41 /* ChangeOperatorControlAckCommonMsg.swift */; };
+		0F6B01E31DEB6F7300991E41 /* ChangeOperatorControlCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D21DEB6F7200991E41 /* ChangeOperatorControlCommonMsg.swift */; };
+		0F6B01E41DEB6F7300991E41 /* CollisionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D31DEB6F7200991E41 /* CollisionCommonMsg.swift */; };
+		0F6B01E51DEB6F7300991E41 /* CommandAckCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D41DEB6F7200991E41 /* CommandAckCommonMsg.swift */; };
+		0F6B01E61DEB6F7300991E41 /* CommandIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D51DEB6F7200991E41 /* CommandIntCommonMsg.swift */; };
+		0F6B01E71DEB6F7300991E41 /* CommandLongCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D61DEB6F7200991E41 /* CommandLongCommonMsg.swift */; };
+		0F6B01E81DEB6F7300991E41 /* CompassmotStatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D71DEB6F7200991E41 /* CompassmotStatusArdupilotmegaMsg.swift */; };
+		0F6B01E91DEB6F7300991E41 /* ControlSystemStateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D81DEB6F7200991E41 /* ControlSystemStateCommonMsg.swift */; };
+		0F6B01EA1DEB6F7300991E41 /* Data16ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00D91DEB6F7200991E41 /* Data16ArdupilotmegaMsg.swift */; };
+		0F6B01EB1DEB6F7300991E41 /* Data32ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00DA1DEB6F7200991E41 /* Data32ArdupilotmegaMsg.swift */; };
+		0F6B01EC1DEB6F7300991E41 /* Data64ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00DB1DEB6F7200991E41 /* Data64ArdupilotmegaMsg.swift */; };
+		0F6B01ED1DEB6F7300991E41 /* Data96ArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00DC1DEB6F7200991E41 /* Data96ArdupilotmegaMsg.swift */; };
+		0F6B01EE1DEB6F7300991E41 /* DataStreamCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00DD1DEB6F7200991E41 /* DataStreamCommonMsg.swift */; };
+		0F6B01EF1DEB6F7300991E41 /* DataTransmissionHandshakeCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00DE1DEB6F7200991E41 /* DataTransmissionHandshakeCommonMsg.swift */; };
+		0F6B01F01DEB6F7300991E41 /* DebugCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00DF1DEB6F7200991E41 /* DebugCommonMsg.swift */; };
+		0F6B01F11DEB6F7300991E41 /* DebugVectCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E01DEB6F7200991E41 /* DebugVectCommonMsg.swift */; };
+		0F6B01F21DEB6F7300991E41 /* DigicamConfigureArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E11DEB6F7200991E41 /* DigicamConfigureArdupilotmegaMsg.swift */; };
+		0F6B01F31DEB6F7300991E41 /* DigicamControlArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E21DEB6F7200991E41 /* DigicamControlArdupilotmegaMsg.swift */; };
+		0F6B01F41DEB6F7300991E41 /* DistanceSensorCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E31DEB6F7200991E41 /* DistanceSensorCommonMsg.swift */; };
+		0F6B01F51DEB6F7300991E41 /* EkfStatusFlagsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E41DEB6F7200991E41 /* EkfStatusFlagsArdupilotmegaEnum.swift */; };
+		0F6B01F61DEB6F7300991E41 /* EkfStatusReportArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E51DEB6F7200991E41 /* EkfStatusReportArdupilotmegaMsg.swift */; };
+		0F6B01F71DEB6F7300991E41 /* EncapsulatedDataCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E61DEB6F7200991E41 /* EncapsulatedDataCommonMsg.swift */; };
+		0F6B01F81DEB6F7300991E41 /* EstimatorStatusCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E71DEB6F7200991E41 /* EstimatorStatusCommonMsg.swift */; };
+		0F6B01F91DEB6F7300991E41 /* EstimatorStatusFlagsCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E81DEB6F7200991E41 /* EstimatorStatusFlagsCommonEnum.swift */; };
+		0F6B01FA1DEB6F7300991E41 /* ExtendedSysStateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00E91DEB6F7200991E41 /* ExtendedSysStateCommonMsg.swift */; };
+		0F6B01FB1DEB6F7300991E41 /* FenceActionCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00EA1DEB6F7200991E41 /* FenceActionCommonEnum.swift */; };
+		0F6B01FC1DEB6F7300991E41 /* FenceBreachCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00EB1DEB6F7200991E41 /* FenceBreachCommonEnum.swift */; };
+		0F6B01FD1DEB6F7300991E41 /* FenceFetchPointArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00EC1DEB6F7200991E41 /* FenceFetchPointArdupilotmegaMsg.swift */; };
+		0F6B01FE1DEB6F7300991E41 /* FencePointArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00ED1DEB6F7200991E41 /* FencePointArdupilotmegaMsg.swift */; };
+		0F6B01FF1DEB6F7300991E41 /* FenceStatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00EE1DEB6F7200991E41 /* FenceStatusArdupilotmegaMsg.swift */; };
+		0F6B02001DEB6F7300991E41 /* FileTransferProtocolCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00EF1DEB6F7200991E41 /* FileTransferProtocolCommonMsg.swift */; };
+		0F6B02011DEB6F7300991E41 /* FirmwareVersionTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F01DEB6F7200991E41 /* FirmwareVersionTypeCommonEnum.swift */; };
+		0F6B02021DEB6F7300991E41 /* FollowTargetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F11DEB6F7200991E41 /* FollowTargetCommonMsg.swift */; };
+		0F6B02031DEB6F7300991E41 /* GimbalAxisArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F21DEB6F7200991E41 /* GimbalAxisArdupilotmegaEnum.swift */; };
+		0F6B02041DEB6F7300991E41 /* GimbalAxisCalibrationRequiredArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F31DEB6F7200991E41 /* GimbalAxisCalibrationRequiredArdupilotmegaEnum.swift */; };
+		0F6B02051DEB6F7300991E41 /* GimbalAxisCalibrationStatusArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F41DEB6F7200991E41 /* GimbalAxisCalibrationStatusArdupilotmegaEnum.swift */; };
+		0F6B02061DEB6F7300991E41 /* GimbalControlArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F51DEB6F7200991E41 /* GimbalControlArdupilotmegaMsg.swift */; };
+		0F6B02071DEB6F7300991E41 /* GimbalReportArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F61DEB6F7200991E41 /* GimbalReportArdupilotmegaMsg.swift */; };
+		0F6B02081DEB6F7300991E41 /* GimbalTorqueCmdReportArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F71DEB6F7200991E41 /* GimbalTorqueCmdReportArdupilotmegaMsg.swift */; };
+		0F6B02091DEB6F7300991E41 /* GlobalPositionIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F81DEB6F7200991E41 /* GlobalPositionIntCommonMsg.swift */; };
+		0F6B020A1DEB6F7300991E41 /* GlobalPositionIntCovCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00F91DEB6F7200991E41 /* GlobalPositionIntCovCommonMsg.swift */; };
+		0F6B020B1DEB6F7300991E41 /* GlobalVisionPositionEstimateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00FA1DEB6F7200991E41 /* GlobalVisionPositionEstimateCommonMsg.swift */; };
+		0F6B020C1DEB6F7300991E41 /* GoproBurstRateArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00FB1DEB6F7200991E41 /* GoproBurstRateArdupilotmegaEnum.swift */; };
+		0F6B020D1DEB6F7300991E41 /* GoproCaptureModeArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00FC1DEB6F7200991E41 /* GoproCaptureModeArdupilotmegaEnum.swift */; };
+		0F6B020E1DEB6F7300991E41 /* GoproChargingArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00FD1DEB6F7200991E41 /* GoproChargingArdupilotmegaEnum.swift */; };
+		0F6B020F1DEB6F7300991E41 /* GoproCommandArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00FE1DEB6F7200991E41 /* GoproCommandArdupilotmegaEnum.swift */; };
+		0F6B02101DEB6F7300991E41 /* GoproFieldOfViewArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B00FF1DEB6F7200991E41 /* GoproFieldOfViewArdupilotmegaEnum.swift */; };
+		0F6B02111DEB6F7300991E41 /* GoproFrameRateArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01001DEB6F7200991E41 /* GoproFrameRateArdupilotmegaEnum.swift */; };
+		0F6B02121DEB6F7300991E41 /* GoproGetRequestArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01011DEB6F7200991E41 /* GoproGetRequestArdupilotmegaMsg.swift */; };
+		0F6B02131DEB6F7300991E41 /* GoproGetResponseArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01021DEB6F7200991E41 /* GoproGetResponseArdupilotmegaMsg.swift */; };
+		0F6B02141DEB6F7300991E41 /* GoproHeartbeatArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01031DEB6F7200991E41 /* GoproHeartbeatArdupilotmegaMsg.swift */; };
+		0F6B02151DEB6F7300991E41 /* GoproHeartbeatFlagsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01041DEB6F7200991E41 /* GoproHeartbeatFlagsArdupilotmegaEnum.swift */; };
+		0F6B02161DEB6F7300991E41 /* GoproHeartbeatStatusArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01051DEB6F7200991E41 /* GoproHeartbeatStatusArdupilotmegaEnum.swift */; };
+		0F6B02171DEB6F7300991E41 /* GoproModelArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01061DEB6F7200991E41 /* GoproModelArdupilotmegaEnum.swift */; };
+		0F6B02181DEB6F7300991E41 /* GoproPhotoResolutionArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01071DEB6F7200991E41 /* GoproPhotoResolutionArdupilotmegaEnum.swift */; };
+		0F6B02191DEB6F7300991E41 /* GoproProtuneColourArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01081DEB6F7200991E41 /* GoproProtuneColourArdupilotmegaEnum.swift */; };
+		0F6B021A1DEB6F7300991E41 /* GoproProtuneExposureArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01091DEB6F7200991E41 /* GoproProtuneExposureArdupilotmegaEnum.swift */; };
+		0F6B021B1DEB6F7300991E41 /* GoproProtuneGainArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B010A1DEB6F7200991E41 /* GoproProtuneGainArdupilotmegaEnum.swift */; };
+		0F6B021C1DEB6F7300991E41 /* GoproProtuneSharpnessArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B010B1DEB6F7200991E41 /* GoproProtuneSharpnessArdupilotmegaEnum.swift */; };
+		0F6B021D1DEB6F7300991E41 /* GoproProtuneWhiteBalanceArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B010C1DEB6F7200991E41 /* GoproProtuneWhiteBalanceArdupilotmegaEnum.swift */; };
+		0F6B021E1DEB6F7300991E41 /* GoproRequestStatusArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B010D1DEB6F7200991E41 /* GoproRequestStatusArdupilotmegaEnum.swift */; };
+		0F6B021F1DEB6F7300991E41 /* GoproResolutionArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B010E1DEB6F7200991E41 /* GoproResolutionArdupilotmegaEnum.swift */; };
+		0F6B02201DEB6F7300991E41 /* GoproSetRequestArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B010F1DEB6F7200991E41 /* GoproSetRequestArdupilotmegaMsg.swift */; };
+		0F6B02211DEB6F7300991E41 /* GoproSetResponseArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01101DEB6F7200991E41 /* GoproSetResponseArdupilotmegaMsg.swift */; };
+		0F6B02221DEB6F7300991E41 /* GoproVideoSettingsFlagsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01111DEB6F7200991E41 /* GoproVideoSettingsFlagsArdupilotmegaEnum.swift */; };
+		0F6B02231DEB6F7300991E41 /* GPS2RawCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01121DEB6F7200991E41 /* GPS2RawCommonMsg.swift */; };
+		0F6B02241DEB6F7300991E41 /* GPS2RTKCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01131DEB6F7200991E41 /* GPS2RTKCommonMsg.swift */; };
+		0F6B02251DEB6F7300991E41 /* GPSFixTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01141DEB6F7200991E41 /* GPSFixTypeCommonEnum.swift */; };
+		0F6B02261DEB6F7300991E41 /* GPSGlobalOriginCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01151DEB6F7200991E41 /* GPSGlobalOriginCommonMsg.swift */; };
+		0F6B02271DEB6F7300991E41 /* GPSInjectDataCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01161DEB6F7200991E41 /* GPSInjectDataCommonMsg.swift */; };
+		0F6B02281DEB6F7300991E41 /* GPSInputCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01171DEB6F7200991E41 /* GPSInputCommonMsg.swift */; };
+		0F6B02291DEB6F7300991E41 /* GPSInputIgnoreFlagsCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01181DEB6F7200991E41 /* GPSInputIgnoreFlagsCommonEnum.swift */; };
+		0F6B022A1DEB6F7300991E41 /* GPSRawIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01191DEB6F7200991E41 /* GPSRawIntCommonMsg.swift */; };
+		0F6B022B1DEB6F7300991E41 /* GPSRtcmDataCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B011A1DEB6F7200991E41 /* GPSRtcmDataCommonMsg.swift */; };
+		0F6B022C1DEB6F7300991E41 /* GPSRTKCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B011B1DEB6F7200991E41 /* GPSRTKCommonMsg.swift */; };
+		0F6B022D1DEB6F7300991E41 /* GPSStatusCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B011C1DEB6F7200991E41 /* GPSStatusCommonMsg.swift */; };
+		0F6B022E1DEB6F7300991E41 /* GripperActionsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B011D1DEB6F7200991E41 /* GripperActionsArdupilotmegaEnum.swift */; };
+		0F6B022F1DEB6F7300991E41 /* HeartbeatCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B011E1DEB6F7200991E41 /* HeartbeatCommonMsg.swift */; };
+		0F6B02301DEB6F7300991E41 /* HighresIMUCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B011F1DEB6F7200991E41 /* HighresIMUCommonMsg.swift */; };
+		0F6B02311DEB6F7300991E41 /* HilActuatorControlsCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01201DEB6F7200991E41 /* HilActuatorControlsCommonMsg.swift */; };
+		0F6B02321DEB6F7300991E41 /* HilControlsCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01211DEB6F7200991E41 /* HilControlsCommonMsg.swift */; };
+		0F6B02331DEB6F7300991E41 /* HilGPSCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01221DEB6F7200991E41 /* HilGPSCommonMsg.swift */; };
+		0F6B02341DEB6F7300991E41 /* HilOpticalFlowCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01231DEB6F7200991E41 /* HilOpticalFlowCommonMsg.swift */; };
+		0F6B02351DEB6F7300991E41 /* HilRCInputsRawCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01241DEB6F7200991E41 /* HilRCInputsRawCommonMsg.swift */; };
+		0F6B02361DEB6F7300991E41 /* HilSensorCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01251DEB6F7200991E41 /* HilSensorCommonMsg.swift */; };
+		0F6B02371DEB6F7300991E41 /* HilStateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01261DEB6F7200991E41 /* HilStateCommonMsg.swift */; };
+		0F6B02381DEB6F7300991E41 /* HilStateQuaternionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01271DEB6F7200991E41 /* HilStateQuaternionCommonMsg.swift */; };
+		0F6B02391DEB6F7300991E41 /* HomePositionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01281DEB6F7200991E41 /* HomePositionCommonMsg.swift */; };
+		0F6B023A1DEB6F7300991E41 /* HwstatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01291DEB6F7200991E41 /* HwstatusArdupilotmegaMsg.swift */; };
+		0F6B023B1DEB6F7300991E41 /* LandingTargetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B012A1DEB6F7200991E41 /* LandingTargetCommonMsg.swift */; };
+		0F6B023C1DEB6F7300991E41 /* LedControlArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B012B1DEB6F7200991E41 /* LedControlArdupilotmegaMsg.swift */; };
+		0F6B023D1DEB6F7300991E41 /* LedControlPatternArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B012C1DEB6F7200991E41 /* LedControlPatternArdupilotmegaEnum.swift */; };
+		0F6B023E1DEB6F7300991E41 /* LimitModuleArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B012D1DEB6F7200991E41 /* LimitModuleArdupilotmegaEnum.swift */; };
+		0F6B023F1DEB6F7300991E41 /* LimitsStateArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B012E1DEB6F7200991E41 /* LimitsStateArdupilotmegaEnum.swift */; };
+		0F6B02401DEB6F7300991E41 /* LimitsStatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B012F1DEB6F7200991E41 /* LimitsStatusArdupilotmegaMsg.swift */; };
+		0F6B02411DEB6F7300991E41 /* LocalPositionNEDCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01301DEB6F7200991E41 /* LocalPositionNEDCommonMsg.swift */; };
+		0F6B02421DEB6F7300991E41 /* LocalPositionNEDCovCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01311DEB6F7200991E41 /* LocalPositionNEDCovCommonMsg.swift */; };
+		0F6B02431DEB6F7300991E41 /* LocalPositionNEDSystemGlobalOffsetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01321DEB6F7200991E41 /* LocalPositionNEDSystemGlobalOffsetCommonMsg.swift */; };
+		0F6B02441DEB6F7300991E41 /* LogDataCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01331DEB6F7200991E41 /* LogDataCommonMsg.swift */; };
+		0F6B02451DEB6F7300991E41 /* LogEntryCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01341DEB6F7200991E41 /* LogEntryCommonMsg.swift */; };
+		0F6B02461DEB6F7300991E41 /* LogEraseCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01351DEB6F7200991E41 /* LogEraseCommonMsg.swift */; };
+		0F6B02471DEB6F7300991E41 /* LogRequestDataCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01361DEB6F7200991E41 /* LogRequestDataCommonMsg.swift */; };
+		0F6B02481DEB6F7300991E41 /* LogRequestEndCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01371DEB6F7200991E41 /* LogRequestEndCommonMsg.swift */; };
+		0F6B02491DEB6F7300991E41 /* LogRequestListCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01381DEB6F7200991E41 /* LogRequestListCommonMsg.swift */; };
+		0F6B024A1DEB6F7300991E41 /* MagCalProgressArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01391DEB6F7200991E41 /* MagCalProgressArdupilotmegaMsg.swift */; };
+		0F6B024B1DEB6F7300991E41 /* MagCalReportArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B013A1DEB6F7200991E41 /* MagCalReportArdupilotmegaMsg.swift */; };
+		0F6B024C1DEB6F7300991E41 /* MagCalStatusArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B013B1DEB6F7200991E41 /* MagCalStatusArdupilotmegaEnum.swift */; };
+		0F6B024D1DEB6F7300991E41 /* ManualControlCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B013C1DEB6F7200991E41 /* ManualControlCommonMsg.swift */; };
+		0F6B024E1DEB6F7300991E41 /* ManualSetpointCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B013D1DEB6F7200991E41 /* ManualSetpointCommonMsg.swift */; };
+		0F6B024F1DEB6F7300991E41 /* MAVAutopilotCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B013E1DEB6F7200991E41 /* MAVAutopilotCommonEnum.swift */; };
+		0F6B02501DEB6F7300991E41 /* MAVBatteryFunctionCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B013F1DEB6F7200991E41 /* MAVBatteryFunctionCommonEnum.swift */; };
+		0F6B02511DEB6F7300991E41 /* MAVBatteryTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01401DEB6F7200991E41 /* MAVBatteryTypeCommonEnum.swift */; };
+		0F6B02521DEB6F7300991E41 /* MAVCmdAckCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01411DEB6F7200991E41 /* MAVCmdAckCommonEnum.swift */; };
+		0F6B02531DEB6F7300991E41 /* MAVCmdArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01421DEB6F7200991E41 /* MAVCmdArdupilotmegaEnum.swift */; };
+		0F6B02541DEB6F7300991E41 /* MAVCollisionActionCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01431DEB6F7200991E41 /* MAVCollisionActionCommonEnum.swift */; };
+		0F6B02551DEB6F7300991E41 /* MAVCollisionSrcCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01441DEB6F7200991E41 /* MAVCollisionSrcCommonEnum.swift */; };
+		0F6B02561DEB6F7300991E41 /* MAVCollisionThreatLevelCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01451DEB6F7200991E41 /* MAVCollisionThreatLevelCommonEnum.swift */; };
+		0F6B02571DEB6F7300991E41 /* MAVComponentCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01461DEB6F7200991E41 /* MAVComponentCommonEnum.swift */; };
+		0F6B02581DEB6F7300991E41 /* MAVDataStreamCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01471DEB6F7200991E41 /* MAVDataStreamCommonEnum.swift */; };
+		0F6B02591DEB6F7300991E41 /* MAVDistanceSensorCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01481DEB6F7200991E41 /* MAVDistanceSensorCommonEnum.swift */; };
+		0F6B025A1DEB6F7300991E41 /* MAVDoRepositionFlagsCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01491DEB6F7200991E41 /* MAVDoRepositionFlagsCommonEnum.swift */; };
+		0F6B025B1DEB6F7300991E41 /* MAVEstimatorTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B014A1DEB6F7200991E41 /* MAVEstimatorTypeCommonEnum.swift */; };
+		0F6B025C1DEB6F7300991E41 /* MAVFrameCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B014B1DEB6F7200991E41 /* MAVFrameCommonEnum.swift */; };
+		0F6B025D1DEB6F7300991E41 /* MAVGotoCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B014C1DEB6F7200991E41 /* MAVGotoCommonEnum.swift */; };
+		0F6B025E1DEB6F7300991E41 /* MAVLandedStateCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B014D1DEB6F7200991E41 /* MAVLandedStateCommonEnum.swift */; };
+		0F6B025F1DEB6F7300991E41 /* MAVLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B014E1DEB6F7200991E41 /* MAVLink.swift */; };
+		0F6B02601DEB6F7300991E41 /* MavlinkDataStreamTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B014F1DEB6F7200991E41 /* MavlinkDataStreamTypeCommonEnum.swift */; };
+		0F6B02611DEB6F7300991E41 /* MAVMissionResultCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01501DEB6F7200991E41 /* MAVMissionResultCommonEnum.swift */; };
+		0F6B02621DEB6F7300991E41 /* MAVModeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01511DEB6F7200991E41 /* MAVModeCommonEnum.swift */; };
+		0F6B02631DEB6F7300991E41 /* MAVModeFlagCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01521DEB6F7200991E41 /* MAVModeFlagCommonEnum.swift */; };
+		0F6B02641DEB6F7300991E41 /* MAVModeFlagDecodePositionCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01531DEB6F7200991E41 /* MAVModeFlagDecodePositionCommonEnum.swift */; };
+		0F6B02651DEB6F7300991E41 /* MAVModeGimbalArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01541DEB6F7200991E41 /* MAVModeGimbalArdupilotmegaEnum.swift */; };
+		0F6B02661DEB6F7300991E41 /* MAVMountModeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01551DEB6F7200991E41 /* MAVMountModeCommonEnum.swift */; };
+		0F6B02671DEB6F7300991E41 /* MAVParamTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01561DEB6F7200991E41 /* MAVParamTypeCommonEnum.swift */; };
+		0F6B02681DEB6F7300991E41 /* MAVPowerStatusCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01571DEB6F7200991E41 /* MAVPowerStatusCommonEnum.swift */; };
+		0F6B02691DEB6F7300991E41 /* MAVProtocolCapabilityCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01581DEB6F7200991E41 /* MAVProtocolCapabilityCommonEnum.swift */; };
+		0F6B026A1DEB6F7300991E41 /* MAVRemoteLogDataBlockCommandsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01591DEB6F7200991E41 /* MAVRemoteLogDataBlockCommandsArdupilotmegaEnum.swift */; };
+		0F6B026B1DEB6F7300991E41 /* MAVRemoteLogDataBlockStatusesArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B015A1DEB6F7200991E41 /* MAVRemoteLogDataBlockStatusesArdupilotmegaEnum.swift */; };
+		0F6B026C1DEB6F7300991E41 /* MAVResultCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B015B1DEB6F7200991E41 /* MAVResultCommonEnum.swift */; };
+		0F6B026D1DEB6F7300991E41 /* MAVROICommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B015C1DEB6F7200991E41 /* MAVROICommonEnum.swift */; };
+		0F6B026E1DEB6F7300991E41 /* MAVSensorOrientationCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B015D1DEB6F7200991E41 /* MAVSensorOrientationCommonEnum.swift */; };
+		0F6B026F1DEB6F7300991E41 /* MAVSeverityCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B015E1DEB6F7200991E41 /* MAVSeverityCommonEnum.swift */; };
+		0F6B02701DEB6F7300991E41 /* MAVStateCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B015F1DEB6F7200991E41 /* MAVStateCommonEnum.swift */; };
+		0F6B02711DEB6F7300991E41 /* MAVSysStatusSensorCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01601DEB6F7200991E41 /* MAVSysStatusSensorCommonEnum.swift */; };
+		0F6B02721DEB6F7300991E41 /* MAVTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01611DEB6F7200991E41 /* MAVTypeCommonEnum.swift */; };
+		0F6B02731DEB6F7300991E41 /* MAVVTOLStateCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01621DEB6F7200991E41 /* MAVVTOLStateCommonEnum.swift */; };
+		0F6B02741DEB6F7300991E41 /* MeminfoArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01631DEB6F7200991E41 /* MeminfoArdupilotmegaMsg.swift */; };
+		0F6B02751DEB6F7300991E41 /* MemoryVectCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01641DEB6F7200991E41 /* MemoryVectCommonMsg.swift */; };
+		0F6B02761DEB6F7300991E41 /* MessageIntervalCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01651DEB6F7200991E41 /* MessageIntervalCommonMsg.swift */; };
+		0F6B02771DEB6F7300991E41 /* MissionAckCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01661DEB6F7200991E41 /* MissionAckCommonMsg.swift */; };
+		0F6B02781DEB6F7300991E41 /* MissionClearAllCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01671DEB6F7200991E41 /* MissionClearAllCommonMsg.swift */; };
+		0F6B02791DEB6F7300991E41 /* MissionCountCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01681DEB6F7200991E41 /* MissionCountCommonMsg.swift */; };
+		0F6B027A1DEB6F7300991E41 /* MissionCurrentCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01691DEB6F7200991E41 /* MissionCurrentCommonMsg.swift */; };
+		0F6B027B1DEB6F7300991E41 /* MissionItemCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B016A1DEB6F7200991E41 /* MissionItemCommonMsg.swift */; };
+		0F6B027C1DEB6F7300991E41 /* MissionItemIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B016B1DEB6F7200991E41 /* MissionItemIntCommonMsg.swift */; };
+		0F6B027D1DEB6F7300991E41 /* MissionItemReachedCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B016C1DEB6F7200991E41 /* MissionItemReachedCommonMsg.swift */; };
+		0F6B027E1DEB6F7300991E41 /* MissionRequestCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B016D1DEB6F7200991E41 /* MissionRequestCommonMsg.swift */; };
+		0F6B027F1DEB6F7300991E41 /* MissionRequestIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B016E1DEB6F7200991E41 /* MissionRequestIntCommonMsg.swift */; };
+		0F6B02801DEB6F7300991E41 /* MissionRequestListCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B016F1DEB6F7200991E41 /* MissionRequestListCommonMsg.swift */; };
+		0F6B02811DEB6F7300991E41 /* MissionRequestPartialListCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01701DEB6F7200991E41 /* MissionRequestPartialListCommonMsg.swift */; };
+		0F6B02821DEB6F7300991E41 /* MissionSetCurrentCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01711DEB6F7200991E41 /* MissionSetCurrentCommonMsg.swift */; };
+		0F6B02831DEB6F7300991E41 /* MissionWritePartialListCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01721DEB6F7200991E41 /* MissionWritePartialListCommonMsg.swift */; };
+		0F6B02841DEB6F7300991E41 /* MotorTestThrottleTypeCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01731DEB6F7200991E41 /* MotorTestThrottleTypeCommonEnum.swift */; };
+		0F6B02851DEB6F7300991E41 /* MountConfigureArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01741DEB6F7200991E41 /* MountConfigureArdupilotmegaMsg.swift */; };
+		0F6B02861DEB6F7300991E41 /* MountControlArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01751DEB6F7200991E41 /* MountControlArdupilotmegaMsg.swift */; };
+		0F6B02871DEB6F7300991E41 /* MountStatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01761DEB6F7200991E41 /* MountStatusArdupilotmegaMsg.swift */; };
+		0F6B02881DEB6F7300991E41 /* NamedValueFloatCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01771DEB6F7200991E41 /* NamedValueFloatCommonMsg.swift */; };
+		0F6B02891DEB6F7300991E41 /* NamedValueIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01781DEB6F7200991E41 /* NamedValueIntCommonMsg.swift */; };
+		0F6B028A1DEB6F7300991E41 /* NavControllerOutputCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01791DEB6F7200991E41 /* NavControllerOutputCommonMsg.swift */; };
+		0F6B028B1DEB6F7300991E41 /* OpticalFlowCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B017A1DEB6F7200991E41 /* OpticalFlowCommonMsg.swift */; };
+		0F6B028C1DEB6F7300991E41 /* OpticalFlowRadCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B017B1DEB6F7300991E41 /* OpticalFlowRadCommonMsg.swift */; };
+		0F6B028D1DEB6F7300991E41 /* ParachuteActionArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B017C1DEB6F7300991E41 /* ParachuteActionArdupilotmegaEnum.swift */; };
+		0F6B028E1DEB6F7300991E41 /* ParamMapRCCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B017D1DEB6F7300991E41 /* ParamMapRCCommonMsg.swift */; };
+		0F6B028F1DEB6F7300991E41 /* ParamRequestListCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B017E1DEB6F7300991E41 /* ParamRequestListCommonMsg.swift */; };
+		0F6B02901DEB6F7300991E41 /* ParamRequestReadCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B017F1DEB6F7300991E41 /* ParamRequestReadCommonMsg.swift */; };
+		0F6B02911DEB6F7300991E41 /* ParamSetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01801DEB6F7300991E41 /* ParamSetCommonMsg.swift */; };
+		0F6B02921DEB6F7300991E41 /* ParamValueCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01811DEB6F7300991E41 /* ParamValueCommonMsg.swift */; };
+		0F6B02931DEB6F7300991E41 /* PidTuningArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01821DEB6F7300991E41 /* PidTuningArdupilotmegaMsg.swift */; };
+		0F6B02941DEB6F7300991E41 /* PidTuningAxisArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01831DEB6F7300991E41 /* PidTuningAxisArdupilotmegaEnum.swift */; };
+		0F6B02951DEB6F7300991E41 /* PingCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01841DEB6F7300991E41 /* PingCommonMsg.swift */; };
+		0F6B02961DEB6F7300991E41 /* PositionTargetGlobalIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01851DEB6F7300991E41 /* PositionTargetGlobalIntCommonMsg.swift */; };
+		0F6B02971DEB6F7300991E41 /* PositionTargetLocalNEDCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01861DEB6F7300991E41 /* PositionTargetLocalNEDCommonMsg.swift */; };
+		0F6B02981DEB6F7300991E41 /* PowerStatusCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01871DEB6F7300991E41 /* PowerStatusCommonMsg.swift */; };
+		0F6B02991DEB6F7300991E41 /* RadioArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01881DEB6F7300991E41 /* RadioArdupilotmegaMsg.swift */; };
+		0F6B029A1DEB6F7300991E41 /* RadioStatusCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01891DEB6F7300991E41 /* RadioStatusCommonMsg.swift */; };
+		0F6B029B1DEB6F7300991E41 /* RallyFetchPointArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B018A1DEB6F7300991E41 /* RallyFetchPointArdupilotmegaMsg.swift */; };
+		0F6B029C1DEB6F7300991E41 /* RallyFlagsArdupilotmegaEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B018B1DEB6F7300991E41 /* RallyFlagsArdupilotmegaEnum.swift */; };
+		0F6B029D1DEB6F7300991E41 /* RallyPointArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B018C1DEB6F7300991E41 /* RallyPointArdupilotmegaMsg.swift */; };
+		0F6B029E1DEB6F7300991E41 /* RangefinderArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B018D1DEB6F7300991E41 /* RangefinderArdupilotmegaMsg.swift */; };
+		0F6B029F1DEB6F7300991E41 /* RawIMUCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B018E1DEB6F7300991E41 /* RawIMUCommonMsg.swift */; };
+		0F6B02A01DEB6F7300991E41 /* RawPressureCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B018F1DEB6F7300991E41 /* RawPressureCommonMsg.swift */; };
+		0F6B02A11DEB6F7300991E41 /* RCChannelsCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01901DEB6F7300991E41 /* RCChannelsCommonMsg.swift */; };
+		0F6B02A21DEB6F7300991E41 /* RCChannelsOverrideCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01911DEB6F7300991E41 /* RCChannelsOverrideCommonMsg.swift */; };
+		0F6B02A31DEB6F7300991E41 /* RCChannelsRawCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01921DEB6F7300991E41 /* RCChannelsRawCommonMsg.swift */; };
+		0F6B02A41DEB6F7300991E41 /* RCChannelsScaledCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01931DEB6F7300991E41 /* RCChannelsScaledCommonMsg.swift */; };
+		0F6B02A51DEB6F7300991E41 /* RemoteLogBlockStatusArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01941DEB6F7300991E41 /* RemoteLogBlockStatusArdupilotmegaMsg.swift */; };
+		0F6B02A61DEB6F7300991E41 /* RemoteLogDataBlockArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01951DEB6F7300991E41 /* RemoteLogDataBlockArdupilotmegaMsg.swift */; };
+		0F6B02A71DEB6F7300991E41 /* RequestDataStreamCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01961DEB6F7300991E41 /* RequestDataStreamCommonMsg.swift */; };
+		0F6B02A81DEB6F7300991E41 /* ResourceRequestCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01971DEB6F7300991E41 /* ResourceRequestCommonMsg.swift */; };
+		0F6B02A91DEB6F7300991E41 /* RpmArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01981DEB6F7300991E41 /* RpmArdupilotmegaMsg.swift */; };
+		0F6B02AA1DEB6F7300991E41 /* SafetyAllowedAreaCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01991DEB6F7300991E41 /* SafetyAllowedAreaCommonMsg.swift */; };
+		0F6B02AB1DEB6F7300991E41 /* SafetySetAllowedAreaCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B019A1DEB6F7300991E41 /* SafetySetAllowedAreaCommonMsg.swift */; };
+		0F6B02AC1DEB6F7300991E41 /* ScaledIMU2CommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B019B1DEB6F7300991E41 /* ScaledIMU2CommonMsg.swift */; };
+		0F6B02AD1DEB6F7300991E41 /* ScaledImu3CommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B019C1DEB6F7300991E41 /* ScaledImu3CommonMsg.swift */; };
+		0F6B02AE1DEB6F7300991E41 /* ScaledIMUCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B019D1DEB6F7300991E41 /* ScaledIMUCommonMsg.swift */; };
+		0F6B02AF1DEB6F7300991E41 /* ScaledPressure2CommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B019E1DEB6F7300991E41 /* ScaledPressure2CommonMsg.swift */; };
+		0F6B02B01DEB6F7300991E41 /* ScaledPressure3CommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B019F1DEB6F7300991E41 /* ScaledPressure3CommonMsg.swift */; };
+		0F6B02B11DEB6F7300991E41 /* ScaledPressureCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A01DEB6F7300991E41 /* ScaledPressureCommonMsg.swift */; };
+		0F6B02B21DEB6F7300991E41 /* SensorOffsetsArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A11DEB6F7300991E41 /* SensorOffsetsArdupilotmegaMsg.swift */; };
+		0F6B02B31DEB6F7300991E41 /* SerialControlCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A21DEB6F7300991E41 /* SerialControlCommonMsg.swift */; };
+		0F6B02B41DEB6F7300991E41 /* SerialControlDevCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A31DEB6F7300991E41 /* SerialControlDevCommonEnum.swift */; };
+		0F6B02B51DEB6F7300991E41 /* SerialControlFlagCommonEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A41DEB6F7300991E41 /* SerialControlFlagCommonEnum.swift */; };
+		0F6B02B61DEB6F7300991E41 /* ServoOutputRawCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A51DEB6F7300991E41 /* ServoOutputRawCommonMsg.swift */; };
+		0F6B02B71DEB6F7300991E41 /* SetActuatorControlTargetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A61DEB6F7300991E41 /* SetActuatorControlTargetCommonMsg.swift */; };
+		0F6B02B81DEB6F7300991E41 /* SetAttitudeTargetCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A71DEB6F7300991E41 /* SetAttitudeTargetCommonMsg.swift */; };
+		0F6B02B91DEB6F7300991E41 /* SetGPSGlobalOriginCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A81DEB6F7300991E41 /* SetGPSGlobalOriginCommonMsg.swift */; };
+		0F6B02BA1DEB6F7300991E41 /* SetHomePositionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01A91DEB6F7300991E41 /* SetHomePositionCommonMsg.swift */; };
+		0F6B02BB1DEB6F7300991E41 /* SetMagOffsetsArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01AA1DEB6F7300991E41 /* SetMagOffsetsArdupilotmegaMsg.swift */; };
+		0F6B02BC1DEB6F7300991E41 /* SetModeCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01AB1DEB6F7300991E41 /* SetModeCommonMsg.swift */; };
+		0F6B02BD1DEB6F7300991E41 /* SetPositionTargetGlobalIntCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01AC1DEB6F7300991E41 /* SetPositionTargetGlobalIntCommonMsg.swift */; };
+		0F6B02BE1DEB6F7300991E41 /* SetPositionTargetLocalNEDCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01AD1DEB6F7300991E41 /* SetPositionTargetLocalNEDCommonMsg.swift */; };
+		0F6B02BF1DEB6F7300991E41 /* SimstateArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01AE1DEB6F7300991E41 /* SimstateArdupilotmegaMsg.swift */; };
+		0F6B02C01DEB6F7300991E41 /* SimStateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01AF1DEB6F7300991E41 /* SimStateCommonMsg.swift */; };
+		0F6B02C11DEB6F7300991E41 /* StatustextCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B01DEB6F7300991E41 /* StatustextCommonMsg.swift */; };
+		0F6B02C21DEB6F7300991E41 /* SysStatusCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B11DEB6F7300991E41 /* SysStatusCommonMsg.swift */; };
+		0F6B02C31DEB6F7300991E41 /* SystemTimeCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B21DEB6F7300991E41 /* SystemTimeCommonMsg.swift */; };
+		0F6B02C41DEB6F7300991E41 /* TerrainCheckCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B31DEB6F7300991E41 /* TerrainCheckCommonMsg.swift */; };
+		0F6B02C51DEB6F7300991E41 /* TerrainDataCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B41DEB6F7300991E41 /* TerrainDataCommonMsg.swift */; };
+		0F6B02C61DEB6F7300991E41 /* TerrainReportCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B51DEB6F7300991E41 /* TerrainReportCommonMsg.swift */; };
+		0F6B02C71DEB6F7300991E41 /* TerrainRequestCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B61DEB6F7300991E41 /* TerrainRequestCommonMsg.swift */; };
+		0F6B02C81DEB6F7300991E41 /* TimesyncCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B71DEB6F7300991E41 /* TimesyncCommonMsg.swift */; };
+		0F6B02C91DEB6F7300991E41 /* UavionixADSBEmergencyStatusUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B81DEB6F7300991E41 /* UavionixADSBEmergencyStatusUavionixEnum.swift */; };
+		0F6B02CA1DEB6F7300991E41 /* UavionixADSBOutCfgAircraftSizeUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01B91DEB6F7300991E41 /* UavionixADSBOutCfgAircraftSizeUavionixEnum.swift */; };
+		0F6B02CB1DEB6F7300991E41 /* UavionixADSBOutCfgGPSOffsetLatUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01BA1DEB6F7300991E41 /* UavionixADSBOutCfgGPSOffsetLatUavionixEnum.swift */; };
+		0F6B02CC1DEB6F7300991E41 /* UavionixADSBOutCfgGPSOffsetLonUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01BB1DEB6F7300991E41 /* UavionixADSBOutCfgGPSOffsetLonUavionixEnum.swift */; };
+		0F6B02CD1DEB6F7300991E41 /* UavionixADSBOutDynamicGPSFixUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01BC1DEB6F7300991E41 /* UavionixADSBOutDynamicGPSFixUavionixEnum.swift */; };
+		0F6B02CE1DEB6F7300991E41 /* UavionixADSBOutDynamicStateUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01BD1DEB6F7300991E41 /* UavionixADSBOutDynamicStateUavionixEnum.swift */; };
+		0F6B02CF1DEB6F7300991E41 /* UavionixADSBOutRfSelectUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01BE1DEB6F7300991E41 /* UavionixADSBOutRfSelectUavionixEnum.swift */; };
+		0F6B02D01DEB6F7300991E41 /* UavionixADSBRfHealthUavionixEnum.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01BF1DEB6F7300991E41 /* UavionixADSBRfHealthUavionixEnum.swift */; };
+		0F6B02D11DEB6F7300991E41 /* V2ExtensionCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C01DEB6F7300991E41 /* V2ExtensionCommonMsg.swift */; };
+		0F6B02D21DEB6F7300991E41 /* VfrHudCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C11DEB6F7300991E41 /* VfrHudCommonMsg.swift */; };
+		0F6B02D31DEB6F7300991E41 /* VibrationCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C21DEB6F7300991E41 /* VibrationCommonMsg.swift */; };
+		0F6B02D41DEB6F7300991E41 /* ViconPositionEstimateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C31DEB6F7300991E41 /* ViconPositionEstimateCommonMsg.swift */; };
+		0F6B02D51DEB6F7300991E41 /* VisionPositionEstimateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C41DEB6F7300991E41 /* VisionPositionEstimateCommonMsg.swift */; };
+		0F6B02D61DEB6F7300991E41 /* VisionSpeedEstimateCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C51DEB6F7300991E41 /* VisionSpeedEstimateCommonMsg.swift */; };
+		0F6B02D71DEB6F7300991E41 /* WindArdupilotmegaMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C61DEB6F7300991E41 /* WindArdupilotmegaMsg.swift */; };
+		0F6B02D81DEB6F7300991E41 /* WindCovCommonMsg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F6B01C71DEB6F7300991E41 /* WindCovCommonMsg.swift */; };
+		0F8F93721DC1ECCA006C71A7 /* Swift in Resources */ = {isa = PBXBuildFile; fileRef = 0F8F93711DC1ECCA006C71A7 /* Swift */; };
+		0FC224C41DA6561F005107DC /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC224C31DA6561F005107DC /* AppDelegate.swift */; };
+		0FC224C61DA6561F005107DC /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0FC224C51DA6561F005107DC /* Assets.xcassets */; };
+		0FC224C91DA6561F005107DC /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = 0FC224C71DA6561F005107DC /* MainMenu.xib */; };
+		0FC224D41DA6561F005107DC /* MAVLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC224D31DA6561F005107DC /* MAVLinkTests.swift */; };
+		0FD2A71E1DC6B07D002D3EF4 /* Testdata.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FD2A71D1DC6B07D002D3EF4 /* Testdata.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0FC224D01DA6561F005107DC /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0FC224B81DA6561F005107DC /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0FC224BF1DA6561F005107DC;
+			remoteInfo = MAVLink;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		0F030A321DBED65F00A8D783 /* flight.tlog */ = {isa = PBXFileReference; lastKnownFileType = file; path = flight.tlog; sourceTree = "<group>"; };
+		0F0B054A1DA65D8E00BCF0EB /* DataExtensionsTests.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DataExtensionsTests.swift; sourceTree = "<group>"; };
+		0F15A4001DC4B83400914AD9 /* CompareWithCImpTests.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CompareWithCImpTests.swift; sourceTree = "<group>"; };
+		0F5882AD1DC3C2B00015D834 /* Delegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = Delegate.swift; sourceTree = "<group>"; };
+		0F6B00B71DEB6F7200991E41 /* ActuatorControlTargetCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ActuatorControlTargetCommonMsg.swift; path = Swift/ActuatorControlTargetCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00B81DEB6F7200991E41 /* ADSBAltitudeTypeCommonEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ADSBAltitudeTypeCommonEnum.swift; path = Swift/ADSBAltitudeTypeCommonEnum.swift; sourceTree = "<group>"; };
+		0F6B00B91DEB6F7200991E41 /* ADSBEmitterTypeCommonEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ADSBEmitterTypeCommonEnum.swift; path = Swift/ADSBEmitterTypeCommonEnum.swift; sourceTree = "<group>"; };
+		0F6B00BA1DEB6F7200991E41 /* ADSBFlagsCommonEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ADSBFlagsCommonEnum.swift; path = Swift/ADSBFlagsCommonEnum.swift; sourceTree = "<group>"; };
+		0F6B00BB1DEB6F7200991E41 /* ADSBVehicleCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ADSBVehicleCommonMsg.swift; path = Swift/ADSBVehicleCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00BC1DEB6F7200991E41 /* Ahrs2ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Ahrs2ArdupilotmegaMsg.swift; path = Swift/Ahrs2ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00BD1DEB6F7200991E41 /* Ahrs3ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Ahrs3ArdupilotmegaMsg.swift; path = Swift/Ahrs3ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00BE1DEB6F7200991E41 /* AhrsArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AhrsArdupilotmegaMsg.swift; path = Swift/AhrsArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00BF1DEB6F7200991E41 /* AirspeedAutocalArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AirspeedAutocalArdupilotmegaMsg.swift; path = Swift/AirspeedAutocalArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00C01DEB6F7200991E41 /* AltitudeCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AltitudeCommonMsg.swift; path = Swift/AltitudeCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C11DEB6F7200991E41 /* ApAdcArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ApAdcArdupilotmegaMsg.swift; path = Swift/ApAdcArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00C21DEB6F7200991E41 /* AttitudeCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AttitudeCommonMsg.swift; path = Swift/AttitudeCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C31DEB6F7200991E41 /* AttitudeQuaternionCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AttitudeQuaternionCommonMsg.swift; path = Swift/AttitudeQuaternionCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C41DEB6F7200991E41 /* AttitudeQuaternionCovCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AttitudeQuaternionCovCommonMsg.swift; path = Swift/AttitudeQuaternionCovCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C51DEB6F7200991E41 /* AttitudeTargetCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AttitudeTargetCommonMsg.swift; path = Swift/AttitudeTargetCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C61DEB6F7200991E41 /* AttPosMocapCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AttPosMocapCommonMsg.swift; path = Swift/AttPosMocapCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C71DEB6F7200991E41 /* AuthKeyCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AuthKeyCommonMsg.swift; path = Swift/AuthKeyCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C81DEB6F7200991E41 /* AutopilotVersionCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AutopilotVersionCommonMsg.swift; path = Swift/AutopilotVersionCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00C91DEB6F7200991E41 /* AutopilotVersionRequestArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AutopilotVersionRequestArdupilotmegaMsg.swift; path = Swift/AutopilotVersionRequestArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00CA1DEB6F7200991E41 /* Battery2ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Battery2ArdupilotmegaMsg.swift; path = Swift/Battery2ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00CB1DEB6F7200991E41 /* BatteryStatusCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = BatteryStatusCommonMsg.swift; path = Swift/BatteryStatusCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00CC1DEB6F7200991E41 /* CameraFeedbackArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CameraFeedbackArdupilotmegaMsg.swift; path = Swift/CameraFeedbackArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00CD1DEB6F7200991E41 /* CameraFeedbackFlagsArdupilotmegaEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CameraFeedbackFlagsArdupilotmegaEnum.swift; path = Swift/CameraFeedbackFlagsArdupilotmegaEnum.swift; sourceTree = "<group>"; };
+		0F6B00CE1DEB6F7200991E41 /* CameraStatusArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CameraStatusArdupilotmegaMsg.swift; path = Swift/CameraStatusArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00CF1DEB6F7200991E41 /* CameraStatusTypesArdupilotmegaEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CameraStatusTypesArdupilotmegaEnum.swift; path = Swift/CameraStatusTypesArdupilotmegaEnum.swift; sourceTree = "<group>"; };
+		0F6B00D01DEB6F7200991E41 /* CameraTriggerCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CameraTriggerCommonMsg.swift; path = Swift/CameraTriggerCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D11DEB6F7200991E41 /* ChangeOperatorControlAckCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ChangeOperatorControlAckCommonMsg.swift; path = Swift/ChangeOperatorControlAckCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D21DEB6F7200991E41 /* ChangeOperatorControlCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ChangeOperatorControlCommonMsg.swift; path = Swift/ChangeOperatorControlCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D31DEB6F7200991E41 /* CollisionCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CollisionCommonMsg.swift; path = Swift/CollisionCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D41DEB6F7200991E41 /* CommandAckCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CommandAckCommonMsg.swift; path = Swift/CommandAckCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D51DEB6F7200991E41 /* CommandIntCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CommandIntCommonMsg.swift; path = Swift/CommandIntCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D61DEB6F7200991E41 /* CommandLongCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CommandLongCommonMsg.swift; path = Swift/CommandLongCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D71DEB6F7200991E41 /* CompassmotStatusArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = CompassmotStatusArdupilotmegaMsg.swift; path = Swift/CompassmotStatusArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00D81DEB6F7200991E41 /* ControlSystemStateCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ControlSystemStateCommonMsg.swift; path = Swift/ControlSystemStateCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00D91DEB6F7200991E41 /* Data16ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Data16ArdupilotmegaMsg.swift; path = Swift/Data16ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00DA1DEB6F7200991E41 /* Data32ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Data32ArdupilotmegaMsg.swift; path = Swift/Data32ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00DB1DEB6F7200991E41 /* Data64ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Data64ArdupilotmegaMsg.swift; path = Swift/Data64ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00DC1DEB6F7200991E41 /* Data96ArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Data96ArdupilotmegaMsg.swift; path = Swift/Data96ArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00DD1DEB6F7200991E41 /* DataStreamCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DataStreamCommonMsg.swift; path = Swift/DataStreamCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00DE1DEB6F7200991E41 /* DataTransmissionHandshakeCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DataTransmissionHandshakeCommonMsg.swift; path = Swift/DataTransmissionHandshakeCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00DF1DEB6F7200991E41 /* DebugCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DebugCommonMsg.swift; path = Swift/DebugCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00E01DEB6F7200991E41 /* DebugVectCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DebugVectCommonMsg.swift; path = Swift/DebugVectCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00E11DEB6F7200991E41 /* DigicamConfigureArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DigicamConfigureArdupilotmegaMsg.swift; path = Swift/DigicamConfigureArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00E21DEB6F7200991E41 /* DigicamControlArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DigicamControlArdupilotmegaMsg.swift; path = Swift/DigicamControlArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00E31DEB6F7200991E41 /* DistanceSensorCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DistanceSensorCommonMsg.swift; path = Swift/DistanceSensorCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00E41DEB6F7200991E41 /* EkfStatusFlagsArdupilotmegaEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = EkfStatusFlagsArdupilotmegaEnum.swift; path = Swift/EkfStatusFlagsArdupilotmegaEnum.swift; sourceTree = "<group>"; };
+		0F6B00E51DEB6F7200991E41 /* EkfStatusReportArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = EkfStatusReportArdupilotmegaMsg.swift; path = Swift/EkfStatusReportArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00E61DEB6F7200991E41 /* EncapsulatedDataCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = EncapsulatedDataCommonMsg.swift; path = Swift/EncapsulatedDataCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00E71DEB6F7200991E41 /* EstimatorStatusCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = EstimatorStatusCommonMsg.swift; path = Swift/EstimatorStatusCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00E81DEB6F7200991E41 /* EstimatorStatusFlagsCommonEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = EstimatorStatusFlagsCommonEnum.swift; path = Swift/EstimatorStatusFlagsCommonEnum.swift; sourceTree = "<group>"; };
+		0F6B00E91DEB6F7200991E41 /* ExtendedSysStateCommonMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ExtendedSysStateCommonMsg.swift; path = Swift/ExtendedSysStateCommonMsg.swift; sourceTree = "<group>"; };
+		0F6B00EA1DEB6F7200991E41 /* FenceActionCommonEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = FenceActionCommonEnum.swift; path = Swift/FenceActionCommonEnum.swift; sourceTree = "<group>"; };
+		0F6B00EB1DEB6F7200991E41 /* FenceBreachCommonEnum.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = FenceBreachCommonEnum.swift; path = Swift/FenceBreachCommonEnum.swift; sourceTree = "<group>"; };
+		0F6B00EC1DEB6F7200991E41 /* FenceFetchPointArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = FenceFetchPointArdupilotmegaMsg.swift; path = Swift/FenceFetchPointArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00ED1DEB6F7200991E41 /* FencePointArdupilotmegaMsg.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = FencePointArdupilotmegaMsg.swift; path = Swift/FencePointArdupilotmegaMsg.swift; sourceTree = "<group>"; };
+		0F6B00EE1DEB6F7200991E41 /* SECOND" value="8">
+        <description>30 Shots / 6 Second</description>
+      </entry>
+    </enum>
+    <!-- led control pattern enums (enumeration of specific patterns) -->
+    <enum name="LED_CONTROL_PATTERN">
+      <entry name="LED_CONTROL_PATTERN_OFF" value="0">
+        <description>LED patterns off (return control to regular vehicle control)</description>
+      </entry>
+      <entry name="LED_CONTROL_PATTERN_FIRMWAREUPDATE" value="1">
+        <description>LEDs show pattern during firmware update</description>
+      </entry>
+      <entry name="LED_CONTROL_PATTERN_CUSTOM" value="255">
+        <description>Custom Pattern using custom bytes fields</description>
+      </entry>
+    </enum>
+    <!-- EKF_STATUS_FLAGS - these values should be bit-and with the messages flags field to know if flag has been set -->
+    <enum name="EKF_STATUS_FLAGS">
+      <description>Flags in EKF_STATUS message</description>
+      <entry name="EKF_ATTITUDE" value="1">
+        <description>set if EKF's attitude estimate is good</description>
+      </entry>
+      <entry name="EKF_VELOCITY_HORIZ" value="2">
+        <description>set if EKF's horizontal velocity estimate is good</description>
+      </entry>
+      <entry name="EKF_VELOCITY_VERT" value="4">
+        <description>set if EKF's vertical velocity estimate is good</description>
+      </entry>
+      <entry name="EKF_POS_HORIZ_REL" value="8">
+        <description>set if EKF's horizontal position (relative) estimate is good</description>
+      </entry>
+      <entry name="EKF_POS_HORIZ_ABS" value="16">
+        <description>set if EKF's horizontal position (absolute) estimate is good</description>
+      </entry>
+      <entry name="EKF_POS_VERT_ABS" value="32">
+        <description>set if EKF's vertical position (absolute) estimate is good</description>
+      </entry>
+      <entry name="EKF_POS_VERT_AGL" value="64">
+        <description>set if EKF's vertical position (above ground) estimate is good</description>
+      </entry>
+      <entry name="EKF_CONST_POS_MODE" value="128">
+        <description>EKF is in constant position mode and does not know it's absolute or relative position</description>
+      </entry>
+      <entry name="EKF_PRED_POS_HORIZ_REL" value="256">
+        <description>set if EKF's predicted horizontal position (relative) estimate is good</description>
+      </entry>
+      <entry name="EKF_PRED_POS_HORIZ_ABS" value="512">
+        <description>set if EKF's predicted horizontal position (absolute) estimate is good</description>
+      </entry>
+    </enum>
+    <enum name="PID_TUNING_AXIS">
+      <entry name="PID_TUNING_ROLL" value="1"/>
+      <entry name="PID_TUNING_PITCH" value="2"/>
+      <entry name="PID_TUNING_YAW" value="3"/>
+      <entry name="PID_TUNING_ACCZ" value="4"/>
+      <entry name="PID_TUNING_STEER" value="5"/>
+    </enum>
+    <enum name="MAG_CAL_STATUS">
+      <entry name="MAG_CAL_NOT_STARTED" value="0"/>
+      <entry name="MAG_CAL_WAITING_TO_START" value="1"/>
+      <entry name="MAG_CAL_RUNNING_STEP_ONE" value="2"/>
+      <entry name="MAG_CAL_RUNNING_STEP_TWO" value="3"/>
+      <entry name="MAG_CAL_SUCCESS" value="4"/>
+      <entry name="MAG_CAL_FAILED" value="5"/>
+    </enum>
+    <enum name="MAV_REMOTE_LOG_DATA_BLOCK_COMMANDS">
+      <description>Special ACK block numbers control activation of dataflash log streaming</description>
+      <!-- C uses signed integers for enumerations; these constants start at MAX_INT32_T and go down -->
+      <!-- 2^31-3 == 2147483645 -->
+      <entry name="MAV_REMOTE_LOG_DATA_BLOCK_STOP" value="2147483645">
+        <description>UAV to stop sending DataFlash blocks</description>
+      </entry>
+      <!-- 2^31-2 == 2147483646 -->
+      <entry name="MAV_REMOTE_LOG_DATA_BLOCK_START" value="2147483646">
+        <description>UAV to start sending DataFlash blocks</description>
+      </entry>
+      <!-- MAV_REMOTE_LOG_DATA_BLOCK_COMMANDS_ENUM_END will be 2^31-1 == 2147483647 -->
+    </enum>
+    <enum name="MAV_REMOTE_LOG_DATA_BLOCK_STATUSES">
+      <description>Possible remote log data block statuses</description>
+      <entry name="MAV_REMOTE_LOG_DATA_BLOCK_NACK" value="0">
+        <description>This block has NOT been received</description>
+      </entry>
+      <entry name="MAV_REMOTE_LOG_DATA_BLOCK_ACK" value="1">
+        <description>This block has been received</description>
+      </entry>
+    </enum>
+  </enums>
+  <messages>
+    <message id="150" name="SENSOR_OFFSETS">
+      <description>Offsets and calibrations values for hardware sensors. This makes it easier to debug the calibration process.</description>
+      <field name="mag_ofs_x" type="int16_t">magnetometer X offset</field>
+      <field name="mag_ofs_y" type="int16_t">magnetometer Y offset</field>
+      <field name="mag_ofs_z" type="int16_t">magnetometer Z offset</field>
+      <field name="mag_declination" type="float">magnetic declination (radians)</field>
+      <field name="raw_press" type="int32_t">raw pressure from barometer</field>
+      <field name="raw_temp" type="int32_t">raw temperature from barometer</field>
+      <field name="gyro_cal_x" type="float">gyro X calibration</field>
+      <field name="gyro_cal_y" type="float">gyro Y calibration</field>
+      <field name="gyro_cal_z" type="float">gyro Z calibration</field>
+      <field name="accel_cal_x" type="float">accel X calibration</field>
+      <field name="accel_cal_y" type="float">accel Y calibration</field>
+      <field name="accel_cal_z" type="float">accel Z calibration</field>
+    </message>
+    <message id="151" name="SET_MAG_OFFSETS">
+      <description>Deprecated. Use MAV_CMD_PREFLIGHT_SET_SENSOR_OFFSETS instead. Set the magnetometer offsets</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="mag_ofs_x" type="int16_t">magnetometer X offset</field>
+      <field name="mag_ofs_y" type="int16_t">magnetometer Y offset</field>
+      <field name="mag_ofs_z" type="int16_t">magnetometer Z offset</field>
+    </message>
+    <message id="152" name="MEMINFO">
+      <description>state of APM memory</description>
+      <field name="brkval" type="uint16_t">heap top</field>
+      <field name="freemem" type="uint16_t">free memory</field>
+      <extensions/>
+      <field name="freemem32" type="uint32_t">free memory (32 bit)</field>
+    </message>
+    <message id="153" name="AP_ADC">
+      <description>raw ADC output</description>
+      <field name="adc1" type="uint16_t">ADC output 1</field>
+      <field name="adc2" type="uint16_t">ADC output 2</field>
+      <field name="adc3" type="uint16_t">ADC output 3</field>
+      <field name="adc4" type="uint16_t">ADC output 4</field>
+      <field name="adc5" type="uint16_t">ADC output 5</field>
+      <field name="adc6" type="uint16_t">ADC output 6</field>
+    </message>
+    <!-- Camera Controller Messages -->
+    <message id="154" name="DIGICAM_CONFIGURE">
+      <description>Configure on-board Camera Control System.</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="mode" type="uint8_t">Mode enumeration from 1 to N //P, TV, AV, M, Etc (0 means ignore)</field>
+      <field name="shutter_speed" type="uint16_t">Divisor number //e.g. 1000 means 1/1000 (0 means ignore)</field>
+      <field name="aperture" type="uint8_t">F stop number x 10 //e.g. 28 means 2.8 (0 means ignore)</field>
+      <field name="iso" type="uint8_t">ISO enumeration from 1 to N //e.g. 80, 100, 200, Etc (0 means ignore)</field>
+      <field name="exposure_type" type="uint8_t">Exposure type enumeration from 1 to N (0 means ignore)</field>
+      <field name="command_id" type="uint8_t">Command Identity (incremental loop: 0 to 255)//A command sent multiple times will be executed or pooled just once</field>
+      <field name="engine_cut_off" type="uint8_t">Main engine cut-off time before camera trigger in seconds/10 (0 means no cut-off)</field>
+      <field name="extra_param" type="uint8_t">Extra parameters enumeration (0 means ignore)</field>
+      <field name="extra_value" type="float">Correspondent value to given extra_param</field>
+    </message>
+    <message id="155" name="DIGICAM_CONTROL">
+      <description>Control on-board Camera Control System to take shots.</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="session" type="uint8_t">0: stop, 1: start or keep it up //Session control e.g. show/hide lens</field>
+      <field name="zoom_pos" type="uint8_t">1 to N //Zoom's absolute position (0 means ignore)</field>
+      <field name="zoom_step" type="int8_t">-100 to 100 //Zooming step value to offset zoom from the current position</field>
+      <field name="focus_lock" type="uint8_t">0: unlock focus or keep unlocked, 1: lock focus or keep locked, 3: re-lock focus</field>
+      <field name="shot" type="uint8_t">0: ignore, 1: shot or start filming</field>
+      <field name="command_id" type="uint8_t">Command Identity (incremental loop: 0 to 255)//A command sent multiple times will be executed or pooled just once</field>
+      <field name="extra_param" type="uint8_t">Extra parameters enumeration (0 means ignore)</field>
+      <field name="extra_value" type="float">Correspondent value to given extra_param</field>
+    </message>
+    <!-- Camera Mount Messages -->
+    <message id="156" name="MOUNT_CONFIGURE">
+      <description>Message to configure a camera mount, directional antenna, etc.</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field enum="MAV_MOUNT_MODE" name="mount_mode" type="uint8_t">mount operating mode (see MAV_MOUNT_MODE enum)</field>
+      <field name="stab_roll" type="uint8_t">(1 = yes, 0 = no)</field>
+      <field name="stab_pitch" type="uint8_t">(1 = yes, 0 = no)</field>
+      <field name="stab_yaw" type="uint8_t">(1 = yes, 0 = no)</field>
+    </message>
+    <message id="157" name="MOUNT_CONTROL">
+      <description>Message to control a camera mount, directional antenna, etc.</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="input_a" type="int32_t">pitch(deg*100) or lat, depending on mount mode</field>
+      <field name="input_b" type="int32_t">roll(deg*100) or lon depending on mount mode</field>
+      <field name="input_c" type="int32_t">yaw(deg*100) or alt (in cm) depending on mount mode</field>
+      <field name="save_position" type="uint8_t">if "1" it will save current trimmed position on EEPROM (just valid for NEUTRAL and LANDING)</field>
+    </message>
+    <message id="158" name="MOUNT_STATUS">
+      <description>Message with some status from APM to GCS about camera or antenna mount</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="pointing_a" type="int32_t">pitch(deg*100)</field>
+      <field name="pointing_b" type="int32_t">roll(deg*100)</field>
+      <field name="pointing_c" type="int32_t">yaw(deg*100)</field>
+    </message>
+    <!-- geo-fence messages -->
+    <message id="160" name="FENCE_POINT">
+      <description>A fence point. Used to set a point when from GCS -&gt; MAV. Also used to return a point from MAV -&gt; GCS</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="idx" type="uint8_t">point index (first point is 1, 0 is for return point)</field>
+      <field name="count" type="uint8_t">total number of points (for sanity checking)</field>
+      <field name="lat" type="float">Latitude of point</field>
+      <field name="lng" type="float">Longitude of point</field>
+    </message>
+    <message id="161" name="FENCE_FETCH_POINT">
+      <description>Request a current fence point from MAV</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="idx" type="uint8_t">point index (first point is 1, 0 is for return point)</field>
+    </message>
+    <message id="162" name="FENCE_STATUS">
+      <description>Status of geo-fencing. Sent in extended status stream when fencing enabled</description>
+      <field name="breach_status" type="uint8_t">0 if currently inside fence, 1 if outside</field>
+      <field name="breach_count" type="uint16_t">number of fence breaches</field>
+      <field enum="FENCE_BREACH" name="breach_type" type="uint8_t">last breach type (see FENCE_BREACH_* enum)</field>
+      <field name="breach_time" type="uint32_t">time of last breach in milliseconds since boot</field>
+    </message>
+    <message id="163" name="AHRS">
+      <description>Status of DCM attitude estimator</description>
+      <field name="omegaIx" type="float">X gyro drift estimate rad/s</field>
+      <field name="omegaIy" type="float">Y gyro drift estimate rad/s</field>
+      <field name="omegaIz" type="float">Z gyro drift estimate rad/s</field>
+      <field name="accel_weight" type="float">average accel_weight</field>
+      <field name="renorm_val" type="float">average renormalisation value</field>
+      <field name="error_rp" type="float">average error_roll_pitch value</field>
+      <field name="error_yaw" type="float">average error_yaw value</field>
+    </message>
+    <message id="164" name="SIMSTATE">
+      <description>Status of simulation environment, if used</description>
+      <field name="roll" type="float">Roll angle (rad)</field>
+      <field name="pitch" type="float">Pitch angle (rad)</field>
+      <field name="yaw" type="float">Yaw angle (rad)</field>
+      <field name="xacc" type="float">X acceleration m/s/s</field>
+      <field name="yacc" type="float">Y acceleration m/s/s</field>
+      <field name="zacc" type="float">Z acceleration m/s/s</field>
+      <field name="xgyro" type="float">Angular speed around X axis rad/s</field>
+      <field name="ygyro" type="float">Angular speed around Y axis rad/s</field>
+      <field name="zgyro" type="float">Angular speed around Z axis rad/s</field>
+      <field name="lat" type="int32_t">Latitude in degrees * 1E7</field>
+      <field name="lng" type="int32_t">Longitude in degrees * 1E7</field>
+    </message>
+    <message id="165" name="HWSTATUS">
+      <description>Status of key hardware</description>
+      <field name="Vcc" type="uint16_t">board voltage (mV)</field>
+      <field name="I2Cerr" type="uint8_t">I2C error count</field>
+    </message>
+    <message id="166" name="RADIO">
+      <description>Status generated by radio</description>
+      <field name="rssi" type="uint8_t">local signal strength</field>
+      <field name="remrssi" type="uint8_t">remote signal strength</field>
+      <field name="txbuf" type="uint8_t">how full the tx buffer is as a percentage</field>
+      <field name="noise" type="uint8_t">background noise level</field>
+      <field name="remnoise" type="uint8_t">remote background noise level</field>
+      <field name="rxerrors" type="uint16_t">receive errors</field>
+      <field name="fixed" type="uint16_t">count of error corrected packets</field>
+    </message>
+    <!-- AP_Limits status -->
+    <message id="167" name="LIMITS_STATUS">
+      <description>Status of AP_Limits. Sent in extended status stream when AP_Limits is enabled</description>
+      <field enum="LIMITS_STATE" name="limits_state" type="uint8_t">state of AP_Limits, (see enum LimitState, LIMITS_STATE)</field>
+      <field name="last_trigger" type="uint32_t">time of last breach in milliseconds since boot</field>
+      <field name="last_action" type="uint32_t">time of last recovery action in milliseconds since boot</field>
+      <field name="last_recovery" type="uint32_t">time of last successful recovery in milliseconds since boot</field>
+      <field name="last_clear" type="uint32_t">time of last all-clear in milliseconds since boot</field>
+      <field name="breach_count" type="uint16_t">number of fence breaches</field>
+      <field name="mods_enabled" type="uint8_t">AP_Limit_Module bitfield of enabled modules, (see enum moduleid or LIMIT_MODULE)</field>
+      <field name="mods_required" type="uint8_t">AP_Limit_Module bitfield of required modules, (see enum moduleid or LIMIT_MODULE)</field>
+      <field name="mods_triggered" type="uint8_t">AP_Limit_Module bitfield of triggered modules, (see enum moduleid or LIMIT_MODULE)</field>
+    </message>
+    <message id="168" name="WIND">
+      <description>Wind estimation</description>
+      <field name="direction" type="float">wind direction that wind is coming from (degrees)</field>
+      <field name="speed" type="float">wind speed in ground plane (m/s)</field>
+      <field name="speed_z" type="float">vertical wind speed (m/s)</field>
+    </message>
+    <message id="169" name="DATA16">
+      <description>Data packet, size 16</description>
+      <field name="type" type="uint8_t">data type</field>
+      <field name="len" type="uint8_t">data length</field>
+      <field name="data" type="uint8_t[16]">raw data</field>
+    </message>
+    <message id="170" name="DATA32">
+      <description>Data packet, size 32</description>
+      <field name="type" type="uint8_t">data type</field>
+      <field name="len" type="uint8_t">data length</field>
+      <field name="data" type="uint8_t[32]">raw data</field>
+    </message>
+    <message id="171" name="DATA64">
+      <description>Data packet, size 64</description>
+      <field name="type" type="uint8_t">data type</field>
+      <field name="len" type="uint8_t">data length</field>
+      <field name="data" type="uint8_t[64]">raw data</field>
+    </message>
+    <message id="172" name="DATA96">
+      <description>Data packet, size 96</description>
+      <field name="type" type="uint8_t">data type</field>
+      <field name="len" type="uint8_t">data length</field>
+      <field name="data" type="uint8_t[96]">raw data</field>
+    </message>
+    <message id="173" name="RANGEFINDER">
+      <description>Rangefinder reporting</description>
+      <field name="distance" type="float">distance in meters</field>
+      <field name="voltage" type="float">raw voltage if available, zero otherwise</field>
+    </message>
+    <message id="174" name="AIRSPEED_AUTOCAL">
+      <description>Airspeed auto-calibration</description>
+      <field name="vx" type="float">GPS velocity north m/s</field>
+      <field name="vy" type="float">GPS velocity east m/s</field>
+      <field name="vz" type="float">GPS velocity down m/s</field>
+      <field name="diff_pressure" type="float">Differential pressure pascals</field>
+      <field name="EAS2TAS" type="float">Estimated to true airspeed ratio</field>
+      <field name="ratio" type="float">Airspeed ratio</field>
+      <field name="state_x" type="float">EKF state x</field>
+      <field name="state_y" type="float">EKF state y</field>
+      <field name="state_z" type="float">EKF state z</field>
+      <field name="Pax" type="float">EKF Pax</field>
+      <field name="Pby" type="float">EKF Pby</field>
+      <field name="Pcz" type="float">EKF Pcz</field>
+    </message>
+    <!-- rally point messages -->
+    <message id="175" name="RALLY_POINT">
+      <description>A rally point. Used to set a point when from GCS -&gt; MAV. Also used to return a point from MAV -&gt; GCS</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="idx" type="uint8_t">point index (first point is 0)</field>
+      <field name="count" type="uint8_t">total number of points (for sanity checking)</field>
+      <field name="lat" type="int32_t">Latitude of point in degrees * 1E7</field>
+      <field name="lng" type="int32_t">Longitude of point in degrees * 1E7</field>
+      <field name="alt" type="int16_t">Transit / loiter altitude in meters relative to home</field>
+      <!-- Path planned landings are still in the future, but we want these fields ready: -->
+      <field name="break_alt" type="int16_t">Break altitude in meters relative to home</field>
+      <field name="land_dir" type="uint16_t">Heading to aim for when landing. In centi-degrees.</field>
+      <field name="flags" type="uint8_t">See RALLY_FLAGS enum for definition of the bitmask.</field>
+    </message>
+    <message id="176" name="RALLY_FETCH_POINT">
+      <description>Request a current rally point from MAV. MAV should respond with a RALLY_POINT message. MAV should not respond if the request is invalid.</description>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <field name="target_component" type="uint8_t">Component ID</field>
+      <field name="idx" type="uint8_t">point index (first point is 0)</field>
+    </message>
+    <message id="177" name="COMPASSMOT_STATUS">
+      <description>Status of compassmot calibration</description>
+      <field name="throttle" type="uint16_t">throttle (percent*10)</field>
+      <field name="current" type="float">current (amps)</field>
+      <field name="interference" type="uint16_t">interference (percent)</field>
+      <field name="CompensationX" type="float">Motor Compensation X</field>
+      <field name="CompensationY" type="float">Motor Compensation Y</field>
+      <field name="CompensationZ" type="float">Motor Compensation Z</field>
+    </message>
+    <!-- Coming soon <message name="RALLY_LAND_POINT" id="177"> <description>A rally landing point. An aircraft loitering at a rally point may choose one of these points to land at.</description> <field name="target_system" type="uint8_t">System ID</field> <field name="target_component" type="uint8_t">Component ID</field> <field name="idx" type="uint8_t">point index (first point is 0)</field> <field name="count" type="uint8_t">total number of points (for sanity checking)</field> <field name="lat" type="int32_t">Latitude of point</field> <field name="lng" type="int32_t">Longitude of point</field> <field name="alt" type="uint16_t">Ground AGL (usually 0)</field> </message> <message name="RALLY_LAND_FETCH_POINT" id="178"> <description>Request a current rally land point from MAV</description> <field name="target_system" type="uint8_t">System ID</field> <field name="target_component" type="uint8_t">Component ID</field> <field name="idx" type="uint8_t">point index (first point is 0)</field> </message> -->
+    <message id="178" name="AHRS2">
+      <description>Status of secondary AHRS filter if available</description>
+      <field name="roll" type="float">Roll angle (rad)</field>
+      <field name="pitch" type="float">Pitch angle (rad)</field>
+      <field name="yaw" type="float">Yaw angle (rad)</field>
+      <field name="altitude" type="float">Altitude (MSL)</field>
+      <field name="lat" type="int32_t">Latitude in degrees * 1E7</field>
+      <field name="lng" type="int32_t">Longitude in degrees * 1E7</field>
+    </message>
+    <!-- camera event message from CCB to autopilot: for image trigger events but also things like heartbeat, error, low power, full card, etc -->
+    <message id="179" name="CAMERA_STATUS">
+      <description>Camera Event</description>
+      <field name="time_usec" type="uint64_t">Image timestamp (microseconds since UNIX epoch, according to camera clock)</field>
+      <field name="target_system" type="uint8_t">System ID</field>
+      <!-- support multiple concurrent vehicles -->
+      <field name="cam_idx" type="uint8_t">Camera ID</field>
+      <!-- component ID, to support multiple cameras -->
+      <field name="img_idx" type="uint16_t">Image index</field>
+      <!-- per camera image index, should be unique+sequential within a mission, preferably non-wrapping -->
+      <field name="event_id" type="uint8_t">See CAMERA_STATUS_TYPES enum for definition of the bitmask</field>
+      <field name="p1" type="float">Parameter 1 (meaning depends on event, see CAMERA_STATUS_TYPES enum)</field>
+      <field name="p2" type="float">Parameter 2 (meaning depends on event, see CAMERA_STATUS_TYPES enum)</field>
+      <field name="p3" type="float">Parameter 3 (meaning depends on event, see CAMERA_STATUS_TYPES enum)</field>
+      <field name="p4" type="float">Parameter 4 (meaning depends on event, see CAMERA_STATUS_TYPES enum)</field>
+    </message>
+    <!-- camera feedback message - can be originated from C

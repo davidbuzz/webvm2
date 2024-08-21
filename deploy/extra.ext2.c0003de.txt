@@ -1,0 +1,1601 @@
+mb_rate_cms(vel_z);
+        }
+    } else {
+        set_climb_rate_cms(vel_z);
+    }
+
+    run_z_controller();
+}
+
+/*
+  run waypoint controller between prev_WP_loc and next_WP_loc
+ */
+void QuadPlane::waypoint_controller(void)
+{
+    setup_target_position();
+
+    const Location &loc = plane.next_WP_loc;
+    const uint32_t now = AP_HAL::millis();
+    if (!loc.same_loc_as(last_auto_target) ||
+        now - last_loiter_ms > 500) {
+        wp_nav->set_wp_destination(poscontrol.target_cm.tofloat());
+        last_auto_target = loc;
+    }
+    last_loiter_ms = now;
+
+    /*
+      this is full copter control of auto flight
+    */
+    // run wpnav controller
+    wp_nav->update_wpnav();
+
+    // nav roll and pitch are controller by waypoint controller
+    plane.nav_roll_cd = wp_nav->get_roll();
+    plane.nav_pitch_cd = wp_nav->get_pitch();
+
+    assign_tilt_to_fwd_thr();
+
+    if (transition->set_VTOL_roll_pitch_limit(plane.nav_roll_cd, plane.nav_pitch_cd)) {
+        pos_control->set_externally_limited_xy();
+    }
+
+    // call attitude controller
+    disable_yaw_rate_time_constant();
+    attitude_control->input_euler_angle_roll_pitch_yaw(plane.nav_roll_cd,
+                                                       plane.nav_pitch_cd,
+                                                       wp_nav->get_yaw(),
+                                                       true);
+
+    // climb based on altitude error
+    set_climb_rate_cms(assist_climb_rate_cms());
+    run_z_controller();
+}
+
+
+/*
+  handle auto-mode when auto_state.vtol_mode is true
+ */
+void QuadPlane::control_auto(void)
+{
+    if (!setup()) {
+        return;
+    }
+
+    if (poscontrol.get_state() > QPOS_APPROACH) {
+        bool should_run_motors = false;
+
+        // don't run the motors if in an arming delay
+        if (plane.arming.get_delay_arming()) {
+            should_run_motors = false;
+        }
+
+        // don't run motors if we are in the wait state for payload place
+        if (motors->get_desired_spool_state() == AP_Motors::DesiredSpoolState::SHUT_DOWN &&
+            plane.in_auto_mission_id(MAV_CMD_NAV_PAYLOAD_PLACE) &&
+            poscontrol.get_state() == QPOS_LAND_COMPLETE) {
+            should_run_motors = false;
+        }
+        
+        if (should_run_motors) {
+            set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+        }
+    }
+
+    uint16_t id = plane.mission.get_current_nav_cmd().id;
+    switch (id) {
+    case MAV_CMD_NAV_VTOL_TAKEOFF:
+    case MAV_CMD_NAV_TAKEOFF:
+        if (is_vtol_takeoff(id)) {
+            takeoff_controller();
+        }
+        break;
+    case MAV_CMD_NAV_VTOL_LAND:
+    case MAV_CMD_NAV_PAYLOAD_PLACE:
+    case MAV_CMD_NAV_LAND:
+        if (is_vtol_land(id)) {
+            vtol_position_controller();
+        }
+        break;
+    case MAV_CMD_NAV_LOITER_UNLIM:
+    case MAV_CMD_NAV_LOITER_TIME:
+    case MAV_CMD_NAV_LOITER_TURNS:
+    case MAV_CMD_NAV_LOITER_TO_ALT: {
+        const uint32_t now = AP_HAL::millis();
+        if (now - poscontrol.last_run_ms > 100) {
+            // ensure that poscontrol is reset
+            poscontrol.set_state(QPOS_POSITION1);
+        }
+        vtol_position_controller();
+    }
+        break;
+    default:
+        waypoint_controller();
+        break;
+    }
+}
+
+/*
+  start a VTOL takeoff
+ */
+bool QuadPlane::do_vtol_takeoff(const AP_Mission::Mission_Command& cmd)
+{
+    if (!setup()) {
+        return false;
+    }
+
+    // we always use the current location in XY for takeoff. The altitude defaults
+    // to relative to current height, but if Q_OPTIONS is set to respect takeoff frame
+    // then it will use normal frame handling for height
+    Location loc = cmd.content.location;
+    loc.lat = 0;
+    loc.lng = 0;
+    plane.set_next_WP(loc);
+    if (option_is_set(QuadPlane::OPTION::RESPECT_TAKEOFF_FRAME)) {
+        if (plane.current_loc.alt >= plane.next_WP_loc.alt) {
+            // we are above the takeoff already, no need to do anything
+            return false;
+        }
+    } else {
+        plane.next_WP_loc.alt = plane.current_loc.alt + cmd.content.location.alt;
+    }
+    throttle_wait = false;
+
+    // set vertical speed and acceleration limits
+    pos_control->set_max_speed_accel_z(-get_pilot_velocity_z_max_dn(), pilot_speed_z_max_up*100, pilot_accel_z*100);
+    pos_control->set_correction_speed_accel_z(-get_pilot_velocity_z_max_dn(), pilot_speed_z_max_up*100, pilot_accel_z*100);
+
+    // initialise the vertical position controller
+    pos_control->init_z_controller();
+
+    // also update nav_controller for status output
+    plane.nav_controller->update_waypoint(plane.current_loc, plane.next_WP_loc);
+
+    // calculate the time required to complete a takeoff
+    // this may be conservative and accept extra time due to clamping
+    // derived from the following latex equations if you want a nicely formatted view
+    // t_{accel} = \frac{V_max - V_z}{a}
+    // d_{accel} = V_z*t_{accel} + \frac{1}{2}*a*t_{accel}^2
+    // d_{remaining} = d_{total} - d_{accel}
+    // t_{constant} = \frac{d_{remaining}}{V_z}
+    // t = max(t_{accel}, 0) + max(t_{constant}, 0)
+    const float d_total = (plane.next_WP_loc.alt - plane.current_loc.alt) * 0.01f;
+    const float accel_m_s_s = MAX(0.1, pilot_accel_z);
+    const float vel_max = MAX(0.1, pilot_speed_z_max_up);
+    const float vel_z = inertial_nav.get_velocity_z_up_cms() * 0.01f;
+    const float t_accel = (vel_max - vel_z) / accel_m_s_s;
+    const float d_accel = vel_z * t_accel + 0.5f * accel_m_s_s * sq(t_accel);
+    const float d_remaining = d_total - d_accel;
+    const float t_constant = d_remaining / vel_max;
+    const float travel_time = MAX(t_accel, 0) + MAX(t_constant, 0);
+
+    // setup the takeoff failure handling code
+    takeoff_start_time_ms = millis();
+    takeoff_time_limit_ms = MAX(travel_time * takeoff_failure_scalar * 1000, 5000); // minimum time 5 seconds
+
+    return true;
+}
+
+
+/*
+  start a VTOL landing
+ */
+bool QuadPlane::do_vtol_land(const AP_Mission::Mission_Command& cmd)
+{
+    if (!setup()) {
+        return false;
+    }
+
+    plane.set_next_WP(cmd.content.location);
+    // initially aim for current altitude
+    plane.next_WP_loc.alt = plane.current_loc.alt;
+
+    // initialise the position controller
+    pos_control->init_xy_controller();
+    pos_control->init_z_controller();
+
+    throttle_wait = false;
+    landing_detect.lower_limit_start_ms = 0;
+    landing_detect.land_start_ms = 0;
+
+    plane.crash_state.is_crashed = false;
+    
+    // also update nav_controller for status output
+    plane.nav_controller->update_waypoint(plane.auto_state.crosstrack ? plane.prev_WP_loc : plane.current_loc,
+                                          plane.next_WP_loc);
+
+    poscontrol_init_approach();
+    return true;
+}
+
+/*
+  check if a VTOL takeoff has completed
+ */
+bool QuadPlane::verify_vtol_takeoff(const AP_Mission::Mission_Command &cmd)
+{
+    if (!available()) {
+        return true;
+    }
+
+    const uint32_t now = millis();
+
+    // reset takeoff if we aren't armed
+    if (!plane.arming.is_armed_and_safety_off()) {
+        do_vtol_takeoff(cmd);
+        return false;
+    }
+
+    if (now - takeoff_start_time_ms < 3000 &&
+        !option_is_set(QuadPlane::OPTION::DISABLE_GROUND_EFFECT_COMP)) {
+        ahrs.set_takeoff_expected(true);
+    }
+    
+    // check for failure conditions
+    if (is_positive(takeoff_failure_scalar) && ((now - takeoff_start_time_ms) > takeoff_time_limit_ms)) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "Failed to complete takeoff within time limit");
+        plane.set_mode(plane.mode_qland, ModeReason::VTOL_FAILED_TAKEOFF);
+        return false;
+    }
+
+#if AP_AIRSPEED_ENABLED
+    if (is_positive(maximum_takeoff_airspeed) && (plane.airspeed.get_airspeed() > maximum_takeoff_airspeed)) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "Failed to complete takeoff, excessive wind");
+        plane.set_mode(plane.mode_qland, ModeReason::VTOL_FAILED_TAKEOFF);
+        return false;
+    }
+#endif
+
+    if (plane.current_loc.alt < plane.next_WP_loc.alt) {
+        return false;
+    }
+    transition->restart();
+    plane.TECS_controller.set_pitch_max_limit(transition_pitch_max);
+
+    // todo: why are you doing this, I want to delete it.
+    set_alt_target_current();
+
+#if AP_FENCE_ENABLED
+    plane.fence.auto_enable_fence_after_takeoff();
+#endif
+
+    if (plane.control_mode == &plane.mode_auto) {
+        // we reset TECS so that the target height filter is not
+        // constrained by the climb and sink rates from the initial
+        // takeoff height.
+        plane.TECS_controller.reset();
+    }
+
+    // don't crosstrack on next WP
+    plane.auto_state.next_wp_crosstrack = false;
+
+    return true;
+}
+
+/*
+  a landing detector based on change in altitude over a timeout
+ */
+bool QuadPlane::land_detector(uint32_t timeout_ms)
+{
+    bool might_be_landed = should_relax() && !poscontrol.pilot_correction_active;
+    if (!might_be_landed) {
+        landing_detect.land_start_ms = 0;
+        return false;
+    }
+    const uint32_t now = AP_HAL::millis();
+    float height = inertial_nav.get_position_z_up_cm() * 0.01;
+    if (landing_detect.land_start_ms == 0) {
+        landing_detect.land_start_ms = now;
+        landing_detect.vpos_start_m = height;
+    }
+
+    // we only consider the vehicle landed when the motors have been
+    // at minimum for timeout_ms+1000 and the vertical position estimate has not
+    // changed by more than 20cm for timeout_ms
+    if (fabsf(height - landing_detect.vpos_start_m) > landing_detect.detect_alt_change) {
+        // height has changed, call off landing detection
+        landing_detect.land_start_ms = 0;
+        return false;
+    }
+           
+    if ((now - landing_detect.land_start_ms) < timeout_ms ||
+        (now - landing_detect.lower_limit_start_ms) < (timeout_ms+1000)) {
+        // not landed yet
+        return false;
+    }
+
+    return true;
+}
+
+/*
+  check if a landing is complete
+ */
+bool QuadPlane::check_land_complete(void)
+{
+    if (poscontrol.get_state() != QPOS_LAND_FINAL) {
+        // only apply to final landing phase
+        return false;
+    }
+    if (land_detector(4000)) {
+        poscontrol.set_state(QPOS_LAND_COMPLETE);
+        gcs().send_text(MAV_SEVERITY_INFO,"Land complete");
+
+        if (plane.in_auto_mission_id(MAV_CMD_NAV_PAYLOAD_PLACE)) {
+            // for payload place with full landing we shutdown motors
+            // and wait for the lua script to trigger a climb (using
+            // landing abort) or disarm
+            set_desired_spool_state(AP_Motors::DesiredSpoolState::SHUT_DOWN);
+            return false;
+        }
+
+        if (plane.control_mode != &plane.mode_auto ||
+            !plane.mission.continue_after_land()) {
+            // disarm on land unless we have MIS_OPTIONS setup to
+            // continue after land in AUTO
+            plane.arming.disarm(AP_Arming::Method::LANDED);
+        }
+        return true;
+    }
+    return false;
+}
+
+
+/*
+  check if we should switch from QPOS_LAND_DESCEND to QPOS_LAND_FINAL
+ */
+bool QuadPlane::check_land_final(void)
+{
+    float height_above_ground = plane.relative_ground_altitude(plane.g.rangefinder_landing);
+    // we require 2 readings at 10Hz to be within 5m of each other to
+    // trigger the switch to land final. This prevents a short term
+    // glitch at high altitude from triggering land final
+    const float max_change = 5;
+    if (height_above_ground < land_final_alt &&
+        fabsf(height_above_ground - last_land_final_agl) < max_change) {
+        return true;
+    }
+    last_land_final_agl = height_above_ground;
+
+    /*
+      also apply landing detector, in case we have landed in descent
+      phase. Use a longer threshold
+     */
+    return land_detector(6000);
+}
+
+/*
+  check if a VTOL landing has completed
+ */
+bool QuadPlane::verify_vtol_land(void)
+{
+    if (!available()) {
+        return true;
+    }
+
+    if (poscontrol.get_state() == QPOS_POSITION2) {
+        // see if we should move onto the descend stage of landing
+        const float descend_dist_threshold = 2.0;
+        const float descend_speed_threshold = 3.0;
+        bool reached_position = false;
+        if (poscontrol.pilot_correction_done) {
+            reached_position = !poscontrol.pilot_correction_active;
+        } else {
+            const float dist = (inertial_nav.get_position_neu_cm().topostype() - poscontrol.target_cm).xy().length() * 0.01;
+            reached_position = dist < descend_dist_threshold;
+        }
+        Vector2f target_vel;
+        if (AP_HAL::millis() - poscontrol.last_velocity_match_ms < 1000) {
+            target_vel = poscontrol.velocity_match;
+        }
+        Vector3f vel_ned;
+        UNUSED_RESULT(plane.ahrs.get_velocity_NED(vel_ned));
+        
+        if (reached_position &&
+            (vel_ned.xy() - target_vel).length() < descend_speed_threshold) {
+            poscontrol.set_state(QPOS_LAND_DESCEND);
+            poscontrol.pilot_correction_done = false;
+            pos_control->set_lean_angle_max_cd(0);
+            poscontrol.xy_correction.zero();
+#if AP_LANDINGGEAR_ENABLED
+            plane.g2.landing_gear.deploy_for_landing();
+#endif
+            last_land_final_agl = plane.relative_ground_altitude(plane.g.rangefinder_landing);
+            gcs().send_text(MAV_SEVERITY_INFO,"Land descend started");
+            if (plane.control_mode == &plane.mode_auto) {
+                // set height to mission height, so we can use the mission
+                // WP height for triggering land final if no rangefinder
+                // available
+                plane.set_next_WP(plane.mission.get_current_nav_cmd().content.location);
+            } else {
+                plane.set_next_WP(plane.next_WP_loc);
+                plane.next_WP_loc.alt = ahrs.get_home().alt;
+            }
+        }
+    }
+
+    // at land_final_alt begin final landing
+    if (poscontrol.get_state() == QPOS_LAND_DESCEND && check_land_final()) {
+        poscontrol.set_state(QPOS_LAND_FINAL);
+
+#if AP_ICENGINE_ENABLED
+        // cut IC engine if enabled
+        if (land_icengine_cut != 0) {
+            plane.g2.ice_control.engine_control(0, 0, 0, false);
+        }
+#endif  // AP_ICENGINE_ENABLED
+        gcs().send_text(MAV_SEVERITY_INFO,"Land final started");
+    }
+
+    // at land_final_alt begin final landing
+    if (poscontrol.get_state() == QPOS_LAND_ABORT &&
+        plane.current_loc.alt*0.01 >= land_descend_start_alt) {
+        // continue to next WP, if there is one
+        return true;
+    }
+
+    if (plane.in_auto_mission_id(MAV_CMD_NAV_PAYLOAD_PLACE) &&
+        (poscontrol.get_state() == QPOS_LAND_DESCEND ||
+         poscontrol.get_state() == QPOS_LAND_FINAL)) {
+        const auto &cmd = plane.mission.get_current_nav_cmd();
+        if (cmd.p1 > 0 && plane.current_loc.alt*0.01 < land_descend_start_alt - cmd.p1*0.01) {
+            gcs().send_text(MAV_SEVERITY_INFO,"Payload place aborted");
+            poscontrol.set_state(QPOS_LAND_ABORT);
+        }
+    }
+    
+    if (check_land_complete() && plane.mission.continue_after_land()) {
+        gcs().send_text(MAV_SEVERITY_INFO,"Mission continue");
+        return true;
+    }
+    return false;
+}
+
+#if HAL_LOGGING_ENABLED
+// Write a control tuning packet
+void QuadPlane::Log_Write_QControl_Tuning()
+{
+    float des_alt_m = 0.0f;
+    int16_t target_climb_rate_cms = 0;
+    if (plane.control_mode != &plane.mode_qstabilize) {
+        des_alt_m = pos_control->get_pos_target_z_cm() * 0.01f;
+        target_climb_rate_cms = pos_control->get_vel_target_z_cms();
+    }
+
+    // Asemble assistance bitmask, defintion here is used to generate log documentation
+    enum class log_assistance_flags {
+        in_assisted_flight = 1U<<0, // true if VTOL assist is active
+        forced             = 1U<<1, // true if assistance is forced
+        speed              = 1U<<2, // true if assistance due to low airspeed
+        alt                = 1U<<3, // true if assistance due to low altitude
+        angle              = 1U<<4, // true if assistance due to attitude error
+    };
+
+    uint8_t assist_flags = 0;
+    if (assisted_flight) {
+        assist_flags |= (uint8_t)log_assistance_flags::in_assisted_flight;
+    }
+    if (assist.in_force_assist()) {
+        assist_flags |= (uint8_t)log_assistance_flags::forced;
+    }
+    if (assist.in_speed_assist()) {
+        assist_flags |= (uint8_t)log_assistance_flags::speed;
+    }
+    if (assist.in_alt_assist()) {
+        assist_flags |= (uint8_t)log_assistance_flags::alt;
+    }
+    if (assist.in_angle_assist()) {
+        assist_flags |= (uint8_t)log_assistance_flags::angle;
+    }
+
+    struct log_QControl_Tuning pkt = {
+        LOG_PACKET_HEADER_INIT(LOG_QTUN_MSG),
+        time_us             : AP_HAL::micros64(),
+        throttle_in         : attitude_control->get_throttle_in(),
+        angle_boost         : attitude_control->angle_boost(),
+        throttle_out        : motors->get_throttle(),
+        throttle_hover      : motors->get_throttle_hover(),
+        desired_alt         : des_alt_m,
+        inav_alt            : inertial_nav.get_position_z_up_cm() * 0.01f,
+        baro_alt            : int32_t(plane.barometer.get_altitude() * 100),
+        target_climb_rate   : target_climb_rate_cms,
+        climb_rate          : int16_t(inertial_nav.get_velocity_z_up_cms()),
+        throttle_mix        : attitude_control->get_throttle_mix(),
+        transition_state    : transition->get_log_transition_state(),
+        assist              : assist_flags,
+    };
+    plane.logger.WriteBlock(&pkt, sizeof(pkt));
+
+    // write multicopter position control message
+    pos_control->write_log();
+
+    // Write tiltrotor tilt angle log
+    tiltrotor.write_log();
+}
+#endif
+
+
+/*
+  calculate the forward throttle percentage. The forward throttle can
+  be used to assist with position hold and with landing approach. It
+  reduces the need for down pitch which reduces load on the vertical
+  lift motors.
+ */
+float QuadPlane::forward_throttle_pct()
+{
+    // handle special case where forward thrust motor is used instead of forward pitch.
+    if (get_vfwd_method() == ActiveFwdThr::NEW) {
+        return 100.0f * q_fwd_throttle;
+    }
+
+    /*
+      Unless an RC channel is assigned for manual forward throttle control,
+      we don't use forward throttle in QHOVER or QSTABILIZE as they are the primary
+      recovery modes for a quadplane and need to be as simple as
+      possible. They will drift with the wind.
+    */
+    if (plane.control_mode == &plane.mode_qacro ||
+        plane.control_mode == &plane.mode_qstabilize ||
+        plane.control_mode == &plane.mode_qhover) {
+
+        if (rc_fwd_thr_ch == nullptr) {
+            return 0;
+        } else {
+            // calculate fwd throttle demand from manual input
+            float fwd_thr = rc_fwd_thr_ch->percent_input();
+
+            // set forward throttle to fwd_thr_max * (manual input + mix): range [0,100]
+            fwd_thr *= .01f * constrain_float(fwd_thr_max, 0, 100);
+            return fwd_thr;
+        }
+    }
+
+    /*
+      see if the controller should be active
+    */
+    if (get_vfwd_method() != ActiveFwdThr::OLD) {
+        return 0;
+    }
+
+    /*
+      in modes with a velocity controller
+    */
+    float deltat = (AP_HAL::millis() - vel_forward.last_ms) * 0.001f;
+    if (deltat > 1 || deltat < 0) {
+        vel_forward.integrator = 0;
+        deltat = 0.1;
+    }
+    if (deltat < 0.1) {
+        // run at 10Hz
+        return vel_forward.last_pct;
+    }
+    vel_forward.last_ms = AP_HAL::millis();
+    
+    // work out the desired speed in forward direction
+    Vector3f desired_velocity_cms = pos_control->get_vel_desired_cms();
+
+    // convert to NED m/s
+    desired_velocity_cms.z *= -1;
+
+    Vector3f vel_ned;
+    if (!plane.ahrs.get_velocity_NED(vel_ned)) {
+        // we don't know our velocity? EKF must be pretty sick
+        vel_forward.last_pct = 0;
+        vel_forward.integrator = 0;
+        return 0;
+    }
+    // get component of velocity error in fwd body frame direction
+    Vector3f vel_error_body = ahrs.get_rotation_body_to_ned().transposed() * ((desired_velocity_cms*0.01f) - vel_ned);
+
+    float fwd_vel_error = vel_error_body.x;
+
+    // scale forward velocity error by maximum airspeed
+    fwd_vel_error /= MAX(plane.aparm.airspeed_max, 5);
+
+    // add in a component from our current pitch demand. This tends to
+    // move us to zero pitch. Assume that LIM_PITCH would give us the
+    // WP nav speed.
+    fwd_vel_error -= (wp_nav->get_default_speed_xy() * 0.01f) * plane.nav_pitch_cd / (plane.aparm.pitch_limit_max*100);
+
+    if (should_relax() && vel_ned.length() < 1) {
+        // we may be landed
+        fwd_vel_error = 0;
+        vel_forward.integrator *= 0.95f;
+    }
+    
+    // integrator as throttle percentage (-100 to 100)
+    vel_forward.integrator += fwd_vel_error * deltat * vel_forward.gain * 100;
+
+    // inhibit reverse throttle and allow petrol engines with min > 0
+    int8_t fwd_throttle_min = plane.have_reverse_thrust() ? 0 : plane.aparm.throttle_min;
+    vel_forward.integrator = constrain_float(vel_forward.integrator, fwd_throttle_min, plane.aparm.throttle_cruise);
+
+    if (in_vtol_land_approach()) {
+        // when we are doing horizontal positioning in a VTOL land
+        // we always allow the fwd motor to run. Otherwise a bad
+        // lidar could cause the aircraft not to be able to
+        // approach the landing point when landing below the takeoff point
+        vel_forward.last_pct = vel_forward.integrator;
+    } else if ((in_vtol_land_final() && motors->limit.throttle_lower) ||
+#if AP_RANGEFINDER_ENABLED
+              (plane.g.rangefinder_landing && (plane.rangefinder.status_orient(ROTATION_PITCH_270) == RangeFinder::Status::OutOfRangeLow))) {
+#else
+              false) {
+#endif
+        // we're in the settling phase of landing or using a rangefinder that is out of range low, disable fwd motor
+        vel_forward.last_pct = 0;
+        vel_forward.integrator = 0;
+    } else {
+        // If we are below alt_cutoff then scale down the effect until
+        // it turns off at alt_cutoff and decay the integrator
+        float alt_cutoff = MAX(0,vel_forward_alt_cutoff);
+        float height_above_ground = plane.relative_ground_altitude(plane.g.rangefinder_landing);
+
+        vel_forward.last_pct = linear_interpolate(0, vel_forward.integrator,
+                                                  height_above_ground, alt_cutoff, alt_cutoff+2);
+    }
+    if (is_zero(vel_forward.last_pct)) {
+        // if the percent is 0 then decay the integrator
+        vel_forward.integrator *= 0.95f;
+    }
+
+    return vel_forward.last_pct;
+}
+
+/*
+  get weathervaning yaw rate in cd/s
+ */
+float QuadPlane::get_weathervane_yaw_rate_cds(void)
+{
+    /*
+      we only do weathervaning in modes where we are doing VTOL
+      position control.
+    */
+    if (!in_vtol_mode() ||
+        !transition->allow_weathervane() ||
+        !motors->armed() || (motors->get_desired_spool_state() != AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED) ||
+        plane.control_mode == &plane.mode_qstabilize ||
+#if QAUTOTUNE_ENABLED
+        plane.control_mode == &plane.mode_qautotune ||
+#endif
+        plane.control_mode == &plane.mode_qhover ||
+        should_relax()
+        ) {
+        // Ensure the weathervane controller is reset to prevent weathervaning from happening outside of the timer
+        weathervane->reset();
+        return 0.0;
+    }
+
+    const bool is_takeoff = in_vtol_auto() && is_vtol_takeoff(plane.mission.get_current_nav_cmd().id);
+    float wv_output;
+    if (weathervane->get_yaw_out(wv_output,
+                                     plane.channel_rudder->get_control_in(),
+                                     plane.relative_ground_altitude(plane.g.rangefinder_landing),
+                                     pos_control->get_roll_cd(),
+                                     pos_control->get_pitch_cd(),
+                                     is_takeoff,
+                                     in_vtol_land_sequence())) {
+        return constrain_float(wv_output * (1/45.0), -100.0, 100.0) * command_model_pilot.get_rate() * 0.5;
+    }
+
+    return 0.0;
+}
+
+/*
+  start guided mode control
+ */
+void QuadPlane::guided_start(void)
+{
+    guided_takeoff = false;
+    setup_target_position();
+    int32_t from_alt;
+    int32_t to_alt;
+    poscontrol_init_approach();
+    if (plane.current_loc.get_alt_cm(Location::AltFrame::ABSOLUTE,from_alt) && plane.next_WP_loc.get_alt_cm(Location::AltFrame::ABSOLUTE,to_alt)) {
+        poscontrol.slow_descent = from_alt > to_alt;
+    } else {
+        // default back to old method
+        poscontrol.slow_descent = (plane.current_loc.alt > plane.next_WP_loc.alt);
+    }
+}
+
+/*
+  update guided mode control
+ */
+void QuadPlane::guided_update(void)
+{
+    if (plane.control_mode == &plane.mode_guided && guided_takeoff && plane.current_loc.alt < plane.next_WP_loc.alt) {
+        throttle_wait = false;
+        set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+        takeoff_controller();
+    } else {
+        if (guided_takeoff) {
+            poscontrol.set_state(QPOS_POSITION2);
+        }
+        guided_takeoff = false;
+        // run VTOL position controller
+        vtol_position_controller();
+    }
+}
+
+void QuadPlane::afs_terminate(void)
+{
+    if (available()) {
+        set_desired_spool_state(AP_Motors::DesiredSpoolState::SHUT_DOWN);
+        motors->output();
+    }
+}
+
+/*
+  return true if we should do guided mode loitering using VTOL motors
+ */
+bool QuadPlane::guided_mode_enabled(void)
+{
+    if (!available()) {
+        return false;
+    }
+    // only use quadplane guided when in AUTO or GUIDED mode
+    if (plane.control_mode != &plane.mode_guided && plane.control_mode != &plane.mode_auto) {
+        return false;
+    }
+    if (plane.control_mode == &plane.mode_auto &&
+        plane.mission.get_current_nav_cmd().id == MAV_CMD_NAV_LOITER_TURNS) {
+        // loiter turns is a fixed wing only operation
+        return false;
+    }
+    return guided_mode != 0;
+}
+
+/*
+  set altitude target to current altitude
+ */
+void QuadPlane::set_alt_target_current(void)
+{
+    pos_control->set_pos_target_z_cm(inertial_nav.get_position_z_up_cm());
+}
+
+// user initiated takeoff for guided mode
+bool QuadPlane::do_user_takeoff(float takeoff_altitude)
+{
+    if (plane.control_mode != &plane.mode_guided) {
+        gcs().send_text(MAV_SEVERITY_INFO, "User Takeoff only in GUIDED mode");
+        return false;
+    }
+    if (!plane.arming.is_armed_and_safety_off()) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Must be armed for takeoff");
+        return false;
+    }
+    if (is_flying()) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Already flying - no takeoff");
+        return false;
+    }
+    plane.auto_state.vtol_loiter = true;
+    plane.prev_WP_loc = plane.current_loc;
+    plane.next_WP_loc = plane.current_loc;
+    plane.next_WP_loc.alt += takeoff_altitude*100;
+    set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    guided_start();
+    guided_takeoff = true;
+    guided_wait_takeoff = false;
+    if (!option_is_set(QuadPlane::OPTION::DISABLE_GROUND_EFFECT_COMP)) {
+        ahrs.set_takeoff_expected(true);
+    }
+    return true;
+}
+
+// return true if the wp_nav controller is being updated
+bool QuadPlane::using_wp_nav(void) const
+{
+    if (plane.control_mode == &plane.mode_qloiter || plane.control_mode == &plane.mode_qland) {
+        return true;
+    }
+    return false;
+}
+
+/*
+  return mav_type for heartbeat
+ */
+MAV_TYPE QuadPlane::get_mav_type(void) const
+{
+    if (mav_type.get() == 0) {
+        return MAV_TYPE_FIXED_WING;
+    }
+    return MAV_TYPE(mav_type.get());
+}
+
+/*
+  return true if current mission item is a vtol takeoff
+*/
+bool QuadPlane::is_vtol_takeoff(uint16_t id) const
+{
+    if (id == MAV_CMD_NAV_VTOL_TAKEOFF) {
+        return true;
+    }
+    if (id == MAV_CMD_NAV_TAKEOFF && available() && !option_is_set(QuadPlane::OPTION::ALLOW_FW_TAKEOFF)) {
+        // treat fixed wing takeoff as VTOL takeoff
+        return true;
+    }
+    return false;
+}
+
+/*
+  return true if current mission item is a vtol land
+*/
+bool QuadPlane::is_vtol_land(uint16_t id) const
+{
+    if (id == MAV_CMD_NAV_VTOL_LAND || id == MAV_CMD_NAV_PAYLOAD_PLACE) {
+        if (landing_with_fixed_wing_spiral_approach()) {
+            return plane.vtol_approach_s.approach_stage == Plane::VTOLApproach::Stage::VTOL_LANDING;
+        } else {
+            return true;
+        }
+    }
+    if (id == MAV_CMD_NAV_LAND && available() && !option_is_set(QuadPlane::OPTION::ALLOW_FW_LAND)) {
+        // treat fixed wing land as VTOL land
+        return true;
+    }
+    return false;
+}
+
+/*
+  return true if we are in a transition to fwd flight from hover
+ */
+bool QuadPlane::in_transition(void) const
+{
+    return available() && transition->active();
+}
+
+/*
+  calculate current stopping distance for a quadplane in fixed wing flight
+ */
+float QuadPlane::stopping_distance(float ground_speed_squared) const
+{
+    // use v^2/(2*accel). This is only quite approximate as the drag
+    // varies with pitch, but it gives something for the user to
+    // control the transition distance in a reasonable way
+    return ground_speed_squared / (2 * transition_decel);
+}
+
+/*
+  calculate acceleration needed to stop in the given distance given current speed
+ */
+float QuadPlane::accel_needed(float stop_distance, float ground_speed_squared) const
+{
+    return ground_speed_squared / (2 * MAX(1,stop_distance));
+}
+
+/*
+  calculate current stopping distance for a quadplane in fixed wing flight
+ */
+float QuadPlane::stopping_distance(void)
+{
+    return stopping_distance(plane.ahrs.groundspeed_vector().length_squared());
+}
+
+/*
+  distance below which we don't do approach, based on stopping
+  distance for cruise speed
+ */
+float QuadPlane::transition_threshold(void)
+{
+    // 1.5 times stopping distance for cruise speed
+    return 1.5 * stopping_distance(sq(plane.aparm.airspeed_cruise));
+}
+
+#define LAND_CHECK_ANGLE_ERROR_DEG  30.0f       // maximum angle error to be considered landing
+#define LAND_CHECK_LARGE_ANGLE_CD   1500.0f     // maximum angle target to be considered landing
+#define LAND_CHECK_ACCEL_MOVING     3.0f        // maximum acceleration after subtracting gravity
+
+void QuadPlane::update_throttle_mix(void)
+{
+    // update filtered acceleration
+    Vector3f accel_ef = ahrs.get_accel_ef();
+    accel_ef.z += GRAVITY_MSS;
+    throttle_mix_accel_ef_filter.apply(accel_ef, plane.scheduler.get_loop_period_s());
+
+    // transition will directly manage the mix
+    if (!transition->allow_update_throttle_mix()) {
+        return;
+    }
+
+    // if disarmed or landed prioritise throttle
+    if (!motors->armed()) {
+        attitude_control->set_throttle_mix_min();
+        return;
+    }
+
+    if (plane.control_mode->is_vtol_man_throttle()) {
+        // manual throttle
+        if (!is_positive(get_throttle_input()) && !air_mode_active()) {
+            attitude_control->set_throttle_mix_min();
+        } else {
+            attitude_control->set_throttle_mix_man();
+        }
+    } else {
+        // autopilot controlled throttle
+
+        // check for aggressive flight requests - requested roll or pitch angle below 15 degrees
+        const Vector3f angle_target = attitude_control->get_att_target_euler_cd();
+        bool large_angle_request = angle_target.xy().length() > LAND_CHECK_LARGE_ANGLE_CD;
+
+        // check for large external disturbance - angle error over 30 degrees
+        const float angle_error = attitude_control->get_att_error_angle_deg();
+        bool large_angle_error = (angle_error > LAND_CHECK_ANGLE_ERROR_DEG);
+
+        // check for large acceleration - falling or high turbulence
+        bool accel_moving = (throttle_mix_accel_ef_filter.get().length() > LAND_CHECK_ACCEL_MOVING);
+
+        // check for requested descent
+        bool descent_not_demanded = pos_control->get_vel_desired_cms().z >= 0.0f;
+
+        bool use_mix_max = large_angle_request || large_angle_error || accel_moving || descent_not_demanded;
+
+        /*
+          special case for auto landing, we want a high degree of
+          attitude control until LAND_FINAL
+         */
+        if (in_vtol_land_sequence()) {
+            use_mix_max = !in_vtol_land_final();
+        }
+
+        if (use_mix_max) {
+            attitude_control->set_throttle_mix_max(1.0);
+        } else {
+            attitude_control->set_throttle_mix_min();
+        }
+    }
+}
+
+/*
+  see if we are in the approach phase of a VTOL landing
+ */
+bool QuadPlane::in_vtol_land_approach(void) const
+{
+    if (plane.control_mode == &plane.mode_qrtl &&
+        poscontrol.get_state() <= QPOS_POSITION2) {
+        return true;
+    }
+    if (in_vtol_auto()) {
+        if (is_vtol_land(plane.mission.get_current_nav_cmd().id) &&
+            (poscontrol.get_state() == QPOS_APPROACH ||
+             poscontrol.get_state() == QPOS_AIRBRAKE ||
+             poscontrol.get_state() == QPOS_POSITION1 ||
+             poscontrol.get_state() == QPOS_POSITION2)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+  see if we are in the descent phase of a VTOL landing
+ */
+bool QuadPlane::in_vtol_land_descent(void) const
+{
+    const auto state = poscontrol.get_state();
+    if (plane.control_mode == &plane.mode_qrtl &&
+        (state == QPOS_LAND_DESCEND || state == QPOS_LAND_FINAL || state == QPOS_LAND_ABORT)) {
+        return true;
+    }
+    if (in_vtol_auto() && is_vtol_land(plane.mission.get_current_nav_cmd().id) &&
+        (state == QPOS_LAND_DESCEND || state == QPOS_LAND_FINAL || state == QPOS_LAND_ABORT)) {
+        return true;
+    }
+    return false;
+}
+
+/*
+  see if we are in the final phase of a VTOL landing
+ */
+bool QuadPlane::in_vtol_land_final(void) const
+{
+    return in_vtol_land_descent() && poscontrol.get_state() == QPOS_LAND_FINAL;
+}
+
+/*
+  see if we are in any of the phases of a VTOL landing
+ */
+bool QuadPlane::in_vtol_land_sequence(void) const
+{
+    return plane.control_mode == &plane.mode_qrtl || in_vtol_land_approach() || in_vtol_land_descent() || in_vtol_land_final();
+}
+
+/*
+  see if we are in the VTOL position control phase of a landing
+ */
+bool QuadPlane::in_vtol_land_poscontrol(void) const
+{
+    if (in_vtol_auto() && is_vtol_land(plane.mission.get_current_nav_cmd().id) &&
+        poscontrol.get_state() >= QPOS_POSITION1) {
+        return true;
+    }
+    return false;
+}
+
+/*
+  see if we are in the airbrake phase of a VTOL landing
+ */
+bool QuadPlane::in_vtol_airbrake(void) const
+{
+    if (plane.control_mode == &plane.mode_qrtl &&
+        poscontrol.get_state() == QPOS_AIRBRAKE) {
+        return true;
+    }
+    if (plane.control_mode == &plane.mode_auto &&
+        is_vtol_land(plane.mission.get_current_nav_cmd().id) &&
+        poscontrol.get_state() == QPOS_AIRBRAKE) {
+        return true;
+    }
+    return false;
+}
+
+// return true if we should show VTOL view
+bool QuadPlane::show_vtol_view() const
+{
+    return available() && transition->show_vtol_view();
+}
+
+// return true if we should show VTOL view
+bool SLT_Transition::show_vtol_view() const
+{
+
+    return quadplane.in_vtol_mode();
+}
+
+/*
+  return the PILOT_VELZ_MAX_DN value if non zero, otherwise returns the PILOT_VELZ_MAX value.
+  return is in cm/s
+*/
+uint16_t QuadPlane::get_pilot_velocity_z_max_dn() const
+{
+    if (is_zero(pilot_speed_z_max_dn)) {
+        return abs(pilot_speed_z_max_up*100);
+   }
+    return abs(pilot_speed_z_max_dn*100);
+}
+
+/*
+  should we use the fixed wing attitude controllers for roll/pitch control
+ */
+bool QuadPlane::use_fw_attitude_controllers(void) const
+{
+    if (available() &&
+        motors->armed() &&
+        motors->get_desired_spool_state() >= AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED &&
+        in_vtol_mode() &&
+        !tailsitter.enabled() &&
+        poscontrol.get_state() != QPOS_AIRBRAKE) {
+        // we want the desired rates for fixed wing slaved to the
+        // multicopter rates
+        return false;
+    }
+    return true;
+}
+
+/*
+  calculate our closing velocity vector on the landing point, taking
+  into account target velocity
+*/
+Vector2f QuadPlane::landing_closing_velocity()
+{
+    Vector2f landing_velocity;
+    if (AP_HAL::millis() - poscontrol.last_velocity_match_ms < 1000) {
+        landing_velocity = poscontrol.velocity_match;
+    }
+    return ahrs.groundspeed_vector() - landing_velocity;
+}
+
+/*
+  calculate our desired closing velocity vector on the landing point.
+*/
+Vector2f QuadPlane::landing_desired_closing_velocity()
+{
+    if (poscontrol.get_state() >= QPOS_LAND_DESCEND) {
+        return Vector2f(0,0);
+    }
+    const Vector2f diff_wp = plane.current_loc.get_distance_NE(plane.next_WP_loc);
+    float dist = diff_wp.length();
+    if (dist < 1) {
+        return Vector2f(0,0);
+    }
+
+    // base target speed based on sqrt of distance
+    float target_speed = safe_sqrt(2*transition_decel*dist);
+
+    // don't let the target speed go above landing approach speed
+    const float eas2tas = plane.ahrs.get_EAS2TAS();
+    float land_speed = plane.aparm.airspeed_cruise;
+    float tecs_land_airspeed = plane.TECS_controller.get_land_airspeed();
+    if (is_positive(tecs_land_airspeed)) {
+        land_speed = tecs_land_airspeed;
+    } else {
+        // use half way between min airspeed and cruise if
+        // TECS_LAND_AIRSPEED not set
+        land_speed = 0.5*(land_speed+plane.aparm.airspeed_min);
+    }
+    target_speed = MIN(target_speed, eas2tas * land_speed);
+
+    Vector2f target_speed_xy = diff_wp.normalized() * target_speed;
+
+    return target_speed_xy;
+}
+
+/*
+  get target airspeed for landing, for use by TECS
+*/
+float QuadPlane::get_land_airspeed(void)
+{
+    const auto qstate = poscontrol.get_state();
+    if (qstate == QPOS_APPROACH ||
+        plane.control_mode == &plane.mode_rtl) {
+        const float cruise_speed = plane.aparm.airspeed_cruise;
+        float approach_speed = cruise_speed;
+        float tecs_land_airspeed = plane.TECS_controller.get_land_airspeed();
+        if (is_positive(tecs_land_airspeed)) {
+            approach_speed = tecs_land_airspeed;
+        } else {
+            if (qstate == QPOS_APPROACH) {
+                // default to half way between min airspeed and cruise
+                // airspeed when on the approach
+                approach_speed = 0.5*(cruise_speed+plane.aparm.airspeed_min);
+            } else {
+                // otherwise cruise
+                approach_speed = cruise_speed;
+            }
+        }
+        const float time_to_pos1 = (plane.auto_state.wp_distance - stopping_distance(sq(approach_speed))) / MAX(approach_speed, 5);
+        /*
+          slow down to landing approach speed as we get closer to landing
+        */
+        approach_speed = linear_interpolate(approach_speed, cruise_speed,
+                                            time_to_pos1,
+                                            20, 60);
+        return approach_speed;
+    }
+
+    if (qstate == QPOS_AIRBRAKE) {
+        // during airbraking ask TECS to slow us to stall speed
+        return plane.aparm.airspeed_min;
+    }
+    
+    // calculate speed based on landing desired velocity
+    Vector2f vel = landing_desired_closing_velocity();
+    const Vector2f wind = plane.ahrs.wind_estimate().xy();
+    const float eas2tas = plane.ahrs.get_EAS2TAS();
+    vel -= wind;
+    vel /= eas2tas;
+    return vel.length();
+}
+
+void QuadPlane::set_desired_spool_state(AP_Motors::DesiredSpoolState state)
+{
+    if (motors->get_desired_spool_state() != state) {
+        if (state == AP_Motors::DesiredSpoolState::SHUT_DOWN) {
+            // also request zero throttle, so we avoid the slow ramp down
+            motors->set_roll(0);
+            motors->set_pitch(0);
+            motors->set_yaw(0);
+            motors->set_throttle(0);
+        }
+        motors->set_desired_spool_state(state);
+    }
+}
+
+bool QuadPlane::air_mode_active() const
+{
+    if ((air_mode == AirMode::ON) || ((air_mode == AirMode::ASSISTED_FLIGHT_ONLY) && assisted_flight)) {
+        return true;
+    }
+    return false;
+}
+
+/*
+  return scaling factor for tilting rotors in forward flight throttle
+  we want to scale back tilt angle for roll/pitch by throttle in forward flight
+ */
+float QuadPlane::FW_vector_throttle_scaling()
+{
+    const float throttle = SRV_Channels::get_output_scaled(SRV_Channel::k_throttle) * 0.01;
+    // scale relative to a fixed 0.5 mid throttle so that changes in TRIM_THROTTLE in missions don't change
+    // the scaling of tilt
+    const float mid_throttle = 0.5;
+    return mid_throttle / constrain_float(throttle, 0.1, 1.0);
+}
+
+QuadPlane *QuadPlane::_singleton = nullptr;
+
+bool SLT_Transition::set_FW_roll_limit(int32_t& roll_limit_cd)
+{
+    if (quadplane.assisted_flight && (transition_state == TRANSITION_AIRSPEED_WAIT || transition_state == TRANSITION_TIMER) &&
+        quadplane.option_is_set(QuadPlane::OPTION::LEVEL_TRANSITION)) {
+        // the user wants transitions to be kept level to within LEVEL_ROLL_LIMIT
+        roll_limit_cd = MIN(roll_limit_cd, plane.g.level_roll_limit*100);
+        return true;
+    }
+    return false;
+}
+
+bool SLT_Transition::allow_update_throttle_mix() const
+{
+    // transition is directly managing throttle mix in these cases
+    return !(quadplane.assisted_flight && (transition_state == TRANSITION_AIRSPEED_WAIT || transition_state == TRANSITION_TIMER));
+}
+
+bool SLT_Transition::active() const
+{
+    return quadplane.assisted_flight && ((transition_state == TRANSITION_AIRSPEED_WAIT) || (transition_state == TRANSITION_TIMER));
+}
+
+/*
+  limit VTOL roll/pitch in POSITION1, POSITION2 and waypoint controller. This serves three roles:
+   1) an expanding envelope limit on pitch to prevent sudden pitch at the start of a back transition
+
+   2) limiting roll and pitch down to the Q_ANGLE_MAX, as the accel limits may push us beyond that for pitch up.
+      This is needed as the position controller doesn't have separate limits for pitch and roll
+
+   3) preventing us pitching up a lot when our airspeed may be low
+      enough that the real airspeed may be negative, which would result
+      in reversed control surfaces
+ */
+bool SLT_Transition::set_VTOL_roll_pitch_limit(int32_t& roll_cd, int32_t& pitch_cd)
+{
+    bool ret = false;
+    const int16_t angle_max = quadplane.aparm.angle_max;
+
+    /*
+      we always limit roll to Q_ANGLE_MAX
+     */
+    int32_t new_roll_cd = constrain_int32(roll_cd, -angle_max, angle_max);
+    if (new_roll_cd != roll_cd) {
+        roll_cd = new_roll_cd;
+        ret = true;
+    }
+
+    /*
+      always limit pitch down to Q_ANGLE_MAX. We need to do this as
+      the position controller accel limits may exceed this limit
+     */
+    if (pitch_cd < -angle_max) {
+        pitch_cd = -angle_max;
+        ret = true;
+    }
+
+    /*
+      prevent trying to fly backwards (negative airspeed) at high
+      pitch angles, which can result in a high degree of instability
+      in SLT aircraft. This can happen with a tailwind in a back
+      transition, where the position controller (which is unaware of
+      airspeed) demands high pitch to hit the desired landing point
+     */
+    float airspeed;
+    if (pitch_cd > angle_max &&
+        plane.ahrs.airspeed_estimate(airspeed) && airspeed < 0.5 * plane.aparm.airspeed_min) {
+        const float max_limit_cd = linear_interpolate(angle_max, 4500,
+                                                      airspeed,
+                                                      0, 0.5 * plane.aparm.airspeed_min);
+        if (pitch_cd > max_limit_cd) {
+            pitch_cd = max_limit_cd;
+            ret = true;
+        }
+    }
+
+    if (quadplane.back_trans_pitch_limit_ms <= 0) {
+        // time based pitch envelope disabled
+        return ret;
+    }
+
+    const uint32_t limit_time_ms = quadplane.back_trans_pitch_limit_ms;
+
+    const uint32_t dt = AP_HAL::millis() - last_fw_mode_ms;
+    if (last_fw_mode_ms == 0 || dt > limit_time_ms) {
+        // we are beyond the time limit, don't apply envelope
+        last_fw_mode_ms = 0;
+        return ret;
+    }
+
+    // we limit pitch during initial transition
+    const float max_limit_cd = linear_interpolate(MAX(last_fw_nav_pitch_cd,0), MIN(angle_max,plane.aparm.pitch_limit_max*100),
+                                            dt,
+                                            0, limit_time_ms);
+
+    if (pitch_cd > max_limit_cd) {
+        pitch_cd = max_limit_cd;
+        return true;
+    }
+
+    /*
+        limit the pitch down with an expanding envelope. This
+        prevents the velocity controller demanding nose down during
+        the initial slowdown if the target velocity curve is higher
+        than the actual velocity curve (for a high drag
+        aircraft). Nose down will cause a lot of downforce on the
+        wings which will draw a lot of current and also cause the
+        aircraft to lose altitude rapidly.pitch limit varies also with speed
+        to prevent inability to progress to position if moving from a loiter
+        to landing
+    */
+    const float min_limit_cd = linear_interpolate(MIN(last_fw_nav_pitch_cd,0), MAX(-angle_max,plane.aparm.pitch_limit_min*100),
+                                                  dt,
+                                                  0, limit_time_ms);
+
+    if (plane.nav_pitch_cd < min_limit_cd) {
+        plane.nav_pitch_cd = min_limit_cd;
+        return true;
+    }
+
+    return ret;
+}
+
+/*
+  remember last fixed wing pitch for pitch envelope in back transition
+ */
+void SLT_Transition::set_last_fw_pitch()
+{
+    last_fw_mode_ms = AP_HAL::millis();
+    last_fw_nav_pitch_cd = plane.nav_pitch_cd;
+}
+
+void SLT_Transition::force_transition_complete() {
+    transition_state = TRANSITION_DONE; 
+    in_forced_transition = false;
+    transition_start_ms = 0;
+    transition_low_airspeed_ms = 0;
+    set_last_fw_pitch();
+
+    // Keep assistance reset while not checking
+    quadplane.assist.reset();
+}
+
+MAV_VTOL_STATE SLT_Transition::get_mav_vtol_state() const
+{
+    if (quadplane.in_vtol_mode()) {
+        QuadPlane::position_control_state state = quadplane.poscontrol.get_state();
+        if ((state == QuadPlane::position_control_state::QPOS_AIRBRAKE) || (state == QuadPlane::position_control_state::QPOS_POSITION1)) {
+            return MAV_VTOL_STATE_TRANSITION_TO_MC;
+        }
+        return MAV_VTOL_STATE_MC;
+    }
+
+    switch (transition_state) {
+        case TRANSITION_AIRSPEED_WAIT:
+        case TRANSITION_TIMER:
+            // we enter this state during assisted flight, not just
+            // during a forward transition.
+            return MAV_VTOL_STATE_TRANSITION_TO_FW;
+
+        case TRANSITION_DONE:
+            return MAV_VTOL_STATE_FW;
+    }
+
+    return MAV_VTOL_STATE_UNDEFINED;
+}
+
+// Set FW roll and pitch limits and keep TECS informed
+void SLT_Transition::set_FW_roll_pitch(int32_t& nav_pitch_cd, int32_t& nav_roll_cd)
+{
+    if (quadplane.in_vtol_mode() || quadplane.in_vtol_airbrake()) {
+        // not in FW flight
+        return;
+    }
+
+    if (transition_state == TRANSITION_DONE) {
+        // transition complete, nothing to do
+        return;
+    }
+
+    if (!plane.control_mode->does_auto_throttle()) {
+        // don't limit pitch when in manually controlled modes like FBWA, ACRO
+        return;
+    }
+
+    float max_pitch;
+    if (transition_state < TRANSITION_TIMER) {
+        if (plane.ahrs.groundspeed() < 3.0) {
+            // until we have some ground speed limit to zero pitch
+            max_pitch = 0.0;
+        } else {
+            max_pitch = quadplane.transition_pitch_max;
+        }
+    } else {
+        max_pitch = (quadplane.transition_pitch_max+1.0)*2.0;
+    }
+
+    // set a single loop pitch limit in TECS
+    plane.TECS_controller.set_pitch_max_limit(max_pitch);
+
+    // ensure pitch is constrained to limit
+    nav_pitch_cd = constrain_int32(nav_pitch_cd, -max_pitch*100.0, max_pitch*100.0);
+}
+
+/*
+  see if we are in a VTOL takeoff
+ */
+bool QuadPlane::in_vtol_takeoff(void) const
+{
+    if (in_vtol_auto() && is_vtol_takeoff(plane.mission.get_current_nav_cmd().id)) {
+        return true;
+    }
+    return false;
+}
+
+// called when we change mode (for any mode, not just Q modes)
+void QuadPlane::mode_enter(void)
+{
+    if (available()) {
+        pos_control->set_lean_angle_max_cd(0);
+    }
+    poscontrol.xy_correction.zero();
+    poscontrol.velocity_match.zero();
+    poscontrol.last_velocity_match_ms = 0;
+    poscontrol.set_state(QuadPlane::QPOS_NONE);
+
+    // clear guided takeoff wait on any mode change, but remember the
+    // state for special behaviour
+    guided_wait_takeoff_on_mode_enter = guided_wait_takeoff;
+    guided_wait_takeoff = false;
+
+    q_fwd_throttle = 0.0f;
+    q_fwd_pitch_lim_cd = 100.0f * q_fwd_pitch_lim;
+}
+
+// Set attitude control yaw rate time constant to pilot input command model value
+void QuadPlane::set_pilot_yaw_rate_time_constant()
+{
+    attitude_control->set_yaw_rate_tc(command_model_pilot.get_rate_tc());
+}
+
+// Disable attitude control yaw rate time constant
+void QuadPlane::disable_yaw_rate_time_constant()
+{
+    attitude_control->set_yaw_rate_tc(0.0);
+}
+
+// Check if servo auto trim is allowed, only if countrol surfaces are fully in use
+bool QuadPlane::allow_servo_auto_trim()
+{
+    if (!available()) {
+        // Quadplane disabled, auto trim always allowed
+        return true;
+    }
+    if (in_vtol_mode()) {
+        // VTOL motors active in VTOL modes
+        return false;
+    }
+    if (!in_assisted_flight()) {
+        // In forward flight and VTOL motors not active
+        return true;
+    }
+    if (tailsitter.enabled() && option_is_set(QuadPlane::OPTION::TAILSIT_Q_ASSIST_MOTORS_ONLY)) {
+        // Tailsitter in forward flight, motors providing active stabalisation with motors only option
+        // Control surfaces are running as normal with I term active, motor I term is zeroed
+        return true;
+    }
+    // In forward flight with active VTOL motors
+    return false;
+}
+
+bool QuadPlane::landing_with_fixed_wing_spiral_approach(void) const
+{
+    const AP_Mission::Mission_Command cmd = plane.mission.get_current_nav_cmd();
+
+    if (cmd.id == MAV_CMD_NAV_PAYLOAD_PLACE &&
+        option_is_set(QuadPlane::OPTION::MISSION_LAND_FW_APPROACH)) {
+        return true;
+    }
+    
+    return ((cmd.id == MAV_CMD_NAV_VTOL_LAND) &&
+            (option_is_set(QuadPlane::OPTION::MISSION_LAND_FW_APPROACH) ||
+             cmd.p1 == NAV_VTOL_LAND_OPTIONS_FW_SPIRAL_APPROACH));
+}
+
+/*
+  setup scaling of roll and pitch angle P gains to match fixed wing gains
+
+  we setup the angle P gain to match fixed wing at high speed (above
+  AIRSPEED_MIN) where fixed wing surfaces are presumed to
+  dominate. At lower speeds we use the multicopter angle P gains.
+*/
+void QuadPlane::setup_rp_fw_angle_gains(void)
+{
+    const float mc_angR = attitude_control->get_angle_roll_p().kP();
+    const float mc_angP = attitude_control->get_angle_pitch_p().kP();
+    const float fw_angR = 1.0/plane.rollController.tau();
+    const float fw_angP = 1.0/plane.pitchController.tau();
+
+    if (!is_positive(mc_angR) || !is_positive(mc_angP)) {
+        // bad configuration, don't scale
+        return;
+    }
+
+    float aspeed;
+    if (!ahrs.airspeed_estimate(aspeed)) {
+        // can't get airspeed, no scaling of VTOL angle gains
+        return;
+    }
+
+    const float low_airspeed = 3.0;
+    if (aspeed <= low_airspeed || plane.aparm.airspeed_min <= low_airspeed) {
+        // no scaling
+        return;
+    }
+
+    const float angR_scale = linear_interpolate(mc_angR, fw_angR,
+                                                aspeed,
+                                                low_airspeed, plane.aparm.airspeed_min) / mc_angR;
+    const float angP_scale = linear_interpolate(mc_angP, fw_angP,
+                                                aspeed,
+                                                low_airspeed, plane.aparm.airspeed_min) / mc_angP;
+    const Vector3f gain_scale{angR_scale, angP_scale, 1.0};
+    attitude_control->set_angle_P_scale(gain_scale);
+}
+
+/*
+  abort landing, used by scripting for payload place and ship landing abort
+  will return false if not in a landing descent
+ */
+bool QuadPlane::abort_landing(void)
+{
+    if (poscontrol.get_state() == QPOS_LAND_ABORT ||
+        !(plane.control_mode == &plane.mode_auto)) {
+        // already aborted or not in AUTO?
+        return false;
+    }
+
+    // special case for payload place with full landing
+    const bool payload_place_landed =
+        plane.in_auto_mission_id(MAV_CMD_NAV_PAYLOAD_PLACE) &&
+        poscontrol.get_state() == QPOS_LAND_COMPLETE;
+
+    if (!payload_place_landed && !in_vtol_land_descent()) {
+        return false;
+    }
+    poscontrol.set_state(QuadPlane::QPOS_LAND_ABORT);
+    return true;
+}
+
+// Should we allow stick mixing from the pilot
+bool QuadPlane::allow_stick_mixing() const
+{
+    if (!available()) {
+        // Quadplane not enabled
+        return true;
+    }
+    // Ask transition logic
+    return transition->allow_stick_mixing();
+}
+
+/*
+  return true if we should disable TECS in the current flight state
+  this ensures that TECS resets when we change height in a VTOL mode
+ */
+bool QuadPlane::should_disable_TECS() const
+{
+    if (in_vtol_land_descent()) {
+        return true;
+    }
+    if (plane.control_mode == &plane.mode_guided &&
+        plane.auto_state.vtol_loiter) {
+        return true;
+    }
+    return false;
+}
+
+// Get pilot throttle input with deadzone, this will return 50% throttle in failsafe!
+// This is a re-implmentation of Plane::get_throttle_input
+// Ignoring the no_deadzone case means we don't need to check for valid RC
+// This is handled by Plane::control_failsafe setting of control in
+float QuadPlane::get_throttle_input() const
+{
+    float ret = plane.channel_throttle->get_control_in();
+    if (plane.reversed_throttle) {
+        // RC option for reverse throttle has been set
+        ret = -ret;
+    }
+    return ret;
+}
+
+// return true if forward throttle from forward_throttle_pct() should be used
+bool QuadPlane::allow_forward_throttle_in_vtol_mode() const
+{
+    return in_vtol_mode() && motors->armed() && (motors->get_desired_spool_state() != AP_Motors::DesiredSpoolState::SHUT_DOWN);
+}
+
+#endif  // HAL_QUADPLANE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   

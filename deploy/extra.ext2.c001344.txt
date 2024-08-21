@@ -1,0 +1,2704 @@
+ma_handle->unlock();
+#endif
+    // disable the pieces from the UART which will get enabled later
+    chSysLock();
+    UARTD2.usart->CR3 &= ~USART_CR3_DMAT;
+    chSysUnlock();
+}
+
+void loop(void)
+{
+    iomcu.update();
+}
+
+void AP_IOMCU_FW::init()
+{
+    // the first protocol version must be 4 to allow downgrade to
+    // old NuttX based firmwares
+    config.protocol_version = IOMCU_PROTOCOL_VERSION;
+    config.protocol_version2 = IOMCU_PROTOCOL_VERSION2;
+    config.mcuid = (*(uint32_t *)DBGMCU_BASE);
+#if defined(STM32F103xB) || defined(STM32F103x8)
+    if (config.mcuid == 0) {
+        // Errata 2.2.2 - Debug registers cannot be read by user software
+        config.mcuid = 0x20036410;  // STM32F10x (Medium Density) rev Y
+    }
+#endif
+    config.cpuid = SCB->CPUID;
+
+    thread_ctx = chThdGetSelfX();
+
+#if AP_HAL_SHARED_DMA_ENABLED
+    tx_dma_handle = NEW_NOTHROW ChibiOS::Shared_DMA(STM32_UART_USART2_TX_DMA_STREAM, SHARED_DMA_NONE,
+                        FUNCTOR_BIND_MEMBER(&AP_IOMCU_FW::tx_dma_allocate, void, Shared_DMA *),
+                        FUNCTOR_BIND_MEMBER(&AP_IOMCU_FW::tx_dma_deallocate, void, Shared_DMA *));
+    tx_dma_handle->lock();
+    // deallocate so that the uart initializes correctly
+    tx_dma_deallocate(tx_dma_handle);
+#endif
+
+    if (palReadLine(HAL_GPIO_PIN_IO_HW_DETECT1) == 1 && palReadLine(HAL_GPIO_PIN_IO_HW_DETECT2) == 0) {
+        has_heater = true;
+    }
+
+    //Set Heater pin mode
+    if (heater_pwm_polarity) {
+        palSetLineMode(HAL_GPIO_PIN_HEATER, PAL_MODE_OUTPUT_PUSHPULL);
+    } else {
+        palSetLineMode(HAL_GPIO_PIN_HEATER, PAL_MODE_OUTPUT_OPENDRAIN);
+    }
+
+    adc_init();
+    rcin_serial_init();
+
+    // power on spektrum port
+    palSetLineMode(HAL_GPIO_PIN_SPEKTRUM_PWR_EN, PAL_MODE_OUTPUT_PUSHPULL);
+    SPEKTRUM_POWER(1);
+
+    // we generally do no allocations after setup completes
+    reg_status.freemem = hal.util->available_memory();
+
+    if (hal.util->was_watchdog_safety_off()) {
+        hal.rcout->force_safety_off();
+        reg_status.flag_safety_off = true;
+    }
+}
+
+
+#if CH_DBG_ENABLE_STACK_CHECK == TRUE
+static void stackCheck(uint16_t& mstack, uint16_t& pstack) {
+    extern stkalign_t __main_stack_base__[];
+    extern stkalign_t __main_stack_end__[];
+    uint32_t stklimit = (uint32_t)__main_stack_end__;
+    uint32_t stkbase  = (uint32_t)__main_stack_base__;
+    uint32_t *crawl   = (uint32_t *)stkbase;
+
+    while (*crawl == 0x55555555 && crawl < (uint32_t *)stklimit) {
+        crawl++;
+    }
+    uint32_t free = (uint32_t)crawl - stkbase;
+    chDbgAssert(free > 0, "mstack exhausted");
+    mstack = (uint16_t)free;
+
+    extern stkalign_t __main_thread_stack_base__[];
+    extern stkalign_t __main_thread_stack_end__[];
+    stklimit = (uint32_t)__main_thread_stack_end__;
+    stkbase  = (uint32_t)__main_thread_stack_base__;
+    crawl   = (uint32_t *)stkbase;
+
+    while (*crawl == 0x55555555 && crawl < (uint32_t *)stklimit) {
+        crawl++;
+    }
+    free = (uint32_t)crawl - stkbase;
+    chDbgAssert(free > 0, "pstack exhausted");
+    pstack = (uint16_t)free;
+}
+#endif /* CH_DBG_ENABLE_STACK_CHECK == TRUE */
+
+/*
+ Update loop design.
+
+ Considerations - the F100 is quite slow and so processing time needs to be used effectively.
+ The CPU time slices required by dshot are generally faster than those required for other processing.
+ Dshot requires even updates at at least 1Khz and generally faster if SERVO_DSHOT_RATE is used.
+ The two most time sensitive regular functions are (1) PWM updates which run at loop rate triggered from the FMU
+ (and thus require efficient code page write) and (2) rcin updates which run at a fixed 1Khz cycle (a speed
+ which is assumed by the rcin protocol handlers) and require efficient code read. The FMU sends code page
+ requests which require a response within 10ms in order to prevent the IOMCU being considered to have failed,
+ however code page requests are always initiated by the FMU and so the IOMCU only ever needs to be ready
+ to read requests - writing responses are always in response to a request. Finally, PWM channels 3-4 share a DMA
+ channel with UART TX and so access needs to be mediated.
+
+ Design -
+ 1. requests are read using circular DMA. In other words the RX side of the UART is always ready. Once
+ a request has been processed DMA is immediately set up for a new request.
+ 2. responses are only ever sent in response to a request. As soon as a request is received the ISR only
+ ever requests that a response be sent - it never actually sends a response.
+ 3. The update loop waits for four different events:
+    3a - a request has been received and should be processed. This does not require the TX DMA lock.
+    3b - a response needs to be sent. This requires the TX DMA lock.
+    3c - a response has been sent. This allows the TX DMA lock to be released.
+    3d - an out of band PWM request, usually triggered by a failsafe needs to be processed.
+ Since requests are processed continuously it is possible for 3b and 3c to occur simultaneously. Since the
+ TX lock is already held to send the previous response, there is no need to do anything with the lock in order
+ to process the next response.
+
+ Profiling shows that sending a response takes very little time - 10s of microseconds - and so a response is sent
+ if required at the beginning of the update. This means that by the end of the update there is a very high chance
+ that the response will have already been sent and this is therefore checked. If the response has been sent the
+ lock is released. If for some reason the response has not gone out, as soon as it does an event will be posted
+ and the update loop will run again.
+
+ This design means that on average the update loop is idle with the TX DMA channel unlocked. This maximises the
+ time that dshot can run uninterrupted leading to very efficient and even output.
+
+ Finally the update loop has a timeout which forces updates to progress even in the absence of requests from the
+ FMU. Since responses will always be triggered in a timely fashion, regardlesss of the timeout, this can be
+ set relatively long.
+
+ If compiled without sharing, DMA - and thus dshot - is not used on channels 3-4, there are no locks and responses
+ are always setup in the request ISR handler.
+*/
+void AP_IOMCU_FW::update()
+{
+    eventmask_t mask = chEvtWaitAnyTimeout(IOEVENT_PWM | IOEVENT_TX_END | IOEVENT_TX_BEGIN, TIME_US2I(1000));
+#ifdef HAL_GPIO_LINE_GPIO107
+    TOGGLE_PIN_DEBUG(107);
+#endif
+
+    iomcu.reg_status.total_ticks++;
+    if (mask) {
+        iomcu.reg_status.total_events++;
+    }
+
+#if AP_HAL_SHARED_DMA_ENABLED
+    // See discussion above
+    if ((mask & IOEVENT_TX_BEGIN) && !(mask & IOEVENT_TX_END)) {        // 3b - lock required to send response
+        tx_dma_handle->lock();
+    } else if (!(mask & IOEVENT_TX_BEGIN) && (mask & IOEVENT_TX_END)) { // 3c - response sent, lock can be released
+        tx_dma_handle->unlock();
+    }   // else 3b and 3c   - current lock required for new response
+
+    // send a response if required
+    if (mask & IOEVENT_TX_BEGIN) {
+        chSysLock();
+        setup_tx_dma(&UARTD2);
+        chSysUnlock();
+    }
+#endif
+
+    // we get the timestamp once here, and avoid fetching it
+    // within the DMA callbacks
+    last_ms = AP_HAL::millis();
+    loop_counter++;
+
+    if (do_reboot && (last_ms > reboot_time)) {
+        hal.scheduler->reboot(true);
+        while (true) {}
+    }
+    if ((mask & IOEVENT_PWM) ||
+        (last_safety_off != reg_status.flag_safety_off)) {
+        last_safety_off = reg_status.flag_safety_off;
+        pwm_out_update();
+    }
+
+    uint32_t now = last_ms;
+    uint32_t now_us = AP_HAL::micros();
+
+    reg_status.timestamp_ms = last_ms;
+    // output SBUS if enabled
+    if ((reg_setup.features & P_SETUP_FEATURES_SBUS1_OUT) &&
+        reg_status.flag_safety_off &&
+        now - sbus_last_ms >= sbus_interval_ms) {
+        // output a new SBUS frame
+        sbus_last_ms = now;
+        sbus_out_write(reg_servo.pwm, IOMCU_MAX_RC_CHANNELS);
+    }
+    // handle FMU failsafe
+    if (now - fmu_data_received_time > 200) {
+        // we are not getting input from the FMU. Fill in failsafe values at 100Hz
+        if (now - last_failsafe_ms > 10) {
+            fill_failsafe_pwm();
+            chEvtSignal(thread_ctx, IOEVENT_PWM);
+            last_failsafe_ms = now;
+        }
+        // turn amber on
+        AMBER_SET(1);
+    } else {
+        last_failsafe_ms = now;
+        // turn amber off
+        AMBER_SET(0);
+    }
+
+    // update status page at 20Hz
+    if (now - last_status_ms > 50) {
+        last_status_ms = now;
+        page_status_update();
+    }
+#ifdef HAL_WITH_BIDIR_DSHOT
+    // EDT updates are semt at ~1Hz per ESC, but we want to make sure
+    // that we don't delay updates unduly so sample at 5Hz
+    if (now - last_telem_ms > 200) {
+        last_telem_ms = now;
+        telem_update();
+    }
+#endif
+    // run fast loop functions at 1Khz
+    if (now_us - last_fast_loop_us >= 1000)
+    {
+        last_fast_loop_us = now_us;
+        heater_update();
+        rcin_update();
+        rcin_serial_update();
+#ifdef HAL_WITH_BIDIR_DSHOT
+        erpm_update();
+#endif
+    }
+
+    // run remaining functions at 100Hz
+    // these are all relatively expensive and take ~10ms to complete
+    // so there is no way they can effectively be run faster than 100Hz
+    if (now - last_slow_loop_ms > 10) {
+        last_slow_loop_ms = now;
+        safety_update();
+        rcout_config_update();
+        hal.rcout->timer_tick();
+        if (dsm_bind_state) {
+            dsm_bind_step();
+        }
+        GPIO_write();
+#if CH_DBG_ENABLE_STACK_CHECK == TRUE
+        stackCheck(reg_status.freemstack, reg_status.freepstack);
+#endif
+    }
+#if AP_HAL_SHARED_DMA_ENABLED
+    // check whether a response has now been sent
+    mask = chEvtGetAndClearEvents(IOEVENT_TX_END);
+
+    if (mask) {
+        tx_dma_handle->unlock();
+    }
+#endif
+#ifdef HAL_GPIO_LINE_GPIO107
+    TOGGLE_PIN_DEBUG(107);
+#endif
+}
+
+void AP_IOMCU_FW::pwm_out_update()
+{
+    memcpy(reg_servo.pwm, reg_direct_pwm.pwm, sizeof(reg_direct_pwm));
+    hal.rcout->cork();
+    for (uint8_t i = 0; i < SERVO_COUNT; i++) {
+        if (reg_status.flag_safety_off || (reg_setup.ignore_safety & (1U<<i))) {
+            hal.rcout->write(i, reg_servo.pwm[i]);
+        } else {
+            hal.rcout->write(i, 0);
+        }
+    }
+    hal.rcout->push();
+}
+
+void AP_IOMCU_FW::heater_update()
+{
+    uint32_t now = last_ms;
+    if (!has_heater) {
+        // use blue LED as heartbeat, run it 4x faster when override active
+        if (now - last_blue_led_ms > (override_active?125:500)) {
+            BLUE_TOGGLE();
+            last_blue_led_ms = now;
+        }
+    } else if (reg_setup.heater_duty_cycle == 0 || (now - last_heater_ms > 3000UL)) {
+        // turn off the heater
+        HEATER_SET(!heater_pwm_polarity);
+    } else {
+        // we use a pseudo random sequence to dither the cycling as
+        // the heater has a significant effect on the internal
+        // magnetometers. The random generator dithers this so we don't get a 1Hz cycly in the magnetometer.
+        // The impact on the mags is about 25 mGauss.
+        bool heater_on = (get_random16() < uint32_t(reg_setup.heater_duty_cycle) * 0xFFFFU / 100U);
+        HEATER_SET(heater_on? heater_pwm_polarity : !heater_pwm_polarity);
+    }
+}
+
+void AP_IOMCU_FW::rcin_update()
+{
+    ((ChibiOS::RCInput *)hal.rcin)->_timer_tick();
+    if (hal.rcin->new_input()) {
+        const auto &rc = AP::RC();
+        rc_input.count = hal.rcin->num_channels();
+        rc_input.flags_rc_ok = true;
+        hal.rcin->read(rc_input.pwm, IOMCU_MAX_RC_CHANNELS);
+        rc_last_input_ms = last_ms;
+        rc_input.rc_protocol = (uint16_t)rc.protocol_detected();
+        rc_input.rssi = rc.get_RSSI();
+        rc_input.flags_failsafe = rc.failsafe_active();
+    } else if (last_ms - rc_last_input_ms > 200U) {
+        rc_input.flags_rc_ok = false;
+    }
+    if (update_rcout_freq) {
+        hal.rcout->set_freq(reg_setup.pwm_rates, reg_setup.pwm_altrate);
+        update_rcout_freq = false;
+    }
+    if (update_default_rate) {
+        hal.rcout->set_default_rate(reg_setup.pwm_defaultrate);
+        update_default_rate = false;
+    }
+
+    bool old_override = override_active;
+
+    // check for active override channel
+    if (mixing.enabled &&
+        mixing.rc_chan_override > 0 &&
+        rc_input.flags_rc_ok &&
+        mixing.rc_chan_override <= IOMCU_MAX_RC_CHANNELS) {
+        override_active = (rc_input.pwm[mixing.rc_chan_override-1] >= 1750);
+    } else {
+        override_active = false;
+    }
+    if (old_override != override_active) {
+        if (override_active) {
+            fill_failsafe_pwm();
+        }
+        chEvtSignal(thread_ctx, IOEVENT_PWM);
+    }
+}
+
+#ifdef HAL_WITH_BIDIR_DSHOT
+void AP_IOMCU_FW::erpm_update()
+{
+    uint32_t now_us = AP_HAL::micros();
+
+    if (hal.rcout->new_erpm()) {
+        dshot_erpm.update_mask |= hal.rcout->read_erpm(dshot_erpm.erpm, IOMCU_MAX_TELEM_CHANNELS);
+        last_erpm_us = now_us;
+    } else if (now_us - last_erpm_us > ESC_RPM_DATA_TIMEOUT_US) {
+        dshot_erpm.update_mask = 0;
+    }
+}
+
+void AP_IOMCU_FW::telem_update()
+{
+    uint32_t now_ms = AP_HAL::millis();
+
+    for (uint8_t i = 0; i < IOMCU_MAX_TELEM_CHANNELS/4; i++) {
+        struct page_dshot_telem &dshot_i = dshot_telem[i];
+        for (uint8_t j = 0; j < 4; j++) {
+            const uint8_t esc_id = (i * 4 + j);
+            if (esc_id >= IOMCU_MAX_TELEM_CHANNELS) {
+                continue;
+            }
+            dshot_i.error_rate[j] = uint16_t(roundf(hal.rcout->get_erpm_error_rate(esc_id) * 100.0));
+#if HAL_WITH_ESC_TELEM
+            const volatile AP_ESC_Telem_Backend::TelemetryData& telem = esc_telem.get_telem_data(esc_id);
+            // if data is stale then set to zero to avoid phantom data appearing in mavlink
+            if (now_ms - telem.last_update_ms > ESC_TELEM_DATA_TIMEOUT_MS) {
+                dshot_i.voltage_cvolts[j] = 0;
+                dshot_i.current_camps[j] = 0;
+                dshot_i.temperature_cdeg[j] = 0;
+#if AP_EXTENDED_DSHOT_TELEM_V2_ENABLED
+                dshot_i.edt2_status[j] = 0;
+                dshot_i.edt2_stress[j] = 0;
+#endif
+                continue;
+            }
+            dshot_i.voltage_cvolts[j] = uint16_t(roundf(telem.voltage * 100));
+            dshot_i.current_camps[j] = uint16_t(roundf(telem.current * 100));
+            dshot_i.temperature_cdeg[j] = telem.temperature_cdeg;
+#if AP_EXTENDED_DSHOT_TELEM_V2_ENABLED
+            dshot_i.edt2_status[j] = uint8_t(telem.edt2_status);
+            dshot_i.edt2_stress[j] = uint8_t(telem.edt2_stress);
+#endif
+            dshot_i.types[j] = telem.types;
+#endif
+        }
+    }
+}
+#endif
+
+void AP_IOMCU_FW::process_io_packet()
+{
+    iomcu.reg_status.total_pkts++;
+
+    if (rx_io_packet.code == CODE_NOOP) {
+        iomcu.reg_status.num_errors++;
+        iomcu.reg_status.err_bad_opcode++;
+        return;
+    }
+
+    uint8_t rx_crc = rx_io_packet.crc;
+    uint8_t calc_crc;
+    rx_io_packet.crc = 0;
+    uint8_t pkt_size = rx_io_packet.get_size();
+    if (rx_io_packet.code == CODE_READ) {
+        // allow for more bandwidth efficient read packets
+        calc_crc = crc_crc8((const uint8_t *)&rx_io_packet, 4);
+        if (calc_crc != rx_crc) {
+            calc_crc = crc_crc8((const uint8_t *)&rx_io_packet, pkt_size);
+        }
+    } else {
+        calc_crc = crc_crc8((const uint8_t *)&rx_io_packet, pkt_size);
+    }
+    if (rx_crc != calc_crc || rx_io_packet.count > PKT_MAX_REGS) {
+        tx_io_packet.count = 0;
+        tx_io_packet.code = CODE_CORRUPT;
+        tx_io_packet.crc = 0;
+        tx_io_packet.page = 0;
+        tx_io_packet.offset = 0;
+        tx_io_packet.crc =  crc_crc8((const uint8_t *)&tx_io_packet, tx_io_packet.get_size());
+        iomcu.reg_status.num_errors++;
+        iomcu.reg_status.err_crc++;
+        return;
+    }
+    switch (rx_io_packet.code) {
+    case CODE_READ: {
+        if (!handle_code_read()) {
+            tx_io_packet.count = 0;
+            tx_io_packet.code = CODE_ERROR;
+            tx_io_packet.crc = 0;
+            tx_io_packet.page = 0;
+            tx_io_packet.offset = 0;
+            tx_io_packet.crc =  crc_crc8((const uint8_t *)&tx_io_packet, tx_io_packet.get_size());
+            iomcu.reg_status.num_errors++;
+            iomcu.reg_status.err_read++;
+        }
+    }
+    break;
+    case CODE_WRITE: {
+        if (!handle_code_write()) {
+            tx_io_packet.count = 0;
+            tx_io_packet.code = CODE_ERROR;
+            tx_io_packet.crc = 0;
+            tx_io_packet.page = 0;
+            tx_io_packet.offset = 0;
+            tx_io_packet.crc =  crc_crc8((const uint8_t *)&tx_io_packet, tx_io_packet.get_size());
+            iomcu.reg_status.num_errors++;
+            iomcu.reg_status.err_write++;
+        }
+    }
+    break;
+    default: {
+        iomcu.reg_status.num_errors++;
+        iomcu.reg_status.err_bad_opcode++;
+        rx_io_packet.code = CODE_NOOP;
+        rx_io_packet.count = 0;
+        return;
+    }
+    break;
+    }
+
+    // prevent a spurious DMA callback from doing anything bad
+    rx_io_packet.code = CODE_NOOP;
+    rx_io_packet.count = 0;
+
+    return;
+}
+
+/*
+  update dynamic elements of status page
+ */
+void AP_IOMCU_FW::page_status_update(void)
+{
+    adc_sample_channels();
+
+    if ((reg_setup.features & P_SETUP_FEATURES_SBUS1_OUT) == 0) {
+        // we can only get VRSSI when sbus is disabled
+        reg_status.vrssi = adc_vrssi();
+    } else {
+        reg_status.vrssi = 0;
+    }
+    reg_status.vservo = adc_vservo();
+}
+
+bool AP_IOMCU_FW::handle_code_read()
+{
+    uint16_t *values = nullptr;
+#define COPY_PAGE(_page_name)							\
+	do {									\
+		values = (uint16_t *)&_page_name;				\
+		tx_io_packet.count = sizeof(_page_name) / sizeof(uint16_t);	\
+	} while(0);
+
+    switch (rx_io_packet.page) {
+    case PAGE_CONFIG:
+        COPY_PAGE(config);
+        break;
+    case PAGE_SETUP:
+        COPY_PAGE(reg_setup);
+        break;
+    case PAGE_RAW_RCIN:
+        COPY_PAGE(rc_input);
+        break;
+#ifdef HAL_WITH_BIDIR_DSHOT
+    case PAGE_RAW_DSHOT_ERPM:
+        COPY_PAGE(dshot_erpm);
+        break;
+    case PAGE_RAW_DSHOT_TELEM_1_4:
+        COPY_PAGE(dshot_telem[0]);
+        break;
+#if IOMCU_MAX_TELEM_CHANNELS > 4
+    case PAGE_RAW_DSHOT_TELEM_5_8:
+        COPY_PAGE(dshot_telem[1]);
+        break;
+#endif
+#endif
+    case PAGE_STATUS:
+        COPY_PAGE(reg_status);
+        break;
+    case PAGE_SERVOS:
+        COPY_PAGE(reg_servo);
+        break;
+    default:
+        return false;
+    }
+
+    /* if the offset is at or beyond the end of the page, we have no data */
+    if (rx_io_packet.offset + rx_io_packet.count > tx_io_packet.count) {
+        return false;
+    }
+
+    /* correct the data pointer and count for the offset */
+    values += rx_io_packet.offset;
+    tx_io_packet.page = rx_io_packet.page;
+    tx_io_packet.offset = rx_io_packet.offset;
+    tx_io_packet.count -= rx_io_packet.offset;
+    tx_io_packet.count = MIN(tx_io_packet.count, rx_io_packet.count);
+    tx_io_packet.count = MIN(tx_io_packet.count, PKT_MAX_REGS);
+    tx_io_packet.code = CODE_SUCCESS;
+    memcpy(tx_io_packet.regs, values, sizeof(uint16_t)*tx_io_packet.count);
+    tx_io_packet.crc = 0;
+    tx_io_packet.crc =  crc_crc8((const uint8_t *)&tx_io_packet, tx_io_packet.get_size());
+
+#ifdef HAL_WITH_BIDIR_DSHOT
+    switch (rx_io_packet.page) {
+    case PAGE_RAW_DSHOT_ERPM:
+        memset(&dshot_erpm, 0, sizeof(dshot_erpm));
+        break;
+    default:
+        break;
+    }
+#endif
+    return true;
+}
+
+bool AP_IOMCU_FW::handle_code_write()
+{
+    switch (rx_io_packet.page) {
+    case PAGE_SETUP:
+        switch (rx_io_packet.offset) {
+        case PAGE_REG_SETUP_ARMING:
+            reg_setup.arming = rx_io_packet.regs[0];
+            break;
+        case PAGE_REG_SETUP_FORCE_SAFETY_OFF:
+            if (rx_io_packet.regs[0] == FORCE_SAFETY_MAGIC) {
+                hal.rcout->force_safety_off();
+                reg_status.flag_safety_off = true;
+            } else {
+                return false;
+            }
+            break;
+        case PAGE_REG_SETUP_FORCE_SAFETY_ON:
+            if (rx_io_packet.regs[0] == FORCE_SAFETY_MAGIC) {
+                hal.rcout->force_safety_on();
+                reg_status.flag_safety_off = false;
+            } else {
+                return false;
+            }
+            break;
+        case PAGE_REG_SETUP_ALTRATE:
+            reg_setup.pwm_altrate = rx_io_packet.regs[0];
+            update_rcout_freq = true;
+            break;
+        case PAGE_REG_SETUP_PWM_RATE_MASK:
+            reg_setup.pwm_rates = rx_io_packet.regs[0];
+            update_rcout_freq = true;
+            break;
+        case PAGE_REG_SETUP_DEFAULTRATE:
+            if (rx_io_packet.regs[0] < 25 && reg_setup.pwm_altclock == 1) {
+                rx_io_packet.regs[0] = 25;
+            }
+
+            if (rx_io_packet.regs[0] > 400 && reg_setup.pwm_altclock == 1) {
+                rx_io_packet.regs[0] = 400;
+            }
+            reg_setup.pwm_defaultrate = rx_io_packet.regs[0];
+            update_default_rate = true;
+            break;
+        case PAGE_REG_SETUP_DSHOT_PERIOD:
+            reg_setup.dshot_period_us = rx_io_packet.regs[0];
+            reg_setup.dshot_rate = rx_io_packet.regs[1];
+            hal.rcout->set_dshot_period(reg_setup.dshot_period_us, reg_setup.dshot_rate);
+            break;
+        case PAGE_REG_SETUP_CHANNEL_MASK:
+            reg_setup.channel_mask = rx_io_packet.regs[0];
+            break;
+        case PAGE_REG_SETUP_SBUS_RATE:
+            reg_setup.sbus_rate = rx_io_packet.regs[0];
+            sbus_interval_ms = MAX(1000U / reg_setup.sbus_rate,3);
+            break;
+        case PAGE_REG_SETUP_FEATURES:
+            reg_setup.features = rx_io_packet.regs[0];
+            /* disable the conflicting options with SBUS 1 */
+            if (reg_setup.features & (P_SETUP_FEATURES_SBUS1_OUT)) {
+                reg_setup.features &= ~(P_SETUP_FEATURES_PWM_RSSI |
+                                        P_SETUP_FEATURES_ADC_RSSI |
+                                        P_SETUP_FEATURES_SBUS2_OUT);
+
+                // enable SBUS output at specified rate
+                sbus_interval_ms = MAX(1000U / reg_setup.sbus_rate,3);
+
+                // we need to release the JTAG reset pin to be used as a GPIO, otherwise we can't enable
+                // or disable SBUS out
+                AFIO->MAPR = AFIO_MAPR_SWJ_CFG_NOJNTRST;
+
+                adc_disable_vrssi();
+                palClearLine(HAL_GPIO_PIN_SBUS_OUT_EN);
+            } else {
+                adc_enable_vrssi();
+                palSetLine(HAL_GPIO_PIN_SBUS_OUT_EN);
+            }
+            if (reg_setup.features & P_SETUP_FEATURES_HEATER) {
+                has_heater = true;
+            }
+            break;
+
+        case PAGE_REG_SETUP_OUTPUT_MODE:
+            mode_out.mask = rx_io_packet.regs[0];
+            mode_out.mode = rx_io_packet.regs[1];
+            mode_out.bdmask = rx_io_packet.regs[2];
+            mode_out.esc_type = rx_io_packet.regs[3];
+            break;
+
+        case PAGE_REG_SETUP_HEATER_DUTY_CYCLE:
+            reg_setup.heater_duty_cycle = rx_io_packet.regs[0];
+            last_heater_ms = last_ms;
+            break;
+
+        case PAGE_REG_SETUP_REBOOT_BL:
+            if (reg_status.flag_safety_off) {
+                // don't allow reboot while armed
+                return false;
+            }
+
+            // check the magic value
+            if (rx_io_packet.regs[0] != REBOOT_BL_MAGIC) {
+                return false;
+            }
+            schedule_reboot(100);
+            break;
+
+        case PAGE_REG_SETUP_IGNORE_SAFETY:
+            reg_setup.ignore_safety = rx_io_packet.regs[0];
+            ((ChibiOS::RCOutput *)hal.rcout)->set_safety_mask(reg_setup.ignore_safety);
+            break;
+
+        case PAGE_REG_SETUP_DSM_BIND:
+            if (dsm_bind_state == 0) {
+                dsm_bind_state = 1;
+            }
+            break;
+
+        case PAGE_REG_SETUP_RC_PROTOCOLS: {
+            if (rx_io_packet.count == 2) {
+                uint32_t v;
+                memcpy(&v, &rx_io_packet.regs[0], 4);
+                AP::RC().set_rc_protocols(v);
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+        break;
+
+    case PAGE_DIRECT_PWM: {
+        if (override_active) {
+            // no input when override is active
+            break;
+        }
+        if (rx_io_packet.count > sizeof(reg_direct_pwm.pwm)/2) {
+            return false;
+        }
+        /* copy channel data */
+        uint16_t i = 0, num_values = rx_io_packet.count;
+        while ((i < IOMCU_MAX_RC_CHANNELS) && (num_values > 0)) {
+            /* XXX range-check value? */
+            if (rx_io_packet.regs[i] != PWM_IGNORE_THIS_CHANNEL) {
+                reg_direct_pwm.pwm[i] = rx_io_packet.regs[i];
+            }
+
+            num_values--;
+            i++;
+        }
+        fmu_data_received_time = last_ms;
+        chEvtSignalI(thread_ctx, IOEVENT_PWM);
+        break;
+    }
+
+    case PAGE_MIXING: { // multi-packet message
+        uint16_t offset = rx_io_packet.offset, num_values = rx_io_packet.count;
+        if (offset + num_values > sizeof(mixing)/2) {
+            return false;
+        }
+        memcpy(((uint16_t *)&mixing)+offset, &rx_io_packet.regs[0], num_values*2);
+        break;
+    }
+
+    case PAGE_FAILSAFE_PWM: {
+        if (rx_io_packet.count != sizeof(reg_failsafe_pwm.pwm)/2) {
+            return false;
+        }
+        memcpy((&reg_failsafe_pwm.pwm[0]), &rx_io_packet.regs[0], rx_io_packet.count*2);
+        break;
+    }
+
+    case PAGE_GPIO:
+        if (rx_io_packet.count != 1) {
+            return false;
+        }
+        memcpy(&GPIO, &rx_io_packet.regs[0] + rx_io_packet.offset, sizeof(GPIO));
+        break;
+
+    case PAGE_DSHOT: {
+        if (rx_io_packet.count != sizeof(dshot)/2) {
+            return false;
+        }
+        memcpy(((uint16_t *)&dshot)+rx_io_packet.offset, &rx_io_packet.regs[0], rx_io_packet.count*2);
+        if(dshot.telem_mask) {
+            hal.rcout->set_telem_request_mask(dshot.telem_mask);
+        }
+        if (dshot.command) {
+            hal.rcout->send_dshot_command(dshot.command, dshot.chan, dshot.command_timeout_ms, dshot.repeat_count, dshot.priority);
+        }
+
+        break;
+    }
+
+    default:
+        break;
+    }
+    tx_io_packet.count = 0;
+    tx_io_packet.code = CODE_SUCCESS;
+    tx_io_packet.crc = 0;
+    tx_io_packet.page = 0;
+    tx_io_packet.offset = 0;
+    tx_io_packet.crc =  crc_crc8((const uint8_t *)&tx_io_packet, tx_io_packet.get_size());
+    return true;
+}
+
+void AP_IOMCU_FW::schedule_reboot(uint32_t time_ms)
+{
+    do_reboot = true;
+    reboot_time = last_ms + time_ms;
+}
+
+void AP_IOMCU_FW::calculate_fw_crc(void)
+{
+#define APP_SIZE_MAX 0xf000
+#define APP_LOAD_ADDRESS 0x08001000
+    // compute CRC of the current firmware
+    uint32_t sum = 0;
+
+    for (unsigned p = 0; p < APP_SIZE_MAX; p += 4) {
+        uint32_t bytes = *(uint32_t *)(p + APP_LOAD_ADDRESS);
+        sum = crc32_small(sum, (const uint8_t *)&bytes, sizeof(bytes));
+    }
+
+    reg_setup.crc[0] = sum & 0xFFFF;
+    reg_setup.crc[1] = sum >> 16;
+}
+
+
+/*
+  update safety state
+ */
+void AP_IOMCU_FW::safety_update(void)
+{
+    uint32_t now = last_ms;
+    if (now - safety_update_ms < 100) {
+        // update safety at 10Hz
+        return;
+    }
+    safety_update_ms = now;
+
+    bool safety_pressed = palReadLine(HAL_GPIO_PIN_SAFETY_INPUT);
+    if (safety_pressed) {
+        if (reg_status.flag_safety_off && (reg_setup.arming & P_SETUP_ARMING_SAFETY_DISABLE_ON)) {
+            safety_pressed = false;
+        } else if ((!reg_status.flag_safety_off) && (reg_setup.arming & P_SETUP_ARMING_SAFETY_DISABLE_OFF)) {
+            safety_pressed = false;
+        }
+    }
+    if (safety_pressed) {
+        safety_button_counter++;
+    } else {
+        safety_button_counter = 0;
+    }
+    if (safety_button_counter == 10) {
+        // safety has been pressed for 1 second, change state
+        reg_status.flag_safety_off = !reg_status.flag_safety_off;
+        if (reg_status.flag_safety_off) {
+            hal.rcout->force_safety_off();
+        } else {
+            hal.rcout->force_safety_on();
+        }
+    }
+
+#if IOMCU_ENABLE_RESET_TEST
+    {
+        // deliberate lockup of IOMCU on 5s button press, for testing
+        // watchdog
+        static uint32_t safety_test_counter;
+        static bool should_lockup;
+        if (palReadLine(HAL_GPIO_PIN_SAFETY_INPUT)) {
+            safety_test_counter++;
+        } else {
+            safety_test_counter = 0;
+        }
+        if (safety_test_counter == 50) {
+            should_lockup = true;
+        }
+        // wait for lockup for safety to be released so we don't end
+        // up in the bootloader
+        if (should_lockup && palReadLine(HAL_GPIO_PIN_SAFETY_INPUT) == 0) {
+#if IOMCU_ENABLE_RESET_TEST == 1
+            // lockup with watchdog
+            while (true) {
+                hal.scheduler->delay(50);
+                palToggleLine(HAL_GPIO_PIN_SAFETY_LED);
+            }
+#else
+            // hard fault to simulate power reset or software fault
+            void *foo = (void*)0xE000ED38;
+            typedef void (*fptr)();
+            fptr gptr = (fptr) (void *) foo;
+            gptr();
+            while (true) {}
+#endif
+        }
+    }
+#endif // IOMCU_ENABLE_RESET_TEST
+
+    led_counter = (led_counter+1) % 16;
+    const uint16_t led_pattern = reg_status.flag_safety_off?0xFFFF:0x5500;
+    palWriteLine(HAL_GPIO_PIN_SAFETY_LED, (led_pattern & (1U << led_counter))?0:1);
+}
+
+/*
+  update hal.rcout mode if needed
+ */
+void AP_IOMCU_FW::rcout_config_update(void)
+{
+    // channels cannot be changed from within a lock zone
+    // so needs to be done here
+    if (GPIO.channel_mask != last_GPIO_channel_mask) {
+        for (uint8_t i=0; i<8; i++) {
+            if ((GPIO.channel_mask & (1U << i)) != 0) {
+                hal.rcout->disable_ch(i);
+                hal.gpio->pinMode(101+i, HAL_GPIO_OUTPUT);
+            } else {
+                hal.rcout->enable_ch(i);
+            }
+        }
+        last_GPIO_channel_mask = GPIO.channel_mask;
+    }
+
+    if (last_channel_mask != reg_setup.channel_mask) {
+        for (uint8_t i=0; i<IOMCU_MAX_CHANNELS; i++) {
+            if (reg_setup.channel_mask & 1U << i) {
+                hal.rcout->enable_ch(i);
+            } else {
+                hal.rcout->disable_ch(i);
+            }
+        }
+        last_channel_mask = reg_setup.channel_mask;
+        // channel enablement will affect the reported output mode
+        uint32_t output_mask = 0;
+        reg_status.rcout_mode = hal.rcout->get_output_mode(output_mask);
+        reg_status.rcout_mask = uint8_t(0xFF & output_mask);
+    }
+
+    // see if there is anything to do, we only support setting the mode for a particular channel once
+    if ((last_output_mode_mask & mode_out.mask) == mode_out.mask
+        && (last_output_bdmask & mode_out.bdmask) == mode_out.bdmask
+        && last_output_esc_type == mode_out.esc_type) {
+        return;
+    }
+
+    switch (mode_out.mode) {
+    case AP_HAL::RCOutput::MODE_PWM_DSHOT150:
+    case AP_HAL::RCOutput::MODE_PWM_DSHOT300:
+#if defined(STM32F103xB) || defined(STM32F103x8)
+    case AP_HAL::RCOutput::MODE_PWM_DSHOT600:
+#endif
+#ifdef HAL_WITH_BIDIR_DSHOT
+        hal.rcout->set_bidir_dshot_mask(mode_out.bdmask);
+        hal.rcout->set_dshot_esc_type(AP_HAL::RCOutput::DshotEscType(mode_out.esc_type));
+#endif
+        hal.rcout->set_output_mode(mode_out.mask, (AP_HAL::RCOutput::output_mode)mode_out.mode);
+        // enabling dshot changes the memory allocation
+        reg_status.freemem = hal.util->available_memory();
+        last_output_mode_mask |= mode_out.mask;
+        last_output_bdmask |= mode_out.bdmask;
+        last_output_esc_type = mode_out.esc_type;
+        break;
+    case AP_HAL::RCOutput::MODE_PWM_ONESHOT:
+    case AP_HAL::RCOutput::MODE_PWM_ONESHOT125:
+        // setup to use a 1Hz frequency, so we only get output when we trigger
+        hal.rcout->set_freq(mode_out.mask, 1);
+        hal.rcout->set_output_mode(mode_out.mask, (AP_HAL::RCOutput::output_mode)mode_out.mode);
+        last_output_mode_mask |= mode_out.mask;
+        break;
+    case AP_HAL::RCOutput::MODE_PWM_BRUSHED:
+        // default to 2kHz for all channels for brushed output
+        hal.rcout->set_freq(mode_out.mask, 2000);
+        hal.rcout->set_esc_scaling(1000, 2000);
+        hal.rcout->set_output_mode(mode_out.mask, AP_HAL::RCOutput::MODE_PWM_BRUSHED);
+        hal.rcout->set_freq(mode_out.mask, reg_setup.pwm_altrate);
+        last_output_mode_mask |= mode_out.mask;
+        break;
+    default:
+        break;
+    }
+
+    uint32_t output_mask = 0;
+    reg_status.rcout_mode = hal.rcout->get_output_mode(output_mask);
+    reg_status.rcout_mask = uint8_t(0xFF & output_mask);
+}
+
+/*
+  fill in failsafe PWM values
+ */
+void AP_IOMCU_FW::fill_failsafe_pwm(void)
+{
+    for (uint8_t i=0; i<IOMCU_MAX_RC_CHANNELS; i++) {
+        if (reg_status.flag_safety_off) {
+            reg_direct_pwm.pwm[i] = reg_failsafe_pwm.pwm[i];
+        } else {
+            reg_direct_pwm.pwm[i] = 0;
+        }
+    }
+    if (mixing.enabled) {
+        run_mixer();
+    }
+}
+
+void AP_IOMCU_FW::GPIO_write()
+{
+    for (uint8_t i=0; i<8; i++) {
+        if ((GPIO.channel_mask & (1U << i)) != 0) {
+            hal.gpio->write(101+i, (GPIO.output_mask & (1U << i)) != 0);
+        }
+    }
+}
+
+AP_HAL_MAIN();
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #pragma once
+
+#include <stdint.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Common/AP_Common.h>
+#include <AP_RCProtocol/AP_RCProtocol.h>
+#include <AP_ESC_Telem/AP_ESC_Telem.h>
+
+#include "hal.h"
+#include "ch.h"
+#include "ioprotocol.h"
+
+#if AP_HAL_SHARED_DMA_ENABLED
+#include <AP_HAL_ChibiOS/shared_dma.h>
+#endif
+
+#define PWM_IGNORE_THIS_CHANNEL UINT16_MAX
+#define SERVO_COUNT 8
+
+class AP_IOMCU_FW {
+public:
+    void process_io_packet();
+
+    struct IOPacket rx_io_packet, tx_io_packet;
+
+    void init();
+    void update();
+    void calculate_fw_crc(void);
+
+    void pwm_out_update();
+    void heater_update();
+    void rcin_update();
+    void erpm_update();
+    void telem_update();
+
+    bool handle_code_write();
+    bool handle_code_read();
+    void schedule_reboot(uint32_t time_ms);
+    void safety_update();
+    void rcout_config_update();
+    void rcin_serial_init();
+    void rcin_serial_update();
+    void page_status_update(void);
+    void fill_failsafe_pwm(void);
+    void run_mixer(void);
+    int16_t mix_input_angle(uint8_t channel, uint16_t radio_in) const;
+    int16_t mix_input_range(uint8_t channel, uint16_t radio_in) const;
+    uint16_t mix_output_angle(uint8_t channel, int16_t angle) const;
+    uint16_t mix_output_range(uint8_t channel, int16_t value) const;
+    int16_t mix_elevon_vtail(int16_t angle1, int16_t angle2, bool first_output) const;
+    void dsm_bind_step(void);
+
+    struct {
+        /* default to RSSI ADC functionality */
+        uint16_t features;
+        uint16_t arming;
+        uint16_t pwm_rates;
+        uint16_t pwm_defaultrate = 50;
+        uint16_t pwm_altrate = 200;
+        uint16_t relays_pad;
+        uint16_t vbatt_scale = 10000;
+        uint16_t reserved1;
+        uint16_t reserved2;
+        uint16_t set_debug;
+        uint16_t reboot_bl;
+        uint16_t crc[2];
+        uint16_t rc_thr_failsafe_us;
+        uint16_t reserved3;
+        uint16_t pwm_reverse;
+        uint16_t trim_roll;
+        uint16_t trim_pitch;
+        uint16_t trim_yaw;
+        uint16_t sbus_rate = 72;
+        uint16_t ignore_safety;
+        uint16_t heater_duty_cycle = 0xFFFFU;
+        uint16_t pwm_altclock = 1;
+        uint16_t dshot_period_us;
+        uint16_t dshot_rate;
+        uint16_t channel_mask;
+    } reg_setup;
+
+    uint16_t last_channel_mask;
+
+    // CONFIG values
+    struct page_config config;
+
+    // PAGE_STATUS values
+    struct page_reg_status reg_status;
+
+    // PAGE_RAW_RCIN values
+    struct page_rc_input rc_input;
+    uint32_t rc_last_input_ms;
+
+    // PAGE_SERVO values
+    struct {
+        uint16_t pwm[IOMCU_MAX_RC_CHANNELS];    // size has to account for virtual channels via SBUS_OUT
+    } reg_servo;
+
+    // PAGE_DIRECT_PWM values
+    struct {
+        uint16_t pwm[IOMCU_MAX_RC_CHANNELS];
+    } reg_direct_pwm;
+
+    // PAGE_FAILSAFE_PWM
+    struct {
+        uint16_t pwm[IOMCU_MAX_RC_CHANNELS];
+    } reg_failsafe_pwm;
+
+    // output rates
+    struct {
+        uint16_t freq;
+        uint16_t chmask;
+        uint16_t default_freq = 50;
+        uint16_t sbus_rate_hz;
+    } rate;
+
+    // output mode values
+    struct page_mode_out mode_out;
+
+    uint16_t last_output_mode_mask;
+    uint16_t last_output_bdmask;
+    uint16_t last_output_esc_type;
+
+    // MIXER values
+    struct page_mixing mixing;
+
+    // GPIO masks
+    struct page_GPIO GPIO;
+    uint8_t last_GPIO_channel_mask;
+    void GPIO_write();
+
+    // DSHOT runtime
+    struct page_dshot dshot;
+
+#if AP_HAL_SHARED_DMA_ENABLED
+    void tx_dma_allocate(ChibiOS::Shared_DMA *ctx);
+    void tx_dma_deallocate(ChibiOS::Shared_DMA *ctx);
+
+    ChibiOS::Shared_DMA* tx_dma_handle;
+#endif
+#ifdef HAL_WITH_BIDIR_DSHOT
+    struct page_dshot_erpm dshot_erpm;
+    uint32_t last_erpm_us;
+    struct page_dshot_telem dshot_telem[IOMCU_MAX_TELEM_CHANNELS/4];
+    uint32_t last_telem_ms;
+#if HAL_WITH_ESC_TELEM
+    AP_ESC_Telem esc_telem;
+#endif
+#endif
+
+    // true when override channel active
+    bool override_active;
+
+    // sbus rate handling
+    uint32_t sbus_last_ms;
+    uint32_t sbus_interval_ms;
+
+    uint32_t fmu_data_received_time;
+
+    bool pwm_update_pending;
+    uint32_t last_heater_ms;
+    uint32_t reboot_time;
+    bool do_reboot;
+    bool update_default_rate;
+    bool update_rcout_freq;
+    bool has_heater;
+    const bool heater_pwm_polarity = IOMCU_IMU_HEATER_POLARITY;
+    uint32_t last_blue_led_ms;
+    uint32_t safety_update_ms;
+    uint32_t safety_button_counter;
+    uint8_t led_counter;
+    uint32_t last_slow_loop_ms;
+    uint32_t last_fast_loop_us;
+    thread_t *thread_ctx;
+    bool last_safety_off;
+    uint32_t last_status_ms;
+    uint32_t last_ms;
+    uint32_t loop_counter;
+    uint8_t dsm_bind_state;
+    uint32_t last_dsm_bind_ms;
+    uint32_t last_failsafe_ms;
+};
+
+// GPIO macros
+#define HEATER_SET(on) palWriteLine(HAL_GPIO_PIN_HEATER, (on));
+#define BLUE_TOGGLE() palToggleLine(HAL_GPIO_PIN_HEATER);
+#define AMBER_SET(on) palWriteLine(HAL_GPIO_PIN_AMBER_LED, !(on));
+#define SPEKTRUM_POWER(on) palWriteLine(HAL_GPIO_PIN_SPEKTRUM_PWR_EN, on);
+#define SPEKTRUM_SET(on) palWriteLine(HAL_GPIO_PIN_SPEKTRUM_OUT, on);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #pragma once
+
+#include <stdint.h>
+#include <AP_Common/AP_Common.h>
+
+/*
+  common protocol definitions between AP_IOMCU and iofirmware
+ */
+
+// 22 is enough for the rc_input page in one transfer
+#define PKT_MAX_REGS 22
+// The number of channels that can be propagated - due to SBUS_OUT is higher than the physical channels
+#define IOMCU_MAX_RC_CHANNELS 16
+// The actual number of output channels
+#define IOMCU_MAX_CHANNELS 8
+#define IOMCU_MAX_TELEM_CHANNELS 4
+
+//#define IOMCU_DEBUG
+
+struct PACKED IOPacket {
+    uint8_t 	count:6;
+    uint8_t 	code:2;
+    uint8_t 	crc;
+    uint8_t 	page;
+    uint8_t 	offset;
+    uint16_t	regs[PKT_MAX_REGS];
+
+    // get packet size in bytes
+    uint8_t get_size(void) const
+    {
+        return count*2 + 4;
+    }
+};
+
+/*
+  values for pkt.code
+ */
+enum iocode {
+    // read types
+    CODE_READ = 0,
+    CODE_WRITE = 1,
+    CODE_NOOP = 2,
+
+    // reply codes
+    CODE_SUCCESS = 0,
+    CODE_CORRUPT = 1,
+    CODE_ERROR = 2
+};
+
+// IO pages
+enum iopage {
+    PAGE_CONFIG = 0,
+    PAGE_STATUS = 1,
+    PAGE_ACTUATORS = 2,
+    PAGE_SERVOS = 3,
+    PAGE_RAW_RCIN = 4,
+    PAGE_RCIN = 5,
+    PAGE_RAW_ADC = 6,
+    PAGE_PWM_INFO = 7,
+    PAGE_SETUP = 50,
+    PAGE_DIRECT_PWM = 54,
+    PAGE_FAILSAFE_PWM = 55,
+    PAGE_MIXING = 200,
+    PAGE_GPIO = 201,
+    PAGE_DSHOT = 202,
+    PAGE_RAW_DSHOT_ERPM = 203,
+    PAGE_RAW_DSHOT_TELEM_1_4 = 204,
+    PAGE_RAW_DSHOT_TELEM_5_8 = 205,
+    PAGE_RAW_DSHOT_TELEM_9_12 = 206,
+    PAGE_RAW_DSHOT_TELEM_13_16 = 207,
+};
+
+// setup page registers
+#define PAGE_REG_SETUP_FEATURES	0
+#define P_SETUP_FEATURES_SBUS1_OUT	1
+#define P_SETUP_FEATURES_SBUS2_OUT	2
+#define P_SETUP_FEATURES_PWM_RSSI   4
+#define P_SETUP_FEATURES_ADC_RSSI   8
+#define P_SETUP_FEATURES_ONESHOT   16
+#define P_SETUP_FEATURES_BRUSHED   32
+#define P_SETUP_FEATURES_HEATER    64
+
+#define PAGE_REG_SETUP_ARMING 1
+#define P_SETUP_ARMING_IO_ARM_OK (1<<0)
+#define P_SETUP_ARMING_FMU_ARMED (1<<1)
+#define P_SETUP_ARMING_RC_HANDLING_DISABLED (1<<6)
+#define P_SETUP_ARMING_SAFETY_DISABLE_ON	(1 << 11) // disable use of safety button for safety off->on
+#define P_SETUP_ARMING_SAFETY_DISABLE_OFF	(1 << 12) // disable use of safety button for safety on->off
+
+#define PAGE_REG_SETUP_PWM_RATE_MASK 2
+#define PAGE_REG_SETUP_DEFAULTRATE   3
+#define PAGE_REG_SETUP_ALTRATE       4
+#define PAGE_REG_SETUP_OUTPUT_MODE   5
+#define PAGE_REG_SETUP_REBOOT_BL    10
+#define PAGE_REG_SETUP_CRC			11
+#define PAGE_REG_SETUP_SBUS_RATE    19
+#define PAGE_REG_SETUP_IGNORE_SAFETY 20 /* bitmask of surfaces to ignore the safety status */
+#define PAGE_REG_SETUP_HEATER_DUTY_CYCLE 21
+#define PAGE_REG_SETUP_DSM_BIND     22
+#define PAGE_REG_SETUP_RC_PROTOCOLS 23 // uses 2 slots, 23 and 24
+#define PAGE_REG_SETUP_DSHOT_PERIOD 25
+#define PAGE_REG_SETUP_CHANNEL_MASK 27
+
+// config page registers
+#define PAGE_CONFIG_PROTOCOL_VERSION  0
+#define PAGE_CONFIG_PROTOCOL_VERSION2 1
+#define IOMCU_PROTOCOL_VERSION       4
+#define IOMCU_PROTOCOL_VERSION2     10
+
+// magic value for rebooting to bootloader
+#define REBOOT_BL_MAGIC 14662
+
+#define PAGE_REG_SETUP_FORCE_SAFETY_OFF 12
+#define PAGE_REG_SETUP_FORCE_SAFETY_ON  14
+#define FORCE_SAFETY_MAGIC 22027
+
+struct page_config {
+    uint16_t protocol_version;
+    uint16_t protocol_version2;
+    uint32_t mcuid;
+    uint32_t cpuid;
+};
+
+struct page_reg_status {
+    uint16_t freemem;
+    uint16_t freemstack;
+    uint16_t freepstack;
+    uint32_t timestamp_ms;
+    uint16_t vservo;
+    uint16_t vrssi;
+    uint32_t num_errors;
+    uint32_t total_pkts;
+    uint32_t total_ticks;
+    uint32_t total_events;
+    uint8_t flag_safety_off;
+    uint8_t rcout_mask;
+    uint8_t rcout_mode;
+    uint8_t err_crc;
+    uint8_t err_bad_opcode;
+    uint8_t err_read;
+    uint8_t err_write;
+    uint8_t err_uart;
+    uint8_t err_lock;
+    uint8_t spare;
+};
+
+struct page_rc_input {
+    uint8_t count;
+    uint8_t flags_failsafe:1;
+    uint8_t flags_rc_ok:1;
+    uint8_t rc_protocol;
+    uint16_t pwm[IOMCU_MAX_RC_CHANNELS];
+    int16_t rssi;
+};
+
+/*
+  data for mixing on FMU failsafe
+ */
+struct page_mixing {
+    uint16_t servo_min[IOMCU_MAX_RC_CHANNELS];
+    uint16_t servo_max[IOMCU_MAX_RC_CHANNELS];
+    uint16_t servo_trim[IOMCU_MAX_RC_CHANNELS];
+    uint8_t servo_function[IOMCU_MAX_RC_CHANNELS];
+    uint8_t servo_reversed[IOMCU_MAX_RC_CHANNELS];
+
+    // RC input arrays are in AETR order
+    uint16_t rc_min[4];
+    uint16_t rc_max[4];
+    uint16_t rc_trim[4];
+    uint8_t rc_reversed[IOMCU_MAX_RC_CHANNELS];
+    uint8_t rc_channel[4];
+
+    // gain for elevon and vtail mixing, x1000
+    uint16_t mixing_gain;
+
+    // channel which when high forces mixer
+    int8_t rc_chan_override;
+
+    // is the throttle an angle input?
+    uint8_t throttle_is_angle;
+
+    // mask of channels which are pure manual in override
+    uint16_t manual_rc_mask;
+
+    // enabled needs to be 1 to enable mixing
+    uint8_t enabled;
+
+    uint8_t pad;
+};
+
+static_assert(sizeof(struct page_mixing) % 2 == 0, "page_mixing must be even size");
+
+struct __attribute__((packed, aligned(2))) page_GPIO {
+    uint8_t channel_mask;
+    uint8_t output_mask;
+};
+
+struct page_mode_out {
+    uint16_t mask;
+    uint16_t mode;
+    uint16_t bdmask;
+    uint16_t esc_type;
+};
+
+struct page_dshot {
+    uint16_t telem_mask;
+    uint8_t command;
+    uint8_t chan;
+    uint32_t command_timeout_ms;
+    uint8_t repeat_count;
+    uint8_t priority;
+};
+
+struct page_dshot_erpm {
+    uint16_t erpm[IOMCU_MAX_TELEM_CHANNELS];
+    uint32_t update_mask;
+};
+
+// separate telemetry packet because (a) it's too big otherwise and (b) slower update rate
+struct page_dshot_telem {
+    uint16_t  error_rate[4]; // as a centi-percentage
+    uint16_t  voltage_cvolts[4];
+    uint16_t  current_camps[4];
+    uint16_t  temperature_cdeg[4];
+    uint16_t  types[4];
+// if EDTv2 needs to be disabled, IOMCU firmware should be recompiled too, this is the reason
+#if AP_EXTENDED_DSHOT_TELEM_V2_ENABLED
+    uint8_t   edt2_status[4];
+    uint8_t   edt2_stress[4];
+#endif
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  mixer for failsafe operation when FMU is dead
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <SRV_Channel/SRV_Channel.h>
+#include "iofirmware.h"
+
+#define ANGLE_SCALE ((int32_t)4500)
+#define RANGE_SCALE ((int32_t)1000)
+
+/*
+  return a RC input value scaled from -4500 to 4500
+ */
+int16_t AP_IOMCU_FW::mix_input_angle(uint8_t channel, uint16_t radio_in) const
+{
+    const uint16_t &rc_min = mixing.rc_min[channel];
+    const uint16_t &rc_max = mixing.rc_max[channel];
+    const uint16_t &rc_trim = mixing.rc_trim[channel];
+    const uint16_t &reversed = mixing.rc_reversed[channel];
+
+    int16_t ret = 0;
+    if (radio_in > rc_trim && rc_max != rc_trim) {
+        ret = (ANGLE_SCALE * (int32_t)(radio_in - rc_trim)) / (int32_t)(rc_max  - rc_trim);
+    } else if (radio_in < rc_trim && rc_trim != rc_min) {
+        ret = (ANGLE_SCALE * (int32_t)(radio_in - rc_trim)) / (int32_t)(rc_trim - rc_min);
+    }
+    if (reversed) {
+        ret = -ret;
+    }
+    return ret;
+}
+
+/*
+  return a RC input value scaled from 0 to 1000
+ */
+int16_t AP_IOMCU_FW::mix_input_range(uint8_t channel, uint16_t radio_in) const
+{
+    const uint16_t &rc_min = mixing.rc_min[channel];
+    const uint16_t &rc_max = mixing.rc_max[channel];
+    const uint16_t &reversed = mixing.rc_reversed[channel];
+
+    int16_t ret = 0;
+    if (radio_in > rc_max) {
+        ret = RANGE_SCALE;
+    } else if (radio_in < rc_min) {
+        ret = -RANGE_SCALE;
+    } else {
+        ret = (RANGE_SCALE * (int32_t)(radio_in - rc_min)) / (int32_t)(rc_max  - rc_min);
+    }
+    if (reversed) {
+        ret = -ret;
+    }
+    return ret;
+}
+
+/*
+  return an output pwm giving an angle for a servo channel
+ */
+uint16_t AP_IOMCU_FW::mix_output_angle(uint8_t channel, int16_t angle) const
+{
+    const uint16_t &srv_min = mixing.servo_min[channel];
+    const uint16_t &srv_max = mixing.servo_max[channel];
+    const uint16_t &srv_trim = mixing.servo_trim[channel];
+    const uint16_t &reversed = mixing.servo_reversed[channel];
+    if (reversed) {
+        angle = -angle;
+    }
+    angle = constrain_int16(angle, -ANGLE_SCALE, ANGLE_SCALE);
+    if (angle > 0) {
+        return srv_trim + ((int32_t)angle * (int32_t)(srv_max - srv_trim)) / ANGLE_SCALE;
+    }
+    return srv_trim - (-(int32_t)angle * (int32_t)(srv_trim - srv_min)) / ANGLE_SCALE;
+}
+
+/*
+  return an output pwm giving an range for a servo channel
+ */
+uint16_t AP_IOMCU_FW::mix_output_range(uint8_t channel, int16_t value) const
+{
+    const uint16_t &srv_min = mixing.servo_min[channel];
+    const uint16_t &srv_max = mixing.servo_max[channel];
+    const uint16_t &reversed = mixing.servo_reversed[channel];
+    value = constrain_int16(value, 0, RANGE_SCALE);
+    if (reversed) {
+        value = RANGE_SCALE - value;
+    }
+    return srv_min + ((int32_t)value * (int32_t)(srv_max - srv_min)) / RANGE_SCALE;
+}
+
+
+/*
+  elevon and vtail mixer
+ */
+int16_t AP_IOMCU_FW::mix_elevon_vtail(int16_t angle1, int16_t angle2, bool first_output) const
+{
+    if (first_output) {
+        return (angle2 - angle1) * mixing.mixing_gain / 1000;
+    }
+    return (angle1 + angle2) * mixing.mixing_gain / 1000;
+}
+
+/*
+  run mixer. This is used when FMU is not providing inputs, or when
+  the OVERRIDE_CHAN is high. It allows for manual fixed wing flight
+ */
+void AP_IOMCU_FW::run_mixer(void)
+{
+    int16_t rcin[4] = {0, 0, 0, 0};
+    int16_t &roll = rcin[0];
+    int16_t &pitch = rcin[1];
+    int16_t &throttle = rcin[2];
+    int16_t &rudder = rcin[3];
+
+    // get RC input angles
+    if (rc_input.flags_rc_ok) {
+        for (uint8_t i=0;i<4; i++) {
+            if (mixing.rc_channel[i] > 0 && mixing.rc_channel[i] <= IOMCU_MAX_RC_CHANNELS) {
+                uint8_t chan = mixing.rc_channel[i]-1;
+                if (i == 2 && !mixing.throttle_is_angle) {
+                    rcin[i] = mix_input_range(i, rc_input.pwm[chan]);
+                } else {
+                    rcin[i] = mix_input_angle(i, rc_input.pwm[chan]);
+                }
+            }
+        }
+    }
+
+    for (uint8_t i=0; i<IOMCU_MAX_RC_CHANNELS; i++) {
+        SRV_Channel::Aux_servo_function_t function = (SRV_Channel::Aux_servo_function_t)mixing.servo_function[i];
+        uint16_t &pwm = reg_direct_pwm.pwm[i];
+
+        if (mixing.manual_rc_mask & (1U<<i)) {
+            // treat as pass-thru if this channel is set in MANUAL_RC_MASK
+            function = SRV_Channel::k_manual;
+        }
+
+        switch (function) {
+        case SRV_Channel::k_manual:
+            pwm = rc_input.pwm[i];
+            break;
+
+        case SRV_Channel::k_rcin1 ... SRV_Channel::k_rcin16:
+            pwm = rc_input.pwm[(uint8_t)(function - SRV_Channel::k_rcin1)];
+            break;
+
+        case SRV_Channel::k_aileron:
+        case SRV_Channel::k_aileron_with_input:
+        case SRV_Channel::k_flaperon_left:
+        case SRV_Channel::k_flaperon_right:
+            pwm = mix_output_angle(i, roll);
+            break;
+
+        case SRV_Channel::k_elevator:
+        case SRV_Channel::k_elevator_with_input:
+            pwm = mix_output_angle(i, pitch);
+            break;
+
+        case SRV_Channel::k_rudder:
+        case SRV_Channel::k_steering:
+            pwm = mix_output_angle(i, rudder);
+            break;
+
+        case SRV_Channel::k_throttle:
+        case SRV_Channel::k_throttleLeft:
+        case SRV_Channel::k_throttleRight:
+            if (mixing.throttle_is_angle) {
+                pwm = mix_output_angle(i, throttle);
+            } else {
+                pwm = mix_output_range(i, throttle);
+            }
+            break;
+
+        case SRV_Channel::k_flap:
+        case SRV_Channel::k_flap_auto:
+            // zero flaps
+            pwm = mix_output_range(i, 0);
+            break;
+
+        case SRV_Channel::k_elevon_left:
+        case SRV_Channel::k_dspoilerLeft1:
+        case SRV_Channel::k_dspoilerLeft2:
+            // treat differential spoilers as elevons
+            pwm = mix_output_angle(i, mix_elevon_vtail(roll, pitch, true));
+            break;
+
+        case SRV_Channel::k_elevon_right:
+        case SRV_Channel::k_dspoilerRight1:
+        case SRV_Channel::k_dspoilerRight2:
+            // treat differential spoilers as elevons
+            pwm = mix_output_angle(i, mix_elevon_vtail(roll, pitch, false));
+            break;
+
+        case SRV_Channel::k_vtail_left:
+            pwm = mix_output_angle(i, mix_elevon_vtail(rudder, pitch, false));
+            break;
+
+        case SRV_Channel::k_vtail_right:
+            pwm = mix_output_angle(i, mix_elevon_vtail(rudder, pitch, true));
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  SBUS output support
+ */
+
+#include "ch.h"
+#include "hal.h"
+#include "iofirmware.h"
+#include "rc.h"
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_SBusOut/AP_SBusOut.h>
+
+extern const AP_HAL::HAL& hal;
+
+// usart3 is for SBUS input and output
+static const SerialConfig sbus_cfg = {
+    100000,   // speed
+    USART_CR1_PCE | USART_CR1_M, // cr1, enable even parity
+    USART_CR2_STOP_1,            // cr2, two stop bits
+    0,        // cr3
+    nullptr,  // irq_cb
+    nullptr,  // ctx
+};
+
+// listen for parity errors on sd3 input
+static event_listener_t sd3_listener;
+
+static uint8_t sd3_config;
+
+void sbus_out_write(uint16_t *channels, uint8_t nchannels)
+{
+    if (sd3_config == 0) {
+        uint8_t buffer[25];
+        AP_SBusOut::sbus_format_frame(channels, nchannels, buffer);
+        chnWrite(&SD3, buffer, sizeof(buffer));
+    }
+}
+
+// usart1 is for DSM input and (optionally) debug to FMU
+static const SerialConfig dsm_cfg = {
+    115200,   // speed
+    0,        // cr1
+    0,        // cr2
+    0,        // cr3
+    nullptr,  // irq_cb
+    nullptr,  // ctx
+};
+
+static enum {
+    RC_SEARCHING,
+    RC_DSM_PORT,
+    RC_SBUS_PORT
+} rc_state;
+
+/*
+  init rcin on DSM USART1
+ */
+void AP_IOMCU_FW::rcin_serial_init(void)
+{
+    sdStart(&SD1, &dsm_cfg);
+    sdStart(&SD3, &sbus_cfg);
+    chEvtRegisterMaskWithFlags(chnGetEventSource(&SD3),
+                               &sd3_listener,
+                               EVENT_MASK(1),
+                               SD_PARITY_ERROR);
+    // disable input for SBUS with pulses, we will use the UART for
+    // SBUS and FPORT
+#if AP_RCPROTOCOL_SBUS_ENABLED
+    AP::RC().disable_for_pulses(AP_RCProtocol::SBUS);
+#endif
+#if AP_RCPROTOCOL_SBUS_NI_ENABLED
+    AP::RC().disable_for_pulses(AP_RCProtocol::SBUS_NI);
+#endif
+#if AP_RCPROTOCOL_FPORT_ENABLED
+    AP::RC().disable_for_pulses(AP_RCProtocol::FPORT);
+#endif
+}
+
+static struct {
+    uint32_t num_dsm_bytes;
+    uint32_t num_sbus_bytes;
+    uint32_t num_sbus_errors;
+    eventflags_t sbus_error;
+    uint32_t last_good_ms;
+} rc_stats;
+
+/*
+  check for data on DSM RX uart
+ */
+void AP_IOMCU_FW::rcin_serial_update(void)
+{
+    uint8_t b[16];
+    uint32_t n;
+    uint32_t now = AP_HAL::millis();
+    auto &rc = AP::RC();
+
+    if (rc.should_search(now)) {
+        rc_state = RC_SEARCHING;
+    }
+
+    // read from DSM port
+    if ((rc_state == RC_SEARCHING || rc_state == RC_DSM_PORT) &&
+        (n = chnReadTimeout(&SD1, b, sizeof(b), TIME_IMMEDIATE)) > 0) {
+        n = MIN(n, sizeof(b));
+        // don't mix two 115200 uarts
+        if (sd3_config == 0) {
+            rc_stats.num_dsm_bytes += n;
+            for (uint8_t i=0; i<n; i++) {
+                if (rc.process_byte(b[i], 115200)) {
+                    rc_stats.last_good_ms = now;
+                    if (!rc.should_search(now)) {
+                        rc_state = RC_DSM_PORT;
+                    }
+                }
+            }
+        }
+        //BLUE_TOGGLE();
+    }
+
+    // read from SBUS port
+    if ((rc_state == RC_SEARCHING || rc_state == RC_SBUS_PORT) &&
+        (n = chnReadTimeout(&SD3, b, sizeof(b), TIME_IMMEDIATE)) > 0) {
+        eventflags_t flags;
+        if (sd3_config == 0 && ((flags = chEvtGetAndClearFlags(&sd3_listener)) & SD_PARITY_ERROR)) {
+            rc_stats.sbus_error = flags;
+            rc_stats.num_sbus_errors++;
+        } else {
+            n = MIN(n, sizeof(b));
+            rc_stats.num_sbus_bytes += n;
+            for (uint8_t i=0; i<n; i++) {
+                if (rc.process_byte(b[i], sd3_config==0?100000:115200)) {
+                    rc_stats.last_good_ms = now;
+                    if (!rc.should_search(now)) {
+                        rc_state = RC_SBUS_PORT;
+                    }
+                }
+            }
+        }
+    }
+    /*
+      when not using SBUS output we switch UART3 between 100000 baud
+      and 115200 baud in order to support RC input protocols that are
+      115200 inverted (such as FPort). If SBUS output is enabled then
+      we need to disable this as the uart is shared between input and
+      output
+     */
+    const bool sbus_out_enabled = (reg_setup.features & P_SETUP_FEATURES_SBUS1_OUT) != 0;
+    if (rc_state == RC_SEARCHING &&
+        now - rc_stats.last_good_ms > 2000 && (sd3_config==1 || !sbus_out_enabled)) {
+        rc_stats.last_good_ms = now;
+        sd3_config ^= 1;
+        sdStop(&SD3);
+        sdStart(&SD3, sd3_config==0?&sbus_cfg:&dsm_cfg);
+    }
+}
+
+/*
+  sleep for 1ms using a busy loop
+ */
+static void delay_one_ms(uint32_t &now)
+{
+    while (now == AP_HAL::millis()) ;
+    now = AP_HAL::millis();
+}
+
+/*
+  perform a DSM bind operation
+ */
+void AP_IOMCU_FW::dsm_bind_step(void)
+{
+    uint32_t now = last_ms;
+    switch (dsm_bind_state) {
+    case 1:
+        palSetLineMode(HAL_GPIO_PIN_SPEKTRUM_PWR_EN, PAL_MODE_OUTPUT_PUSHPULL);
+        SPEKTRUM_POWER(0);
+        palSetLineMode(HAL_GPIO_PIN_SPEKTRUM_OUT, PAL_MODE_OUTPUT_PUSHPULL);
+        SPEKTRUM_SET(1);
+        dsm_bind_state = 2;
+        last_dsm_bind_ms = now;
+        break;
+
+    case 2:
+        if (now - last_dsm_bind_ms >= 500) {
+            SPEKTRUM_POWER(1);
+            dsm_bind_state = 3;
+            last_dsm_bind_ms = now;
+        }
+        break;
+
+    case 3: {
+        if (now - last_dsm_bind_ms >= 72) {
+            // 9 pulses works with all satellite receivers, and supports the highest
+            // available protocol
+            delay_one_ms(now);
+            const uint8_t num_pulses = 9;
+            for (uint8_t i=0; i<num_pulses; i++) {
+                // the delay should be 120us, but we are running our
+                // clock at 1kHz, and 1ms works fine
+                delay_one_ms(now);
+                SPEKTRUM_SET(0);
+                delay_one_ms(now);
+                SPEKTRUM_SET(1);
+            }
+            last_dsm_bind_ms = now;
+            dsm_bind_state = 4;
+        }
+        break;
+    }
+
+    case 4:
+        if (now - last_dsm_bind_ms >= 50) {
+            // set back as input pin
+            palSetLineMode(HAL_GPIO_PIN_SPEKTRUM_OUT, PAL_MODE_INPUT);
+            dsm_bind_state = 0;
+        }
+        break;
+
+    default:
+        dsm_bind_state = 0;
+        break;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #pragma once
+
+#include <stdint.h>
+void sbus_out_write(uint16_t *channels, uint8_t nchannels);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_stlib(
+        name= 'iofirmware_libs',
+        ap_vehicle='iofirmware',
+        ap_libraries= [
+        'AP_Common',
+        'AP_HAL',
+        'AP_HAL_Empty',
+        'AP_Math',
+        'AP_RCProtocol',
+        'AP_BoardConfig',
+        'AP_ESC_Telem',
+        'AP_SBusOut'
+        ],
+        exclude_src=[
+            'libraries/AP_HAL_ChibiOS/Storage.cpp'
+        ]
+    )
+
+    bld.ap_program(
+        program_name='iofirmware_lowpolh',
+        use='iofirmware_libs',
+        program_groups=['bin','iofirmware'],
+        defines=['IOMCU_IMU_HEATER_POLARITY=0']
+    )
+
+    bld.ap_program(
+        program_name='iofirmware_highpolh',
+        use='iofirmware_libs',
+        program_groups=['bin','iofirmware'],
+        defines=['IOMCU_IMU_HEATER_POLARITY=1']
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * AP_IRLock.h
+ *
+ *  Created on: Nov 10, 2014
+ *      Author: MLandes
+ */
+
+// @file AP_IRLock.h
+// @brief Catch-all headerthat defines all supported irlock classes.
+
+#include "IRLock.h"
+#include "AP_IRLock_I2C.h"
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include "AP_IRLock_SITL_Gazebo.h"
+#include "AP_IRLock_SITL.h"
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * AP_IRLock_I2C.cpp
+ *
+ * Based on AP_IRLock_PX4 by MLandes
+ *
+ * See: http://irlock.com/pages/serial-communication-protocol
+ */
+#include <AP_HAL/AP_HAL.h>
+#include "AP_IRLock_I2C.h"
+#include <stdio.h>
+#include <utility>
+#include <AP_HAL/I2CDevice.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define IRLOCK_I2C_ADDRESS      0x54
+
+#define IRLOCK_SYNC         0xAA55AA55
+
+void AP_IRLock_I2C::init(int8_t bus)
+{
+    if (bus < 0) {
+        // default to i2c external bus
+        bus = 1;
+    }
+    dev = std::move(hal.i2c_mgr->get_device(bus, IRLOCK_I2C_ADDRESS));
+    if (!dev) {
+        return;
+    }
+
+    // read at 50Hz
+    printf("Starting IRLock on I2C\n");
+
+    dev->register_periodic_callback(20000, FUNCTOR_BIND_MEMBER(&AP_IRLock_I2C::read_frames, void));
+}
+
+/*
+   synchronise with frame start. We expect 0xAA55AA55 at the start of
+   a frame
+*/
+bool AP_IRLock_I2C::sync_frame_start(void)
+{
+    uint32_t sync_word;
+    if (!dev->transfer(nullptr, 0, (uint8_t *)&sync_word, 4)) {
+        return false;
+    }
+
+    // record sensor successfully responded to I2C request
+    _last_read_ms = AP_HAL::millis();
+
+    uint8_t count=40;
+    while (count-- && sync_word != IRLOCK_SYNC && sync_word != 0) {
+        uint8_t sync_byte;
+        if (!dev->transfer(nullptr, 0, &sync_byte, 1)) {
+            return false;
+        }
+        if (sync_byte == 0) {
+            break;
+        }
+        sync_word = (sync_word>>8) | (uint32_t(sync_byte)<<24);
+    }
+    return sync_word == IRLOCK_SYNC;
+}
+
+/*
+  converts IRLOCK pixels to a position on a normal plane 1m in front of the lens
+  based on a characterization of IR-LOCK with the standard lens, focused such that 2.38mm of threads are exposed
+  see: https://github.com/ArduPilot/ardupilot/issues/5232 and https://gist.github.com/jschall/eac130ed9d6e5dcd9ce582f3eeeb3071
+ */
+void AP_IRLock_I2C::pixel_to_1M_plane(float pix_x, float pix_y, float &ret_x, float &ret_y)
+{
+    ret_x = (-0.00293875727162397f*pix_x + 0.470201163459835f)/(4.43013552642296e-6f*((pix_x - 160.0f)*(pix_x - 160.0f)) +
+                                                                4.79331390531725e-6f*((pix_y - 100.0f)*(pix_y - 100.0f)) - 1.0f);
+    ret_y = (-0.003056843086277f*pix_y + 0.3056843086277f)/(4.43013552642296e-6f*((pix_x - 160.0f)*(pix_x - 160.0f)) +
+                                                            4.79331390531725e-6f*((pix_y - 100.0f)*(pix_y - 100.0f)) - 1.0f);
+}
+
+/*
+  read a frame from sensor
+*/
+bool AP_IRLock_I2C::read_block(struct frame &irframe)
+{
+    if (!dev->transfer(nullptr, 0, (uint8_t*)&irframe, sizeof(irframe))) {
+        return false;
+    }
+
+    // record sensor successfully responded to I2C request
+    _last_read_ms = AP_HAL::millis();
+
+    /* check crc */
+    uint32_t crc = irframe.signature + irframe.pixel_x + irframe.pixel_y + irframe.pixel_size_x + irframe.pixel_size_y;
+    if (crc != irframe.checksum) {
+        // printf("bad crc 0x%04x 0x%04x\n", crc, irframe.checksum);
+        return false;
+    }
+    return true;
+}
+
+void AP_IRLock_I2C::read_frames(void)
+{
+    if (!sync_frame_start()) {
+        return;
+    }
+    struct frame irframe;
+    
+    if (!read_block(irframe)) {
+        return;
+    }
+
+    int16_t corner1_pix_x = irframe.pixel_x - irframe.pixel_size_x/2;
+    int16_t corner1_pix_y = irframe.pixel_y - irframe.pixel_size_y/2;
+    int16_t corner2_pix_x = irframe.pixel_x + irframe.pixel_size_x/2;
+    int16_t corner2_pix_y = irframe.pixel_y + irframe.pixel_size_y/2;
+
+    float corner1_pos_x, corner1_pos_y, corner2_pos_x, corner2_pos_y;
+    pixel_to_1M_plane(corner1_pix_x, corner1_pix_y, corner1_pos_x, corner1_pos_y);
+    pixel_to_1M_plane(corner2_pix_x, corner2_pix_y, corner2_pos_x, corner2_pos_y);
+
+    {
+        WITH_SEMAPHORE(sem);
+
+        /* convert to angles */
+        _target_info.timestamp = AP_HAL::millis();
+        _target_info.pos_x = 0.5f*(corner1_pos_x+corner2_pos_x);
+        _target_info.pos_y = 0.5f*(corner1_pos_y+corner2_pos_y);
+        _target_info.pos_z = 1.0f;
+    }
+
+#if 0
+    // debugging
+    static uint32_t lastt;
+    if (_target_info.timestamp - lastt > 2000) {
+        lastt = _target_info.timestamp;
+        printf("pos_x:%.5f pos_y:%.5f size_x:%.6f size_y:%.5f\n", 
+               _target_info.pos_x, _target_info.pos_y,
+               (corner2_pos_x-corner1_pos_x), (corner2_pos_y-corner1_pos_y));
+    }
+#endif
+}
+
+// retrieve latest sensor data - returns true if new data is available
+bool AP_IRLock_I2C::update()
+{
+    bool new_data = false;
+    if (!dev) {
+        return false;
+    }
+    WITH_SEMAPHORE(sem);
+
+    if (_last_update_ms != _target_info.timestamp) {
+        new_data = true;
+    }
+    _last_update_ms = _target_info.timestamp;
+    _flags.healthy = (AP_HAL::millis() - _last_read_ms < 100);
+
+    // return true if new data found
+    return new_data;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * AP_IRLock_I2C.h
+ *
+ */
+#pragma once
+
+#include "IRLock.h"
+#include <AP_HAL/AP_HAL.h>
+
+class AP_IRLock_I2C : public IRLock
+{
+public:
+    // init - initialize sensor library
+    void init(int8_t bus) override;
+
+    // retrieve latest sensor data - returns true if new data is available
+    bool update() override;
+
+private:
+    AP_HAL::OwnPtr<AP_HAL::Device> dev;
+
+    struct PACKED frame {
+        uint16_t checksum;
+        uint16_t signature;
+        uint16_t pixel_x;
+        uint16_t pixel_y;
+        uint16_t pixel_size_x;
+        uint16_t pixel_size_y;
+    };
+
+    bool timer(void);
+
+    bool sync_frame_start(void);
+    bool read_block(struct frame &irframe);
+    void read_frames(void);
+
+    void pixel_to_1M_plane(float pix_x, float pix_y, float &ret_x, float &ret_y);
+
+    HAL_Semaphore sem;
+    uint32_t _last_read_ms;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * AP_IRLock_SITL.cpp
+ *
+ *  Created on: June 09, 2016
+ *      Author: Ian Chen
+ */
+#include <AP_HAL/AP_HAL.h>
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include "AP_IRLock_SITL.h"
+#include "AP_AHRS/AP_AHRS.h"
+
+void AP_IRLock_SITL::init(int8_t bus)
+{
+    _sitl = AP::sitl();
+    _sitl->precland_sim._type.set_and_notify(SITL::SIM_Precland::PreclandType::PRECLAND_TYPE_CONE);
+}
+
+// retrieve latest sensor data - returns true if new data is available
+bool AP_IRLock_SITL::update()
+{
+    // return immediately if not healthy
+    _flags.healthy = _sitl->precland_sim.healthy();
+    if (!_flags.healthy) {
+        return false;
+    }
+
+    if (_sitl->precland_sim.last_update_ms() != _last_timestamp) {
+        const Vector3d position = _sitl->precland_sim.get_target_position();
+        const Matrix3d body_to_ned = AP::ahrs().get_rotation_body_to_ned().todouble();
+        const Vector3d real_position =  body_to_ned.mul_transpose(-position);
+        _last_timestamp = _sitl->precland_sim.last_update_ms();
+        _last_update_ms = _last_timestamp;
+        _target_info.timestamp = _last_timestamp;
+        _target_info.pos_x = real_position.y;
+        _target_info.pos_y = -real_position.x;
+        _target_info.pos_z = real_position.z;
+        return true;
+    }
+    return false;
+}
+
+#endif // CONFIG_HAL_BOARD == HAL_BOARD_SITL
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * AP_IRLock_SITL.h
+ *
+ *  Created on: June 09, 2016
+ *      Author: Ian Chen
+ */
+#pragma once
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include "IRLock.h"
+#include <SITL/SITL.h>
+
+class AP_IRLock_SITL : public IRLock
+{
+public:
+    // init - initialize sensor library
+    void init(int8_t bus) override;
+
+    // retrieve latest sensor data - returns true if new data is available
+    bool update() override;
+
+private:
+    SITL::SIM          *_sitl;                 // sitl instance pointer
+    uint32_t _last_timestamp = 0;
+};
+#endif // CONFIG_HAL_BOARD
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * IRLock.cpp
+ *
+ *  Created on: Nov 12, 2014
+ *      Author: MLandes
+ */
+
+#include "IRLock.h"
+
+// retrieve body frame unit vector in direction of target
+// returns true if data is available
+bool IRLock::get_unit_vector_body(Vector3f& ret) const
+{
+    // return false if we have no target
+    if (!_flags.healthy) {
+        return false;
+    }
+
+    // use data from first (largest) object
+    ret.x = -_target_info.pos_y;
+    ret.y = _target_info.pos_x;
+    ret.z = _target_info.pos_z;
+    ret /= ret.length();
+    return true;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * IRLock.h - IRLock Base Class for Ardupilot
+ *
+ *  Created on: Nov 10, 2014
+ *      Author: MLandes
+ */
+#pragma once
+
+#include <AP_Math/AP_Math.h>
+
+class IRLock
+{
+public:
+    // init - initialize sensor library
+    // library won't be useable unless this is first called
+    virtual void init(int8_t bus) = 0;
+
+    // true if irlock sensor is online and healthy
+    bool healthy() const { return _flags.healthy; }
+
+    // timestamp of most recent data read from the sensor
+    uint32_t last_update_ms() const { return _last_update_ms; }
+
+    // returns the number of blocks in the current frame
+    size_t num_targets() const { return _flags.healthy?1:0; }
+
+    // retrieve latest sensor data - returns true if new data is available
+    virtual bool update() = 0;
+
+    // retrieve body frame unit vector in direction of target
+    // returns true if data is available
+    bool get_unit_vector_body(Vector3f& ret) const;
+    
+
+protected:
+    struct AP_IRLock_Flags {
+        uint8_t healthy : 1; // true if sensor is healthy
+    } _flags;
+
+    // internals
+    uint32_t _last_update_ms;
+
+    // irlock_target_info is a duplicate of the PX4Firmware irlock_s structure
+    typedef struct {
+        uint32_t timestamp;   // milliseconds since system start
+        float pos_x;          // x-axis distance from center of image to center of target in units of tan(theta)
+        float pos_y;          // y-axis distance from center of image to center of target in units of tan(theta)
+        float pos_z;
+    } irlock_target_info;
+
+    irlock_target_info _target_info;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include "AP_InternalError_config.h"
+
+#if AP_INTERNALERROR_ENABLED
+
+#include "AP_InternalError.h"
+
+#include <AP_HAL/HAL.h>
+#include <AP_HAL/Util.h>
+
+#include <stdio.h>
+
+extern const AP_HAL::HAL &hal;
+
+// actually create the instance:
+static AP_InternalError instance;
+
+void AP_InternalError::error(const AP_InternalError::error_t e, uint16_t line) {
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL && defined(HAL_DEBUG_BUILD)
+    switch (e) {
+    case AP_InternalError::error_t::watchdog_reset:
+    case AP_InternalError::error_t::main_loop_stuck:
+    case AP_InternalError::error_t::params_restored:
+        // don't panic on these to facilitate watchdog testing
+        break;
+    default:
+        char buffer[50];
+        AP::internalerror().error_to_string(buffer, ARRAY_SIZE(buffer), e);
+        AP_HAL::panic("AP_InternalError::error_t::%s", buffer);
+    }
+#endif
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+if (e == AP_InternalError::error_t::imu_reset) return;// don't worry about this for esp32
+#endif
+    internal_errors |= uint32_t(e);
+    total_error_count++;
+    last_line = line;
+
+    hal.util->persistent_data.internal_errors = internal_errors;
+    hal.util->persistent_data.internal_error_count = total_error_count;
+    hal.util->persistent_data.internal_error_last_line = line;
+}
+
+static const char * const error_bit_descriptions[] {
+    "mapfailure",  // logger_mapfailure
+    "miss_struct",  // logger_missing_logstructure
+    "write_mssfmt",  // logger_logwrite_missingfmt
+    "many_deletes",  // logger_too_many_deletions
+    "bad_getfile",  // logger_bad_getfilename
+    "panic",
+    "flush_no_sem",  // logger_flushing_without_sem
+    "bad_curr_blk",  // logger_bad_current_block
+    "blkcnt_bad",  // logger_blockcount_mismatch
+    "dq_failure",  // logger_dequeue_failure
+    "cnstring_nan",  // constraining_nan
+    "watchdog_rst",  // watchdog_reset
+    "iomcu_reset",
+    "iomcu_fail",
+    "spi_fail",
+    "main_loop_stk",  // main_loop_stuck
+    "gcs_bad_link",  // gcs_bad_missionprotocol_link
+    "bitmask_range",
+    "gcs_offset",
+    "i2c_isr",
+    "flow_of_ctrl",  // flow_of_control
+    "sfs_recursion",  // switch_full_sector_recursion
+    "bad_rotation",
+    "stack_ovrflw",  // stack_overflow
+    "imu_reset",  // imu_reset
+    "gpio_isr",
+    "mem_guard",
+    "dma_fail",
+    "params_restored",
+    "invalid arguments",
+};
+
+static_assert((1U<<(ARRAY_SIZE(error_bit_descriptions))) == uint32_t(AP_InternalError::error_t::__LAST__), "too few descriptions for bits");
+
+void AP_InternalError::error_to_string(char *buffer, const uint16_t len, error_t error_code) const
+{
+    uint32_t temp = log2f(int(error_code));
+    strncpy(buffer, error_bit_descriptions[temp], len - 1);
+}
+
+void AP_InternalError::errors_as_string(uint8_t *buffer, const uint16_t len) const
+{
+    buffer[0] = 0;
+    uint32_t buffer_used = 0;
+    const char *format = "%s"; // no comma before the first item
+    for (uint8_t i=0; i<ARRAY_SIZE(error_bit_descriptions); i++) {
+        if (buffer_used >= len) {
+            break;
+        }
+        if (internal_errors & (1U<<i)) {
+            const int written = hal.util->snprintf((char*)&buffer[buffer_used],
+                                                      len-buffer_used,
+                                                      format,
+                                                      error_bit_descriptions[i]);
+            format = ",%s"; // once we write something, need commas thereafter
+
+            if (written < 0) {
+                break;
+            }
+            buffer_used += written;
+        }
+    }
+}
+
+namespace AP {
+
+AP_InternalError &internalerror()
+{
+    return instance;
+}
+
+};
+
+// stack overflow hook for low level RTOS code, C binding
+void AP_stack_overflow(const char *thread_name)
+{
+    static bool done_stack_overflow;
+    INTERNAL_ERROR(AP_InternalError::error_t::stack_overflow);
+    if (!done_stack_overflow) {
+        // we don't want to record the thread name more than once, as
+        // first overflow can trigger a 2nd
+        strncpy_noterm(hal.util->persistent_data.thread_name4, thread_name, 4);
+        done_stack_overflow = true;
+    }
+    hal.util->persistent_data.fault_type = 42; // magic value
+    if (!hal.util->get_soft_armed()) {
+        AP_HAL::panic("stack overflow %s\n", thread_name);
+    }
+}
+
+// hook for memory guard errors with --enable-memory-guard
+void AP_memory_guard_error(uint32_t size)
+{
+    INTERNAL_ERROR(AP_InternalError::error_t::mem_guard);
+    if (!hal.util->get_soft_armed()) {
+        ::printf("memory guard error size=%u\n", unsigned(size));
+        AP_HAL::panic("memory guard size=%u\n", unsigned(size));
+    }
+}
+
+#endif  // AP_INTERNALERROR_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   //
+// tests for the AP_JSON parser
+//
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_JSON/AP_JSON.h>
+
+#include <stdio.h>
+
+void setup();
+void loop();
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+static uint32_t test_count;
+static uint32_t label_count;
+
+static bool test_xplane(void)
+{
+    const uint32_t m1 = hal.util->available_memory();
+    auto *obj = AP_JSON::load_json("@ROMFS/models/xplane_plane.json");
+    if (obj == nullptr) {
+        ::printf("Failed to load or parse json\n");
+        return false;
+    }
+    const uint32_t m2 = hal.util->available_memory();
+    ::printf("Used %u bytes\n", unsigned(m1-m2));
+
+    const AP_JSON::value::object& o = obj->get<AP_JSON::value::object>();
+    for (AP_JSON::value::object::const_iterator i = o.begin();
+         i != o.end();
+         ++i) {
+        const char *label = i->first.c_str();
+        ::printf("Label: %s\n", label);
+        label_count++;
+    }
+    delete obj;
+    return label_count > 10;
+}
+
+/*
+ *  euler angle tests
+ */
+void setup(void)
+{
+    hal.console->printf("AP_JSON tests\n");
+}
+
+void loop(void)
+{
+    ::printf("Memory: %u\n", (unsigned)hal.util->available_memory());
+    if (test_xplane()) {
+        test_count++;
+    } else {
+        ::printf("Test FAILED\n");
+        exit(1);
+    }
+    if (test_count > 10) {
+        ::printf("Test PASSED\n");
+        exit(0);
+    }
+}
+
+AP_HAL_MAIN();
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ *  Example of AP_Motors library.
+ *  Code by Randy Mackay. DIYDrones.com
+ */
+
+/* on Linux run with
+    ./waf configure --board linux
+    ./waf --targets examples/AP_Motors_test
+    ./build/linux/examples/AP_Motors_test
+*/
+
+// Libraries
+#include <AP_HAL/AP_HAL.h>
+#include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_Motors/AP_Motors.h>
+#include <SRV_Channel/SRV_Channel.h>
+#include <AP_ESC_Telem/AP_ESC_Telem.h>
+#include <stdio.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+// declare functions
+void setup();
+void loop();
+void motor_order_test();
+void stability_test();
+void update_motors();
+void print_all_motors();
+void print_motor_matrix(uint8_t frame_class, uint8_t frame_type);
+void print_motor_tri(uint8_t frame_class, uint8_t frame_type);
+
+// Instantiate a few classes that will be needed so that the singletons can be called from the motors lib
+#if HAL_WITH_ESC_TELEM
+AP_ESC_Telem esc_telem;
+#endif
+
+#define VERSION "AP_Motors library test ver 1.2"
+
+SRV_Channels srvs;
+AP_BattMonitor _battmonitor{0, nullptr, nullptr};
+
+AP_Motors *motors;
+AP_MotorsHeli *motors_heli;
+AP_MotorsMatrix *motors_matrix;
+AP_MotorsTri *motors_tri;
+
+bool thrust_boost = false;
+
+uint8_t num_outputs;
+
+// setup
+void setup()
+{
+
+    // default to quad frame class, frame class can be changed by argument in parser below
+    AP_Motors::motor_frame_class frame_class = AP_Motors::MOTOR_FRAME_QUAD;
+
+    // Parse the command line arguments
+    uint8_t argc;
+    char * const *argv;
+    hal.util->commandline_arguments(argc, argv);
+    if (argc > 1) {
+        for (uint8_t i = 2; i < argc; i++) {
+            const char *arg = argv[i];
+            const char *eq = strchr(arg, '=');
+
+            if (eq == NULL) {
+                ::printf("Expected argument with \"=\"\n");
+                exit(1);
+            }
+
+            char cmd[20] {};
+            strncpy(cmd, arg, eq-arg);
+            const float value = atof(eq+1);
+            if (strcmp(cmd,"yaw_headroom") == 0) {
+                if (motors_matrix != nullptr) {
+                    motors_matrix->set_yaw_headroom(value);
+                } else {
+                    ::printf("frame_class = %d does not accept yaw_headroom commands\n", frame_class);
+                }
+
+            } else if (strcmp(cmd,"throttle_avg_max") == 0) {
+                if (motors_matrix != nullptr) {
+                    motors_matrix->set_throttle_avg_max(value);
+                } else {
+                    ::printf("frame_class = %d does not accept throttle_avg_max commands\n", frame_class);
+                }
+
+            } else if (strcmp(cmd,"thrust_boost") == 0) {
+                thrust_boost = value > 0.0;
+
+            } else if (strcmp(cmd,"swash") == 0) {
+                if (frame_class == AP_Motors::MOTOR_FRAME_HELI) {
+                    // This is a extremely complicated and unsafe way to get at the swash type parameter
+                    // without adding helpers to both AP_MotorsHeli_Single and AP_MotorsHeli_Swash
+                    // This works in the same way as AP_Param
+                    char *swash = (char*)motors + AP_MotorsHeli_Single::var_info[6].offset;
+                    AP_Int8 *swash_type = (AP_Int8*)swash + AP_MotorsHeli_Swash::var_info[0].offset;
+                    swash_type->set(value);
+
+                } else if (frame_class == AP_Motors::MOTOR_FRAME_HELI_DUAL) {
+                    // More param hacking, its only a example
+                    char *swash1 = (char*)motors + AP_MotorsHeli_Dual::var_info[7].offset;
+                    char *swash2 = (char*)motors + AP_MotorsHeli_Dual::var_info[8].offset;
+                    AP_Int8 *swash_type1 = (AP_Int8*)swash1 + AP_MotorsHeli_Swash::var_info[0].offset;
+                    AP_Int8 *swash_type2 = (AP_Int8*)swash2 + AP_MotorsHeli_Swash::var_info[0].offset;
+                    swash_type1->set(value);
+                    swash_type2->set(value);
+
+                } else {
+                    ::printf("frame_class %i does not support swash\n", frame_class);
+                    exit(1);
+                }
+                // Re-init motors to switch to the new swash type
+                // Have to do this twice to make sure the swash type sticks
+                motors->set_initialised_ok(false);
+                motors->init(frame_class, AP_Motors::MOTOR_FRAME_TYPE_X);
+                motors->set_initialised_ok(false);
+                motors->init(frame_class, AP_Motors::MOTOR_FRAME_TYPE_X);
+
+                // Check that init worked
+                if (!motors->initialised_ok()) {
+                    ::printf("ERROR: swash=%0.0f re-initialisation failed\n", value);
+                    exit(1);
+                }
+
+            } else if (strcmp(cmd,"dual_mode") == 0) {
+                if (frame_class != AP_Motors::MOTOR_FRAME_HELI_DUAL) {
+                    ::printf("dual_mode only supported by dual heli frame type (%i), got %i\n", AP_Motors::MOTOR_FRAME_HELI_DUAL, frame_class);
+                    exit(1);
+                }
+
+                // look away now, more dodgy param access.
+                AP_Int8 *dual_mode = (AP_Int8*)motors + AP_MotorsHeli_Dual::var_info[1].offset;
+                dual_mode->set(value);
+
+            } else if (strcmp(cmd,"tail_type") == 0) {
+                if (frame_class != AP_Motors::MOTOR_FRAME_HELI) {
+                    ::printf("tail_type only supported by single heli frame type (%i), got %i\n", AP_Motors::MOTOR_FRAME_HELI, frame_class);
+                    exit(1);
+                }
+
+                // Union allows pointers to be aligned despite different sizes
+                // avoids "increases required alignment of target type" error when casting from char* to AP_Int16*
+                union {
+                    char *char_ptr;
+                    AP_Int16 *int16;
+                } tail_type;
+
+                // look away now, more dodgy param access.
+                tail_type.char_ptr = (char*)motors + AP_MotorsHeli_Single::var_info[1].offset;
+                tail_type.int16->set(value);
+
+                // Re-init motors to switch to the new tail type
+                // Have to do this twice to make sure the tail type sticks
+                motors->set_initialised_ok(false);
+                motors->init(frame_class, AP_Motors::MOTOR_FRAME_TYPE_X);
+                motors->set_initialised_ok(false);
+                motors->init(frame_class, AP_Motors::MOTOR_FRAME_TYPE_X);
+
+            } else if (strcmp(cmd,"frame_class") == 0) {
+                // We must have the frame_class argument 2nd as resulting class is used to determine if
+                // we have access to certain functions in the multicopter motors child class
+                if (i != 2) {
+                    ::printf("frame_class must be second argument\n");
+                    exit(1);
+                }
+
+                // Setup the correct motors object for the frame class to test
+                frame_class = (AP_Motors::motor_frame_class)value;
+
+                switch (frame_class) {
+
+                    case AP_Motors::MOTOR_FRAME_QUAD:
+                    case AP_Motors::MOTOR_FRAME_HEXA:
+                    case AP_Motors::MOTOR_FRAME_OCTA:
+                        motors_matrix = new AP_MotorsMatrix(400);
+                        motors = motors_matrix;
+                        break;
+
+                    case AP_Motors::MOTOR_FRAME_HELI:
+                        motors_heli = new AP_MotorsHeli_Single(400);
+                        motors = motors_heli;
+                        // Mot 1-3: Swash plate 1 to 3
+                        // Mot 4: Tail rotor
+                        // Mot 5: 4th servo in H4-90 swash
+                        // Mot 6: Unused
+                        // Mot 7: Tail rotor RSC / external governor output
+                        // Mot 8: Main rotor RSC
+                        num_outputs = 8;
+                        break;
+
+                    case AP_Motors::MOTOR_FRAME_HELI_DUAL:
+                        motors_heli = new AP_MotorsHeli_Dual(400);
+                        motors = motors_heli;
+                        // Mot 1-3 swashplate 1, mot 4-6 swashplate 2, mot 7 and 8 for 4th servos on H4-90 swash plates front and back, respectively
+         

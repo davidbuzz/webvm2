@@ -1,0 +1,2005 @@
+nt32(Param::Recording, start_recording ? 1 : 0);
+}
+
+// set zoom specified as a rate or percentage
+bool AP_Mount_Xacti::set_zoom(ZoomType zoom_type, float zoom_value)
+{
+    // zoom rate
+    if (zoom_type == ZoomType::RATE) {
+        if (is_zero(zoom_value)) {
+            // stop zooming
+            _zoom_rate_control.enabled = false;
+        } else {
+            // zoom in or out
+            _zoom_rate_control.enabled = true;
+            _zoom_rate_control.dir = (zoom_value < 0) ? -1 : 1;
+        }
+        return true;
+    }
+
+    // zoom percentage
+    if (zoom_type == ZoomType::PCT) {
+        if (capabilities.optical_zoom == Capability::True) {
+            // optical zoom capable cameras use combination of optical and digital zoom
+            // convert zoom percentage (0 ~ 100) to zoom times using linear interpolation
+            // optical zoom covers 1x to 2.5x, param values are in 100 to 250
+            // digital zoom covers 2.5x to 25x, param values are 100 to 1000
+            const float zoom_times = linear_interpolate(1, 25, zoom_value, 0, 100);
+            const uint16_t optical_zoom_param = constrain_uint16(uint16_t(zoom_times * 10) * 10, 100, 250);
+            const uint16_t digital_zoom_param = constrain_uint16(uint16_t(zoom_times * 0.4) * 100, 100, 1000);
+            bool ret = true;
+            if (optical_zoom_param != _last_optical_zoom_param_value) {
+                ret = set_param_int32(Param::OpticalZoomMagnification, optical_zoom_param);
+            }
+            if (digital_zoom_param != _last_digital_zoom_param_value) {
+                ret &= set_param_int32(Param::DigitalZoomMagnification, digital_zoom_param);
+            }
+            return ret;
+        }
+        // digital only zoom
+        // convert zoom percentage (0 ~ 100) to zoom parameter value (100, 200, 300, ... 1000)
+        // 0~11pct:100, 12~22pct:200, 23~33pct:300, 34~44pct:400, 45~55pct:500, 56~66pct:600, 67~77pct:700, 78~88pct:800, 89~99pct:900, 100:1000
+        const uint16_t zoom_param_value = uint16_t(linear_interpolate(1, 10, zoom_value, 0, 100)) * 100;
+        return set_param_int32(Param::DigitalZoomMagnification, zoom_param_value);
+    }
+
+    // unsupported zoom type
+    return false;
+}
+
+// set focus specified as rate, percentage or auto
+// focus in = -1, focus hold = 0, focus out = 1
+SetFocusResult AP_Mount_Xacti::set_focus(FocusType focus_type, float focus_value)
+{
+    // convert focus type and value to parameter value
+    uint8_t focus_param_value;
+    switch (focus_type) {
+    case FocusType::RATE:
+    case FocusType::PCT:
+        // focus rate and percentage control not supported so simply switch to manual focus
+        // FocusMode of 0:Manual Focus
+        focus_param_value = 0;
+        break;
+    case FocusType::AUTO:
+        // FocusMode of 1:Single AutoFocus, 2:Continuous AutoFocus
+        focus_param_value = 2;
+        break;
+    default:
+        // unsupported forucs mode
+        return SetFocusResult::INVALID_PARAMETERS;
+    }
+
+    // set FocusMode parameter
+    return set_param_int32(Param::FocusMode, focus_param_value) ? SetFocusResult::ACCEPTED : SetFocusResult::FAILED;
+}
+
+// set camera lens as a value from 0 to 5
+bool AP_Mount_Xacti::set_lens(uint8_t lens)
+{
+    // sanity check
+    if (lens > (uint8_t)SensorsMode::NDVI) {
+        return false;
+    }
+
+    return set_param_int32(Param::SensorMode, lens);
+}
+
+// set_camera_source is functionally the same as set_lens except primary and secondary lenses are specified by type
+// primary and secondary sources use the AP_Camera::CameraSource enum cast to uint8_t
+bool AP_Mount_Xacti::set_camera_source(uint8_t primary_source, uint8_t secondary_source)
+{
+    // maps primary and secondary source to xacti SensorsMode
+    SensorsMode new_sensor_mode;
+    switch (primary_source) {
+    case 0: // Default (RGB)
+        FALLTHROUGH;
+    case 1: // RGB
+        switch (secondary_source) {
+        case 0: // RGB + Default (None)
+            new_sensor_mode = SensorsMode::RGB;
+            break;
+        case 2: // PIP RGB+IR
+            new_sensor_mode = SensorsMode::PIP;
+            break;
+        default:
+            return false;
+        }
+        break;
+    case 2: // IR
+        if (secondary_source != 0) {
+            return false;
+        }
+        new_sensor_mode = SensorsMode::IR;
+        break;
+    case 3: // NDVI
+        if (secondary_source != 0) {
+            return false;
+        }
+        // NDVI + Default (None)
+        new_sensor_mode = SensorsMode::NDVI;
+        break;
+    default:
+        return false;
+    }
+
+    // send desired sensor mode to camera
+    return set_param_int32(Param::SensorMode, (uint8_t)new_sensor_mode);
+}
+
+// send camera information message to GCS
+void AP_Mount_Xacti::send_camera_information(mavlink_channel_t chan) const
+{
+    // exit immediately if not initialised
+    if (!_initialised) {
+        return;
+    }
+
+    static const uint8_t vendor_name[32] = "Xacti";
+    static uint8_t model_name[32] = "CX-GB100";
+    const char cam_definition_uri[140] {};
+    const float NaN = nanf("0x4152");
+
+    // capability flags
+    const uint32_t flags = CAMERA_CAP_FLAGS_CAPTURE_VIDEO |
+                           CAMERA_CAP_FLAGS_CAPTURE_IMAGE |
+                           CAMERA_CAP_FLAGS_HAS_BASIC_FOCUS;
+
+    // send CAMERA_INFORMATION message
+    mavlink_msg_camera_information_send(
+        chan,
+        AP_HAL::millis(),       // time_boot_ms
+        vendor_name,            // vendor_name uint8_t[32]
+        model_name,             // model_name uint8_t[32]
+        _firmware_version.received ? _firmware_version.mav_ver : 0, // firmware version uint32_t
+        NaN,                    // focal_length float (mm)
+        NaN,                    // sensor_size_h float (mm)
+        NaN,                    // sensor_size_v float (mm)
+        0,                      // resolution_h uint16_t (pix)
+        0,                      // resolution_v uint16_t (pix)
+        0,                      // lens_id uint8_t
+        flags,                  // flags uint32_t (CAMERA_CAP_FLAGS)
+        0,                      // cam_definition_version uint16_t
+        cam_definition_uri,     // cam_definition_uri char[140]
+        _instance + 1);         // gimbal_device_id uint8_t
+}
+
+// send camera settings message to GCS
+void AP_Mount_Xacti::send_camera_settings(mavlink_channel_t chan) const
+{
+    const float NaN = nanf("0x4152");
+
+    // send CAMERA_SETTINGS message
+    mavlink_msg_camera_settings_send(
+        chan,
+        AP_HAL::millis(),   // time_boot_ms
+        _recording_video ? CAMERA_MODE_VIDEO : CAMERA_MODE_IMAGE,   // camera mode (0:image, 1:video, 2:image survey)
+        0,                  // zoomLevel float, percentage from 0 to 100, NaN if unknown
+        NaN);               // focusLevel float, percentage from 0 to 100, NaN if unknown
+}
+
+// get attitude as a quaternion.  returns true on success
+bool AP_Mount_Xacti::get_attitude_quaternion(Quaternion& att_quat)
+{
+    att_quat = _current_attitude_quat;
+    return true;
+}
+
+// send target pitch and yaw rates to gimbal
+// yaw_is_ef should be true if yaw_rads target is an earth frame rate, false if body_frame
+void AP_Mount_Xacti::send_target_rates(float pitch_rads, float yaw_rads, bool yaw_is_ef)
+{
+    // send gimbal rate target to gimbal
+    send_gimbal_control(3, degrees(pitch_rads) * 100, degrees(yaw_rads) * 100);
+}
+
+// send target pitch and yaw angles to gimbal
+// yaw_is_ef should be true if yaw_rad target is an earth frame angle, false if body_frame
+void AP_Mount_Xacti::send_target_angles(float pitch_rad, float yaw_rad, bool yaw_is_ef)
+{
+    // convert yaw to body frame
+    const float yaw_bf_rad = yaw_is_ef ? wrap_PI(yaw_rad - AP::ahrs().get_yaw()) : yaw_rad;
+
+    // send angle target to gimbal
+    send_gimbal_control(2, degrees(pitch_rad) * 100, degrees(yaw_bf_rad) * 100);
+}
+
+// subscribe to Xacti DroneCAN messages
+void AP_Mount_Xacti::subscribe_msgs(AP_DroneCAN* ap_dronecan)
+{
+    // return immediately if DroneCAN is unavailable
+    if (ap_dronecan == nullptr) {
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "%s DroneCAN subscribe failed", send_text_prefix);
+        return;
+    }
+
+    _subscribed = true;
+
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_gimbal_attitude_status, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("gimbal_attitude_status_sub");
+        _subscribed = false;
+    }
+
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_gnss_status_req, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("gnss_status_req_sub");
+        _subscribed = false;
+    }
+}
+
+// register backend in detected modules array used to map DroneCAN port and node id to backend
+void AP_Mount_Xacti::register_backend()
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    // add this backend to _detected_modules array
+    _detected_modules[_instance].driver = this;
+
+    // return if devid is zero meaning this backend has not yet been associated with a mount
+    const uint32_t devid = (uint32_t)_params.dev_id.get();
+    if (devid == 0) {
+        return;
+    }
+
+    // get DroneCan port from device id
+    const uint8_t can_driver_index = AP_HAL::Device::devid_get_bus(devid);
+    const uint8_t can_num_drivers = AP::can().get_num_drivers();
+    for (uint8_t i = 0; i < can_num_drivers; i++) {
+        AP_DroneCAN *ap_dronecan = AP_DroneCAN::get_dronecan(i);
+        if (ap_dronecan != nullptr && ap_dronecan->get_driver_index() == can_driver_index) {
+            _detected_modules[_instance].ap_dronecan = ap_dronecan;
+        }
+    }
+
+    // get node_id from device id
+    _detected_modules[_instance].node_id = AP_HAL::Device::devid_get_address(devid);
+}
+
+// find backend associated with the given dronecan port and node_id.  also associates backends with zero node ids
+// returns pointer to backend on success, nullptr on failure
+AP_Mount_Xacti* AP_Mount_Xacti::get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id)
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    // exit immediately if DroneCAN is unavailable or invalid node id
+    if (ap_dronecan == nullptr || node_id == 0) {
+        return nullptr;
+    }
+
+    // search for backend with matching dronecan port and node id
+    for (uint8_t i = 0; i < ARRAY_SIZE(_detected_modules); i++) {
+        if (_detected_modules[i].driver != nullptr &&
+            _detected_modules[i].ap_dronecan == ap_dronecan &&
+            _detected_modules[i].node_id == node_id ) {
+            return _detected_modules[i].driver;
+        }
+    }
+
+    // if we got this far, this dronecan port and node id are not associated with any backend
+    // associate with first backend with node id of zero
+    for (uint8_t i = 0; i < ARRAY_SIZE(_detected_modules); i++) {
+        if (_detected_modules[i].driver != nullptr &&
+            _detected_modules[i].node_id == 0) {
+                _detected_modules[i].ap_dronecan = ap_dronecan;
+                _detected_modules[i].node_id = node_id;
+                const auto dev_id = AP_HAL::Device::make_bus_id(AP_HAL::Device::BUS_TYPE_UAVCAN,
+                                                                ap_dronecan->get_driver_index(),
+                                                                node_id, 0);
+                _detected_modules[i].driver->set_dev_id(dev_id);
+                return _detected_modules[i].driver;
+        }
+    }
+
+    return nullptr;
+}
+
+// handle xacti gimbal attitude status message
+void AP_Mount_Xacti::handle_gimbal_attitude_status(AP_DroneCAN* ap_dronecan, const CanardRxTransfer& transfer, const com_xacti_GimbalAttitudeStatus &msg)
+{
+    // fetch the matching backend driver, node id and gimbal id backend instance
+    AP_Mount_Xacti* driver = get_dronecan_backend(ap_dronecan, transfer.source_node_id);
+    if (driver == nullptr) {
+        return;
+    }
+
+    // convert body-frame Euler angles to Quaternion.  Note yaw direction is reversed from normal
+    driver->_current_attitude_quat.from_euler(radians(msg.gimbal_roll * 0.01), radians(msg.gimbal_pitch * 0.01), radians(-msg.gimbal_yaw * 0.01));
+    driver->_last_current_attitude_quat_ms = AP_HAL::millis();
+}
+
+// handle xacti gnss status request message
+void AP_Mount_Xacti::handle_gnss_status_req(AP_DroneCAN* ap_dronecan, const CanardRxTransfer& transfer, const com_xacti_GnssStatusReq &msg)
+{
+    // sanity check dronecan port
+    if (ap_dronecan == nullptr) {
+        return;
+    }
+
+    // get current location
+    uint8_t gps_status = 2;
+    Location loc;
+    if (!AP::ahrs().get_location(loc)) {
+        gps_status = 0;
+    }
+
+    // get date and time
+    uint16_t year, ms;
+    uint8_t month, day, hour, min, sec;
+#if AP_RTC_ENABLED
+    if (!AP::rtc().get_date_and_time_utc(year, month, day, hour, min, sec, ms)) {
+        year = month = day = hour = min = sec = 0;
+    }
+#else
+    year = month = day = hour = min = sec = 0;
+    (void)ms;
+#endif
+
+    // send xacti specific gnss status message
+    com_xacti_GnssStatus xacti_gnss_status_msg {};
+    xacti_gnss_status_msg.gps_status = gps_status;
+    xacti_gnss_status_msg.order = msg.requirement;
+    xacti_gnss_status_msg.remain_buffer = 1;
+    xacti_gnss_status_msg.utc_year = year;
+    xacti_gnss_status_msg.utc_month = month + 1;
+    xacti_gnss_status_msg.utc_day = day;
+    xacti_gnss_status_msg.utc_hour = hour;
+    xacti_gnss_status_msg.utc_minute = min;
+    xacti_gnss_status_msg.utc_seconds = sec;
+    xacti_gnss_status_msg.latitude = loc.lat * 1e-7;
+    xacti_gnss_status_msg.longitude = loc.lng * 1e-7;
+    xacti_gnss_status_msg.altitude = loc.alt * 1e-2;
+    ap_dronecan->xacti_gnss_status.broadcast(xacti_gnss_status_msg);
+}
+
+// handle param get/set response
+bool AP_Mount_Xacti::handle_param_get_set_response_int(AP_DroneCAN* ap_dronecan, uint8_t node_id, const char* name, int32_t &value)
+{
+    // error string prefix to save on flash
+    const char* err_prefix_str = "Xacti: failed to";
+
+    // take picture
+    if (strcmp(name, get_param_name_str(Param::SingleShot)) == 0) {
+        if (value < 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s take pic", err_prefix_str);
+        }
+        return false;
+    }
+
+    // recording
+    if (strcmp(name, get_param_name_str(Param::Recording)) == 0) {
+        if (value < 0) {
+            _recording_video = false;
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s record", err_prefix_str);
+        } else {
+            _recording_video = (value == 1);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s recording %s", send_text_prefix, _recording_video ? "ON" : "OFF");
+        }
+        return false;
+    }
+
+    // focus
+    if (strcmp(name, get_param_name_str(Param::FocusMode)) == 0) {
+        if (value < 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s change focus", err_prefix_str);
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s %s focus", send_text_prefix, value == 0 ? "manual" : "auto");
+        }
+        return false;
+    }
+
+    // camera lens (aka sensor mode)
+    if (strcmp(name, get_param_name_str(Param::SensorMode)) == 0) {
+        if (value < 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s change lens", err_prefix_str);
+        } else if ((uint32_t)value < ARRAY_SIZE(sensor_mode_str)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s %s", send_text_prefix, sensor_mode_str[(uint8_t)value]);
+        }
+        return false;
+    }
+
+    // digital zoom
+    if (strcmp(name, get_param_name_str(Param::DigitalZoomMagnification)) == 0) {
+        if (value < 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s change zoom", err_prefix_str);
+            // disable zoom rate control (if active) to avoid repeated failures
+            _zoom_rate_control.enabled = false;
+        } else if (value >= 100 && value <= 1000) {
+            _last_digital_zoom_param_value = value;
+        }
+        return false;
+    }
+
+    // optical zoom
+    if (strcmp(name, get_param_name_str(Param::OpticalZoomMagnification)) == 0) {
+        if (value < 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s change optical zoom", err_prefix_str);
+            // disable zoom rate control (if active) to avoid repeated failures
+            _zoom_rate_control.enabled = false;
+        } else if (value >= 100 && value <= 250) {
+            capabilities.optical_zoom = Capability::True;
+            capabilities.received = true;
+            _last_optical_zoom_param_value = value;
+        }
+        return false;
+    }
+    
+    // unhandled parameter get or set
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s get/set %s res:%ld", send_text_prefix, name, (long int)value);
+    return false;
+}
+
+// handle param get/set response
+bool AP_Mount_Xacti::handle_param_get_set_response_string(AP_DroneCAN* ap_dronecan, uint8_t node_id, const char* name, AP_DroneCAN::string &value)
+{
+    if (strcmp(name, get_param_name_str(Param::FirmwareVersion)) == 0) {
+        _firmware_version.received = true;
+        const uint8_t len = MIN(value.len, ARRAY_SIZE(_firmware_version.str)-1);
+        memcpy(_firmware_version.str, (const char*)value.data, len);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mount: Xacti fw:%s", _firmware_version.str);
+
+        // firmware str from gimbal is of the format YYMMDD[b]xx.  Convert to uint32 for reporting to GCS
+        if (len >= 9) {
+            const char major_str[3] = {_firmware_version.str[0], _firmware_version.str[1], 0};
+            const char minor_str[3] = {_firmware_version.str[2], _firmware_version.str[3], 0};
+            const char patch_str[3] = {_firmware_version.str[4], _firmware_version.str[5], 0};
+            const char dev_str[3] = {_firmware_version.str[7], _firmware_version.str[8], 0};
+            const uint8_t major_ver_num = atoi(major_str) & 0xFF;
+            const uint8_t minor_ver_num = atoi(minor_str) & 0xFF;
+            const uint8_t patch_ver_num = atoi(patch_str) & 0xFF;
+            const uint8_t dev_ver_num = atoi(dev_str) & 0xFF;
+            _firmware_version.mav_ver = UINT32_VALUE(dev_ver_num, patch_ver_num, minor_ver_num, major_ver_num);
+        }
+        return false;
+    } else if (strcmp(name, get_param_name_str(Param::DateTime)) == 0) {
+        // display when time and date have been set
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s datetime set %s", send_text_prefix, (const char*)value.data);
+        return false;
+    } else if (strcmp(name, get_param_name_str(Param::Status)) == 0) {
+        // check for expected length
+        const char* error_str = "error";
+        if (value.len != sizeof(_status)) {
+            INTERNAL_ERROR(AP_InternalError::error_t::invalid_arg_or_result);
+            return false;
+        }
+
+        // backup error status and copy to structure
+        const uint32_t last_error_status = _status.error_status;
+        memcpy(&_status, value.data, value.len);
+
+        // report change in status
+        uint32_t changed_bits = last_error_status ^ _status.error_status;
+        const char* ok_str = "OK";
+        if (changed_bits & (uint32_t)ErrorStatus::TIME_NOT_SET) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s time %sset", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::TIME_NOT_SET ? "not " : "");
+            if (_status.error_status & (uint32_t)ErrorStatus::TIME_NOT_SET) {
+                // try to set time again
+                _datetime.set = false;
+            }
+        }
+        if (changed_bits & (uint32_t)ErrorStatus::MEDIA_ERROR) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s media %s", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::MEDIA_ERROR ? error_str : ok_str);
+        }
+        if (changed_bits & (uint32_t)ErrorStatus::LENS_ERROR) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s lens %s", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::LENS_ERROR ? error_str : ok_str);
+        }
+        if (changed_bits & (uint32_t)ErrorStatus::MOTOR_INIT_ERROR) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s motor %s", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::MOTOR_INIT_ERROR ? "init error" : ok_str);
+        }
+        if (changed_bits & (uint32_t)ErrorStatus::MOTOR_OPERATION_ERROR) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s motor op %s", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::MOTOR_OPERATION_ERROR ? error_str : ok_str);
+        }
+        if (changed_bits & (uint32_t)ErrorStatus::GIMBAL_CONTROL_ERROR) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s control %s", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::GIMBAL_CONTROL_ERROR ? error_str : ok_str);
+        }
+        if (changed_bits & (uint32_t)ErrorStatus::TEMP_WARNING) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s temp %s", send_text_prefix, _status.error_status & (uint32_t)ErrorStatus::TEMP_WARNING ? "warning" : ok_str);
+        }
+
+        // set motor error for health reporting
+        _motor_error = _status.error_status & ((uint32_t)ErrorStatus::MOTOR_INIT_ERROR | (uint32_t)ErrorStatus::MOTOR_OPERATION_ERROR | (uint32_t)ErrorStatus::GIMBAL_CONTROL_ERROR);
+        _camera_error = _status.error_status & ((uint32_t)ErrorStatus::LENS_ERROR | (uint32_t)ErrorStatus::MEDIA_ERROR);
+        return false;
+    }
+
+    // unhandled parameter get or set
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s get/set string %s res:%s", send_text_prefix, name, (const char*)value.data);
+    return false;
+}
+
+void AP_Mount_Xacti::handle_param_save_response(AP_DroneCAN* ap_dronecan, const uint8_t node_id, bool success)
+{
+    // display failure to save parameter
+    if (!success) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s CAM%u failed to set param", send_text_prefix, (int)_instance+1);
+    }
+}
+
+// get parameter name for a particular param enum value
+// returns an empty string if not found (which should never happen)
+const char* AP_Mount_Xacti::get_param_name_str(Param param) const
+{
+    // check to avoid reading beyond end of array.  This should never happen
+    if ((uint8_t)param > ARRAY_SIZE(_param_names)) {
+        INTERNAL_ERROR(AP_InternalError::error_t::invalid_arg_or_result);
+        return "";
+    }
+    return _param_names[(uint8_t)param];
+}
+
+// helper function to set integer parameters
+bool AP_Mount_Xacti::set_param_int32(Param param, int32_t param_value)
+{
+    if (_set_param_int32_queue == nullptr) {
+        return false;
+    }
+
+    // set param request added to queue to be sent.  throttling requests improves reliability
+    return _set_param_int32_queue->push(SetParamQueueItem{param, param_value});
+}
+
+// helper function to set string parameters
+bool AP_Mount_Xacti::set_param_string(Param param, const AP_DroneCAN::string& param_value)
+{
+    if (_detected_modules[_instance].ap_dronecan == nullptr) {
+        return false;
+    }
+
+    // convert param to string
+    const char* param_name_str = get_param_name_str(param);
+    if (param_name_str == nullptr) {
+        return false;
+    }
+
+    if (_detected_modules[_instance].ap_dronecan->set_parameter_on_node(_detected_modules[_instance].node_id, param_name_str, param_value, &param_string_cb)) {
+        last_send_getset_param_ms = AP_HAL::millis();
+        return true;
+    }
+    return false;
+}
+
+// helper function to get string parameters
+bool AP_Mount_Xacti::get_param_string(Param param)
+{
+    if (_detected_modules[_instance].ap_dronecan == nullptr) {
+        return false;
+    }
+
+    // convert param to string
+    const char* param_name_str = get_param_name_str(param);
+    if (_detected_modules[_instance].ap_dronecan->get_parameter_on_node(_detected_modules[_instance].node_id, param_name_str, &param_string_cb)) {
+        last_send_getset_param_ms = AP_HAL::millis();
+        return true;
+    }
+    return false;
+}
+
+// process queue of set parameter items
+bool AP_Mount_Xacti::process_set_param_int32_queue()
+{
+    if ((_set_param_int32_queue == nullptr) || (_detected_modules[_instance].ap_dronecan == nullptr)) {
+        return false;
+    }
+
+    SetParamQueueItem param_to_set;
+    if (_set_param_int32_queue->pop(param_to_set)) {
+        // convert param to string
+        const char* param_name_str = get_param_name_str(param_to_set.param);
+        if (_detected_modules[_instance].ap_dronecan->set_parameter_on_node(_detected_modules[_instance].node_id, param_name_str, param_to_set.value, &param_int_cb)) {
+            last_send_getset_param_ms = AP_HAL::millis();
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// send gimbal control message via DroneCAN
+// mode is 2:angle control or 3:rate control
+// pitch_cd is pitch angle in centi-degrees or pitch rate in cds
+// yaw_cd is angle in centi-degrees or yaw rate in cds
+void AP_Mount_Xacti::send_gimbal_control(uint8_t mode, int16_t pitch_cd, int16_t yaw_cd)
+{
+    // exit immediately if no DroneCAN port
+    if (_detected_modules[_instance].ap_dronecan == nullptr) {
+        return;
+    }
+
+    // send at no faster than 5hz
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - last_send_gimbal_control_ms < 200) {
+        return;
+    }
+    last_send_gimbal_control_ms = now_ms;
+
+    // send xacti specific gimbal control message
+    com_xacti_GimbalControlData gimbal_control_data_msg {};
+    gimbal_control_data_msg.pitch_cmd_type = mode;
+    gimbal_control_data_msg.yaw_cmd_type = mode;
+    gimbal_control_data_msg.pitch_cmd_value = pitch_cd;
+    gimbal_control_data_msg.yaw_cmd_value = -yaw_cd;
+    _detected_modules[_instance].ap_dronecan->xacti_gimbal_control_data.broadcast(gimbal_control_data_msg);
+}
+
+// send copter attitude status message to gimbal.  now_ms is current system time
+// returns true if sent so that we avoid immediately trying to also send other messages
+bool AP_Mount_Xacti::send_copter_att_status(uint32_t now_ms)
+{
+    // exit immediately if no DroneCAN port
+    if (_detected_modules[_instance].ap_dronecan == nullptr) {
+        return false;
+    }
+
+    // send at no faster than 5hz
+    if (now_ms - last_send_copter_att_status_ms < 100) {
+        return false;
+    }
+
+    // send xacti specific vehicle attitude message
+    Quaternion veh_att;
+    if (!AP::ahrs().get_quaternion(veh_att)) {
+        return false;
+    }
+
+    last_send_copter_att_status_ms = now_ms;
+    com_xacti_CopterAttStatus copter_att_status_msg {};
+    copter_att_status_msg.quaternion_wxyz_e4[0] = veh_att.q1 * 1e4;
+    copter_att_status_msg.quaternion_wxyz_e4[1] = veh_att.q2 * 1e4;
+    copter_att_status_msg.quaternion_wxyz_e4[2] = veh_att.q3 * 1e4;
+    copter_att_status_msg.quaternion_wxyz_e4[3] = veh_att.q4 * 1e4;
+    copter_att_status_msg.reserved.len = 2;
+    copter_att_status_msg.reserved.data[0] = 0;
+    copter_att_status_msg.reserved.data[1] = 0;
+    _detected_modules[_instance].ap_dronecan->xacti_copter_att_status.broadcast(copter_att_status_msg);
+    return true;
+}
+
+// update zoom rate controller.  now_ms is current system time
+// returns true if sent so that we avoid immediately trying to also send other messages
+bool AP_Mount_Xacti::update_zoom_rate_control(uint32_t now_ms)
+{
+    // return immediately if zoom rate control is not enabled
+    if (!_zoom_rate_control.enabled) {
+        return false;
+    }
+
+    // we are controlling optical zoom if the camera has it and we are below the optical zoom upper limit
+    // or at the optical zoom upper limit, the lower digital zoom limit and are zooming out
+    bool optical_zoom_control = (capabilities.optical_zoom == Capability::True) &&
+                                ((_last_optical_zoom_param_value < 250) ||
+                                 ((_last_optical_zoom_param_value == 250) && (_last_digital_zoom_param_value == 100) && (_zoom_rate_control.dir < 0)));
+
+    // update every 0.25 or 0.5 sec
+    const uint32_t update_interval_ms = optical_zoom_control ? XACTI_OPTICAL_ZOOM_RATE_UPDATE_INTERVAL_MS : XACTI_DIGITAL_ZOOM_RATE_UPDATE_INTERVAL_MS;
+    if (now_ms - _zoom_rate_control.last_update_ms < update_interval_ms) {
+        return false;
+    }
+    _zoom_rate_control.last_update_ms = now_ms;
+
+    // optical zoom
+    if (optical_zoom_control) {
+        const uint16_t optical_zoom_value = _last_optical_zoom_param_value + _zoom_rate_control.dir * 10;
+        // if reached lower limit of optical zoom, disable zoom control
+        if (optical_zoom_value < 100) {
+            _zoom_rate_control.enabled = false;
+            return false;
+        }
+
+        // send desired optical zoom to camera
+        return set_param_int32(Param::OpticalZoomMagnification, MIN(optical_zoom_value, 250));
+    }
+
+    // digital zoom
+    const uint16_t digital_zoom_value = _last_digital_zoom_param_value + _zoom_rate_control.dir * 100;
+    // if reached limit then disable zoom
+    if (((capabilities.optical_zoom != Capability::True) && (digital_zoom_value < 100)) || (digital_zoom_value > 1000)) {
+        _zoom_rate_control.enabled = false;
+        return false;
+    }
+
+    // send desired digital zoom to camera
+    return set_param_int32(Param::DigitalZoomMagnification, digital_zoom_value);
+}
+
+// request firmware version. now_ms should be current system time (reduces calls to AP_HAL::millis)
+// returns true if sent so that we avoid immediately trying to also send other messages
+bool AP_Mount_Xacti::request_firmware_version(uint32_t now_ms)
+{
+    // return immediately if already have version or no dronecan
+    if (_firmware_version.received) {
+        return false;
+    }
+
+    // send request once per second until received
+    if (now_ms - _firmware_version.last_request_ms < 1000) {
+        return false;
+    }
+    _firmware_version.last_request_ms = now_ms;
+    return get_param_string(Param::FirmwareVersion);
+}
+
+// request parameters used to determine camera capabilities.  now_ms is current system time
+// returns true if a param get/set was sent so that we avoid sending other messages
+bool AP_Mount_Xacti::request_capabilities(uint32_t now_ms)
+{
+    // return immediately if we have already determined this models capabilities
+    if (capabilities.received) {
+        return false;
+    }
+
+    // send requests once per second until received
+    if (now_ms - capabilities.last_request_ms < 1000) {
+        return false;
+    }
+    capabilities.last_request_ms = now_ms;
+
+    // record start time
+    if (capabilities.first_request_ms == 0) {
+        capabilities.first_request_ms = now_ms;
+    }
+
+    // timeout after 10 seconds
+    if (now_ms - capabilities.first_request_ms > 10000) {
+        capabilities.optical_zoom = Capability::False;
+        capabilities.received = true;
+        return false;
+    }
+
+    // optical zoom: try setting optical zoom to 1x
+    // return is handled in handle_param_get_set_response_int
+    return set_param_int32(Param::OpticalZoomMagnification, 100);
+}
+
+// set date and time.  now_ms is current system time
+bool AP_Mount_Xacti::set_datetime(uint32_t now_ms)
+{
+    // return immediately if gimbal's date/time has been set
+    if (_datetime.set) {
+        return false;
+    }
+
+    // attempt to set datetime once per second until received
+    if (now_ms - _datetime.last_request_ms < 1000) {
+        return false;
+    }
+    _datetime.last_request_ms = now_ms;
+
+    // get date and time
+    uint16_t year, ms;
+    uint8_t month, day, hour, min, sec;
+#if AP_RTC_ENABLED
+    if (!AP::rtc().get_date_and_time_utc(year, month, day, hour, min, sec, ms)) {
+        return false;
+    }
+#else
+    (void)ms;
+    return false;
+#endif
+
+    // date time is of the format YYYYMMDDHHMMSS (14 bytes)
+    // convert month from 0~11 to 1~12 range
+    AP_DroneCAN::string datetime_string {};
+    const int num_bytes = snprintf((char *)datetime_string.data, sizeof(AP_DroneCAN::string::data), "%04u%02u%02u%02u%02u%02u",
+                             (unsigned)year, (unsigned)month+1, (unsigned)day, (unsigned)hour, (unsigned)min, (unsigned)sec);
+    // sanity check bytes to be sent
+    if (num_bytes != 14) {
+        INTERNAL_ERROR(AP_InternalError::error_t::invalid_arg_or_result);
+        return false;
+    }
+    datetime_string.len = num_bytes;
+    _datetime.set = set_param_string(Param::DateTime, datetime_string);
+    if (!_datetime.set) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s failed to set date/time", send_text_prefix);
+    }
+
+    return _datetime.set;
+}
+
+// request status. now_ms should be current system time (reduces calls to AP_HAL::millis)
+// returns true if sent so that we avoid immediately trying to also send other messages
+bool AP_Mount_Xacti::request_status(uint32_t now_ms)
+{
+    // return immediately if 3 seconds has not passed
+    if (now_ms - _status_report.last_request_ms < XACTI_STATUS_REQ_INTERVAL_MS) {
+        return false;
+    }
+
+    _status_report.last_request_ms = now_ms;
+    return get_param_string(Param::Status);
+}
+
+// check if safe to send message (if messages sent too often camera will not respond)
+// now_ms should be current system time (reduces calls to AP_HAL::millis)
+bool AP_Mount_Xacti::is_safe_to_send(uint32_t now_ms) const
+{
+    // check time since last attitude sent
+    if (now_ms - last_send_copter_att_status_ms < XACTI_MSG_SEND_MIN_MS) {
+        return false;
+    }
+
+    // check time since last angle target sent
+    if (now_ms - last_send_gimbal_control_ms < XACTI_MSG_SEND_MIN_MS) {
+        return false;
+    }
+
+    // check time since last set param message sent
+    if (now_ms - last_send_getset_param_ms < XACTI_MSG_SEND_MIN_MS) {
+        return false;
+    }
+
+    return true;
+}
+
+#endif // HAL_MOUNT_XACTI_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+  DroneCAN gimbal driver
+
+  Implements gimbal control and attitude feedback using the DroneCAN / DSDL / com / xacti messages
+  see https://github.com/dronecan/DSDL/tree/master/com/xacti
+
+ */
+
+#pragma once
+
+#include "AP_Mount_Backend.h"
+
+#if HAL_MOUNT_XACTI_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Common/AP_Common.h>
+#include <AP_DroneCAN/AP_DroneCAN.h>
+#include <AP_HAL/utility/RingBuffer.h>
+#include "AP_Mount.h"
+
+class AP_Mount_Xacti : public AP_Mount_Backend
+{
+
+public:
+    // Constructor
+    AP_Mount_Xacti(class AP_Mount &frontend, class AP_Mount_Params &params, uint8_t instance);
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Mount_Xacti);
+
+    // init - performs any required initialisation for this instance
+    void init() override;
+
+    // update mount position - should be called periodically
+    void update() override;
+
+    // return true if healthy
+    bool healthy() const override;
+
+    // has_pan_control - returns true if this mount can control its pan (required for multicopters)
+    bool has_pan_control() const override { return yaw_range_valid(); };
+
+    //
+    // camera controls
+    //
+
+    // take a picture.  returns true on success
+    bool take_picture() override;
+
+    // start or stop video recording
+    // set start_recording = true to start record, false to stop recording
+    bool record_video(bool start_recording) override;
+
+    // set zoom specified as a rate or percentage
+    bool set_zoom(ZoomType zoom_type, float zoom_value) override;
+
+    // set focus specified as rate, percentage or auto
+    // focus in = -1, focus hold = 0, focus out = 1
+    SetFocusResult set_focus(FocusType focus_type, float focus_value) override;
+
+    // set camera lens as a value from 0 to 5
+    bool set_lens(uint8_t lens) override;
+
+    // set_camera_source is functionally the same as set_lens except primary and secondary lenses are specified by type
+    // primary and secondary sources use the AP_Camera::CameraSource enum cast to uint8_t
+    bool set_camera_source(uint8_t primary_source, uint8_t secondary_source) override;
+
+    // send camera information message to GCS
+    void send_camera_information(mavlink_channel_t chan) const override;
+
+    // send camera settings message to GCS
+    void send_camera_settings(mavlink_channel_t chan) const override;
+
+    // subscribe to Xacti DroneCAN messages
+    static void subscribe_msgs(AP_DroneCAN* ap_dronecan);
+
+    // xacti specific message handlers
+    static void handle_gimbal_attitude_status(AP_DroneCAN* ap_dronecan, const CanardRxTransfer& transfer, const com_xacti_GimbalAttitudeStatus &msg);
+    static void handle_gnss_status_req(AP_DroneCAN* ap_dronecan, const CanardRxTransfer& transfer, const com_xacti_GnssStatusReq &msg);
+
+protected:
+
+    // get attitude as a quaternion.  returns true on success
+    bool get_attitude_quaternion(Quaternion& att_quat) override;
+
+private:
+
+    // send text prefix string to reduce flash cost
+    static const char* send_text_prefix;
+
+    // Sensor mode enumeration (aka lens)
+    enum class SensorsMode : uint8_t {
+        RGB = 0,    // RGB (aka "visible)")
+        IR = 1,     // Infrared, aka thermal
+        PIP = 2,    // RGB with IR PIP
+        NDVI = 3,   // NDVI (vegetation greenness)
+    };
+    // array of sensor mode enumeration strings for display to user
+    // if enum above is updated, also update sensor_mode_str definition in cpp
+    static const char* sensor_mode_str[];
+
+    // send target pitch and yaw rates to gimbal
+    // yaw_is_ef should be true if yaw_rads target is an earth frame rate, false if body_frame
+    void send_target_rates(float pitch_rads, float yaw_rads, bool yaw_is_ef);
+
+    // send target pitch and yaw angles to gimbal
+    // yaw_is_ef should be true if yaw_rad target is an earth frame angle, false if body_frame
+    void send_target_angles(float pitch_rad, float yaw_rad, bool yaw_is_ef);
+
+    // register backend in detected modules array used to map DroneCAN port and node id to backend
+    void register_backend();
+
+    // find backend associated with the given dronecan port and node_id.  also associates backends with zero node ids
+    // returns pointer to backend on success, nullptr on failure
+    static AP_Mount_Xacti* get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id);
+
+    // DroneCAN parameter handling methods
+    FUNCTOR_DECLARE(param_int_cb, bool, AP_DroneCAN*, const uint8_t, const char*, int32_t &);
+    FUNCTOR_DECLARE(param_string_cb, bool, AP_DroneCAN*, const uint8_t, const char*, AP_DroneCAN::string &);
+    FUNCTOR_DECLARE(param_save_cb, void, AP_DroneCAN*, const uint8_t, bool);
+    bool handle_param_get_set_response_int(AP_DroneCAN* ap_dronecan, const uint8_t node_id, const char* name, int32_t &value);
+    bool handle_param_get_set_response_string(AP_DroneCAN* ap_dronecan, const uint8_t node_id, const char* name, AP_DroneCAN::string &value);
+    void handle_param_save_response(AP_DroneCAN* ap_dronecan, const uint8_t node_id, bool success);
+
+    // param enum.  If enum is updated also update _param_names definition in cpp
+    enum class Param : uint8_t {
+        SingleShot = 0,
+        Recording,
+        FocusMode,
+        SensorMode,
+        DigitalZoomMagnification,
+        FirmwareVersion,
+        Status,
+        DateTime,
+        OpticalZoomMagnification,
+        LAST = OpticalZoomMagnification,            // this should be equal to the final parameter enum
+    };
+    static const char* _param_names[];              // array of Xacti parameter strings
+
+    // get parameter name for a particular param enum value
+    // returns an empty string if not found (which should never happen)
+    const char* get_param_name_str(Param param) const;
+
+    // helper function to get and set parameters
+    bool set_param_int32(Param param, int32_t param_value);
+    bool set_param_string(Param param, const AP_DroneCAN::string& param_value);
+    bool get_param_string(Param param);
+
+    // process queue of set parameter items. returns true if set-parameter message was sent
+    bool process_set_param_int32_queue();
+
+    // send gimbal control message via DroneCAN
+    // mode is 2:angle control or 3:rate control
+    // pitch_cd is pitch angle in centi-degrees or pitch rate in cds
+    // yaw_cd is angle in centi-degrees or yaw rate in cds
+    void send_gimbal_control(uint8_t mode, int16_t pitch_cd, int16_t yaw_cd);
+
+    // send vehicle attitude to gimbal via DroneCAN.  now_ms is current system time
+    // returns true if sent so that we avoid immediately trying to also send other messages
+    bool send_copter_att_status(uint32_t now_ms);
+
+    // update zoom rate controller.  now_ms is current system time
+    // returns true if sent so that we avoid immediately trying to also send other messages
+    bool update_zoom_rate_control(uint32_t now_ms);
+
+    // request firmware version.  now_ms is current system time
+    // returns true if sent so that we avoid immediately trying to also send other messages
+    bool request_firmware_version(uint32_t now_ms);
+
+    // request parameters used to determine camera capabilities.  now_ms is current system time
+    // returns true if a param get/set was sent so that we avoid sending other messages
+    bool request_capabilities(uint32_t now_ms);
+
+    // set date and time.  now_ms is current system time
+    bool set_datetime(uint32_t now_ms);
+
+    // request status.  now_ms is current system time
+    // returns true if sent so that we avoid immediately trying to also send other messages
+    bool request_status(uint32_t now_ms);
+
+    // check if safe to send message (if messages sent too often camera will not respond)
+    // now_ms is current system time
+    bool is_safe_to_send(uint32_t now_ms) const;
+
+    // internal variables
+    bool _initialised;                              // true once the driver has been initialised
+
+    // attitude received from gimbal
+    Quaternion _current_attitude_quat;              // current attitude as a quaternion
+    uint32_t _last_current_attitude_quat_ms;        // system time _current_angle_rad was updated
+    bool _recording_video;                          // true if recording video
+    uint16_t _last_digital_zoom_param_value = 100;  // last digital zoom parameter value sent to camera.  100 ~ 1000 (interval 100)
+    uint16_t _last_optical_zoom_param_value = 100;  // last optical zoom parameter value sent to camera.  100 ~ 250 (interval 10)
+    struct {
+        bool enabled;                               // true if zoom rate control is enabled
+        int8_t dir;                                 // zoom direction (-1 to zoom out, +1 to zoom in)
+        uint32_t last_update_ms;                    // system time that zoom rate control last updated zoom
+    } _zoom_rate_control;
+
+    // firmware version received from gimbal
+    struct {
+        uint32_t last_request_ms;                   // system time of last request for firmware version
+        bool received;                              // true once firmware version has been received
+        char str[12] {};                            // firmware version string (11 bytes + 1 null byte)
+        uint32_t mav_ver;                           // version formatted for reporting to GCS via CAMERA_INFORMATION message
+    } _firmware_version;
+
+    // date and time handling
+    struct {
+        uint32_t last_request_ms;                   // system time that date/time was last requested
+        bool set;                                   // true once date/time has been set
+    } _datetime;
+
+    // capability handling
+    enum class Capability : uint8_t {
+        False = 0,
+        True = 1,
+        Unknown = 2,
+    };
+    struct {
+        bool received;                              // true if we have determined cameras capabilities
+        uint32_t first_request_ms;                  // system time of first request for capabilities (used to timeout)
+        uint32_t last_request_ms;                   // system time of last capability related parameter check
+        Capability optical_zoom;                    // Yes if camera has optical zoom
+    } capabilities = {false, 0, 0, Capability::Unknown};
+
+    // gimbal status handling
+    enum class ErrorStatus : uint32_t {
+        TAKING_PICTURE = 0x04,                      // currently taking a picture
+        RECORDING_VIDEO = 0x08,                     // currently recording video
+        CANNOT_TAKE_PIC = 0x20,
+        TIME_NOT_SET = 0x10000,
+        MEDIA_ERROR = 0x20000,
+        LENS_ERROR = 0x40000,
+        MOTOR_INIT_ERROR = 0x100000,
+        MOTOR_OPERATION_ERROR = 0x200000,
+        GIMBAL_CONTROL_ERROR = 0x400000,
+        TEMP_WARNING = 0x1000000
+    };
+    struct {
+        uint32_t error_status;                      // see ErrorStatus enum
+        uint32_t video_remain_time;                 // max seconds of video that may be recorded before SD card is full
+        uint32_t photo_remain_count;                // max number of pics before SD card is full
+        uint32_t sd_card_size_mb;                   // SD card size in MB
+        uint32_t sd_card_free_mb;                   // SD card remaining size in MB
+        uint16_t body;                              // body type
+        uint16_t cmos;                              // cmos type
+        uint16_t gimbal_pitch;                      // gimbal pitch angle
+        uint16_t gimbal_roll;                       // gimbal roll angle
+        uint16_t gimbal_yaw;                        // gimbal yaw angle
+        uint16_t reserved1;
+        uint8_t date_time[7];                       // camera's date and time
+        uint8_t reserved2;
+        uint32_t exposure_time_us;                  // camera's exposure time in us
+        uint16_t apeture;                           // cameras' aperture * 100
+        uint16_t iso_sensitivity;                   // camera's iso sensitivity
+    } _status;                                      // latest status received
+    static_assert(sizeof(_status) == 48, "status must be 48 bytes");           // status should be 48 bytes
+    struct {
+        uint32_t last_request_ms;                   // system time that status was last requested
+        uint32_t last_error_status;                 // last error status reported to user
+    } _status_report;
+    bool _motor_error;                              // true if status reports motor or control error (used for health reporting)
+    bool _camera_error;                             // true if status reports camera error
+
+    // DroneCAN related variables
+    static bool _subscribed;                        // true once subscribed to receive DroneCAN messages
+    static struct DetectedModules {
+        AP_Mount_Xacti *driver;                     // pointer to Xacti backends
+        AP_DroneCAN* ap_dronecan;                   // DroneCAN interface used by this backend
+        uint8_t node_id;                            // DroneCAN node id associated by this backend
+    } _detected_modules[AP_MOUNT_MAX_INSTANCES];
+    static HAL_Semaphore _sem_registry;             // semaphore protecting access to _detected_modules table
+    uint32_t last_send_gimbal_control_ms;           // system time that send_gimbal_control was last called (used to slow down sends to 5hz)
+    uint32_t last_send_copter_att_status_ms;        // system time that send_copter_att_status was last called (used to slow down sends to 10hz)
+    uint32_t last_send_getset_param_ms;             // system time that a get or set parameter message was sent
+
+    // queue of set parameter int32 items.  set-parameter requests to camera are throttled to improve reliability
+    struct SetParamQueueItem {
+        Param param;                                // parameter (name)
+        int32_t value;                              // parameter value
+    };
+    ObjectArray<SetParamQueueItem> *_set_param_int32_queue; // queue of set-parameter items
+};
+
+#endif // HAL_MOUNT_XACTI_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+#include <AP_Terrain/AP_Terrain.h>
+
+#ifndef HAL_MOUNT_ENABLED
+#define HAL_MOUNT_ENABLED 1
+#endif
+
+#ifndef AP_MOUNT_BACKEND_DEFAULT_ENABLED
+#define AP_MOUNT_BACKEND_DEFAULT_ENABLED HAL_MOUNT_ENABLED
+#endif
+
+#ifndef HAL_MOUNT_ALEXMOS_ENABLED
+#define HAL_MOUNT_ALEXMOS_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED
+#endif
+
+#ifndef HAL_MOUNT_GREMSY_ENABLED
+#define HAL_MOUNT_GREMSY_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED && HAL_GCS_ENABLED && BOARD_FLASH_SIZE > 1024
+#endif
+
+#ifndef HAL_MOUNT_SCRIPTING_ENABLED
+#define HAL_MOUNT_SCRIPTING_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED && AP_SCRIPTING_ENABLED
+#endif
+
+#ifndef HAL_MOUNT_SERVO_ENABLED
+#define HAL_MOUNT_SERVO_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED
+#endif
+
+#ifndef HAL_MOUNT_SIYI_ENABLED
+#define HAL_MOUNT_SIYI_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED
+#endif
+
+// solo gimbal is enabled explicitly in hwdefs on some Cubes:
+#ifndef HAL_SOLO_GIMBAL_ENABLED
+#define HAL_SOLO_GIMBAL_ENABLED 0
+#endif
+
+#ifndef HAL_MOUNT_STORM32MAVLINK_ENABLED
+#define HAL_MOUNT_STORM32MAVLINK_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED && HAL_GCS_ENABLED
+#endif
+
+#ifndef HAL_MOUNT_STORM32SERIAL_ENABLED
+#define HAL_MOUNT_STORM32SERIAL_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED
+#endif
+
+#ifndef HAL_MOUNT_XACTI_ENABLED
+#define HAL_MOUNT_XACTI_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED && HAL_ENABLE_DRONECAN_DRIVERS && BOARD_FLASH_SIZE > 1024
+#endif
+
+#ifndef HAL_MOUNT_VIEWPRO_ENABLED
+#define HAL_MOUNT_VIEWPRO_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED && BOARD_FLASH_SIZE > 1024
+#endif
+
+#ifndef AP_MOUNT_POI_TO_LATLONALT_ENABLED
+#define AP_MOUNT_POI_TO_LATLONALT_ENABLED HAL_MOUNT_ENABLED && AP_TERRAIN_AVAILABLE && BOARD_FLASH_SIZE > 1024
+#endif
+
+#ifndef HAL_MOUNT_TOPOTEK_ENABLED
+#define HAL_MOUNT_TOPOTEK_ENABLED AP_MOUNT_BACKEND_DEFAULT_ENABLED
+#endif
+
+// set camera source is supported on gimbals that may have more than one lens
+#ifndef HAL_MOUNT_SET_CAMERA_SOURCE_ENABLED
+#define HAL_MOUNT_SET_CAMERA_SOURCE_ENABLED HAL_MOUNT_SIYI_ENABLED || HAL_MOUNT_XACTI_ENABLED || HAL_MOUNT_VIEWPRO_ENABLED
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #pragma once
+
+#include <AP_Logger/LogStructure.h>
+
+#define LOG_IDS_FROM_MOUNT \
+    LOG_MOUNT_MSG
+
+// @LoggerMessage: MNT
+// @Description: Mount's desired and actual roll, pitch and yaw angles
+// @Field: TimeUS: Time since system startup
+// @Field: I: Instance number
+// @Field: DRoll: Desired roll
+// @Field: Roll: Actual roll
+// @Field: DPitch: Desired pitch
+// @Field: Pitch: Actual pitch
+// @Field: DYawB: Desired yaw in body frame
+// @Field: YawB: Actual yaw in body frame
+// @Field: DYawE: Desired yaw in earth frame
+// @Field: YawE: Actual yaw in earth frame
+// @Field: Dist: Rangefinder distance
+
+struct PACKED log_Mount {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t  instance;
+    float    desired_roll;
+    float    actual_roll;
+    float    desired_pitch;
+    float    actual_pitch;
+    float    desired_yaw_bf;
+    float    actual_yaw_bf;
+    float    desired_yaw_ef;
+    float    actual_yaw_ef;
+    float    rangefinder_dist;
+};
+
+#define LOG_STRUCTURE_FROM_MOUNT \
+    { LOG_MOUNT_MSG, sizeof(log_Mount), \
+      "MNT", "QBfffffffff","TimeUS,I,DRoll,Roll,DPitch,Pitch,DYawB,YawB,DYawE,YawE,Dist", "s#ddddddddm", "F---------0" },
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #include <AP_HAL/AP_HAL.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include "SoloGimbal.h"
+
+#if HAL_SOLO_GIMBAL_ENABLED
+
+#include <stdio.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_Logger/AP_Logger.h>
+
+extern const AP_HAL::HAL& hal;
+
+bool SoloGimbal::present()
+{
+    if (_state != GIMBAL_STATE_NOT_PRESENT && AP_HAL::millis()-_last_report_msg_ms > 3000) {
+        // gimbal went away
+        _state = GIMBAL_STATE_NOT_PRESENT;
+        return false;
+    }
+
+    return _state != GIMBAL_STATE_NOT_PRESENT;
+}
+
+bool SoloGimbal::aligned()
+{
+    return present() && _state == GIMBAL_STATE_PRESENT_RUNNING;
+}
+
+gimbal_mode_t SoloGimbal::get_mode()
+{
+    const auto &_ahrs = AP::ahrs();
+
+    if ((_gimbalParams.initialized() && is_zero(_gimbalParams.get_K_rate())) || (_ahrs.get_rotation_body_to_ned().c.z < 0 && !(_lockedToBody || _calibrator.running()))) {
+        return GIMBAL_MODE_IDLE;
+    } else if (!_ekf.getStatus()) {
+        return GIMBAL_MODE_POS_HOLD;
+    } else if (_calibrator.running() || _lockedToBody) {
+        return GIMBAL_MODE_POS_HOLD_FF;
+    } else {
+        return GIMBAL_MODE_STABILIZE;
+    }
+}
+
+void SoloGimbal::receive_feedback(mavlink_channel_t chan, const mavlink_message_t &msg)
+{
+    mavlink_gimbal_report_t report_msg;
+    mavlink_msg_gimbal_report_decode(&msg, &report_msg);
+    uint32_t tnow_ms = AP_HAL::millis();
+    _last_report_msg_ms = tnow_ms;
+
+    _gimbalParams.set_channel(chan);
+
+    if (report_msg.target_system != 1) {
+        _state = GIMBAL_STATE_NOT_PRESENT;
+    } else {
+        GCS_MAVLINK::set_channel_private(chan);
+    }
+
+    switch(_state) {
+        case GIMBAL_STATE_NOT_PRESENT:
+            // gimbal was just connected or we just rebooted, transition to PRESENT_INITIALIZING
+            _gimbalParams.reset();
+            _gimbalParams.set_param(GMB_PARAM_GMB_SYSID, 1);
+            _state = GIMBAL_STATE_PRESENT_INITIALIZING;
+            break;
+
+        case GIMBAL_STATE_PRESENT_INITIALIZING:
+            _gimbalParams.update();
+            if (_gimbalParams.initialized()) {
+                // parameters done initializing, finalize initialization and transition to aligning
+                extract_feedback(report_msg);
+                _ang_vel_mag_filt = 20;
+                _filtered_joint_angles = _measurement.joint_angles;
+                _vehicle_to_gimbal_quat_filt.from_vector312(_filtered_joint_angles.x,_filtered_joint_angles.y,_filtered_joint_angles.z);
+                _ekf.reset();
+                _state = GIMBAL_STATE_PRESENT_ALIGNING;
+            }
+            break;
+
+        case GIMBAL_STATE_PRESENT_ALIGNING:
+            _gimbalParams.update();
+            extract_feedback(report_msg);
+            update_estimators();
+            if (_ekf.getStatus()) {
+                // EKF done aligning, transition to running
+                _state = GIMBAL_STATE_PRESENT_RUNNING;
+            }
+            break;
+
+        case GIMBAL_STATE_PRESENT_RUNNING:
+            _gimbalParams.update();
+            extract_feedback(report_msg);
+            update_estimators();
+            break;
+    }
+
+    send_controls(chan);
+}
+
+void SoloGimbal::send_controls(mavlink_channel_t chan)
+{
+    if (_state == GIMBAL_STATE_PRESENT_RUNNING) {
+        // get the gimbal quaternion estimate
+        Quaternion quatEst;
+        _ekf.getQuat(quatEst);
+
+        // run rate controller
+        _ang_vel_dem_rads.zero();
+        switch(get_mode()) {
+            case GIMBAL_MODE_POS_HOLD_FF: {
+                _ang_vel_dem_rads += get_ang_vel_dem_body_lock();
+                _ang_vel_dem_rads += get_ang_vel_dem_gyro_bias();
+                float _ang_vel_dem_radsLen = _ang_vel_dem_rads.length();
+                if (_ang_vel_dem_radsLen > radians(400)) {
+                    _ang_vel_dem_rads *= radians(400)/_ang_vel_dem_radsLen;
+                }
+                if (HAVE_PAYLOAD_SPACE(chan, GIMBAL_CONTROL)) {
+                    mavlink_msg_gimbal_control_send(chan, mavlink_system.sysid, _compid,
+                                                    _ang_vel_dem_rads.x, _ang_vel_dem_rads.y, _ang_vel_dem_rads.z);
+                }
+                break;
+            }
+            case GIMBAL_MODE_STABILIZE: {
+                _ang_vel_dem_rads += get_ang_vel_dem_yaw(quatEst);
+                _ang_vel_dem_rads += get_ang_vel_dem_roll_tilt(quatEst);
+                _ang_vel_dem_rads += get_ang_vel_dem_feedforward(quatEst);
+                _ang_vel_dem_rads += get_ang_vel_dem_gyro_bias();
+                float ang_vel_dem_norm = _ang_vel_dem_rads.length();
+                if (ang_vel_dem_norm > radians(400)) {
+                    _ang_vel_dem_rads *= radians(400)/ang_vel_dem_norm;
+                }
+                if (HAVE_PAYLOAD_SPACE(chan, GIMBAL_CONTROL)) {
+                    mavlink_msg_gimbal_control_send(chan, mavlink_system.sysid, _compid,
+                                                    _ang_vel_dem_rads.x, _ang_vel_dem_rads.y, _ang_vel_dem_rads.z);
+                }
+                break;
+            }
+            default:
+            case GIMBAL_MODE_IDLE:
+            case GIMBAL_MODE_POS_HOLD:
+                break;
+        }
+    }
+
+    // set GMB_POS_HOLD
+    if (get_mode() == GIMBAL_MODE_POS_HOLD) {
+        _gimbalParams.set_param(GMB_PARAM_GMB_POS_HOLD, 1);
+    } else {
+        _gimbalParams.set_param(GMB_PARAM_GMB_POS_HOLD, 0);
+    }
+
+    // set GMB_MAX_TORQUE
+    float max_torque;
+    _gimbalParams.get_param(GMB_PARAM_GMB_MAX_TORQUE, max_torque, 0);
+    if (!is_equal(max_torque,_max_torque) && !is_zero(max_torque)) {
+        _max_torque = max_torque;
+    }
+
+    if (!hal.util->get_soft_armed() || joints_near_limits()) {
+        _gimbalParams.set_param(GMB_PARAM_GMB_MAX_TORQUE, _max_torque);
+    } else {
+        _gimbalParams.set_param(GMB_PARAM_GMB_MAX_TORQUE, 0);
+    }
+}
+
+void SoloGimbal::extract_feedback(const mavlink_gimbal_report_t& report_msg)
+{
+    _measurement.delta_time = report_msg.delta_time;
+    _measurement.delta_angles.x = report_msg.delta_angle_x;
+    _measurement.delta_angles.y = report_msg.delta_angle_y;
+    _measurement.delta_angles.z = report_msg.delta_angle_z;
+    _measurement.delta_velocity.x = report_msg.delta_velocity_x,
+    _measurement.delta_velocity.y = report_msg.delta_velocity_y;
+    _measurement.delta_velocity.z = report_msg.delta_velocity_z;
+    _measurement.joint_angles.x = report_msg.joint_roll;
+    _measurement.joint_angles.y = report_msg.joint_el;
+    _measurement.joint_angles.z = report_msg.joint_az;
+
+    if (_calibrator.get_status() == ACCEL_CAL_COLLECTING_SAMPLE) {
+        _calibrator.new_sample(_measurement.delta_velocity,_measurement.delta_time);
+    }
+
+    _measurement.delta_angles -= _gimbalParams.get_gyro_bias() * _measurement.delta_time;
+    _measurement.joint_angles -= _gimbalParams.get_joint_bias();
+    _measurement.delta_velocity -= _gimbalParams.get_accel_bias() * _measurement.delta_time;
+    Vector3f accel_gain = _gimbalParams.get_accel_gain();
+    _measurement.delta_velocity.x *= (is_zero(accel_gain.x) ? 1.0f : accel_gain.x);
+    _measurement.delta_velocity.y *= (is_zero(accel_gain.y) ? 1.0f : accel_gain.y);
+    _measurement.delta_velocity.z *= (is_zero(accel_gain.z) ? 1.0f : accel_gain.z);
+
+    // update _ang_vel_mag_filt, used for accel sample readiness
+    Vector3f ang_vel = _measurement.delta_angles / _measurement.delta_time;
+    Vector3f ekf_gyro_bias;
+    _ekf.getGyroBias(ekf_gyro_bias);
+    ang_vel -= ekf_gyro_bias;
+    float alpha = constrain_float(_measurement.delta_time/(_measurement.delta_time+0.5f),0.0f,1.0f);
+    _ang_vel_mag_filt += (ang_vel.length()-_ang_vel_mag_filt)*alpha;
+    _ang_vel_mag_filt = MIN(_ang_vel_mag_filt,20.0f);
+
+    // get complementary filter inputs
+    _vehicle_to_gimbal_quat.from_vector312(_measurement.joint_angles.x,_measurement.joint_angles.y,_measurement.joint_angles.z);
+
+    // update log deltas
+    _log_dt += _measurement.delta_time;
+    _log_del_ang += _measurement.delta_angles;
+    _log_del_vel += _measurement.delta_velocity;
+}
+
+void SoloGimbal::update_estimators()
+{
+    if (_state == GIMBAL_STATE_NOT_PRESENT || _state == GIMBAL_STATE_PRESENT_INITIALIZING) {
+        return;
+    }
+
+    // Run the gimbal attitude and gyro bias estimator
+    _ekf.RunEKF(_measurement.delta_time, _measurement.delta_angles, _measurement.delta_velocity, _measurement.joint_angles);
+    update_joint_angle_est();
+}
+
+void SoloGimbal::readVehicleDeltaAngle(uint8_t ins_index, Vector3f &dAng) {
+    const AP_InertialSensor &ins = AP::ins();
+
+    if (ins_index < ins.get_gyro_count()) {
+        float dAng_dt;
+        if (!ins.get_delta_angle(ins_index,dAng, dAng_dt)) {
+            dAng = ins.get_gyro(ins_index) / ins.get_loop_rate_hz();
+        }
+    }
+}
+
+void SoloGimbal::update_fast() {
+    const AP_InertialSensor &ins = AP::ins();
+
+#if INS_MAX_INSTANCES > 1
+    if (ins.use_gyro(0) && ins.use_gyro(1)) {
+        // dual gyro mode - average first two gyros
+        Vector3f dAng;
+        readVehicleDeltaAngle(0, dAng);
+        _vehicle_delta_angles += dAng*0.5f;
+        readVehicleDeltaAngle(1, dAng);
+        _vehicle_delta_angles += dAng*0.5f;
+    } else
+#endif
+    {
+        // single gyro mode - one of the first two gyros are unhealthy or don't exist
+        // just read primary gyro
+        Vector3f dAng;
+        readVehicleDeltaAngle(ins.get_first_usable_gyro(), dAng);
+        _vehicle_delta_angles += dAng;
+    }
+}
+
+void SoloGimbal::update_joint_angle_est()
+{
+    static const float tc = 1.0f;
+    float dt = _measurement.delta_time;
+    float alpha = constrain_float(dt/(dt+tc),0.0f,1.0f);
+
+    Matrix3f Tvg; // vehicle frame to gimbal frame
+    _vehicle_to_gimbal_quat.inverse().rotation_matrix(Tvg);
+
+    Vector3f delta_angle_bias;
+    _ekf.getGyroBias(delta_angle_bias);
+    delta_angle_bias *= dt;
+
+    Vector3f joint_del_ang;
+    gimbal_ang_vel_to_joint_rates((_measurement.delta_angles-delta_angle_bias) - Tvg*_vehicle_delta_angles, joint_del_ang);
+
+    _filtered_joint_angles += joint_del_ang;
+    _filtered_joint_angles += (_measurement.joint_angles-_filtered_joint_angles)*alpha;
+
+    _vehicle_to_gimbal_quat_filt.from_vector312(_filtered_joint_angles.x,_filtered_joint_angles.y,_filtered_joint_angles.z);
+
+    _vehicle_delta_angles.zero();
+}
+
+Vector3f SoloGimbal::get_ang_vel_dem_yaw(const Quaternion &quatEst)
+{
+    static const float tc = 0.1f;
+    static const float yawErrorLimit = radians(5.7f);
+    float dt = _measurement.delta_time;
+    float alpha = dt/(dt+tc);
+
+    const auto &_ahrs = AP::ahrs();
+    Matrix3f Tve = _ahrs.get_rotation_body_to_ned();
+    Matrix3f Teg;
+    quatEst.inverse().rotation_matrix(Teg);
+
+
+    //_vehicle_yaw_rate_ef_filt = _ahrs.get_yaw_rate_earth();
+
+    // filter the vehicle yaw rate to remove noise
+    _vehicle_yaw_rate_ef_filt += (_ahrs.get_yaw_rate_earth() - _vehicle_yaw_rate_ef_filt) * alpha;
+
+    float yaw_rate_ff = 0;
+
+    // calculate an earth-frame yaw rate feed-forward that prevents gimbal from exceeding the maximum yaw error
+    if (_vehicle_yaw_rate_ef_filt > _gimbalParams.get_K_rate()*yawErrorLimit) {
+        yaw_rate_ff = _vehicle_yaw_rate_ef_filt-_gimbalParams.get_K_rate()*yawErrorLimit;
+    } else if (_vehicle_yaw_rate_ef_filt < -_gimbalParams.get_K_rate()*yawErrorLimit) {
+        yaw_rate_ff = _vehicle_yaw_rate_ef_filt+_gimbalParams.get_K_rate()*yawErrorLimit;
+    }
+
+    // filter the feed-forward to remove noise
+    //_yaw_rate_ff_ef_filt += (yaw_rate_ff - _yaw_rate_ff_ef_filt) * alpha;
+
+    Vector3f gimbalRateDemVecYaw;
+    gimbalRateDemVecYaw.z = yaw_rate_ff - _gimbalParams.get_K_rate() * _filtered_joint_angles.z / constrain_float(Tve.c.z,0.5f,1.0f);
+    gimbalRateDemVecYaw.z /= constrain_float(Tve.c.z,0.5f,1.0f);
+
+    // rotate the rate demand into gimbal frame
+    gimbalRateDemVecYaw = Teg * gimbalRateDemVecYaw;
+
+    return gimbalRateDemVecYaw;
+}
+
+Vector3f SoloGimbal::get_ang_vel_dem_roll_tilt(const Quaternion &quatEst)
+{
+    // Calculate the gimbal 321 Euler angle estimates relative to earth frame
+    Vector3f eulerEst = quatEst.to_vector312();
+
+    // Calculate a demanded quaternion using the demanded roll and pitch and estimated yaw (yaw is slaved to the vehicle)
+    Quaternion quatDem;
+    quatDem.from_vector312( _att_target_euler_rad.x,
+                            _att_target_euler_rad.y,
+                            eulerEst.z);
+
+    //divide the demanded quaternion by the estimated to get the error
+    Quaternion quatErr = quatDem / quatEst;
+
+    // Convert to a delta rotation
+    quatErr.normalize();
+    Vector3f deltaAngErr;
+    quatErr.to_axis_angle(deltaAngErr);
+
+    // multiply the angle error vector by a gain to calculate a demanded gimbal rate required to control tilt
+    Vector3f gimbalRateDemVecTilt = deltaAngErr * _gimbalParams.get_K_rate();
+    return gimbalRateDemVecTilt;
+}
+
+Vector3f SoloGimbal::get_ang_vel_dem_feedforward(const Quaternion &quatEst) const
+{
+    // quaternion demanded at the previous time step
+    static float lastDemY;
+
+    // calculate the delta rotation from the last to the current demand where the demand does not incorporate the copters yaw rotation
+    float deltaY = _att_target_euler_rad.y - lastDemY;
+    lastDemY = _att_target_euler_rad.y;
+
+    // quaternion demanded at the previous time step
+    static float lastDemX;
+
+    // calculate the delta rotation from the last to the current demand where the demand does not incorporate the copters yaw rotation
+    float deltaX = _att_target_euler_rad.x - lastDemX;
+    lastDemX = _att_target_euler_rad.x;
+
+    Vector3f gimbalRateDemVecForward;
+    gimbalRateDemVecForward.x = deltaX / _measurement.delta_time;
+    gimbalRateDemVecForward.y = deltaY / _measurement.delta_time;
+    return gimbalRateDemVecForward;
+}
+
+Vector3f SoloGimbal::get_ang_vel_dem_gyro_bias()
+{
+    Vector3f gyroBias;
+    _ekf.getGyroBias(gyroBias);
+    return gyroBias + _gimbalParams.get_gyro_bias();
+}
+
+Vector3f SoloGimbal::get_ang_vel_dem_body_lock()
+{
+    // Define rotation from vehicle to gimbal using a 312 rotation sequence
+    Matrix3f Tvg;
+    _vehicle_to_gimbal_quat_filt.inverse().rotation_matrix(Tvg);
+
+    // multiply the joint angles by a gain to calculate a rate vector required to keep the joints centred
+    Vector3f gimbalRateDemVecBodyLock;
+    gimbalRateDemVecBodyLock = _filtered_joint_angles * -_gimbalParams.get_K_rate();
+
+    joint_rates_to_gimbal_ang_vel(gimbalRateDemVecBodyLock, gimbalRateDemVecBodyLock);
+
+    // Add a feedforward term from vehicle gyros
+    const auto &_ahrs = AP::ahrs();
+    gimbalRateDemVecBodyLock += Tvg * _ahrs.get_gyro();
+
+    return gimbalRateDemVecBodyLock;
+}
+
+void SoloGimbal::update_target(const Vector3f &newTarget)
+{
+    // Low-pass filter
+    _att_target_euler_rad.y = _att_target_euler_rad.y + 0.02f*(newTarget.y - _att_target_euler_rad.y);
+    // Update tilt
+    _att_target_euler_rad.y = constrain_float(_att_target_euler_rad.y,radians(-90),radians(0));
+
+    // For roll angle
+    // Low-pass filter
+    _att_target_euler_rad.x = _att_target_euler_rad.x + 0.02f*(newTarget.x - _att_target_euler_rad.x);
+    // Update roll
+    _att_target_euler_rad.x = constrain_float(_att_target_euler_rad.x,radians(-30),radians(30));
+}
+
+#if HAL_LOGGING_ENABLED
+void SoloGimbal::write_logs()
+{
+    AP_Logger &logger = AP::logger();
+
+    const uint64_t tstamp = AP_HAL::micros64();
+
+    // @LoggerMessage: GMB1
+    // @Vehicles: Copter
+    // @Description: Solo Gimbal measurements
+    // @Field: TimeUS: Time since system startup
+    // @Field: dt: sum of time across measurements in this packet
+    // @Field: dax: delta-angle sum, x-axis
+    // @Field: day: delta-angle sum, y-axis
+    // @Field: daz: delta-angle sum, z-axis
+    // @Field: dvx: delta-velocity sum, x-axis
+    // @Field: dvy: delta-velocity sum, y-axis
+    // @Field: dvz: delta-velocity sum, z-axis
+    // @Field: jx: joint angle, x
+    // @Field: jy: joint angle, y
+    // @Field: jz: joint angle, z
+    logger.Write(
+        "GMB1",
+        "TimeUS,dt,dax,day,daz,dvx,dvy,dvz,jx,jy,jz",
+        "ssrrrEEELLL",
+        "FC000000000",
+        "Qffffffffff",
+        tstamp,
+        _log_dt,
+        _log_del_ang.x,
+        _log_del_ang.y,
+        _log_del_ang.z,
+        _log_del_vel.x,
+        _log_del_vel.y,
+        _log_del_vel.z,
+        _measurement.joint_angles.x,
+        _measurement.joint_angles.y,
+        _measurement.joint_angles.z
+        );
+
+    Quaternion quatEst;
+    _ekf.getQuat(quatEst);
+    Vector3f eulerEst;
+    quatEst.to_euler(eulerEst.x, eulerEst.y, eulerEst.z);
+
+    // @LoggerMessage: GMB2
+    // @Vehicles: Copter
+    // @Description: Solo Gimbal estimation and demands
+    // @Field: TimeUS: Time since system startup
+    // @Field: es: Solo Gimbal EKF status bits
+    // @Field: ex: Solo Gimbal EKF estimate of gimbal angle, x-axis
+    // @Field: ey: Solo Gimbal EKF estimate of gimbal angle, y-axis
+    // @Field: ez: Solo Gimbal EKF estimate of gimbal angle, y-axis
+    // @Field: rx: Angular velocity demand around x-axis
+    // @Field: ry: Angular velocity demand around y-axis
+    // @Field: rz: Angular velocity demand around z-axis
+    // @Field: tx: Angular position target around x-axis
+    // @Field: ty: Angular position target around y-axis
+    // @Field: tz: Angular position target around z-axis
+    logger.Write(
+        "GMB2",
+        "TimeUS,es,ex,ey,ez,rx,ry,rz,tx,ty,tz",
+        "s-rrrEEELLL",
+        "F-000000000",
+        "QBfffffffff",
+        tstamp,
+        (uint8_t) _ekf.getStatus(),
+        eulerEst.x,
+        eulerEst.y,
+        eulerEst.z,
+        _ang_vel_dem_rads.x,
+        _ang_vel_dem_rads.y,
+        _ang_vel_dem_rads.z,
+        _att_target_euler_rad.x,
+        _att_target_euler_rad.y,
+        _att_target_euler_rad.z
+        );
+
+    _log_dt = 0;
+    _log_del_ang.zero();
+    _log_del_vel.zero();
+}
+#endif
+
+bool SoloGimbal::joints_near_limits() const
+{
+    return fabsf(_measurement.joint_angles.x) > radians(40) || _measurement.joint_angles.y > radians(45) || _measurement.joint_angles.y < -radians(135);
+}
+
+AccelCalibrator* SoloGimbal::_acal_get_calibrator(uint8_t instance)
+{
+    if(instance==0 && (present() || _calibrator.get_status() == ACCEL_CAL_SUCCESS)) {
+        return &_calibrator;
+    } else {
+        return nullptr;
+    }
+}
+
+bool SoloGimbal::_acal_get_ready_to_sample()
+{
+    return _ang_vel_mag_filt < radians(10);
+}
+
+bool SoloGimbal::_acal_get_saving()
+{
+    return _gimbalParams.flashing();
+}
+
+void SoloGimbal::_acal_save_calibrations()
+{
+    if (_calibrator.get_status() != ACCEL_CAL_SUCCESS) {
+        return;
+    }
+    Vector3f bias;
+    Vector3f gain;
+    _calibrator.get_calibration(bias,gain);
+    _gimbalParams.set_accel_bias(bias);
+    _gimbalParams.set_accel_gain(gain);
+    _gimbalParams.flash();
+}
+
+void SoloGimbal::gimbal_ang_vel_to_joint_rates(const Vector3f& ang_vel, Vector3f& joint_rates) const
+{
+    float sin_theta = sinf(_measurement.joint_angles.y);
+    float cos_theta = cosf(_measurement.joint_angles.y);
+
+    float sin_phi = sinf(_measurement.joint_angles.x);
+    float cos_phi = cosf(_measurement.joint_angles.x);
+    float sec_phi = 1.0f/cos_phi;
+    float tan_phi = sin_phi/cos_phi;
+
+    joint_rates.x = ang_vel.x*cos_theta+ang_vel.z*sin_theta;
+    joint_rates.y = ang_vel.x*sin_theta*tan_phi-ang_vel.z*cos_theta*tan_phi+ang_vel.y;
+    joint_rates.z = sec_phi*(ang_vel.z*cos_theta-ang_vel.x*sin_theta);
+}
+
+void SoloGimbal::joint_rates_to_gimbal_ang_vel(const Vector3f& joint_rates, Vector3f& ang_vel) const
+{
+    float sin_theta = sinf(_measurement.joint_angles.y);
+    float cos_theta = cosf(_measurement.joint_angles.y);
+
+    float sin_phi = sinf(_measurement.joint_angles.x);
+    float cos_phi = cosf(_measurement.joint_angles.x);
+
+    ang_vel.x = cos_theta*joint_rates.x-sin_theta*cos_phi*joint_rates.z;
+    ang_vel.y = joint_rates.y + sin_phi*joint_rates.z;
+    ang_vel.z = sin_theta*joint_rates.x+cos_theta*cos_phi*joint_rates.z;
+}
+
+#endif // HAL_SOLO_GIMBAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         function Q = calcQ(daxNoise,dayNoise,dazNoise,dvxNoise,dvyNoise,dvzNoise,q0,q1,q2,q3)
+%CALCQ
+%    Q = CALCQ(DAXNOISE,DAYNOISE,DAZNOISE,DVXNOISE,DVYNOISE,DVZNOISE,Q0,Q1,Q2,Q3)
+
+%    This function was generated by the Symbolic Math Toolbox version 5.8.
+%    27-Dec-2014 13:59:04
+
+t3 = q0.^2;
+t4 = q1.^2;
+t5 = q2.^2;
+t6 = q3.^2;
+t2 = t3+t4+t5+t6;
+t7 = t2.^2;
+t11 = q0.*q3.*2.0;
+t12 = q1.*q2.*2.0;
+t8 = t11-t12;
+t13 = q0.*q2.*2.0;
+t14 = q1.*q3.*2.0;
+t9 = t13+t14;
+t10 = t3+t4-t5-t6;
+t15 = q0.*q1.*2.0;
+t16 = t11+t12;
+t17 = dvxNoise.*t10.*t16;
+t18 = t3-t4+t5-t6;
+t19 = q2.*q3.*2.0;
+t20 = t15-t19;
+t21 = t15+t19;
+t22 = t3-t4-t5+t6;
+t23 = t13-t14;
+t24 = dvzNoise.*t9.*t22;
+t25 = t24-dvxNoise.*t10.*t23-dvyNoise.*t8.*t21;
+t26 = dvyNoise.*t18.*t21;
+t27 = t26-dvxNoise.*t16.*t23-dvzNoise.*t20.*t22;
+Q = reshape([daxNoise.*t7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,dayNoise.*t7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,dazNoise.*t7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,dvxNoise.*t10.^2+dvyNoise.*t8.^2+dvzNoise.*t9.^2,t17-dvyNoise.*t8.*t18-dvzNoise.*t9.*t20,t25,0.0,0.0,0.0,0.0,0.0,0.0,t17-dvzNoise.*t9.*(t15-q2.*q3.*2.0)-dvyNoise.*t8.*t18,dvxNoise.*t16.^2+dvyNoise.*t18.^2+dvzNoise.*t20.^2,t27,0.0,0.0,0.0,0.0,0.0,0.0,t25,t27,dvxNoise.*t23.^2+dvyNoise.*t21.^2+dvzNoise.*t22.^2,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[9, 9]);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    MATLAB 5.0 MAT-file, Platform: GLNXA64, Created on: Sat Feb 28 15:08:55 2015                                        §è      IM   ‰ç xœìYMlE~k;)¨²"í¥
+ÜhØ8‰Â¥ÊºnÓR9`ì€l€ÉîÔ^±Şµf×ª[	Nä€*$rAP‰$ÔcÅ	q åÆ¡H´åÂ	©3³?öîx7^ï¦‰*e¤Éæ};ß¼÷fŞÎ›Ÿ €…¯æa–>Ÿ¢5N™qeÁWçhm·jïŠk"-^»<í¾_£ÕºÖÅnm¤+š#t‰ÑÅÄR±	r[Õ‚uŠš],«H³[œ õUZ=;r!vÌºOVò®|Emõvø¢?»‡`û)@ÖÕ[ŸXş{ştå
+ıSAÔ±·tÕ2!P*†©Zª¡„ã›†‚ıx©Gè XÅ>6¯^Ç}«¢ÖX?Loˆ¯©×qX{†sŠm|k4icxX{Ûßà‹šL0Ö+jkf“×t¹m7¨ æï-@±ÛÕT1ëÏ#q6ì^¼±’we™jQ;ØÂÄöã§°xÈùúÉ¹ø7™ÅŒ˜ùZàã)Ì??O%Ô³Œ¤qÜAz}
+qôfü, E±y•)ü=Në­Õ[§?úûÍ?×¯Øå”äÈ+ÒÏ~{ñ÷ë‹?aıf¸~™Oâ¯‹ƒéÎ?¼¸üİY)ÍxNâe¼WâcR}kŞÓòw`ºuì´+³ç†ªáM¬÷6d½ŒLëB¿k+EÓ]’¬¯9—wk7^~ñìÚ¯|2õ<ÒÅ7Îºá·÷¸‹;E\güçæjĞÛ*¾
+!¥„:˜ ñuÔÁÇAñ|‘¶Æûqp¿¶8×ºHæó Ã‹lÀ­*[Ä£ğ!‹å°sFŒ2;”zYí„ÃÇG Ñ¾Ñ¾Ñ¾Ñ¾dh	ƒ(,å)¸?ÄËªkÖ5sïJ,\K†n!Ú€Œú:eƒØé0ø²~‘¨Ê%;òŠ8ËBç’÷¡^íi~}C|K•ß/£m¬EáARı2±FİáújDØÓˆ°§aO#ÂF„={šx±³­Ò­EYmµ­šÑ#Şü×èò¸‰­¶¡õpnØ|…ù7#p:¿!(Dî³â¬Ûşü™aR3]ş¼4AŸÿÂÖÏ“±Ò§’ı¼½-=|eí—gªK©ö“Öq¿9·ÍıìĞq;èıC|{ÙØ¡Ìü³~ù¥›ŸU/?>÷kÜ&ÅiÎîåî±ƒÒ—¥¼İÁNªsÁ´úáPâ0é>oZ^Ú¸=â…ó¤	ó0şïÈ¹×øW¸Ÿ½7s÷˜ƒ§Ò/ŒxÇót{x=şöyúŸ“ÇŸ“WE1‘_K¢(&â­&ãê;¬x›”?ü÷5lN£uwğó   
+Ü€á¼,¼#ìéân'wÓÄ¯çÌR¼yáãîÌj¼¸KçüıU—èûXŠù}ŒñbúÇó
+	õê[N¨o9¡¾•„ëÍ“œoÂxs#Û×6;;øAŞ²{’'‰—ö^>‰¾ãóñ~Ş¿ùóB˜İóœİLnÔm”Ev71a†ı%½—[ çû·çg§º—Ë»ò{àŞóÀ¨Ø²ï¸ÍŸ¿ë_5è9Ÿ“ùß?ÒÃ îüWûãæ÷Ö?¼ıÓ—¾ÿ+Õ9,m¼}>—İÓMô£=—…£rTÊÁ—ÿ  ÿÿìÁ   Â ÷Om7        €w  ÿÿìÁ   Â ÷Om7        €w  ÿÿìÁ   Â ÷Om7        €w  ÿÿìÁ   Â ÷Om7        €w  ÿÿì•ûWÓuÆ7åj¨ÈEdã²Á`\Ç.ßmG÷¨ty@’`¢_9*™hh¤¯„	´E™qLã EK@213¢Ú$HÁK NLÉ •0x?¢¾Ï/;Û¾û|Şïçy=g<'Nœ8qâÄ‰'Nœ8qâÄ‰'Nœ8qâÄ‰ÓÿK-Ò^I·±^gmÖuT|Õ.c.¾¿¢ëLó©ı…wS×NŸwéZ;ğö²wtéûn]óšâÄë}İô\.=e¢Áøhôù¿ui9×,G×§Kqü¤d`ô÷Otó’fÖ–1ÏFÏÔ%¸Ñş˜=Ñ½¼ãìçòQá¶¿d;öóÇBsMâÄw€ı”%GÕš°ßç¯ù‰ËgØïuÁ»¥?¶O²ºÀ~¿+Æ×ûæ4²ã`Ÿãìn_Å{ïû<npª-ñ7‡}®	Ø.rù™™û|î(W-‰cİ!¦9İq®æR¥3	™4ï$ğâŸ>ø“çÃ4·Ğ*Ö·xàÍï‰·G3z"öğÂÙşuÍ¯³^H§}¼0´«Ü#‘ñÆ‡´—7f—ˆø“qö›Œ-U¶Ê~ËdøÓ>8;ñ¡Õèƒ¥´ïZ4Ú£ì|@{OAlFºaã‹vÚßù=…ÍùÉ
+ª=¢¬,&?„xêÑºd¬I#ùâ‡i•ƒ•WY?\!ü°Y-yøã_òÉußÏÕñF~``Q®!Ó€rò-ÚaÈ´¦@Ü'ÿD˜·¬È™aù(B»ã?Ñ¹F"ÉOò­».]ç‰ñù*†°Ì//‰c5ù+ÆéŒÏ…§,bŒ#Ÿƒ°8,¾QÌá3ò;O{Ú²öƒD¾ÁX¿Úõ	/÷Èÿ`Lİö¼:‹FåŒ+ISZ,Á§<$Øì)íŸÎHĞL¹HàÛqÚô©Q‚lÊG‚ºÊ—àÉKÑHN!H[Ûyk+‚c”WÔoİ³„`åŠò!WY*Š»”_(´M—ÎC±“rEÛE^4_
+)å)E^Úáû¬M”«>â—¬R°”oNußÏZÇ„ÁÉ:’sRk®Æ0¥¼ÃĞ÷¦×‰ùáH ÜÃQ:ûXÊ—l8îPşáP»ÅöXÃQHD õ×‹¦İLBˆ‡l¬X>c.ğ^Ùk?+ˆH˜e{Š,l$<G8‰ÄÂş ÙTk$*‰—(<>;…xâ&
+ïíJÈs7E¡‹ø‰‚*ùªğ-~4Ş!¢qyøZ`â)¹ü¬Ñ8O\ÉàYuÈõ,#Ã«Ä—5¹á'"L2ŒIáL†”Ø3)¥ü!ŞbĞëÜÏ_ƒYÄ]J,·Lk­1xDüÉá;7öğ3‰C9²cv¬?¢—£˜x”£Î³%şwƒ7‰K9\|}&˜åŸr¤u,ïm“Ã@œ*p¬±ºa³@âUÊş}'õ
+ˆˆ[æÍÌ¼mP`ñ«@ùÚ=J¡YFâX»É­É6&ÏJh5m;Jd×JìdÿZ¯ÄIâ[‰¶¡šü^ƒÏ‰s%¤]ƒú0³ó‰w%òšDé6%>"îUhª*î=(Pá/â_Ÿâ«ß5ëUĞQT`7HÊTØO}PáTZN¶Ú¬Âuê…
+NquÓWÛTQ?¤ŠÇLøXÀ`+õ„ÁQÇy7Ó3°R_ôuªq+`@½a`½±}–™Aõ‡AiMø¢M6ßPÔ¸]:¨@ñÔ'5ÔùguéÕx…z¥Fa†³Õ·@jê—­³“Ï7«ñ/õL0ÓúB›zê›İnÇ74¨ Şip¡GæóH¯ÁêŸŞ­›ºC4ˆ£jUÿmÃR³{©˜GşpltP/µpØ–šùƒ@‹(ê§ÿ  ÿÿ,™y\ÌùÇKl9ÊÚBJ(Ö8
+Ùt¯é˜©¦™æ>¾s‰ˆ¨ã(´ÒÚZ”£h©µÆQ‘mCµˆUV$”c,Éf#G–Á›ß÷ûyüüíQÍw>ßÏûù|¾¥óÌìãû`­ò’óŒîêï•áƒ«C_5úÀ<ÍëÎÂJŒvUïßäƒpûô#û;}°xÀO;ü-}‘ÿ¡aM«“/jŸ½ˆ_âå‹¿îøbp“·Ï¡_|s^=áõÉõÿ,ôEæÁŸß¬¬ôÅ±]WîkòÅ­ìîßK;}ñ1Í¡œké‡ñI~»;ù§×­_çå‡å¢Ì…?ì;,ş%Ág]døá9ëÍ„g…~°wi÷]¥†~Óä‡9}³éôÃ¦×ÿZúãäã£'»üaj¹¾w“—?ú5˜¿ûZà)gF%ŸOğ‡øX°Bá´¢¹x_è’­Ù“·WúãJFÙWîMşx³üæÇúN8ÍÿĞg€Påè¦ONHŒfŸÚí€ô zÚæ®% }Ü‰e20Ğ¾Umµ7 zÃ¬€êÃ˜i~MÈx6²¥3 Gî/°H±Äk9Ï:¢çÜÉ›½ázòNMˆ Q?4%bé.×ÜØ“ÍYõåŞ@Ô¥-š}¬2Ïo‹â4b˜ş×™íğ™œ×ZavØçş#ƒ=kÂ«
+¯ œ`Eİ‰á.ıq;‚`1$ïÈ†Œ Lê;µÃeo„¯ÿ\sº2«[Î“4á@ËDÁ«Î \®çùü`Œ×§—Œ›àÇc;ó
+Šªß¨ÁX°µí¾9!Û2ú_ÚšŒSË'—OÙŒ¶y‚İ—*ƒa­\¾~vS0¦G,üØEàoâ]–!øvÚã OçÇY}Õ+×¿r·K„àCÑË!ûaÅ£}!à>+üÃgoRîÓ¦2»¯uìMj
+Á¹s7Ú<Á[åÈS7, ë›G¦î·œy;ÓorğgaAq?X{Šª·ÿµ X4ıûe%|àÛÃ)ïzL” ƒš€jûæğ»ë¦-sÎüœ´xç±¼x—U#`óï¨‘v•Àè¥¥›ïŸ§OW°Å‘kôï™{Ã°ÒÈÿœû,¬H”½×3ëš²o>´`c×™[jËÆÁóe5©NlœòÃ.‹FúëvğbãáÔy£ƒ7?äç³1`Ì¦~ë(6Fí½*:÷/?i`?°g?YÏ†¤_KËÉ6ÖÌZ_ÈFšùßßøF6r’6Ït®d£øoãÓólTêO8W]cãòİĞm™&6î‹Zû‹:Ùè¾’:ÆÌF¿ğŞ—Ï-B1â7úÛ†b²÷Ø;ß;…"èxOÊ
+…pRøyW¯PÌ-¾íÕP¬rZx¤–ŠMy]6Q¡øqHîEB(*6Ò_¤!—úN®y³>wWE¼>—Š¯ïÄç†âóÂÄ{”1ö}âOªÅDÍÖïÎ‡Â¯ÕÕçâµPğ•Ç¶™B1»3N×
+îåO5‡"ëÌ¢=aØ;³o]½mÊm{“ç†Æ'Ä±ÂĞZôëıi^ax6"Rø	aø´Õôûü0H_ TÆoø\ŸïÛİfÂm˜°ûóú0h_V¾–†¥Ìã+ÃwÌ16†¡@™¼pVeİ°xØ¯.ç¢óÄÍ×Âpóâ×E¦0<	<°¨3=¿FŸğ5‡aÈô¾°Ç¸Ã){nÙ†ã×~vÅNáàæoHf…ƒ²g}ğ
+Gòúƒ°Ã‘1 æÑm~8v¦?”¤ÂqøÃ’?–&„£v‰Upˆ!×Ÿí<9$#çLb™rÂñş~õ^ca8Êø_®0†Ã¥©í»ĞÊpúğ,ëZğóı“\‡‚¾.šÂ±èädÅêÎp¤O­mŒ0‡cÇAì-#ğ³K{å#ÛœŞE¿ N¸:ô‹×°"Ğ–]ğU”WŞZNÍÁÀk~ûø?NæØ%T<’w¤'D€ı·Acˆ€Toİ4*#îî	íÌ‰À‘û©ÊÂä^9;uƒ1%a¢±•øµö/—ºü1kå]×"ğg¹Mß)S^³ö.ÛØ«bN±9#èÁ`ÉÁú1¿´å xÈ“ğ'DWÉfqß7pšÜ‹ƒÕ«ö•Œgs°ùõ´‘ÿğ9Ø¿°nóYŠCßë‹-	Ô«é?ĞÀÁ½–ÕÏ&fpğ’?XgÎáÀ¢¡èf]!ôÛjä€uæB¦’ƒ€™²Sê8ë<øáqÒF]2q°¢ˆ>ĞdØßo¶™ƒ}[=WyXrqÜæ÷ç½¶\\ÌÏ¾ìÄÅíŞ§-;Y\t-_5×‹‹ÿ^ØÁæb™£\Lh›il¤¸ğ!ó”ŞÅ¶ù.td®r±ìâÚTË\.6’ùÊÅ_‹çì3rQJæ,çôÅ[ÇÅ­qÌ¼å¢sÏs¯›&.z¿bæ.¶[¾“dæÂ•ÌßHx¥Ï²¶±‹D$™Ã‘P/¡^—°"‘Bæq$6Ìùö^;»È\ÄéÁw©Hüv™Ï‘hæüql¹!cæt$>ø¾Ê·ËÄ 2¯#1f*=ğ‘ğ$s;.¾	áu‘P’ù‰ÅCµÂ6S$¾%s<y–üÒÌ‘8DæyÎ¼=ä6Ü.
+×3s=
+4¦gÌ:f¾GÁúîks4;
+ÎdÎGaÚ•áŸPQ%ó>
+²Zÿ†õ†(,$s?
+kËé‹-7
+ÛÈüÂO¾ÛSeŒBÕ(†¢peÇ‘¢º(<Ìğ@şù®iÑSú.ˆ‚ãª·Ò,s¦>ˆFÈBÇ`7»hˆ	'Dc¾:ˆõ+©„¢±…?çK%;ênˆÆ/!Y=o¨h4œfø!&ÏÒÇ9†h¼:ÊpD4,'Ühœ”á„'¢1iÄûÊ‹Æh®ˆF¬óººhÌ!|•½ô4EãÂÑ(¢¿¶|s4NÌcxƒ‡ßş šnÇÃÃ<<o.½Ââ¡/Šá¾ºxkê<6_áÁ÷×,Ô<ÄáAoté+4ğ°œp	ßÓ¯ï¬\
+¿bø„‡²Í	ÍÍFêú3œÂCË:úÂªãáé{†Wxø˜RQòÅ}ì·ğà6çöæb3³¿Ä JúÑhá˜,¡¯ñ;¬d‰Ánßî2vV0\ƒ³SgØªcpã'†obğdôÖQ‡1øw'Ã91<´²_XnÆŞ‰ÁLË{ÏcÀ!Ü=ÎW×Å ‰ğOÖ?q;k?ù:†ƒb`¼Ã5–›cP#dxˆ¦?èÿhÇG{(ÃE|¼«ÙÚÁâÃ†ğ£Ë«æ|Ëæc:á$>ÂÜç9©ù^â#q‡Å¬_|¬ÌpÛ¿ûzŒ0—ƒÿ1üÄÇ©•ÑÖÏ|4v3ÅÇÃ)¯7Öññ¦á)>¨óï»ÏÇ(ÂU|¸óé‹ÈLƒá+$!ÉíH œ%@š§ÕÎXäexK€âñ“Ò·°¨ÜÇp— —‡óXjîç2ƒK€nëeÂú`Dï.?m® “		ô¢Æí_£ BÂeÄ?|48¯N€U
+†ÏØÔLƒÎ}~Œb8M€ŠS^6p)€áµXÜ­Œm˜k‹·Åâó!Ã‰>V,ì	¿Åbâú;ş„ãbÁß|vƒ—:³	ÏÅÂ°î¯E×±ÈzÏp],ö¦ØÈscQş”á»X\ˆóp8­&†óbñL"f¨‹Å§«ïÅâKúÜÅxÂ}±ğöİ×ÓjÅÏ„ÿ„˜¾söR_k!Nß`8PˆP»·O8q5šáA!äY©[ã„h»Èp¡-¯ğâm Ã‡B¬K=–ì/Ä„…Øö†ô\!œ/
+ñÓ¢ëî¥BxnâTG\ñíÙB°	?
+Ñ¨5?˜$„Œp$ı{n¿iiš‰„'…0Çúœ%D:áJ!lèëvH¾y„/…p	~zï€FÂ™BxÖ4kŒeBÔ|`xS˜ÕB4/a¸Sªì]DhƒÏş"ebvõĞ!zæ0*Dæ~§é	aKxTˆÇ²Ÿ¾Âp©¥ÛCW÷
+áMøT„ºA7·DX‹À#œ*Bkf¼¥½ƒzÂ«"t}¢¿¸q"·ŠĞ·â‡®2²	¿Š`ßí¬_ã/BáXXÊoErE¨ <+B@;"GHE¨wa¸V!u«ö¯Ù"˜v1|+Bü­yI"te8W„Ô˜NOÁŠğ®9—69Åd‰àH¸W„’`—­£òEp'ü+BÕ©ãVD`¡qFèêÊ2d„‡Eh;Òò"£Z„DÂÅ"˜İâbDH'|,‚}œF·ˆG8Y—á[¢»‰`$¼,‚gî˜s§^ŠPC¸YuÅ7{EhcøYj==¨¬Åè¨e8ZŒúÇs£gÃÓbd.[°ıå81l	W‹Qğ¼w@‡n„¯Å(ÏIËöÃ›p¶uÆvË¸bğo‹Ñ*?9w¼T=án1º®‡ß}=[áo1ú"ïÄœM#›p¸öh@J£ˆğ¸¬€O³TYbT.#°2÷èÄ|1ê	Ÿ‹!ôpk> †‰pºñ‡~É«+£û1Ãëb¤åØl­ÃŠp»9w×jÄp$ü.FÉ°EÿLnÃp¼U›ş›÷á‘lÂób4Zm3ışRáz1ÚÖºÅîè#‘ğ½æw•õÖ¤Î—À&…ëëá Aá}	\Ş+í'‘p¿q‹]/{HPKø_©oçN	š‰H@I¶šË• ƒø€)WÇ;C*AãdFĞ/úl	l‰HPp6rAc’nÄ$(õ¹ÿgAšŞÄ$¨;‘$šŸ%xƒ­“-ê¿É—@OüA‚®ÃŠ%0 ÏùëãMedŸÀ~ç©ñûª%("^!Ëâ	*ˆ_H˜õçŸ	ê‰gH ´HÉèß.‰ø†ñ©–ïo¼” ›x‡©oò÷÷J`EüCŠœEÛ[KáH<DŠ’Ó)Ü‰HQ¥å]¶v•‚M¼DŠÆÛ[=¤?‘¢Æı)‰§Ha¾Üoâ®éÄW¤°	İY$•"x‹.5¬¡ƒã¤0‘ÂÓ«:ón’ôÿ#§Œ~Ó¤h&>#EÿyË³¤è ^#EÊş¥íÈ—¢‡ø™ıåvÅRØÏ‘¢`;–eR¸ß‘¢tĞä#ÕRxï‘¢.³æ—•RğˆÿHÑJÓğ)ôÄƒ¤è¢ÇÌ°v)Ä‡¤è{µlXÛK)²‰Ia¿`À÷¥½R?’Õ¾»7ÕZ†
+âI2RSR¸2Ô_’AH_W®2˜ˆ7É«|ì!C7ñ'R/µ_=î/ƒU?Æ£dÈ	6°×qep$>%CÉ©/ª¢¥2¸¯’¡jÆ)q2°‰_ÉĞH­'I2ÈˆgÉĞFãÌ/i2$ß’Á¼W˜½>K†tâ]2Ø§E:_†<â_2¸ä®Xê\,ƒ‘x˜Ö6?-“¡–ø˜œõ…TUµÍÄËd zÜ¯g6ÈĞAüL†”eçÂD-2ôO“!ó¹èô˜vl'1¾&CA|‡û‹—2¸o“¡ôÁÊâ3½2x“£N>pD–µ<âqr´ÒØ,uCO|N®ÈiŸ]]å0¯“£¯îüòn9²‰ßÉa yZë/Gñ<9X•O4›¸rTß“#Ğcõ…Tzâ}râ|'‡‰øŸñc‹ªß$ÉÑM<PÔ‚éÓÏ§ÉaÕÊø 9Ã.ü”“%‡£€ñB9J6IÕùr¸?”£ÊªsË¤b9ØÄåh¤õì}™2â‹r´½¼òbµ‰Äå0'ÿØµ­AtârØ<¡×µÈ‘G<R—8ÈÛå0Ÿ”ÃÓ$‹ìy)G-ñJ98ôÇ­ï•£™ø¥ÔÕ4Ï|k:ˆg*a{(ÎAâ›
+d¥º«¶ïT ÀgæÖO
+¸ÿT ôÄïVWüğ~Éx¨uô±ßÍU€G|TÖZ¥
+è‰—*Ğå¼6nfœâ§
+ôåÛİşœ¤@6ñTìíŠ£¯¥)PD|UVÖ7ç
+³¨ Şª@ }ı-ÈW ø«ÂTåáYÅ
+˜ˆÇ*ÿ¦k´U¹İÄgH]´n{sµV‡¯U §ƒ~‘p$=YmIÚ¢ÜÏU Šƒ¾í
+°IgV ‘ÆÏ/^) #Ş«@ÛeÕİ[½
+$ÿUÂÌ~Sl­D:ñ`%ljÒë’”È#>¬„‹×0ï@W%ŒÄ‹•ğ¤qhà4åÿ{µœ‰Şcïø+ÑL<Y	jÿå¼ƒ\%:ˆ/+‘â¨¶Y&U¢‡x³™Û_®‰SÂ–ôm%
+­ÿgH²n\Æ£•(Íüj¾)M	oÒ½•¨£5Ç˜¥Ïñj%ZWøÄ®ÈWBOüZ‰®W\-VÂ@<[‰¾ï—åJdßVÂ¾ıUéƒj%Šˆw+Á¢2\5(QAü[‰À[ö»V·(QO<\	aı‚´+a">®Dü%ßoí_)ÑM¼\‰ÔàÆ·z•°ZÃø¹
+9§´Ê­Up43®BÉŒ×®qPÁtxªhrUı7ãí*4º¯1Méó*´í5úwø«H<^³ƒÿñ
+®
+éÄçU°É¥°T…<âõ*¸XëbâT0¿WÁ“~|NÉ*ÔÏWÓ“™Ñ™¦B3ñ}¨e´@g©ğ„x¿
+)Ï'nÈW¡‡ø¿
+™ñm±Å*Ø3@…‚×$.å*¸‘½€
+¥ôkÔU­‚wÓT¨»N~ƒ
+<²/P¡5rcÅÆô™N BWİÈ‰’v¤¨Ğç´pÜ+²I7PÁ¾’>ø½*‘~@åq=³ÆšBéÅı›í@¡ô
+Â±æÅrW
+&Ò(Ì+ø¾}ü4
+İ¤/PH6Jş?+Ó(äl:vå,—‚#ÙSP(¡Çê)w0İBÕÚæ_TqØdA¡ñ=X“)Èf2‚B[ò»}æ4
+‰d¯AÁÜ™5ìB…tÒ%(ØÄ9}¿5ŸBé\L¥½šb
+FÒ)(xJBR¦”S¨%½‚çê¿>TSh&İ‚¯¼Ô@á	éRÎ¾¿º£…Bé2}hpo§`k`z…³=^Qp{Ét
+¥´–~ì¥àMö)jÔ•`ÿek5xmLçP£Õ™>ĞjèÉE®üyÙs]Õ0Ü`º‡}¶ÿ~š1Ml²QÃ>kÓÒ>5ŠHQƒeáòw#W
+ÒCÔL=Ní‘ªQOºˆÂ7ìëóãÔ0‘>¢Æ¼E-a^Éjt“N¢FjÇüÓ–kÔ°rez‰9Zz`f©áXÈt5Jno.Ş—¯†;Ùï¨Q;fDb±ì-LGQ£ñò‰M>åjÈÈŞG6vØçş5j$¦3]Esuëò›j¤“}6^îoQ#o	ÓYÔp)ëÕ$µ«a$½EÏ‰97ü_©QKº‹œı4T£™ô(Ç“Õ­Ö<!Fƒ”íáÓrĞ ‡ô2İùi‰«¶\¦ËhP@¿–ÁÓ4p;ÏôJ?}Ü28@o?¦ÓhP·"×òWÙCiĞújÜÊCRôS™n£AWÂ/]Ëã40ı”}"ôìd²]˜£=u÷–İŠÈŞJÖ­ÄÈ?³4¨ ]GƒÀ˜ÿjäkPOúÂKô ,ÖÀD:ó‚İ…—kĞMz©§*¾ªÑÀÊÌtrè1İÖ cÓ4(9rÏª¬E÷¿™¤A•ÛâÕií°É^LƒÆ½}/¸¯4İeºmÛã†Ô ‘ìË´0çŒ¿ıØZ‹ô+L'ÒÂÆº*ú„ƒyd¦…ËúÈsë\µ0Ö2İHÏÓ7¼iZÔ’~¤gYÒaÇ -šIGÒ‚zşyôß\-¤EJüí¿Hµè!]I‹LÛ3â´°ubú’òSi‚d-Üò˜Î¤Eéõ¨nç5Zx“=u‘´ÈgiÁÛÈt'-Zë’ïVåk¡'û;-ºü-ùßkaXÅt(-úh}•k‘MözZØ{Ğ®F‹¢…L—Ò‚uèôÑZT}Ÿcyc«[´¨'JaÁƒ¼¬v-L¤Wi1oØÙ+-ºI·Ò"•Öx·ZX50ıJ‡«ÿt[ëà¦céP²–5ÿ7ÜÏ0=K‡ªwgL›\u`Ïdº–É4@OÓAFö‰:´u>¼øu€‰˜Î¥ƒyöRß·\ÒÉQ“UÙy©y#˜î¥ƒ‹„>Xq:ÉşQÏ«“v©“u¨µa:˜œˆšA“×èĞLz˜ÔYş·ï³txBº˜)>Ş^Ì×¡‡ô12é×|{±¶/™N¦CÁätå:¸Ígz™¥%»Eî5:x·1İL‡:ç)õ=:ğÈ~S‡Ö|zpµè ¿Át4ºlcç·ë` {Oúèë~Î+²/2]M{CÁô:‘}¨¬Ô/lÿ³Ö£âW¦³éø¦ ãŠƒõdOª‡pÑÔ÷»]õ0™î¦Ç¼ßçMÓ£›ô7=Ré±?3@«B¦Ãé‘s›ãH=í™§GIìŠË×¤z¸oaºœU—­ƒöÆéÁÀô9=ş  ÿÿ˜iXMoÅQD”(ED”""ª""ª='‰È?Šˆˆ"""Šˆ(•ˆˆ""J‘©ˆˆ%Şı~?×Şû¹Ÿu¯õ[ç¾c\†°Â‹BŞÈ|ğ*gôğ	ë} µ¬©9êƒæq7â:o÷AÈÊn‹¤(tKuëUãƒ}âîÙöÁğº-G}L™Ûw9í«ckÉi>¸öìFfy–fèu÷tÕ¥îLò}à}¸¶ë]¼-®;ì[â?‹Å••>ø=#°÷äg>Ø²%¯(±Öšyİ·v{ïƒƒ8ø}öÁIG~?jöÁ¹5o/LióÁÀ¥ºÙe-“uº¨8¹ŸğŸ¨Nàã¸­%²Ëò3£iX³²d{yo9ZßßvÑ!ğïœî´IºœfOIPéØñh?f@ $|«g…á)Ù]M,-(Ñ±5%p”úîïkFàM½‡	æF›2ºÒ’€¯¹Cİš@æ³­ïlm´ü—2m…-;åg‰v6_úŞ^	…îzËº9èù}ÊåÉÎÜ¢É~~.ŒÙ¶ê¸+gÅ)Í'`¤z8º»;V£yÇgOëÕûyø:ÃÎé„ñoÉÄÇ -ÛşvgÜ0>»Ì'Ğ9ïáå•™ŞÍı’|	ìú£·ºj%²8»R ı')HÀ³j[„ckÎÖ'+çé[êôd“rÌæÄaÊyæøgN ã³İòU~î¢®œŒ$`;*¼ÿÓ=6Ş;»ºg¾´Ô!–@·®?ÌWÇpM°óT<½Síß?M ğ¸†š®™D`àÆğãH&àcpîßêIWK—'§ø°ôÇ•êtæ¿èjeXuÀ>À1›À%kº, ‡@[y¸Åé\ğ?·óY°^eïµ
+ÜKı1}j!Í9ú'ÖXĞ`ßáL1Øí´×óReÃ·çôªTæx[¹à*Œò¸µÕÎtüYvæÏÇôÇ¼¨!0ÖŞaWï:ÏéÓê	\Ú>#°@‡©'R	LWTõò«¢‹E?½´›]|×¿êÔB ï^½u­<,™5gÛ	Qdõ²‰Uê˜>j$†õ(ß5]„tæç‡u$Òœ:ŸÓ$ñı­CÒ«Ş$lÂ˜}uHl²Ã{†.‰ü¼Ô«ÿé“èâS®—j@Â¥ıçš#Q‡Vô5!Q1	–Î¦$ô0‘Af$–¯İÑjN"Q'Í¹Ö’ÄÛÌò$kfn-gÚğû2Ğg½-‰‘¸–fGâ×(vÀk°+Ú±¶Ÿ‰P!­b¦3‰;]+,7¸Ğ8ÙyŞ•Ä¼iƒ>¾O"¦3û»“x²‘=9Ëƒ„aD§`Oäµ4Ÿt/§<+®½!H|üÕ2@—!1&vP O"`¼ce°Dârk•áK¢İ?"ªn%‰©½ÏÔ ±Myíì@÷çü:D¢×ÇA3ƒI¸ïp$Şn"qÈ”ËÕ#ñâv„şœpC˜ó#Hğ*+3#IœMøeõn‰¯ö»Ä°~áøiN,‰ÿÖs³6Å‘¸®ÈïB<‰N—Ïw®O á¼¸’ĞO"±³ùW®k2‰Ò½CSHô³šº.+•ÄÒ‡Ü£útG}w˜Eâuôİs³I˜¦T~
+Í!¡šù{ÖÅ\éï’ßç‘ø6UmP‰ICyr^!‰ü×7‘¸å“>ğR1	õ¿•ë>”’˜£ØÓ J{lÇÍ¯"ñèÉÔ=[ªIèò—^ğî·Ë¥¡†Ä‰éÉu$Ş»=Rs«'1úëo2¬„”áìFG+ò•DkÿŸa3	q×c·[Ô3Æmm%q÷ä£=—ÛIôtjmüØ‚ÛkÃÙƒÕ(Ø4íôu
+Õ†B—mç*¬I^–qãSo
+§•Ï3Ò¡ĞÛúßB]
+VWmÓ§°¶ršu…œUBt£…½#?™Pp:Ÿ1Ûİ”Âv×Ç§ÃÍ(lírÕœBŸˆÁôgK
+‹G8å[S8|G0XdCá•"Óí¶L:gV]µ£ &>¶ş
+©mÑCœ(|{1øË"g
+68ÍÙáBa½¾xæš+…¼Ë‘]¿Î§ æ‘Iu§0ëÇã¼Å"÷µDxR(·2ZŸëEAW±«¯…e+Äñ&…„Q{=x
+u)™_"$
+#gUÍ¹îKaE}Û™¦•2·© Ğ2t:³$Â”›bşÎ 
+›eĞÁnÿÍ\ÿm…îñUO†…Q˜;ùÏø¥áö=5Ú·+‚BUàô¯7")ê/¹~ßCÈŠJCáä‚ê±¾V1‘q,vÿÉÏ‹§°ÚÜxps…ìûÓ7˜&Qø#JO=“)8vÛ=!*…ÂÖSöå§R(RÑœNAëÍ×Y†*FMáààİvçPx+±7s)/ß}óG¶õÂà‘R>Ù°¼Â—	íOwQ÷ÈØæV1…u«gÄü,¥«-7¬¤ĞQ‘³W…s³Îî©¦ñéI·‚F´³-5tF¹eVGaIá#ïz
+ñ¬İ@¡¶óê‚F
+ÃgÙüúJAÆÓ˜QÍÎ¿loòn¡Ğ¼aÈ¼½­&*¶v»Bğ¹ûï4nzìáF«Ñèú3ë–:Ù1Ê 5hìû7ø&ÊÒ!Ï~÷¦1ÀÏy¢¹/MÕ~B—Æñ³{¾íÓ§Q?ëâ¼B£Ş?=×jDc¥o&4²L”…3¥ñû¦sAŒ{Re|×œÆæ{BÚ,iÆ_|faM£Ç”ê‰”ùÕ÷ï·¥±İĞïwíh<í?sşĞ0¼¨´ja´íL#¹é"À…Æ§İÕ÷\iXZü3nŸOcÍƒ¡-İi\‘f>§=hüíæ;)Ö“Æ´äèE^4Â§+NĞxğ¦z¾C£÷æ©Oc‘‘Iƒ¸ë3…û¾4^.÷½ıw%¡ŠìÇĞ]ÚÈÒ8góìùÁ MşMzLc|€Iì¿M4‚úÌjFãFº¯N£ó¼½i‡"hÌl¼Ô£8’Æ®Ï„Ñ4ÊFv¸3.†Fÿ»Ê`bixşßşâhS[ñ¢8Æ›ã{m;&Òá˜kDÃ÷Õ³f>™FFp‡‡Shü8ì|I*ÛœY=;eĞØ¸DY¤,?÷Ş²itÛŸ=ôH×qÏ7=Ì¥±W‰ÁNù4û›<¡€Æ@-—ƒb!Ÿs+~)¢‘ä²oAi1ï³Ïw.£aş¼§M%UÃ:JRK·†ÆWÓh#]LÊ^Ğ@¿PµZaG÷½´©£qOÁ!¹†¦2–£4ü§u#Xİá»4ÑxvÑ%}b3#w?MUæÛ>éX+3{.–·ÓølñÂ¤kGc‹;n¤Æ PşJ¥ÎàZwì4t8íw¨B“Áte=ºj3ØQwy¡­ƒ’Í/Ò}uô5î¤•¨ÏÀãÆp¹Ò€Á¯ÙwÕÔ´)6a0,.fó
+SÒÄ+¯Í¤=~1å‘9ƒïâºY1°ékÚ2ÙšÁÅ&ıläÏ[™qÜ–A—Ï1Zí¸ìRÄ‘A”ÙË»SœTÜí4|¥3=ŞtË	Ë»Ì©yìÊ ñÄJ;7o÷ÇÙ¹30«¹Ò²Òƒ_ÈK÷$O”¸¬òbğ+Ç´W’İÒ9*{†AhËÊ{ş<ƒ;û÷?)1Ğ°ÎÙòÄ—Á¼ò—5=üÄ¬ìlïÀà‰ÖˆÃ«¤*Ä€œí¿èi0ƒSögöeğ1<§ÂŒQÆ·:œA@Aç¢S.S#L«#´wpÓŒf0õ˜-bl³S€-–Áıg9‡“ãô
+zõ«:»Úb­D‡.¸à˜Äà…»kï5É†(ø|:…¯¬Ñ³TgÇ\5í•Áàkñ«°©Y¬Uj¯×d3øOc¤Ã™×O»yË “óªß½ò8¿=°xZƒ[®^X[È Ô¸¦wJƒ~yÿ>ƒ¥Ş#ï÷.cpT±S§J¯ãVm¬b`:)öuJ5UÕU‡—/¤+uF»–Á¾]ZêLÊé±®AÈ|Å(Üú¼JûU#õÈØ}šÌuíşôfÑ÷jFü×ÂàßeÛ¹Vú]ÍŞ¼jgà4};²81uuü5ïk”`Ug1zã5TşµY5š,.^íÒGG›EëR3?g¿æ>Òe±åÀê‘iú,îZÜVkÀ¢§‚W:Æ,Ü”1Ï4aq W×£ëMYT§šµ¥™±<gŞ’×æ,è†ÕûY±8½ı`ŸYÖ,‡çúm°aau»öÁy[kiåíXätTÀİ‘Å¿cóêf9±pR0;Ø™ÅveİÒ]Xå¶½qeÑgÀë%ºn,gw½äâÎâğ¢Q}C<X¼ú®Ú“…ÉŞ€â:/¢å!3=’EjInøl†Å7ÕëºÅ„êS3%ë•ºõÖ—Eóü?zş,ÔŞ,ÀbV˜b€,"‡\ï{!ˆEyŞë•ï‚Yèú¨—e±¬}Ô(×0	‡çoßÎ¢n’Rğ"XŒ|rhj}$‹k¯Óf‘©£f‹–LuÏĞXSÜFggÅ±Øôe¾Îûx·#×øLdÑ}t\ÉÜ$s‹®ÚœÌbŸğfûÅU]»½{ŸÊbĞI°2XÓÜæe±8Y»¦}s6‹†q—rXX(ö!—Åjå:òYd{v[5¿€ÅŸ_£n)dá«¼¸ˆÅÖñ
+³(ªˆ{gPÆBkÕin•,ö®K«bq0­ÛßìjÏç˜/ûø‚…ñG·Ë†µ,8ÇÔ±H1=¼jk=‹/·o<¼ÜÀbS7úS#‹uºGnb‘›`^¿ ™EG‡NÛZXÌx±6ñJ+‹ˆõ‡ÿ~jgñp@Ş2£t.+Æ¦ÆaÉâîıÃÕ9Ä7›¯ÎÑàP»wAi£&‡áVæÆÚä‡‡#Üu8œ÷Í«×åĞÜã­ÓU}SºÿlÀ!x¦„Æn¾[°|‘	‡®[¯l7å0{è‘ş×Ì8ìÎÏ[ıÅœC¥ÏÛÒ!V(1½Øšƒ×‹;l8·]øşš-‡ú'
+8ÙqxäøPG+ûåÿ[ìÄ!ëÂÛåÎ~»iääºp°ÿj¡ÛäÊasÔÂ 7…£×•y¸sèq_y ‡ù
+®]÷ä°_ıİû&/OOjÌFr0tsb	Ãz½°Ã.Cò¦u^7$Ÿãs¾ùr°ÌÍ×îÏaÍ2E€®üÖ(ßÈáoì˜1yA¦Mpßõ=˜C¸‚íÃC9<X?Ã3Œƒ¶öÍ‘á×!?‚CœkïæH/?*†Íah„Räc8#ş[ËáÜøòü8MÌÍ1?â9Œï\¿kD"‡ ÄË’8Üp°tŞÌ¡³bã7S8ÌÜ \*‡]úG½Gfp(»|óêò,ı=êõödsğüÑcí­ÇöYVüÌåğÆj‘¥Y>‡¥ÿEzpğ]q´aO!‡Œ·œŠ8üL©Oj)æ0Y‰óQe6Ö[úxWr(ØºèZt‡n&AnWsp½ytí¯ö·*FÕrxüWùa‡ñ
+@×sğ™lõñv‡¤§‹fşnäğ!0èäè&æıu"š9¬R°n_‡KŞ_»ÓÊ¡íkOıÖvØ­«#0s¥p©ñ¸w?È*F‡¦t,ªPƒÇ‚n[5yÄz?ÓB›Ç3'ÍS¤£7V÷ëò`Bwõyœ¼>·Í€Çç\¥ ó»¼ 2áØú¾r¿)k5ÇŞ3ãÑÁfìî?æ<¦?ZüiŒ«×Ï¢­y”h'œ:`Ã£oº\¶<<æ~ Úíxù¤yİÒ‘GMÄØŒaŠİÇ:ó
+×?*rá‘Æ&ŒıëÊã{çÛ»­ÜxØÿğ‰qç±
+èxğÈ96ù¾'.Ájÿ¼x¸Ü@%yD]I¸Î2<*<n<ÄóĞSêş‰Çr%öÿùòH;nÜ8ïJ0àaæ·¡ñP ?ÍD—â ÎŞNîÂã×¬5ëPvïµ(>ŒGè¶q7âÂyÜ1Y2¨$‚‡Æ-E0Q<æ‘J‘Šæóïö8!†Ç“ø†=‡cyLéõ¹$Y=nv§£<N­[rz|"ıƒ»ˆI<Æ\L¤$óXxçÆÃ—›uNãÑ¾»WĞ„S-¬«Ä,Û,±Ïæq_
+.ÍáÑK±ƒÎ×y¸'ß™m“ÏãĞô§¥/Ş(TÈcÈfkº¬ˆo´4O­„ÇÙëÁËx|]~<H®äaİv§êhÿ}´.¯æqİ¦÷Ş./ytRêàÄZÎJ,¨êxììræX=Òôã]+xô›WHwıÌciãÇ¼IM<îìmèÛÌãõÈñëZx˜Ş]ú¤¢•‡Š¯ş—GºÚ	xü8^øÅWMÀ$ÇOsÕ„¼êR©!àVğxõnZÔy2“µÌÉ	É_¡# zÉ	ÃãºıT„ /@¿RxÓ0ÅXÀ‰²ñûüL¼÷óüzÜTÀh­®ÍøŸ;‘ÒİBÀE—»êvVZßbVZpWŒÃFÀ–aJ¡¶p÷–ç{=©Oí¸uHšàï$àÀÑ»û’œTOiüZå"`ğ3í¹=æ
+ ÿ›pÖŞMÀiİeİV¹h¼¸‘=é!ÀJ±'Ö~»;¸§·€«{78şYô©^Åp*`sŠ°]^óTPÜ}SSÏúœVÀÄ_Àâ÷Î®p¸®±[r €W›ûpÕAL”Ú¨"@¼±ÌÈ1T@ª×¦à€0ßÚ’ª“ÃLˆ»gó,BÀú‰
+ÈF	È{Üç›c´ µ56óÖÄ˜Õwù¹Ó±"36u' |ŞI®×QºŸïİšš(`Ù®ÏFk“$˜õ9“, î®R|RŒä—Oì&`E—ĞıÓ2d8ùmm–€Ç¢y)Ù¦Ô|>÷"GÀ¦¾Ú×Ü4‘wÊĞıªbæ.UŠr¡€}-'C^	¨Ú_ôL»DÀ EVÓËå}¬«pråÄïg«4hyÍU-À"54µÏK«gŸÒ˜Q+ ûCÿ_€?á_
+ÎÕp®3¤¦AÀÖ‚‰û~PDy=ŸÑ$@K©AÍ;u µEÀA»ûßkZ<¦ Ç_ÆA:iÎEpz“z¬W‘rÉKHSñÅ}óíZã¾ŸÒOKÄºèûgj‹ÈóõùzKtlÏëŠ˜¡R U_D„†ws?COov›e,BÇ99mƒ‰ˆ%oï÷H7¿å«ğÆLD­q¿;ı-DÏ›4ÔÅJ„ìí½)ØZÄù?J¡±Ñ—l[g+bâ¤±ºö"‚«¾6»8Š¸¹¦ß‚']•×f8‹˜éİó­‹ˆ=ó·ˆzsET~VİMÄ€H¥ »‹ğÕ´)ÓCÄñ{ı^¾õQÏÛNà-bTWŸƒsH+“¶üØÈˆÈšzzÁ^ÄïšçßI"ì76õÔ_!b³AÉÕ_DáUÛÂM"zxú˜dŠ˜ÿkKh}ˆıN¿ÔñÔºxòÜP†MCÃDPşıf…‹Hî5yáûŸR}ÒF‰°œ¦9/ZÄš†ÓÒæW¶^Œñwø7“q"¦İî¿yĞQáôäWóE<èHLÙ’$B;AÏd‹ìÏüü""îyñBƒ4/ƒ¾¥ÏÏ1t€®VX–!{²œ-âÜ"ânCˆ¦ïaÃ¯‹¿÷Ìf·|A–%¯Â
+DÜ(ù6år¡ˆÎ¾ºq‹DÌì1¥Å°DÄ®3„û‚2eÎ[3¶VŠèÿîŒÖ•*a%ò§jÇ†|¿;ø¥ˆ7yJ±­1ÂgÊ–mu"|Û‰š+õ"2oµklñsRJœÑg“Ÿ”´,l±qíw÷ğf:z™9-"º]P¿U„«©2ş+bï—­÷Ü;Jx™2|»š„
+^U—àSô½æ³†„$AÏ~ˆ–„]í/Ò–`~’üµ]GÂªiÛ]Ó•p©6%ó‹¾„¶{5” ÃfÕbc	a×ôŠv˜H¸çigšk*Aó7öÕLÂ‚ØmµC-$Ä?kïa%áY…”ÖŒV5ÿÊµ‘Àö°¸ÉVÂ™4»&ö>Ï¡z/q”0öã6ßNwœ-ºî,áši©é7	î4‡›+a:£7	;:Ù;ìr—P’@¹á!¡¯Cøïo<^œ]<Ü[Â‘õ¥–’jüèÉHvyÀŠ<^‚´ØşşwIBZ³RXWHø¾7|«§¿«s¯#$lxXê(!ß÷Ç‘æ 	]|1‘à’bï±,TBÔL:+*LBÅ;ÅÈÃ%èm=·âG„„åCËîˆ’˜ÿcÄòh	ï|ô·í‘`ö×şÍÍX	~GhüŒ“pÁv{üÈ£~=9×º<Q‚]`™Ç$	¡ı~fİJ–pç‚~Ÿ–	üÌÒ$ÌûJ?ğÊµ}dt–„'£S·dK0¸_ö¦%G)şÄ¨ëN©<ê/áãI‡¶è	cœ˜%·%¼Ş~ñW‘„Ë›RûŒ.‘ĞnXîçS&ajîÏ{+%l[6ĞìN•„û¿•VKè}P)/%¸OØáHÔJ8T™zt_„«ÊÛîÔK¢İ²¤µA~à%óÏÎº¢/Ù$áëGfeL³ëˆÅ…-ş‘fÖÖ*áúòp‹¿:±-udGÎMİ¯&cg"İU—QêÀşiÓÑïå¥c´d,İv‰Ò–qT¿¢ï¯/·¬¼§+ÃÔcPÉ}ªei(#}»6–ñÃ*âí¶¥iS‹Le„¬¨8Ön&ãVÏ_,-d¨ŸUİJÆœYÿÿ£KFt=«sßFÆ£­şmeè›œ/±²—á}³bë(ãñkûA'ïÿzwßYÆèxÇiÿ\døOæÆÎ•qñiD;ë&£5ğ¼ç!wı+³xÈØ’õK§Ã2w¬ç-£g“ãC”á¶›ÇÈ8`¾sG1/£ú¾Rdƒ¥ÊiÖ+dĞİ~'ğş2NŸ2ø £Ñiê²’@Vo¸Ë×ËXº³ßøW§¯BeüË­|x8L†Óòß£†ËØŞjÑi§ŒâƒSëÇGÉècÃ;‰Ñ2?Ú™x$FÆáÕéÆÊx¥ıhYçÃ2LÒ_pT†8×°¿”(#õÓÔÕñI2¾Eğ¥¥É2&ŒÜe®vVÆúÂô›4yì£z)C†šZ«ÓÑ,³/Ë–‰iÿÔ®Ê(©õuºÁ»®Èù2–Ìè¬@FÂ•G«Ëe¼õh-ír_ÆÈŸ†“Jd¬ˆ™¶SU&#s¬ğşX¥Œ–Ò]Ó+ªdLñË8Şõ™ŒMšÿMz)ãöÙÖå¾µ2º»ÎI¨“1÷ı4İÊzû¶	êeT™D–Ù~–1èV†ÅŠ&ùxgb³Œ“ÿ”"Ğ"£!~ğŒnm2,¦8˜üWÆêj¡ƒ_G²×EzWSáOÿÌœGê*8^|¬Û½‡
+[¶LÑR¡¨ip¹Ÿ¶
+½ö(ÅQG……â®Çº*|ù¡û@K™3ìU0î^ub¥±
+\r[‡$R¦yW™ªğåÓUQ*ŒÛ,êÙ[¨°Î(j¿•
+¹×3Ë“¬UèèU5æ‰
+3ÚÚvõ˜¬BÄ!£{{ÚLw^å¨‚Îc1é¤“
+K¢:>uV!¾Ïï³U¨M¯ºê0W…áóşè­vSAn4Z{Ê]…ó;§W<õP¡y¤d©¹L…‰w£"á­B0w¡a5©ÂMµ'ÎÉŒ
+]OüIªæU˜íhÜIKVaÏ«é>+T¨–®ø«0`Ğî§TğÊ¹°öY 
+Ç—<©ĞZ¯BıÏ?–SCTµß8jM¨
+ÿ  ÿÿÙw<Uÿp$¤ÒôU!Y©$mÉè•¬M•¤TîÙGZ%„Œ¬´K‘MVJÚÚ²BÚ{H¨Œßçwÿ>sï=Ÿ÷óı~½ïegYN; AAÕ6Û!üa¢Î—À\©@fÑa	‚2Ÿ¯ß#A…]ïÕ‹qş¨9®9Qçk¿áÇ$ˆ×õ©]tR‚†[Q3üÎH0Ş³àpzŠRŸ›S%H=Ùk;"C‚/¦Z,³%˜Şd=`G¾;}<2
+$(U‰.k)– ¯°`ÜÈ+,rmğ³º&AH{oí<ŠÖš™y[‚†6Q­¸=öù2ò¡É>Ñ‹­ŸHĞ2¨ğÂÎ*	´ÓdÕJ°ÅºÏãe½™o´®j’àgªM‹s4%;vµI°«<º.ëåkg¶½—`@OCÔèÏØ&÷}±ù&AÄ<m»İ?%¨zf“šİ!Á¾ÙW]¬³AùŸ§ò
+¯ÙöIğÚ©Qu4…IßúväÈR "´Ÿ½’§7ÅvÖƒ)tŞ“D/V¢`âóuÏ
+‹ìrGS¸}®1õµ
+‹~YU
+K^j{Ú§»×¶Ü_“Â35J-O‡‚ê•˜oô(¬_UôLEŸBJWã,ûi>Æ÷GïAÁ`¶Î·¼Ùøj[û·FŠX*mŒ	…J±Ì) «È3`!…öMåù–îìW{gCah¨Î®±ö\&.®wp¤x›š½o)…&ÏØ˜K®&H{·‚Â¦SMöãÖP¸h&uqÉ:
+ßštä7P˜¹kñÆ/
+~cèëï½)\-ŠUWõ¡ åV¼Ë‘¦`õ«©>£#5§P¤ğÄP7öƒ…QOWİMa…„vpÚKá¸â‘‹A^¦Ë  kóbãÇ
+ÛŞJİP§½_w¼óa
+¿4ívï¡`t~^GaÏº#s>%R¸ÑS«~ŒÂÀc/¾;Ÿ¤`g,½äÀ
+QõºéÅ)j|íä?§R3šñŸAÁ=ÿÈ¥ÙÎ8—ŒÎ£ğîÛ‹İ%¦DJ7|.¦ÀèOœ«q…Â¥ûvG\®Qèöf~ß `&·äòm
+)%é_*(Üµh–Ÿğ‚b›ô¦eO(8L¼y°ŠBœº½Fi-…çW˜=_ë)¨¯k˜ĞDaCwÉ\×
+š„´Qø<[ægé
+†5¿½§ röšŸ)”cÜ¾QèÍŠÛú“‚…Ãå›W:(üÔ¬ñ½‹ÂÃP­†ëé5ºõQp½co&MãèF6îª,féøŸßåih¾ì¨=˜†·yKÆr%/dAãÇ.½Íe£iÌëpë‡
+ÅìU×ÜâıWŒ§!Óq¹ñ&›Ø£k:4Â§ˆÿ©Gãé½v}Ê”ƒÓÊi4Væ2ÃgĞ8y1~Pùl¯lJ7·ÑĞ{×rK×„†äÀ ÍUæ4rµ&íXHã÷u‡¦rKó×só~ÙĞØÛ?ÑÆ­c¥í«iÈÏouŠ\JÃáù€¬ë®4b¶ORìXA£nôo½54Æ]ân¯^GcİÒÍÃhœû^º÷†‘­MŞ4¦N•5äCƒ{0)aM£pË’_‡9åxç›"ç²~ûÑØ¿èŠâäİ4îµµz»ï¥1dŸì¨@KÇOÖºu€FÂÕ%!4Wó/&‡ÓĞø“`¼ö0¯Ä+	Ñ14Òæ¼üu+Æ×Ù¥]‰4fğ“³§£±}¸ãàu'i\Éæ·Äœ¡Ñïxçv
+ËÏW´ºSi„†½ĞÏ ñXo`óºl#ïN›Gc¹—câÇd„îb­§—N½BCgÁÕìõ×hlm~9øÈY»n½{›FûØ)wÿTĞ˜[â¨mğÆîåÂ>'4®w$6©¢!{äêüŠZ‹g´%ş­§Y9ğ·AjjŠË†*CœrâÚh¬I†Ü{Cã´mÒÖïi¼}wõî´Ï4&·i{~£AkËÆÿ¤‘cJË½]ëLzºh˜ö	I†ÿhì;ôÛ³Æùe.	Ò5´åÜ—eàè'7´WÁeımÓ3¨¿äT±Q‰š‹¨“8‚Ç¤À£œ?\ÖÒ«ÂàÓÔW&3TL{(wÔk<a«~g¢&ƒbyçeuôœsûô,´<:t¦>ƒàWeÛ6Mcğ`ß«Š¤†iÈë>šÍ`Y™~P¿ƒ¤5Î­3M¼ø#šn6g ™tôèÑ…6Ï½ÖùÈ’Azí«eR¶¾óòy³ìÌ1UÉÛ‘ÁgŸä¥Ê–øŞ{ìÊ@úËQ]é•¬]š½†Á¡I¯[½×1¨¼+ovlƒÑ›¦&?ñb°rÀÒ.é-NœñuãÃ mArŞšÁÄ–kJÇ9>{^ûTŠrÆ)Ü—ÙÁ £dêÄ¹»¯Xºë^ş¿}_dpóH²ÙÓäf–'e`ÿôu×ÜpÑ´‚Û¶Ãj‡äŸˆa06cé°ª8ko—È&18û>ù¾Ñ1ïƒË'úœd ¯ófÿÉ3Ø›
+mU)
+<Ì¦1øÓ·ôØ¼æ'¶wûd329æv*AECy~uƒÁ;Ş“+aàüß Êø
+ƒøƒ’k\\ôNß`0şçö5·xFk“»Ç Õàºùü‡¾<|sŒzÂ`ú¶ANW1ğU˜¶¼¶–Aé—KòÏôYú7ib°èõ1ŠnaxıÁ™64ŞêÕ½a0âÚ `…ÜÜ§½2ùÌ ù¯Ëæƒ–$¿ãg2Ğ6:ş§®ƒÁ–ºëËu3ÈŞ^2ıÇàçÅlÕ•*ÅUR,ÌR/nò‘a±¾Ódô@YAVOnÈ"%Îƒ›'Ïâîëvjg?ñQd18HÅàUõOeá4Á´qŞ0<ó$´z8‹¸kF’‘,Š†şz;p4‹÷à¸SÊ,şe¨,2Va¡şïâÏê1,`gzZ2…çÑ'rj,|ğè=¥Îâ‚Ñ¯c÷¯®™ÀâsÊ J‹ÅP2–ätXL'åyZ—…Ë­'£çë±Gn¸U3‰Eâ†_5…ÅåÜà	òSY4õ«T6`Ñç˜î?ßÅ„“¦Sk§³°øú¤‘šÉÂËtC˜ül!á¿ŒÎÌaq±1øİ|#'‰¯ÇâÛôEô|Ãï™¶Ë›²˜InwÆŒ…ÛæN&Xøşê­‹£²3iW–Y£`É¢ålú ³V,¤ÚMKLlXh-¬Ü\gËÂ*zƒ2cÇÂ»õ×-aÓòg—°Èô£iêÄâÉ£ôÊ:g?TÍö2.,FùTNäÊbNé†¦³n,Vê3]ÁbçÊƒó­dq<uÌ{f5‹kéñƒÜY¼´2³<·–Å€øÊvÓõ,tßl8óÌƒ…í¬'Ö“…OĞÁ¾A^,"«ÆdÛÄ"wBÆ3o5Œ™bı×*KØm,Æ*yz+JX˜¬íPN¡X¬Ë<xÛŒaøoŒPÏ’º°ËĞäxGÍ*Š,>}¨Ü›âËbÈ<Os?†!Mõ;Èù<;xˆÛÅÂWw¬ñà=,’ÄŒ÷)ş,Jo™%˜°hùÔòù>òœ<=qA,´ó:Î>ÀÂZ*Äù|0‹­NcûÍCX„ŸÌÈzÊ"û«™;ˆE•éSÅ!,:Â=/Ÿd¡B¦Ø‚(ÆSBşkˆfá¾sì>–EÀ½aH‹³*æZâYÜÙüôé‚D
+=’X(’ö.$“:vy1ä8çscÃ/œ`!´gã‹„…æN³(‰~š œ%õÔêi54…ÔÓ´ß¿.œg¡¹7ä,RYX>»´1ÅfµÌ~!œ«yöĞLr®¥OİS³XTÚ8xa‹ö•¿/7æ²PNÙ"æ³0ê«¢TÀbµuæÔBşñæâÂb§ß<Õj*aqkÖÆ*±”ÅÛ ßJWY(T‡LK+c¡OÖ‡…å,ÙÌğ¦ë,¸róù¾7‰;¥ªJ·‰»µÓîw™¿­,*Xôü#r…†ı¸s¾Hı'g.öˆÔÿGs©‹IıÏ«Ê¶¨d‘²qí‹§,?û=x{5©CİĞÒaµ¤}Çm½XGêğv¦Ê¢z+G-¸ûâ9‹İUâöF'ó6jÁâ†TgÕÅf–äúĞ}‹ZYÈgØü’Åäo™ÍÛ_±p0[1ü&¢j~ú[±M?.zÏ¢`Jgbóõ;C­ı>±ø{oÜïá_HŸ ešş•ô	ï.–ßIŸ(ª’jùÁ"x W_;‹4×Îµ#:ˆ×s¡C2~¯íã®Xv¯Y[[ºYÌŠY0fÇ_Ë_VİÑCÜzùfô7{;µ­úY”?­n‘âĞ¦¦¸C†ƒ¬$Ëp¤,½+Z2r°S¬°’ç@­ò2iUà•Öùq‡"‡ü®Ğ¤‘C8ÔY«ÚdåĞŸõÛjÕ·RZ‡s0Ÿ]í²s$ı^Ò£FsØ_İ™“©Ìá‚fØ:k÷YÕ¡/ÇpøRueç8JÃ°m”‡ëªÇd©spÍòª°Öàà×Óéûr‡dû0]ZÊ’UkFéphı˜˜¥ËAÆÓmô8è’¯ñrÛz¯È]S8øLì2=•C¤oØ§,¹·UÚr¨•mÓ6C§':wÍä06¿:eôl&$†gÏá°Î¹KÚÖˆCà©°Ü¶yR¾©®ß=ŸC…YöPeSŸ"p5ÛŒÃÕÛlp0Ôß4ö8¸ìêªØmÁÁ÷~ØveKIcÔts¬8”zg×ØÚph.BĞ+[Rr5Ó÷ØqĞvÛÔªìÀÁ:¥+2g	‡­¿ÂL;q·PûüÊ™CvLöÑ=.ª^Âö?W†59nT6_¼‚ƒñ“®e¯WrpW?$ã¿šC€D-ï?wg¯d¯Ï]ËáâB%»õ>¬ª¹úÚƒƒ"oşº	8/Î6‡îånâ $¨ùÙysHx›­ûf‡’Ùkı·qhÚ_¤"áĞW½iFÅAS«»Õá`É:ü†åà}]Íl/Ï!lXÎg‘Cæº…Éy¾*³jlíı8´÷lêz³ƒƒ²C÷ù½»8;ä:f‡ÕŸÔäûsğ7ÎÉ³àp:t¡ÇÛ}nÕ×(qx;qsÙ˜HÌÈæ çĞ8‡£Õï¿åÀmÌñ8Ä!.áÄ±Š¤kkó#948oŞïÅ¡çT÷ŒwÑ4¾zËÁÂ\=jl¯È³KñB^,üâÈ!]¿6ù]‡Ç»6/Ş—ÌáÇ}ò`sEÚß¥ælQw[rŠÃÊâœïOsØ-g‘¿ï,‡“nµãR8ÜHÙ<¬à<‡×¿ºË–¤r[.yŸÆa2YcÓ988;.“3İbGA‡Ø€Ú‰9
+l®{ŸË¡^ıÏşÀ|%á3U8¨_Uo+(ä€Á¹QÅ<W[˜(á|±öK`)‡´îÍÇT¯rxhógqa‡o	áİå†¿SOıpÃ¬9¹nA79,?`!«v›ÃÎšÚüÂ;kyopªàPÎıöñq~=üZĞâ|øxJíq¾>Wµè1qmñÀ©’8ï­İññ)qîà­·¿š8?ö§N­–8ÿ~ ¨87?Ë¹8'<>>'ÎŸ[Dïo$ÎõêÌÕ_çÛ½¿5çwşsn%ÎGGØ}zIœoÿgÿ+âüRnªúâ\fÑòâ·ÄùÒ:Ù¥ï‰óÓŞ—>} Î¿ÿÙpàqn1|üâ<r|yñWâ¼9—Zú8ŸºHíóâ|wİƒíÄùïã;ˆó±õJ~ç["-í"Î‹Çî&Îåòfÿ%Î—/z5¾‡8?_]ÒKœ“qéÒOœ/úûõ³”ØˆãÁ2<*ÚÆÛkÈòø4=ïOÉ@ìw‹Ò\äyVÖ-ÿ¢ÀÃeü–yøR/iá‘t5ÂóòP¥ƒ5F,Æ£yu^ù—á<¤Hl:8’‡6y|Fó°¶İòğ²2­‰w.Sáş.bÒ×1<²çhÔÇ£ê@^ğ55‹f—ªóPÑ~öj™c²~ÀÃıÆß!Z<†G~› Ããìz¥º<îdçÙ»êñøĞK¾È$ŠK¥…Láap|Ë
+Í©<œ?ÿxÅ€‡0?²ÀÕGB˜ÆÆoÓy”<Ï:“G“åuÍÙ<ú¶?£¯Ìá¡y—¾Kå¿ÍãáMÚiè|a—4&k™òÈ”É¯¿bÆ£r©åA·<ÚO?›ı<”lyjÁÃhÁ¿-K«Gâªÿfïn6<NOÍ?ñİ–Ç­İ–av<Ş>xöWË‡«W—ğĞßúoÅr'%‘r?œypò
+Ã\xÄ-Ïß¨íÊ£è¼åÈ27Ï®/_Á£gÑVæÇJGş©ZÍÃâUä#mw^3&ì.[Ë#d_şäëy¤WZ>ÿáÁãñøúƒ‡<yü ¶ÎÑñâ1ªìßë²M<æ9»Â›ÇÊ5şÜÂcwzş÷CÛxœücyRGÂã†m½Ã5ŠÇëDòrïIpgyL{xe8ÏÃÄl]‘C¸]óå«måµÒG_?²}ú[o„ïâñwx£»‡‡ºÇáñåş<3áñÊ }ù»Û÷ñ^b5%"ˆGÚñúçºx<ü¼5¤<˜Ç·ù=sV…ğNÚn{(YDâ±|Ò¥…#xìô³úQÉãøİú“«¢x”+o[ò+šG›WÏ¿ˆX²‡Ó'ÆñĞ ¹êz<;²V­NäA±*ú•Ä#ê˜É<òl¥wœGİá×Oğèn>Ì®>ÅCÕ@S£ã4ó=—GåáñĞj^
+ıãO¹qÇ…­ÛV§ò¸_ÒÒ‘Æã‹|ÔÜÃé<”Vh¾ÕËä1ãÂ¥#7²x¸’¶&‡‡9\ÉG¶:œÏ£ìUÏ’I<ZgDõÜ(ä!¨™±¦˜‡îÓK«~—ğ°Õ°Vˆ*åáC?/št•G$Yßo–ñÈÒ;Ê½œGÍš¨›¿¯óèL×ä¢nòKXN¾ÍÃt±õ“›wx¬Kz¾Ç½‚Gàûmú÷ˆó¹½Qˆóà¨ĞÉˆóZM£[‰s‚·î•Ä¹`×ù”8¿I[5q>ÂççäZâœ¬e·êˆóœ(ÇµõÄyŸfoçsâÜ± #º‘8?a½zÊâüËs…ÛÍÄ¹‰OñÚVâüPï¦®—ÄyCÔè˜WÄù$­[SŞç~Üí·Äy…õ„uï‰óÿt} ÎÉ˜ùDœôêë!ÎD7ŞşJœ»h…­ûNœŸ)0êşAœÿ´~ÓNœ£!N¿ƒ8òYtç7qŞÒûs]qn}º»›8ß£åû—8HnØCœ³É¼ÓKœ“c[ßOœ_öôGJ€·B_q¬Œ€°Ñ›§Ê
+È¼ ¥|w €Êß·ÖËh·´áÿ(P#¨(Àè5YÌ†X=³ÏÿîPşÑS=†	8MbûŸáni†)à-m3Ï`´ …kïî*Ğ*‰÷PàèŞ·èï\Ftû‘qâşj1PP´¸Ğ©B]@C’MŸ‡†€÷™'Ğ0’¬‰Ó`AÖ·i:¼H¯Ğ¢£í½AO@ºP¨üo’€Ç7mnÇMğcD#?mª€Q$š÷ÌÉí«Ü`(`eôŞÓìvÔ6ˆŸ)àä‰Â¦i³ÜøBÑ¯Mçy	#ãüß<“ûâãçp˜cih*€Ù¡ıë™€ØŠÂ3ügëÜõ›È…ş m)@]¶Í}+X£¸ÑF€çYíË=¶‚z'Ø	H#±nºƒ€‡Q·ï/ğ­E"lt0|Z¿f¯³€Yş1O\,¤0İUÀNÕ"ƒno³}±q…€òË‡zW
+hS ŒW]Ùÿ~º» ½Ô˜„kØ‘xïµ^ E˜÷zˆŠ³=›è) ÿu£ó/u3©ş›tögyyP­ŠqïÛ"À|‚Îà¤m<˜¢Ë3$ö_#ƒ‹pahÓ›÷İ©;}¬€/ıB/@‰´û™¢€v:U}¸-
+Øä'Àïƒí´ş’š^$íPv
+Ÿ¹G@k]¿ñ#2º±6Ğuû÷	°½Udu4H€ÏÈÅ3ˆ$ëş£`¹dìoPÓO^¡:c³0ö¤ÎÚYL¿~)`éâÒÍQÃ›¶HÅHi¤T’cTL–º;+NÀ§±âãxCî‘‚I`øÿŸ}
+pùüKàûÿ28. I–n~|B@é2©ïSšÏÆÎ—>#@ª]çcòYÚ‹g§°şÿßFçlıÿÏÇ©Â§Ñç¤/
+Èö—r9–. êQ¬ÔœLªº9O²¨v°%G€qéâ!2yÜ½(=–/ `%½uN€³©Rc*ÜéŒ½»¥XÀ+]_™Ëã‹µ—
+0x³¸zÎUÎ³^ì«, Ñ†[Ë$uPæ†€2ßĞÄèšÌ½- ïZñÇÊ;4•ì’¶V°\ûÂzÀ}â<“ş}üqşO*eî#âÜîˆËÓÇÄùQ]ém•Äùx«ˆóyvëNTç!/†Õç$<­#ÎÉeÛê‰sñÈÙâü–nÅ‰Fâ|d‰¯ÑâÜ“B3qG¤Vâ\Š	”m#Î¤§Ÿ|EœŸ<Òbô†8ÿªYõ–87-1ñyOœ‡Û}’ıHœ“r9ù‰8ŸÂØÌûBœï”î¬úJœß;’âó8W™¸làOâ|s‰ô©vâ¼Ğ.w^q>°y]õoâÜ•*é"ÎÏI_ø‡8o'ƒæ/qNÖãâœ´ê^â¼Õn»¤Ÿ87lÖ‘“1y/SsJF„Ãcé cYŒZÜôš"b}&¶JäE”’`2HDı {ÓÓŠ"ş®lşd<D„zs´f¨µ‘&Â“Œ¹"‚ã'?=RDÚ›’eóG‹x8Ë^¦VYÄ· dUDŒ¨fÖË1KSFéÌ8ËÙ¸«óÕDì,ŸèS«.â¸Òå±´†ˆòµö÷ä5E´e6o?£%B–Äzävµº"ì’ã‚h=ÔÇ‰3&‹ˆšw¹õÌù!ö‡M¦Š¨{ÖlZg ¢[—ıLŠPõ•IV˜!Âü6i3ExŒÒë2™-b¿çåóusD\ q’1qŸ”Õ c_œØ¼³óE(’ñ051ã[œÒ33®fzeÌ~d€,‘Üd?îœ…ˆ²)-÷L-E´îdıY‰¹/3‘µ¡;&¾vĞb¶d­8g'Â‡´3‘^>[""×µå0ë$¢æk¦¸TDg»Ì—s."ÆZÄ'›¹Š0Ñ[\ï&bİËË]ì
+†W‰HÙÛâš²ZDÅcv€¹»ˆÿ¯—õkE!c†[/ÂğŠŞ°ÁD¸(––¥xŠğ]å 1÷‘”Ö2îù&¥]ì}Î[D³õ€ƒ·ŠJ ·M„ö[²ĞHDXÏ.İÿœ±u¿ÃL^İòr0'"›Äó¼ˆ*ò¶Dåñ_ûŠP6éï'Âx¾S„{Y€w‰èi¹°`ˆ³öœ[ƒ¿ˆ;Éd… >Æç	¡h<iÃ… ¡¥Ãp@„3‰Á"R~Bˆˆ_Nuh˜ˆ’Û\8$¢iTÂDˆèóœ¤×)B3¿´Nˆa)½äÀĞŞÎ­3ScE„âÚ'"ó	ñ"*ÍÌÅDídızT„2iC©É"Œô—Ø-<.bõ®ÖîÆ"üïs©â)§ÇÈ.W:#â–w‚lÚYo‹HğL¡ weCÓyúnK†û¦Šø   ÿÿ×‡_ÎmpzRJJK*IVÚBRR‡¬´¥%-áé‰û7+iËŠ$$!I%!ÉjhkIV²ÒĞ’–„„÷ºÿûs]¿ë{Ça“ÖR$™)@à×@ÿŒ,Ì…gšg"±æíuš?.ä¨Œë=T—º%€j¨õ«Œ\ÌŸ´Dšç	à«²wÉ»;Äìn£î
+õ0ñ¸Ô}êÅ5Ì20èúğ‹y ²™ÖÉï
+0øÑbIà²vïO©‚…32KHù”èôo¹ %K5&½¯ =âámºJ ‘çÖ>ÓªĞ˜óqZV V{‹ÿ­ à‘ğ÷õÄKÉ4ç¡Q;­Q€¦ë¹¬gŒ[/´x!€ŠÕÇWï_
+€s{£˜&|z…—J7etº-ë 5NX¼ ¶é¡Ù‡÷ô/°égZ¦?&K·
+°¤bï†km8ÉM³è€Ûz:ãÃ'’s5œÙ.Š'L’é ÕÎ&ïZ¯ Â?ú¬î@}`¯tË,M'=bğ?zzÌ qï4T²‡ÈÕ*¨]="ÀKŞ†où&ÀjrÑßPVÜ×$óS ÓÿMŠÎÀëîé¥kÆˆÑloù-@ú¦‚Ü_ªÓl ;‘Bß×ıÙB$ÿİw~0ıøIV'Qpl==Æ‰R`ifÊŠQH
+-p¾.N¡ğ‰ÈZ	
+-*­y§Ròß·•—¢0ŸCNšÂº)g]—¡°ËM3`­…£™*­ònş°©ã(<_ÛÊË)RMÜ§‘£DA±sÒëµ3)˜œ‰nU¡à©i¤J!ìyA»œ…´9¶ñ9s(T¶bİ<
+½ö´Î§ 1M$%H‚ç+y
+9š¿r4)P¿2×iS8ceëÒ¦CáÁ¹V‘`=
+ï{÷İ‘×§0ÁXÄ÷Æb
+scÏÈ¬_JaÍkÍ’6
+~ê…Á†Ó¶³¦QÈ©h­»aL¡QN´Ş„ÂÈVr+)(Ü>ó:ØŒ‚‘VÌôUÜínšS½hÛ±Ş‚Bê@k|ûj
+¦‚U!k)tœ¾‚øû3)7-)èhkY[ZQ°*üÕnMa_mVˆ-…DÅ6{
+÷ş'½å@áí]‘|KG
+DÎúvl¢ æ¤%»ß™‚Å•ÂW
+;Flÿ»åF!öß¶YÜ)dÇê;¶Ph ÇİïIaxÑYÍŞäh5ßò¡`ØP³Á—‚Û,»eŸ¶QñoëØ¿ƒÂÅÁÉ~Ê¦ˆšçî¤ĞévvpÃn
+“³´.|ò§ õ³Ğ:4€‚Í:»ñÉ³ÏİK!¡Sàj% o :¹“¢Ğy6?”¡0ş\k›"GAun‘ìm‚ù^»R«`
+¾%mÿu†Pˆ™F©¥å)úD1ŒB}ÎÙàÛákiYGRµ.jîŒ¢`lwğ@—ÏmË”b)SŸn¢+š`}„BÉë³æ]G)´«kˆ£ Â]P:AA£’@Š§`%ß>n@!À—ºÖuŠBümQ·°Óò„’&+Ÿ¥Ğd¯}7/‰ÂØÅ¢m6ÉTíäºÏS€Y{iØ
+>Ç¨@åK¢Ş‹Î¾“J!C;é‰M…Ú íî+úkŠ´Â¯RV²£œIa‰_ûÁ;YœîQ†¶Ù8r-İ×)$;%%„ß P|Eûß™·(´İÉ¥ laÑ6‚úÉv›;,Û¨ßáw)øëOÎyŸBÜ$·ür´Åì
+(¼œU|·§ÂûíÅ”ÛåTJ(˜JĞeù¥¼6OŞkWN!"+ivo…ôŸÚUª×‡¨Tç§Ékˆó®ö7vuÄù2:¶·8š¼<²8‘Ô©ÒHœÏÕ9u÷qNÆ¤ıâ¼Ä~¸÷%q.İq1²‰8÷"@š‰ó“ÿÜ}CœÿIÊ¶Gœ[ëlşü8O.‹j!Î?Ûß›ÕJœwl¿×Fœ¢å:ˆóæÉåŸ?çÉ@í"Î5Õâ¼²¸á^/q.ï°ß¡8÷íĞîûBœçÑo£ˆóÄ©çç–ß&Î/ét9ŒçƒÅ§ú¾çfÑß‰ócÃª?‰óô¥ûcÄ¹˜İÆqâ<øÜŸ¾ßÄy­Îõè¿Ä¹Ò£Í³'ÒÈñs D£ñ^Ç½Â4FD™_&ÑPp›#JÃ(ı\ùl1îßtö=§jñHÍQ‚FêI‡§_¦Ò¨ Œb¤htë“ƒHÓ{÷@††ÎÓs‡åhØ©êõËÓØ·çQWŒÄB‡D5E÷$>Y<T¢ñv3óÕq&?Yb©ı*4ÔÆÎÙT¥a±^÷¯šdœ>œC#¶ËÁ}Ó<ÙË>‰Ì§ÑÅÜ?¨Ncø…ØÿæhĞŸ—<½@“†á>İŠMÚ4ÜJÉ Ô¡"½qN¬‹^ŸÎÑ§Qvƒ	-XL£ó˜®ÓR“m’ßĞĞ:¯{8Ö†Mß#£¹F4Wlì.0¦‘pˆ,VùÍÌêÁ•4šŠÄšÑg’Sç®¢¡Z¥k_hNÃ|zÉ_'¾Û6æ®¦“÷ÉıĞZYÿ°Sæ­§QO®¹Ğ’Æà¥äÿ9[ÑÒU²¦a€’ŠC¶4\â6
+æÙÓúğiN‘¶ÑÙ‘FI°ø¡M4Úk“u;ÓQÖ{?Ï•†ÆÎ’ÃEn4¬îo4vq§@¸m¡ïÌ>ìI#/]|Í|oMß’GŠ|hŒYè]vñ¥¡’@ô6hß8áÈ>‹;sæûÑˆ
+c·ï¤‘ñT\Âu7ZÕó†ıiôïÑó;@Cº¨DaA %S+‹÷Òpr'P@ƒ»ÆÎıJÑHv„¡Q¼şüÖ3zzxÂİ%ï]ƒi¨:ùBÃ2ºÓøh(ÿ—lÏ‚0qóÈÂ§‘KÖ¯[$—¥zß¾FÑø!]zùheoGõX¦7;'”¢áõ—½áv„F„Í‘£4ÒÏŸ—8G£º¬4úV”ú•ÄÓ<ì8csı7•#§h8jpÔ±Ó4ò9¥‘TuşYIÂé‹Â6'ÓhÙFşø<¡;] 1_¸ëÈÂK4ÖmäV”¦ÒØ•:¥ws£CçÏ|»Bã&­»Jãy\é·…™4F?8¦•fÑPÔ%5›†I7qô:º)7ãnĞSNñĞ¸E#mç¢©e¹4ªî—>tÏ£Ñ;yÓÎÑ;4$\ºf¿KCï*W¥qŸ†ÃèºìjuÊ¼-4Î$,z>ZHã!ÏÇ‹i¼_¼i‘f		á]ÊJiÌmän)§±f¶„É÷
+~)½Ç«h."‹°š8ŸZ¶¶¼†8wß4º¥8¿Ö•ö½8ÿÅm<Ñ@œ[Ji5çgSn–?#Î»yz¼ ÎË¦şxIœG“àÔDœ¿ìÚ©ÕLœÏç+Şç‰Çïˆó²úÇ{â\F~|qî]ö\«•8¿¹)¼¢8ÿÛµÈ³ƒ8'qíÇ'â<EâX|qş%ÅD»‡87Ñÿ\ÑKœ.;ëÙGœ¿Ù´îçâ\£{4~€8gù+ÚCÄùc	ÇÊaâ\á‚×q¾]ÿÖÏoÄù2Ï“ß‰sa'IŸÄ9á[9Fœ§ò»¼Æ‰óa	¥±ßÄùªOş%Î“5‘A`KÙü*!	ºN/¼„ä‡t‡MbĞ\Çë'ˆ2WúQGŒê®ÇªÄ˜?Ğ_é-ÁÀW¬üóØT1.dÁI1ÈºÚ½NWšAı(ÿ½J†Áàê©éŞrdO]pü%ÏÀ CÿŸS
+\–”ßÒUdîäõX‰AJc·¤ÏL%³I RaĞ0u÷)U"Å”ôÔhH.®~<‡Õ–rÆgƒ€l§ãóÄÿê~qJAeP„ƒ¦³SWk2ë¾ğÑG›ÊòÅqã:S¾2QÏ+§>=}Qó{’ª3È ±nëRµäó0è—¹˜hÈ@Ú‡<,#Kn•ÿScÌÀi‚sîVœm×ï•’S‚¤N›1(ş2µhÑ*­&w×˜3>²XÙ×‚úÛòêß«Xj’A´–?×³@=ƒ¸ÇA/k,ä*HFúZ1x¹ıââ?Ö~ÜYÜzÚ–ò¤Š8}{¦Î¦µ¼.÷ôù:2ˆ:÷gƒôU’–gœT¿øCß•A_Ëâ«µn$õ*6msg ¿ßYøïõ=¹g<03ƒ½{3HÚ%9­Î‡Aát|´ˆ-ñÿ»k…òÙæg8×,öc°î{[·“Á®5ÁêÛw38zJòÕ_7ÉÚ?Ààùòd0N‚ñ^ŠÏœo00Që5@3ğø/øËY†AX±dòAšä%ËzAÕ–%?·3èÍ®¸:a?‰qg§¤PzH‘
+cà|»>œÕ#é³#’Á™å—¦MŒfğ0fIqRƒ÷¯*ü—Æ2˜°Àeæ“CæR½5;0XSÌM<ÆÀOVjá¹8‡}.½Zz‚AÎ­%QOâ4N¨\ò¿#¤LLd p¡÷ø¹ÓŒúƒÍÎ2p_)Õÿ$‰Aè²’¤¾]²A(…A…fåÏsts.—ˆW÷:5¤2Ğ™2É/İ©<¡tûò/ù$_e8i©ô²L÷ÈZhÈbğö²Ë¿l†{gş“Ã@Í<¤6ù‹Rü²[v|¼´ği.ƒX½¥M~y²÷WFı“Ï ¡Şeéù»†g’À{ŸüîO00|(…ÜÄSûÿ)bâºôüùb3*7–0(ûî2ö´”AçšÏ;ËLNq®d õIJ$¥ŠÍÒÔ<Ãjâ<béÖÆâüY¥ô®:â\Íõ‘ğâü¿Ï{Rˆs—7çRÓêŸçdp¼ Î¯“BıŠ8¯lJi"Î7¸F/o&Î“>/}ö†8ï	ißõ87š?éq~0Zˆó¦¥Ë[‰ódÑ´ç”«ÕîâœŒIÄ¹ìşÌ]ÄùÖi.F=ÄynªÈó^â|¢Áİ}Ä¹]ÕV‘~âü‚«ÌÅâ¼ÿó#£!â|åş€çÃÄù‘i³üGˆów©u"£Ä¹–AĞÅïÄ9_¥aü“8¯v}ı|Œ8ŸÑí?NœïØo ú‡8ÏŸÖqñ/q.r9Şx"‹%›V½bá”V5à/Ì‚ûêš"*Â"Ù¼Ïê’(‹âû‹±hı8-ë…8áEäK°P%ÅG’…å“ª;—¤Xø«¸ù®fq|wŸÌK¹÷—ì‘cñR\ú¿ÉÓYüp½<+U…r¦Aı
+E¦?ª‚^*±ğZKŠòL‰}¯'Ïb‘şiLª*‹jò¬LÔXôE\îx9‡…äsƒ“óXèÏy¼JlÇ@·ÁTuÌ£¾IR¡Ö¯4YzHh³h¹~9KL—…Ğo×Ëz,æ[=]©Ïbİ9·üW‹Yìêíóıo)‹£F¡²âËXÜ<H‡!‹çM—ÿ[iÄbtÁ2Õ&cŠôãúÿLX˜T¸‹›²ğû¢™fÆ"lkhóÊU,Òr¥6™³¨š˜¶,Ğ‚E/©—âkXH\||2m-½7sÓõ,L¿6Y² †^´bqæ´ÍµÒÆÓlY¼ç—]3µg1¡æ±ëksI¡qd±æ_ò§8±ğ»ºíŠ3‹Ã"2rf®,r6¥•¾vcÑHşv¯;‹‘¯U%<X(ü»ùÉOFñ_‚Í¼Y¸·†j5û°]$óf¯/‹ÔĞ´ƒÛYT<Yf˜¾ƒE·Jõ'3?âş›šw²Ğ)øb¾o7»)†$ö°ØçFC ‹ÄÌ4²¸÷cÙïæ½,Ş®­¾¶OÀâOâf·©4µÎ/“¯2,,ÜÇbG¤Ìö7<‹Øçir‚`ÙsHØÏ¢!°:ğj(‹aR?V…±ŸÖÿäM8CÏ!‚Hn92Ú’Ñ,B~§½¹Ãâ¢•aìªXeçªßbÑÙ»¹Sp„ÅdãşÉc,´bü›ÇÂæµÌğª,Õ¯\|Ï"6´¥XäWTÿ–LdÑ,çqšÅøÖ~7ó³,To{—ÄÂ\Hö•ÌÂ×şÊv©1å3/°È¨.3¿Ä¢ŞÔ}ï»TƒGûgÓi,dßhJga M _eáDŠm&‹ Ã·ï²X¤(ÖÄÒÙ,Jşç¾|Z‹ö»ı™7Xˆˆ†ú÷'Y‹÷¹,¬®\¦óXŒ^š–Ï"şßÛ¬»,òâİÿü{ŸESköû,ÆH<e
+X¨—.b†+÷²ŠYøÌZ¾Ã¢„E”ü‡RîåL9‹Ú){¥+Yô»…©]«b!%ûÔ¢š8ÿyeÿ‡â|İr¶8?]óVú	qŞé~èZqn0°|u#qÖõáqşB6‘}AœÏM·yEœï]şõZq^Rsiu3q>m‹]ËâÜsàû8Ï	».ó8ÿ-ëİBœ[“ÒJœ'/¿ßÒFœ®ÙÁuçÆ[¦Ëvç±åÙ]Äùë°}kzˆsu¹9{‰s&ı)×GœW.•í'ÎåIa Î}·¼[3Dœß8ôq˜8
+7âGˆs{¹nÙQâüRzâõïÄùàòÕkçfµ_?çÇ¶¤òãÄùû;¹?Ä¹vøßë‰ó ¹œµ9ŒÖ¤»·
+qPT2š$ÌÁÄ¯ö¾œ{[ş—#Ê!Ltpú:1iNdñ‹s¨º"'’àĞ;’>G^’ƒ„…Qc½“µ¡ë¤98´mÑm“á@é¾’ãpæ@øaùé6ÈßPàğ~	ŠŠ&ì1:İ¦Äanaíêà™ÖHxŒÈÏâà·y0õ†*‡ÃYáöëÕ8äü”›Ğ>‡Cãº«9Áó8Œœ6Ú2}…®Ú)7Õ9-óx°^ƒƒ{ÔàÿÚ59„¾WÑæ:W¾rº.‡Š½W7õ8t—ÍµÔç .]×Ø¾˜ƒ—Ç¥ìnê*,ã°ïOøû›†­åXq¸—|Õ¸Ã˜ÃÛÏF=!&ş×V0å vÈcÍ-3Íƒ#–«8ìXH´9‡XFŞa¿‡ìÊ«f¬áĞ o|ãÖZÃ¾u[6¬ç Ÿç!ñÉ’ƒá?Cö[qpsˆğ›aÃ!ä’üŒ\[¯Vn°çPffL}ràĞy¬nn¨#‡É<Ípâ ¥3t ×™ƒMp„•+‡ÀZùŸÜ8$(e	uçïg¼BÑƒCó½º\Oã¢g¬¼9¨:­éôá`ñ-Ô—Ã¶oòiŠÛ9ÄXd8ÜŞÁ!ë¤ñDk?õmu7:wrÔ÷ô8°›ƒlØ„ÒO#Şàà¢:}§u ‡ =3ºörH)4®: àP"QO)ÑÚ7{ÎËc8ˆ\zfÍqĞ‹ëâ9X­'3˜CÀ™ŒJû9ÄwÍå·¬~…M‡¦(ÏŞ®pc/†Î„ErP™¹V9šöMÍ‹áàSš‘fË!JzÅÆîC2¼ê'†áP{Ãó¦ò1ı†<îÄq¶‰œj{‚Ã’óÓºã98õeìOàÀ­X¡83‘Cò¡úª;§97{Ò¶g9´.×“ÄA˜|ÌA½jzøÌ–Ó3å_àà¿mE‹í%Çóêö¤rÈıÇË$"ÃKìÒ9ü¸y6ÿ*å¡éëì29˜"s´'‹ƒWÜŠ+Ù">ÔoTÉá®ã%t÷‡êàá›v·8ôÕFzöærT&E ƒşÎÌ•|÷Wìº{—3ù‰¢ı}IÎ^{p(L¦#8´|‹œ?«ˆƒĞj…w‹9ÌOÈ·/á°®}…şçR»?i‰,çp4ÌëØ¬J7Ÿ›Ü«âğ\5ê³}5q¾G!ésq^”¹.ª8Ÿjò}ÖâÜıÉ•{Äù5/G‡Fâ|lX¨ïq¾>êVÔâüŒ‚—ê+â¼;Sò~qnhRèĞLœG?ÙÕ÷†8é¥ı8ŸGğâ|_s¿…8/UX°±•8—ÉzÑ×Fœ{›DDwç7ŸèÏî$Îÿz}¼ßEœÛ|=¶±‡8?µòK/qŞ§ĞİGœ¯ÈJšİOœ6Yÿ`€8óäûÆ!â\Ã;ıË0qÎ~uŒ!Î«¢şQ%Î§ÏÈ}ğ8ß–ååø“8¿c"Õ?Fœ7ÆŒç½w«ı!ÎS¿*=üKœEU;Näq3Ø~!oã²æñçƒÉK5jºEyX„x/Ş$ÆcGİ×ıâ<b•£ãJğÈŞ9Ãt$†ûY}¥xO^yn“4y—†õ2<¯zÿ8(ÇÃmôkúœé<BVGo*Pàq1a†°“"²ö¬Ü%‹WzÇÎä19¼Ajî,ZŞEª<lfìvRã­<8‡GBÑŒšØy<ò§^cç.àÑì¾R½PÇøµ†—N<TyGjò0·Y|H›Ç¶³Ñ­suyÄtÏ8^¨Ç#Ëğš©³>úè•_ó|ÙpîĞR²ó},ç-ãa ùQhÈÃ¥,úª³ E§!c)Ş×„›ğ(¹¹òö<Sí¼‹ÌxˆØúLsYÅC#e¤hÈœ‡Õ—hÿÃ<LgÎ_Ã#şğµš¢µ<òŞ¬ä\ÖóhÒxª>lÉcŒõyuØŠ‡Êã‘Èù6< @Š-ŸíŠm.ö<¢î\;>ìÀ#CØÔìˆ#ÚO¿ÌwâÑŸê“\ìÌCzxÄÒÕ•Ç’U1?‡İx8WÌ8âÎƒk¹æ´ÀƒG²®é¤G<ŠCŞvõæÑZçãóÕ‡‡ğÌoÓúòPßS¼`;ËŠ{íàá/–=ÓÍÇqÓÚ¯;yä^}ÊİÍãå¨ÏBõ=<~¬şöêQ åS1Qn<L;—ìåáµ$»í¨€GD¸é	ušGzãS³†Gõl°8}ß’Gx’Å1óĞ—TSßÏÃqKvFI(&ÛÔys¤_O'}çQh¹5ïX$–³ß|Fóê‰‘.á1¹Ò£Í±<ÖÅdïùvˆÇ®W¦*qGxßX»ğ›‚­|içeßºŸà1*s°é[<E¥è¸&·²—j$òğ˜`Ö^zšG˜mã	÷³<ÒR¶b4‰GÕ—oıqÉ<zM×Há!qDÉªì½·Ùcî—x8hše¦ò ¸Fçãi<Î<Ş*¢™Îã¡Âh^ÙUï·Üº%“Ç„|%™ïY<æNºşèx65fš9<ü.7ª”ßàqxxkİ–[<rVòßsy4?¨q"ÇH‹ÒkÍ|
+z×£Ëïò0ŞofàqŸ‡{}cû÷<BgúÆŸ(à‘ºkZE<*(/æÑ-¦œâQÂCÜõºÕR:f¿N”ó°ûŞ˜©UÉcß_—Š*‰§FE<«‰óƒw~ÔçK”}ãëˆóğë2ÚOˆógf%Ä¹Ú³ ÏFâü?ßY?ŸçÅ£uñ/ˆsÉØ íWÄùeÍÊ&â<ûúkÏfâ|Ü,æçâ|Ã3ƒ“ïˆó$ßíÄyÏh|eq¾<v•W+q£<ø³8u=ådq¾ Ö:Ä9õìWeq^î›åÕCœË’"ßKœûÄŠ&ôç·”óuú‰ó	9¾UÄ¹-d½‡ˆóÏJÆ†‰ó~ßÿFˆó•ßgéçGbë«¾ço•ƒ½çš9š¿Æˆs	Æ‰óêg1ºˆóÛ–=şKœïøŞá=1Aù±'	!eÒLóSÂA(qÌÔ	Bûe\x,‘¯Ï¬}Ä‚ a¾mü—x¬N|Ï:%„€±®z’Aø?   ÿÿÓ÷;}†q$»=PI(*©dvYI¨´¼BYÙÕ=KH2’ì„¤B²2BêÑÒ0²B’†–&%ŞïOçpŸ¸eóÄê§P(eÊœ§Qèx—ÑéşÌk™‘0“‚œ—ËËfS@Õo¿zi
+Î'å÷ÊRİ9¯at…Ë—è„yı†Úòù¾˜´tÖËS˜–àrb¯­·¿WÿS¤`·òäÛ„…‡Ì‹_®L!íiÁú‡*jÖ}ß«J¡Ï¯åü¿%„o¹X%ªSP™2<º|)‡“y—Qğ¾:o×>M
+±£bc+(o\W¸’B[J‹‹æj
+Ã\f>Ò¦0Wgø¿}:OœôÓ¥àØ1oA’>…åkš†r®c­¥P§EÍe…®]cë)LŞ;|"É˜‚fñIí&¶
+Êõ?2¥l}-ŞÅœBÊùuFãj¾´|O²¤Ğkàš±ÂŠ‚PÔ°ÕãÍ=?ùÏÅ†‚™š\ş¸-Ï#×v%o¥U¿N\ËB¡LkùãíZÜ\]]wRøU6<S`7Y‘Èºd{
+úÛäh9PpÈ¾¶àÉ
+G×5º:QÈ^ßÊì¥pÿ´«zÊ>
+_wi¹RZñÄÂ2Nn›Û†kıÊ­?›âE!É«Õh¥…ª*×O|)ôHŒd¸ùSØ¹Y0€‚Ò¹±”@
+&Ã×òWQğ0]¿»!˜BdB«¸ûa
+o]+)
+Í+G\Si
+C!‘³V±¤[äî4pt¸¥`ï¿^A(„w«µ1õ8…¬)nìª0
+wFÔÃ)¼¿ÙíAAâŸÜI¡H
+–…kÒNQ°N]ÿnU4…€­gc($è¸{œ¦Pqbä‡Ğ
+İ‘™iñÆ”ç[¯N  T8Ö˜HÁøîú«ÉÜf¶íJ!b¯›Ä¹4
+ùÅ#«Ó)4
+rk:Oá‡õüÙû3)ÌÊ(¼3áí¯ëÎeSØeØ¦ C‰rkjºD!ãù»ÿ
+…:µSÂyúÌ~.Ÿ‚ØÃÂ“ÚÔdtš¯Q°ro{·¿ˆ‚¹[‚p	…x‘?Æé¥Ê¶Ô.£Ğ™=?«¹œÂè`¡µg%y#£qá*
+ëãÚ®¦WSpés³_s“Bøò?Ok)är§*=oSxÒ0ß}b…orE³Ïß¡0ÃÛèîš{VU·<½Oa‡¤»¢W=j×Ÿ¦‰(¤_9ÅLáöğü¥:^›=ÚHA$Ñ(Ò«™‚j›HËUîïÏ·Rğ=ş'A§B\Ë©-Ä¹¢üW'qî_”%ÒMœß2²ÉxNœOm×yAœïq/hé%ÎşØ{÷çÿNIŠ¾&Î-åod¼!ÎS‹Üuû‰óFÒ­ïˆsİö»Şˆó÷@ÑOÄù³?Š™Ä¹JT³îâ<HoıJœß-Zêó8ŸiÜ#:HœïkÌ"ÎKÜuõ~çBß·ş&Îm¢}Fˆóy±¿Äù×¢¡ÌQâÜĞø‚ŞqÕnÓ6Nœ÷¸ø
+Ò0Tÿ[ 6†#õ¿,a!å¥ôEhäÈßh¥Qïnìá+Nc ¼]Z\’ÆQ{YR44íşêO¦±õb”RûÁCòO}§ÑH1*æÅgĞ¨‰3^va&Ş¾öıÙ4„4=NµKÓXÄÿÕõ“¥aÖõA|.Ïù’.Ì£å]lb0ŸFaµñÏvy-’ühüÚåa+¡DC6÷¯@öBú#Q×”i8˜-pèP¡q4±XÊ_•Fv¿q•„û«:<²Õi|<î!c¸”†Tëß{Ëh,SŠ>è¯IÃöÀ‚…’Z4Ş.~š½’FÒÔGWÓ¨ÚÓ±ì™6ş:4Æş’Ô£¡´)Zï¢>“´ix|*Nz¶–F¤îÓëhDtü”4¢ÑüÌ#û¢1!•QÛµ&4¤ƒ£;MièŞ[PxÀœ†ı¬©4¸}&åXÒÈ*é¨ZkEã®Ğşı›i¼·•	°¡!‘}_jo‚r¶Ò°^[²v4¢7´tn§‘ĞÓq4`'
+õıË'í¦ÑM¾È±§1ö0:
+4æ(èwí¡aìQò1À‰†[Å†äI{iDˆ>3½´F¾İş_p¥Ñxq4»ËÆ¡è-4f+Mö¤¡}¦¤ğ’]¯6ìYçCƒÑ|6©Û—F¿¿:ĞŸF]ãèşÉ4úçÇÈ^¤!æ£ğ`]µš’ î`VR&‹¦á¿ûYËdŠF|îşc—ie#£Ë×³4:Íbz»9£‰
+ÑÒW¢?%„ÆúÕ&Ÿ.§áú,y}ğÖıfÏÃiä*ıûu0‚Æ“1§DÒøv[aë•S4fL+2Š¦±ÊÑ¤èy×í	:MƒÛ?yêé›şU_‰§q;-ÆÓ(ÆëO
+sziˆè•>J¦¡zÒ$xj*ËÎg‹rÓhø.öl5J§üïXÏy¥÷b4ƒ3itÌR|9õ?ûJ£s³iÈ•šçĞÀ„ÎO=—h8Ûz¦_¡šùÏlZËßb~çæÓx´V1Ç¸€Æ—èÒ­/®Ñ˜öÂdÂ¡"ZEÓJh²ÔÓ1¯”ÆáGÿ&o(£‘6'¶æE9ZE¯C•4ú*JçL¯¢!,fZŸWMCe{gğ†›4,r<•{kixÿü×zè6XãØéu4ŠÏ(®È¿C£íUéË÷hkšÆôŞ§1÷h§Áázâ¼És`ú#â\~,%ÿ1qîknÒ@œ×(÷6çR×s7ç»M·Íh!Îó:'\m%Îÿx›´çæc/;ˆó¤Ø)G:‰ówŠ7gtç«¯{]}Nœ‡šÎ5}Aœ·uÖ¿ì%Îz:ÒGœŒ)Ï|MœÿÛvõq>Mé¸i?qîx}Eß;âüšiß‘ÄùXgÌÌOÄ¹•—aÁ q~nlÀôq>›Ú÷•8×S² ¾ç'¯Ï$Î;M/ç‹»¶™ı"Îy	¿úMœß+¦FˆóÙ§fı%Î]”¦^%ÎK¯ß4#Î'˜y¿'Îm»æÒ‚²¼ÎšÀ@éûØ¡kÂLpZÅ\„GŒRû+Q‘/®§Åh˜iÍ–dĞLwõ]“b0ôÈ+Ö|2é¹ã†¯§0Ğİú3=}¥RÚì8±2‹Â™²¶›˜Ïfp7§ëÒkiïzÙ1²$6ŒKÏe º¤pë×JÎó¬(›úFAÂQ³ZFAES—·´ƒnyïyEŒùŒ?´Pf póôá7*Œ'-\Ìª2p³/k—Vc‘gZ¤Î ÿO—ÖÆ¥Í½_½YÆàGÒx,«É`ÖûÓke´hk/üR´’Á®°²´«0mfßj3ÈXØ=Âê0¨ğ¾,£Ç ÿ¿q»b}bÓã&Z2PsZXúv-«Â2gnÿq³i²Fâ­ºk‹”óö±4aĞ90>¯ß”Á¨^Ü#Îœ|äÂ#²¬ï*[\bÉÀEÕ¼ÃÒŠAø¡îĞşÍrï{¯äm<™-ğZvƒo.q§K¶2˜q}!6Ù1X%\ş¥;ƒ[ÌÏñ;PYİçìfşİûO‰=ƒÛ¸²ÉÁ›˜¸íïö0é](rÔ‰êÒòÒ9{X2æ{K÷1ğ}Ü=ÍÊ•AÜ\Ÿ[ïÜ”îğ=êÁ £2Nn®'ƒ?b‹—z1ÛQ~ÄÊ‡.™«¾÷eàü«»ã¨?ƒĞ>as\Xu=Á£×q¯­‚|Y±(î}0ƒiÇÊqì0­fó¯s)vŸ»N38ìëc¹™evSàï{Aí¤3WeĞg¿hÇ¼Âùå"eÇ¨ü5¿¾9Œ…Åó½Âx'ûL‰`û^àö¼HÅÚg|ËN1h[4ß:šÁp[ùã1æ.² BN30|®*w†cÏ³²x!ÓÃ­ä8Yõ1‘A}á¢7!ÉÆËãäRLÙl±®<fúó¯Öé¶~öIÿxA°¾à¦ã™R"Ïü•»À ¦kQny6ƒ^ÕŠ69„[ˆ~ºÄ`Ñƒç×_a`&í»o~OWÁù¢®Ÿ¹mSÀ PXÙïÓ5-[*æ‡1ø•eñd~	ÙÏ©ŠRúë|—Ø–1pˆìüTÎàhï™ğĞJÙK•WËW1¸ÏT¼©¨fğñ±ÅÛ›¤æõ¬¨e°ÌÓ÷[èm¶7ÏË×18(¿©òƒ¤Ê£¶÷T]ªÈ¸Ï ç—ÅÎ°zâÜ¤GtÁ#âü¬oYåcâü Ë–â\+~ÆçFâü˜òaÍÄys…ß‚â|ÁFù­Ä¹oÏ“-íÄy­/ı¹ƒ8Ÿ,¤ŞIœÿ/¾sA7q¯|âÆsâüoÅê­/ˆs‹o?÷çÉ=gÂûˆó¾ë^çk„¾ßxCœ‡ÇŸßÚOœ·+[}yGœ/ªÿ@œnÌSøDœ×õì¬ Î§û‰mûBœ;•ùJœÅ»œøNœ¨ÌT$Î7WşW5Dœ§oôßö‹8ÿÜ#ÿõ7q®ï×pb„8?%Ä(ş%Î»ãÕªG‰ó%*]ÛÆˆóÃ•'¾ç6jG²¨“~ñVq‹~W¿øjabeBFv",Ô&ışU”…ÕV•Œqş*­”$YÄÿØø¯ZŠEÙºyv“YtÆúíú6…Åh¯øÉi,ä—-WšÁb=«âZ3“…Ë“Ê™Ûg³ŸgY÷MšE®çÿ“²,Üğ[°p.‹oâkæ±˜±ó,³}>‹U—UÔ¿Ë³Øñ»²ë¤ÊÄ2b¡‹ô³/´o.dqû_ÿveo´&œı®ÂB$ä¬Q¤*Õ§*?ª±°T¸‘qS…¯ŸåæKYÄÕ¾ø÷}‹ÒÉşù‘š,:ş7a÷"-òÏŠ×®d!7ªR±c5l¼áúC›…sŠå¬S:,B?¼¨[¤Çâòÿµú,…OPØiÈâKûÙÆkYLS^ÌZÇBëàue#vw,»kYÑ±Ó„Eš³ÿšASµEŞ2gÑ'pVy#aëÅÆ·,Y¨œ¿ñc§‹/–™ƒ›Yxôn²a{ÊLy‹âî	WomeÑ¶$a÷.;Ã‡Kmg1·şFEÔN†2›ÜTv³ptëuÛEH™ÿ],r&
+íaQ¿5A!Ú‰ÅÀ…ÅM*{YL¼ÁŞŞÇBsı&İ®,¶îírcüÒÿd´‹”eÂ:‹=YÔ°	ïn{±è}²8a·!¹*ãŸ¾,ymŒögaVÕ›¹8€…§ÄëÿYDíßÄ¢ğrÂÕŸÁ,Z~/¶9Ìâ—I•„*ÅB6aSå4ı·½nö,‡•fÿâX¾s”EöÓ„ Õ÷Të³øèWÕdÆBêÖ&îW8‹eS^jÄF°°u8ğ\5’ÅÁ«Â‘u§X$&èü/šEÕFÕ÷¿bXô¤T%Äf!ğqÓ†%gX(é¼¬‹garâ@ÖÿXxtÛüNd©œ8›Ì¢à jÁ’TÍwªìï¤±ša%éÎBzïËÊßçYèp?ÉÂ^p¢´Úœuâİ;Ù,²Î«:ä°¸û¥Jqø‹÷VÍ§¯°ˆzÉ©å±Ğx~`éİ|Öj{
+XIŒ¾Æ"¡^U7®ˆE…Lõ{µİnV‰wKYŒ•½Ü°§Œ…‚HÀĞp9ãm/ÄU²pËN´Q¯b1¨*p¯šEşúê‚=7Y4¶úßH-‹/_J¹ÍbÖò€êu,´¹‰÷î°ØÕ(íx#·äŞÈ}^Õgê‰ó*+%GÄ¹D_ó½ÇÄù® Ş±8¿2qÙŸFâ|8±çL3qnºä”FqP­{¿•8kõÁ±8_Ù—ø§ƒ8	0‰ï$Î[&şÔè&Î“.ÜNœû/±uzAœßªøÛKœOÙ|-¾8wèûßÒ×ÄùÕ ©oˆó«œú‰sË$¿ïˆóÔ%2g?ç«ï-ıDœël>ø`€8?Ñ§äü…8ïxú÷+q®"rôìwâ<(iÙ²Aâüî’†ˆó™5§œç{7ëş&Î‹û>œ!Î“–ı%Î­ELëG‰óŒ¤ŸÎcÄù×%Ù£ãÄ¹am‚ ‡Ğ¨Í‚Ë'p¸ü¼ïZ½0‡Gj{E8|9"2éŸ(‡i“ªÄ9hÉªí_.ÉÁÎ½Fæ¡‡Ãå›ïïÌ!MäÕÁS8Ôn\˜8C_¶HËò„‡’>œÉAÅHmù¾Ù,âj^ü“æàİ·9*Q–CìòWzšs9sÎãĞÖ ’¼o>‡a¹dÓ1ys½Õ~%*p0¬®ÉÖTâà(i½åÑB!»^	º(sÈ¹X8¦Â¡~XdO’*‡ÓäI+Ô8LIT«~¤ÎA³¿f¿ËR[WYË/ã|üÕı$M)-A+´8Ô(Š.z¼’C¯r‹ËjB·ÕksX4õæòdf{¬{Wèqğ,xõXŸCÔ¿@}WC…–¢ŸÆ×rhIMNN^Çá×G53-#²º7=6æ a}ÑÕ„ƒÃ³W[Ì8U9(”bÎ!;H´Hk#‡ûw“÷<±äğq¦úd7+RûnVXsXVbí™bÃÁVèµìÊ-Ú|ğd+‡¤Ñ`7;U_“	îàĞc¨Şš²“ƒ@ôÍc+wsPê±Öl°ç`¢şº×Íƒu0ZĞ‘CäCQƒT'²)ŸVîåĞì®Ò°ÃPùM3wWÒ¢6¿İ9èÚ½¾˜êÁÁşâÁ­«<9pC¢½8d¥¹ûp¸§î(äÇá}ßÍÉiş$4mjVpĞà_{6r°n<8Ç#ˆCÀ|±z¡C¼S‚Ós¨¬VW^Mqè–¬mm¤9Œí²	ñ`9(ä¾ÖœÀs09ø2í(73±˜Õ!"SšsÈïWğãĞ¸ª6eÂ	?Û˜Ÿ‹à0«õõïÕ‘´•‚ršNqØu@lÛşhÌí”	Â±2¦jŸ;Í¡nO­£öı6Sšã9ˆ½®ÙŸÀAmS—p«4±¹éÉü?¥Ôk§rˆ×Õ8ÔœÆ¡,¢VÙ3Cç3›6á£*oBÒ39È­XsÃú{b}ÍÙ\f¥Æxæpß§a8ñ2‡Ü’Úô+Ù¦®ÉãğÍæùÓ|32ƒ†=8¬ú&vib!‡kS·/â@Ekë”pHï©-~ZÊá¶º­“W‡7Ô›)"Dİ<_ÉAu¸·NKÔ¹-Õ|+4zİä'zëÈ-¥v¶*·9t\|Ó¦SÇáÏPĞñ–;äŒÅµ¼ïqÀ™Ô>‘œ_iÄfÔçš·uç¼íç–ÇÄyã›Tïâ|~°…hqî#>’ÑLœ×¤^Òm!Î¥–Úµ¶ç»o	û´ç¹¶%¢Ïˆó‘7N™Ä¹YğT½nâ<I¼¶õ9qş.ÕÛçq¾zé<±—Äyè­‡™}Äy«ía½×Ä¹Ò[•¶7ÄùàvŸ~âü¶x¨Ø{â|ZšVÖâÜqé+½OÄùµ[±mÄù˜íZß/Äù¦·ŸÅ¾çiÁiYß‰óOâõ‰s½´‘¶!âüäÒË¾¿ˆóÎ[vâÃÄùâ-/ŒçÁoKôÿç÷‚ÛG‰óYÓüÆˆÇ½Â<fì’.o&Í>ê.ÈcÕ•+.B<î7ıĞ_3Ça½™…y|”ıÔLJ™6ü—>‘‡”¯tŠ§ôGÿ5¢<–İ¼b6QŒÇí·?äŸ’ÚNÒÿ.ÎãõÊĞO	í.®‘ä!r\š™(Å#)ÏqëSRÕ–+jç'ñ¸ñç‡×d–Šú]k¦ğè1-š8•‡¯Ã‰§¤ÉÒç§ñˆ»å¨í5‡Òû+“ufğ(2øvâL&Úú5OI;BãÏÏâáÖàé5›ÇŸ«ÒF:Ò<"ÛçˆÈğûwåûSÒ‚…ƒÎËò€¥~†×Í¡Á:sy8§6X‰Ìã1ôŸ´rièGÇçåxHOÏmõšÏã²Î`<'ı‘<İÕBj_Ø ™¡ÀãK‡´¸·"nÜñ¥©*¹å"ydYF·jé»f,âq÷\¨·2»»3uUx¼YÌãğL§ºR	ıÜ”Ui{ı½—ğĞˆÔ7×UãQ[º@T‡uWÃïÒ>A™ÆªN9ŞKyÛä2ºËx$Ü*ºœ‡J†¾z+iÅıĞ	™š<,¾6ty¯àÑ=[¦XW‹‡·¡S„èJc.¹­¤1QƒÚ™«x(\×Ÿâ³šGñóĞ~]mÆÂ5¢kx´©Éœm%uİâä•©ÃcøH®‘.ˆ¬Á9zz<æ>Ôÿ!ªÏ#ÿ{h}+©¡lcF¦FÈò1äáèî´Yo-1¹ÊbàR>ø¯•tV¯~[æ:9"aù>ëyh/mÑ3âQ¿Mf·˜1]ŒÓŠ6Òì\ñ¬<˜Çƒ/}LxLÒ¯Ğ3å‘17,FÌŒ‡¦Q£kiİ~Ã,s[ãœfùZğx[™; ·‘Gpß`˜%1qƒÔ6Ò”åa²6ñPÛÑhîkÅ£†“QĞßÌÃê’Ó°˜5Ş†ÜÆ6Rÿ_ƒ9Y6<„æ°¾¶<â7„mÓßÂc‘w£ºøVeñ2Âí¤fÕNİYÛxt¾Î-öµãá)9¡¿Çè
+'ñ<¢v…­i'•?Ö8åÂN…WdŞùîâ±¾Ùé¦şn-Ã¹gÅíyì[0äÕNúËÔÀøÂÿx„û†Íõsà!›ØøCÜ›2Åyèõ;e¶“>™”wè‚‡UC›ıœy|³7P1ØËãèñ°1ñ}Äy~c[;iv‹ÌÕ.Äù_§ã~®Ä¹bŞn7âÜbh…„;qîo ÑAJ%‡õ]ğ Îo7Vøí'ÎßËÄxçSİ$¼ˆsí<ÃRÛ=C³²½‰ó0ƒÏ~>ÄyAØ_â¼½1UÂ8ÿ'ĞAªºÈÙ"ÛŸ8·ÌSğ?@œç©MÄy]Ø¥ROlöAâ|º¬q®ë¬aLœ;å	K"Î#†º;H;
+J²çÏÂNú!ÎÇ)â\EVG’&Î7;O}FZ”÷.›!ÎÓ‡nú³Äù]ƒC8ÿæ-Éç3›ŒŸ‘†êËÎ»x”8ßç<èŒ8Ì{hBœ—eJ'Î»?#µ
+·¾Jœ«6©#ÎmdÇÃ‰óÃÎí’'ˆóŒ¼«ÏHµ¿Aœ5°?p’8—×ZIœ6IH"Î]e_=#•ˆv®¼Eœ_Ï‹=Mœ÷¹­!Î…×JÅçêá³;Iû¶4}¾xš8§dïˆ#Î/8§­=Cœ?ÌŠ'ÎYt’VÈ*æœ%Î×…H Îİ›šÖ&ç±²—¥’ˆórg®“4¦7Ï.'™8ı©Bœ/5œˆTâÜ.ü¹TqÎ4•t’º^”Ì9Gœ?vvH'Î‡òtp8Ÿ÷sê¤âÜÈğ}'©¡gxmN&q×”EœßõÁâ¼ÏyÃ¤lâ\<^é,ÍŸƒ9‰ó†rˆs><—ˆóKM‡']&ÎemºH~9/¾t…8ŸŸ?Kœ›ülGqîmX0)Ÿ8?ÚEZWİdé*qşFve`q.¹Wrİ5â\+ÿÕ¤Bâ|÷ÏÊ.Ò”c†§/ç¹áîÅÄysÓÚu%Äùˆ¬ôäRâ|ÁŞ/]¤şfùw/]'Îı~¦–ç‰†ëÊ‰óÚğ“+ˆóş&ÅnR³Ésş\ª$ÎWím¼Áãÿ   ÿÿ×÷[ÏÅñodoI´'B²ÕİB²Ihï¬¬ĞgH{I²zÌö–‘$I’öF2’$´çs~zÿ¯s]Çioì=­Çœëôœü„¡ÀXu¨L¹÷¢{OJì?ÊıCÚ
+âZÙ•[¥N~ÎõáXÿ:´ëJ§å½†¼s4V»¿`höïiÚ¹=˜ZÒ<ù%CkVŠ?¯C‹öY]¾—Ç…w¬«û+†Úã;õ´ób+5¤¦¼fHdÈ»£Q*)¼WÀúñÛîoÊ?juJ»¡Q±›§¼e¨%·s^=êñSCp¿ˆ¡‰">UîïŠ^]¯]Ìª¥øù)ïÊñµÚ[š%Å.»_ÂPSuç„c¥¹4›´Ë=Ï'kJ9C›JBëQåãâ÷+ÊŠ¶¢c•™¼ŠÓ©b¨áWgÛ”j†ÜD5_Õ£‚u>×î×0f]rôX-C
+â&:u¥¦X)L­gH¿.¶¯­ÑUr¿!‡ùš÷}`¨o³£ó‘!ÿ“%;¦~bHê¦¸jÿÚjôƒF†¨=¶áØg†JÄºRuš²ÔÔ˜ú…¡[«Ô+¨dõƒ¯‰¥‹O?ş¡{V?t¾3´jTÜó©Í.èºÜ€šoÕt{ğƒ¡6ıã-yŞ.‘ÒıÉĞÔBñÎ©­İúkõ¶U»ıàCyZ]§·1´İAÓL÷7CÍ!>ÊÓÚ:™Y"ø€ÿ$^ıàCQc¬ÿeh¡jÜyİeoïÚ;­ƒ!Ó³šêĞÆÿ|&>ìdèHQIÓñ.†„;Åëv3tIÒ:lZCsuã> ™N]ô°—!ãpÍY'úªËòù­ÛÏËç’WÓ'ı^bíşp!¹]q&'†Jfºô†Ò½§Ù?MÀRE±OéÔ¶»äşC!–z¤%Ø#XòÕ·Ş©7’%	×8ÕéÂ,Å^ìıÕxªùáá(–Š¿ø¤ÍÒş‰¥zcXú«&a=},Küë5QQ>nzì8–î<èúqb<K+J5sô&°TĞë1}"K»åJİ>¢­†±“X:sĞZúäd–&GÄuêMaéFv×ÛéSYZò]3æ#š;Ù×#vK[——šœÎÒ×½óõEX:îe-$2ƒ¥±qqÕÑÈò®„XQ–T4½OÎdé©‚¯…¾K×—ª‹Ìbéãa‰IŸĞC‘Ö_bg³4âEÜã“â,]øÑ¦/Á’Ò4r‘d)}¥¯Ö'Ôpé¬8)–j¼%ÚOJ³ä”`¯/ÃÒ@e\´ˆ,KC]îŸP™9´!N¥Ä¾Š§äYÒv/í×W`©,J¢LD‘%ë—Ö>¡]?ãØ8%–¼EºwšÃÒì5´Ø`.K,}ÇÌ˜ÇÒ¿ÒŸĞ¢$‰ô8e–,j¬OÍg©]om Â;¯{ÍŒ,‰˜’H#sÜ·%n!Kê×KsN-b)ÿ•ÄU–v¶Yœ±˜¥ÑxƒFÔc]·tü–&ÚP×©¥,Eø¨±¤šZ3cK9u§Q³‘6[âÕYjš?ßc9KîfİB†+X}Šjf¬d)â¦ob#ª\Pê¿Š¥¬v‰}«Y2™e³ÜpKšñ“D×²äf×ı¥Ó“øu,…¥û†{h°¤ğ¡ÔÑP“¥ÔQ’Ú¢Ä’şB›ÙŸÑª­ñíñZ,9œîÎ÷Ğf©ï6]7ÔaÉ¿Ğ÷˜¨.KRÿJ7|FãÅ%•ôX"m›}–JâËX²í~ jÈRG&qŸQ¯O¾»ŒX[¶ø´1K÷T%Ç­giÕ›¢&,OÿŒšßéLØÀR[ÙœŞÈ’g§ïZ£M,M•*™iÊÒ-]ÉŸŸQ5g›	›YÊ¿rÚŒ¥í»ma©ù3ÎÜÊÒÉñ~2Mèø¥e]	ÛXŠÚ%ùîôv–²6ÿí`)û^üé™;Y2}ß½¥	mì&•Ä],‘ñqf7KÂe5F{Xºä*™4Óœ¥¹—l|šĞÌ§ñû÷²düµ{ù–ê&jM6ŞÇ’Ë2¿¯3÷³4´§ìIÌK^H<À’ÜC§3–,%—Æk[±¤Û×=[ÌÎå´ş4¡vF~¯màü`Ùõ3¶p!yÜØÎŸÛl³‡óïñJ_P)=‰p¾\«üŒ#œ[ø=4v‚s¯2NÌÎã$wAE+l–$¹Àù@üØ³®p®ØóÑØÎ×keˆ„ó#~A_ĞÖÈ2›¤CpşBrİÙÃpŞb3cı8Ÿ–ğSì(œ¯êyñÍİ¯™äç>~‡Îƒó„2ÃõÇá¼JRvÖ	8¶éş‚FÎIx—tÎ7öüwöœ»kYïç×ü¶Î:ç/ËT¾¢‡Z%G&Ÿó¶µgÏÂùš„¤õpnÕã3‹s?­ı_QÃd¿É,œ×”Möäà\HêÛzÎçÙ>uÎM.|EeNô8%{Áùu-Ïópï'nâçmefùÀùL©‚¯h×:ÛÉ¾pn“pÜÓÎ{6šøÃyªÖœÙp^ï7ø-Y^ç*R±ApnfË›Ãù©„İ³CàüVÏ’ohLÖ¸”P8ÿã÷É3Îg•g˜„Ã9IÏ¾ çv¶¶ßPà„u)á<£gs	Î?hµš\†óÑş¹³#à|ayä7Ôl›Ôá”+p~ÚÖˆ‰„ó˜ÙWáümO÷ì(8ÿ§UüU–ğ¿“rÎµËÏ0Ñpî(µmÃu8µ] ~Î%Œü
+{jSnÂùXídæœ/ö÷İpÎw”ïsO©•ßÑª;¶SRÿƒów	ß˜;pŞÙótÃ]8—Ò¾(~Îõü¿£ñÎå:©÷áü‚”û ÎÛşİğÎ›
+Äcá||ïï¨×Rí©qp¾Ûçlùœ	p~_jH<ÎßÛV|GÍ{bS“à\¦—g“áÜ@{ÏÆ8wó_*‘
+ç—ÊÇ5£jÏ¤SÓàü«m&›ç“ƒ7fÀù²^[‰L87×ÖhFÇŸóM{çË[Ù,8/“z¹ñ1œ÷Ù^•xçò‰‡›ÑF£^£´§p~H[{çWü{6fÃùóòb‰çpŞ,u·Íœbw6-ÎW$nã^À¹Eï‚M¹p~^[Xò%œÇù×5£ÁåÉiyp>(åÇ½‚sE»›òáÜ$q¥äk8?Ò;åjwUû{Zœ¿ğÆ½ó–ò‹›
+á|º´‹ä[8_e§ûÕ8(‘^ç>½¹wp¨ıfS1œWùß”|çÃå'~ ¢s¥MÓKà|£İ\¾Î%m*ƒók½’åp§÷mmõ?—^ç3*öğ•p¾VZÍ´
+Î­ìÆKUÃ¹bã47¹73½ÎkµCøZ8
+°3­ƒså
+©z8ß,=³<a÷+½Îo$¾ä?Ày~ïUÓpş[ûˆÔ'8Ÿ`Ü‚Ò¨Ëh„s[é^ş3œÚ½7m‚ó´Ä»R_à¼¾÷lj(¬³=ã+œ«,<÷Î·Toşç§¤ë¥šáü–]J*ó&Ñ/ãœÿé=p®Îgë¬ÚüÎ)`ªt+œÛW|oA»‚¥³3~Áy†İ¥smpş1Ñeóo8İ§+İç‹t$¢EÛşeüó3oÎı…óé[›ÿÁù[»“ÒpŞ‘hú‘è››Ù	ç::ÃçºàÜ1 rs7œ‡UÄI÷Àù#i¯Ÿ¨G£yf/œKRóêƒóÅ}ãÍúá|§Îgé8÷xô5»[’9çï¤í½†à¼ËNÓlÎ¥“fÊ8ŠĞëûõUvÑÉËâ(ëB@”×LT1ÉQC“ôzaÜ&ØË·¢µ¤ŞÌQ…íî{ï5š#NçÙRïxÊŒåH¿¤b{+ZÕ#½èÑ8díGÏQŸAR½ÙüİúRd&r$uYÇ¿`ùhGô­bÕùÉ•L’™¶e
+G–êöÍ2S9ê0OÊnE½Îõ]z4#±X×óÓ9ºW ·E„£Uı’²38*”—éhEÍí‰rÔv(éÖù™y^é;¹EŒ£©9:›egqt«9`Ş/Tmjåğ£Ùå­©:/ÎÑö}öñ[$8j>Ÿä%+ÉÑÉø>ó_èøJeYRELğ–æh¡Råç-2e›ÈdÉÊrdzÔ>ôÚx5É>K£#¹}šŞò	ÿÔÛªÀÑ¥ém²ŠÍ]]™÷Í< s-K‰#c_û£Şs8ªKLZ¿u.G.Õ}òró8Öéû…Ï,ÉRæHnSå=ïù%“a¶ªp¤m¿CnGyI‹ÚP»_}£/ä¨g†nƒ÷"|×¦nUåHÂºÒ_n1G±ş2Vm¨FŠıêÇK8*®Mšæ³”£ı#ú›·ªqôWY÷¹Ü2øÍ—ÛPÑ“•®Õ9ºsCFßg9G+^ÛKm[ÁQÁï¤¹•íë/lC[5to?^ÅÑÛÀS>«9šT¹yÛn¤É(Ë¯åhIƒ½à7š+œ\õxG[ôÇûhpôu‹îùmš÷Ü+O½]¹ì7ùFfâ-TşÚ7ùhsôtvrÖ66jõ‡ÊërôÑ^×á7z($èq4"³RÌWŸ£e~o3àHiŒÃ+yCÒ%_ûnï?úÄˆ£š3º&¾Æ9ı¨°}=Go+ûäM8
+ì)ıÊH:Ü²£DdÆw#GÚNı;¶oâ¨,LWUÁ”#ë¬ÀÑíhWceÃ“Íy“Mó5ãhö‡€í[8z°3ÙJa+Gk˜şÕíhÑ]İéO·qdQøÃw;Gí]•Ï·ïàˆ•–PØÉ‘ˆ¾ƒ[;ã’¬ÿtGêû¥üvs”ÿD·sûv~	|«`ÎQË„ªÛí¨‡š¬ÇÓ½MÜã`ægÁQ4—¬¼cGªúŠû9Ê)Ñ­nGÍzà¨I¶ê¼Ÿ%Gî†²;¬8}ĞA]ÑÎ/'Oüƒ*g÷7=µóoºılá|rPØ;8W¯rP´‡ó½²ZP—Ã¬gp›üÛÏÎËû_íp‚ó~İhEg8WrÿƒVW™<sóÃ²Šş®p~Å¡‡œç$—*„óı÷ÿ ñSõØg‡à|eĞNÿÃp¾¯Juç8÷–£tÎã>üA½*“Ó¹ÃùP€ÿ18WÒ³ŞyÎ7­Q:çG«¦ÿEÍ£d[„ó\‡ÿSpş39b§œ‹¸)†óÕzQ5Ë éì3pî[ÕéÎ“d‹vzÂyµCŒç‚¿èøyfÙ,œoÒ›ÀÁùñ ¡]<œGWU+ƒóW²‰ÑÆ_ŞÙ^p.šbpÎ×¨ïò†sk½Is|à< èË_43¥êq¶/œ×É†øÁùGÇ]şp>?EkN œo˜õ>©×ç7ƒò‚àüuUô®`8o—=6'ÎÅ7üCí4SŸ‡Â¹í@@œé•í
+‡óô s.ÀyCûÕ%·ëùE8_à¸8ğœoM³û2œ{|˜ç·õÒÿ¡¢…AÏ¯Àùß*ëÀH8—[»û*œk9ŠÌ‚s‡”–hkÈ@Îókp©w%0Î?Ü}ÎÇTÌ½çªr2hîvÇ®ç7áülJQà-8ÿo f÷m8/Ò;=7Î;ƒ¶t ‘’Õósşƒs]¹AwàÜÉ±f÷]8OIœ{Î³¼;ĞCŸõöåÜ‡óñÁËƒÀù’êI{Âù.¹¯scáœq|ÒŞK	Ï‰ƒóâÇ x8ïÖÓŞ“ çÒÁ³ç%Â¹~u{*ã*÷:'	Î/:^J†ó§)Çö¤Àù—óRá|¢¾R'Ú¥<“ç{ªË‚Òáœ—{¸'Î8ró29Z[š²«-êXüâœËéÎ‚sÃà{ÃùÁêôyOà<B.¨Év´yñÎ¿§¬~ç“EÌ³á|¹şÏyÏá|oğ‹NÔÃ«úÊ‹8“;üÎËÍsá| EFù%œ+vu¢fëõß½ÈƒóÃÁÿ¿‚óÈêÓæùpşBn«òk8ÿá¨Ò…*OK‘[ ç+k‚ßÀù~ı$óB8÷öQ~ç	ÕûºPA•ÜŠÜ"8rœòÎç¤~5/†óƒO”ßÃ¹»ş….´**Ø)·Î_Vk‡”ÂùO9ñ½ep.âôG¹Î×¤¾îBã-¯çVÀ¹ŸşñJ8O
+Ş¸·
+Îkª•æWÃ¹@~°õšçT[ç¦©Cjáüø ··Î¯ëï_ç¯‚—t£æmÕc_6À¹¨ü§p¾Î)cïG8·Išÿ	ÎmºQµTıu/á¼.xFèg8YósoœÏ—ÏÿÎÍœ"»Ññ§R½ü
+ç7C¿Áy¾¬Åw8oîßç³jŞu£šòw^ş€s;§3¡-pœºÕâ'œ§ª¨´Âùı‘=hæ¨Ú—¿à|aMRhœo•÷µøç§ö«´ÃùíÔ=hpáàä¼?pşOÿ[è_8yjñÎµk.¨tÀ¹ƒ¼sjê¤“×	ç™©âa]pşiğE7œ5(PésÕ=¨Æšãy½p~V~SXœßqš³¯Î‹RUà¼s°¼•2ˆÍ„sİ>lÎkvï†ópù¥<í~ì4®mıœú)Oˆ§3ã‡2ÂFğ4y©Ağ¾‘<İØb»@˜§%lÍº^4÷¼è«Q<m}ïÔ6š§¯İ©¹ûÆğt\f(rÁXÆîE#]CŒ^ãIåRløx>•ïÙ7§_ŠLäéãÄ´;½è¡eCg^Mâi„¹Á¶ğÉ<]àCìŸÂ“ÒÃš‘§ò”^*_×‹ö9%¿šÆS\šoøtœŒ†öïáià ÁÊ…3x
+Œ™Ò‡Ê<¯ùöJ”§ÄïòÏÂgò¤=Åùâ~1Ê–§9/œÅ“µÅNÚåe ‘?›'ï¸¿áâ<Í®¨)Ø/ÁÓƒù›%yZ«è|¢-ZŸ¶)_Š'‹#Cs.HóÔi0´_†'öEHÅBYDZjbûĞ˜i
+çòåxR_å¼ç‚<OùûÓ–Pài§ÏĞ¸EŠ<µ$4ö¡U!™ùJ<M®	¾0‡§è9
+væò¤ºÑYcÑ<rÜÓDûQ³kC­ùÊ<5½4xya>Oî­!W¨ğ4zFíáExŠX£`Ü*[9Ë½^ÈS–_ZÏ…E<™$På©¡Æàî¢Å<¹	…íGÊµÛ^/á)ÌTaáÅ¥<)œp¶Tã)õzZİ¢e<éç%÷£Um~¯Õyr˜zàârúÖÕ®´\Á“¿ÂTÕ•<I:ïGãSÓ½^ÅÕ]¼¸š§’‘†.–kx²T	ÕU]ËS‡Y­Ä êuJáßëu<‰İr~sQƒ§{i7-5yZõgè„*ñT8ËĞt

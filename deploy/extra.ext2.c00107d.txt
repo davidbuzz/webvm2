@@ -1,0 +1,2979 @@
+ir_public_key [32])
+{
+    // restrict the possible scalar values
+    u8 e[32];
+    COPY(e, your_secret_key, 32);
+    trim_scalar(e);
+    scalarmult(raw_shared_secret, e, their_public_key, 255);
+    WIPE_BUFFER(e);
+}
+
+void crypto_x25519_public_key(u8       public_key[32],
+                              const u8 secret_key[32])
+{
+    static const u8 base_point[32] = {9};
+    crypto_x25519(public_key, secret_key, base_point);
+}
+
+///////////////////////////
+/// Arithmetic modulo L ///
+///////////////////////////
+static const u32 L[8] = {0x5cf5d3ed, 0x5812631a, 0xa2f79cd6, 0x14def9de,
+                         0x00000000, 0x00000000, 0x00000000, 0x10000000,};
+
+//  p = a*b + p
+static void multiply(u32 p[16], const u32 a[8], const u32 b[8])
+{
+    FOR (i, 0, 8) {
+        u64 carry = 0;
+        FOR (j, 0, 8) {
+            carry  += p[i+j] + (u64)a[i] * b[j];
+            p[i+j]  = (u32)carry;
+            carry >>= 32;
+        }
+        p[i+8] = (u32)carry;
+    }
+}
+
+static int is_above_l(const u32 x[8])
+{
+    // We work with L directly, in a 2's complement encoding
+    // (-L == ~L + 1)
+    u64 carry = 1;
+    FOR (i, 0, 8) {
+        carry += (u64)x[i] + ~L[i];
+        carry >>= 32;
+    }
+    return carry;
+}
+
+// Final reduction modulo L, by conditionally removing L.
+// if x < l     , then r = x
+// if l <= x 2*l, then r = x-l
+// otherwise the result will be wrong
+static void remove_l(u32 r[8], const u32 x[8])
+{
+    u64 carry = is_above_l(x);
+    u32 mask  = ~(u32)carry + 1; // carry == 0 or 1
+    FOR (i, 0, 8) {
+        carry += (u64)x[i] + (~L[i] & mask);
+        r[i]   = (u32)carry;
+        carry >>= 32;
+    }
+}
+
+// Full reduction modulo L (Barrett reduction)
+static void mod_l(u8 reduced[32], const u32 x[16])
+{
+    static const u32 r[9] = {0x0a2c131b,0xed9ce5a3,0x086329a7,0x2106215d,
+                             0xffffffeb,0xffffffff,0xffffffff,0xffffffff,0xf,};
+    // xr = x * r
+    u32 xr[25] = {0};
+    FOR (i, 0, 9) {
+        u64 carry = 0;
+        FOR (j, 0, 16) {
+            carry  += xr[i+j] + (u64)r[i] * x[j];
+            xr[i+j] = (u32)carry;
+            carry >>= 32;
+        }
+        xr[i+16] = (u32)carry;
+    }
+    // xr = floor(xr / 2^512) * L
+    // Since the result is guaranteed to be below 2*L,
+    // it is enough to only compute the first 256 bits.
+    // The division is performed by saying xr[i+16]. (16 * 32 = 512)
+    ZERO(xr, 8);
+    FOR (i, 0, 8) {
+        u64 carry = 0;
+        FOR (j, 0, 8-i) {
+            carry   += xr[i+j] + (u64)xr[i+16] * L[j];
+            xr[i+j] = (u32)carry;
+            carry >>= 32;
+        }
+    }
+    // xr = x - xr
+    u64 carry = 1;
+    FOR (i, 0, 8) {
+        carry  += (u64)x[i] + ~xr[i];
+        xr[i]   = (u32)carry;
+        carry >>= 32;
+    }
+    // Final reduction modulo L (conditional subtraction)
+    remove_l(xr, xr);
+    store32_le_buf(reduced, xr, 8);
+
+    WIPE_BUFFER(xr);
+}
+
+static void reduce(u8 r[64])
+{
+    u32 x[16];
+    load32_le_buf(x, r, 16);
+    mod_l(r, x);
+    WIPE_BUFFER(x);
+}
+
+// r = (a * b) + c
+static void mul_add(u8 r[32], const u8 a[32], const u8 b[32], const u8 c[32])
+{
+    u32 A[8];  load32_le_buf(A, a, 8);
+    u32 B[8];  load32_le_buf(B, b, 8);
+    u32 p[16];
+    load32_le_buf(p, c, 8);
+    ZERO(p + 8, 8);
+    multiply(p, A, B);
+    mod_l(r, p);
+    WIPE_BUFFER(p);
+    WIPE_BUFFER(A);
+    WIPE_BUFFER(B);
+}
+
+///////////////
+/// Ed25519 ///
+///////////////
+
+// Point (group element, ge) in a twisted Edwards curve,
+// in extended projective coordinates.
+// ge        : x  = X/Z, y  = Y/Z, T  = XY/Z
+// ge_cached : Yp = X+Y, Ym = X-Y, T2 = T*D2
+// ge_precomp: Z  = 1
+typedef struct { fe X;  fe Y;  fe Z; fe T;  } ge;
+typedef struct { fe Yp; fe Ym; fe Z; fe T2; } ge_cached;
+typedef struct { fe Yp; fe Ym;       fe T2; } ge_precomp;
+
+static void ge_zero(ge *p)
+{
+    fe_0(p->X);
+    fe_1(p->Y);
+    fe_1(p->Z);
+    fe_0(p->T);
+}
+
+static void ge_tobytes(u8 s[32], const ge *h)
+{
+    fe recip, x, y;
+    fe_invert(recip, h->Z);
+    fe_mul(x, h->X, recip);
+    fe_mul(y, h->Y, recip);
+    fe_tobytes(s, y);
+    s[31] ^= fe_isodd(x) << 7;
+
+    WIPE_BUFFER(recip);
+    WIPE_BUFFER(// Monocypher version 3.1.2
+//
+// This file is dual-licensed.  Choose whichever licence you want from
+// the two licences listed below.
+//
+// The first licence is a regular 2-clause BSD licence.  The second licence
+// is the CC-0 from Creative Commons. It is intended to release Monocypher
+// to the public domain.  The BSD licence serves as a fallback option.
+//
+// SPDX-License-Identifier: BSD-2-Clause OR CC0-1.0
+//
+// ------------------------------------------------------------------------
+//
+// Copyright (c) 2017-2019, Loup Vaillant
+// All rights reserved.
+//
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the
+//    distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// ------------------------------------------------------------------------
+//
+// Written in 2017-2019 by Loup Vaillant
+//
+// To the extent possible under law, the author(s) have dedicated all copyright
+// and related neighboring rights to this software to the public domain
+// worldwide.  This software is distributed without any warranty.
+//
+// You should have received a copy of the CC0 Public Domain Dedication along
+// with this software.  If not, see
+// <https://creativecommons.org/publicdomain/zero/1.0/>
+
+#ifndef MONOCYPHER_H
+#define MONOCYPHER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+////////////////////////
+/// Type definitions ///
+////////////////////////
+
+// Vtable for EdDSA with a custom hash.
+// Instantiate it to define a custom hash.
+// Its size, contents, and layout, are part of the public API.
+typedef struct {
+    void (*hash)(uint8_t hash[64], const uint8_t *message, size_t message_size);
+    void (*init  )(void *ctx);
+    void (*update)(void *ctx, const uint8_t *message, size_t message_size);
+    void (*final )(void *ctx, uint8_t hash[64]);
+    size_t ctx_size;
+} crypto_sign_vtable;
+
+// Do not rely on the size or contents of any of the types below,
+// they may change without notice.
+
+// Poly1305
+typedef struct {
+    uint32_t r[4];   // constant multiplier (from the secret key)
+    uint32_t h[5];   // accumulated hash
+    uint32_t c[5];   // chunk of the message
+    uint32_t pad[4]; // random number added at the end (from the secret key)
+    size_t   c_idx;  // How many bytes are there in the chunk.
+} crypto_poly1305_ctx;
+
+// Hash (Blake2b)
+typedef struct {
+    uint64_t hash[8];
+    uint64_t input_offset[2];
+    uint64_t input[16];
+    size_t   input_idx;
+    size_t   hash_size;
+} crypto_blake2b_ctx;
+
+// Signatures (EdDSA)
+typedef struct {
+    const crypto_sign_vtable *hash;
+    uint8_t buf[96];
+    uint8_t pk [32];
+} crypto_sign_ctx_abstract;
+typedef crypto_sign_ctx_abstract crypto_check_ctx_abstract;
+
+typedef struct {
+    crypto_sign_ctx_abstract ctx;
+    crypto_blake2b_ctx       hash;
+} crypto_sign_ctx;
+typedef crypto_sign_ctx crypto_check_ctx;
+
+////////////////////////////
+/// High level interface ///
+////////////////////////////
+
+// Constant time comparisons
+// -------------------------
+
+// Return 0 if a and b are equal, -1 otherwise
+int crypto_verify16(const uint8_t a[16], const uint8_t b[16]);
+int crypto_verify32(const uint8_t a[32], const uint8_t b[32]);
+int crypto_verify64(const uint8_t a[64], const uint8_t b[64]);
+
+// Erase sensitive data
+// --------------------
+
+// Please erase all copies
+void crypto_wipe(void *secret, size_t size);
+
+
+// Authenticated encryption
+// ------------------------
+void crypto_lock(uint8_t        mac[16],
+                 uint8_t       *cipher_text,
+                 const uint8_t  key[32],
+                 const uint8_t  nonce[24],
+                 const uint8_t *plain_text, size_t text_size);
+int crypto_unlock(uint8_t       *plain_text,
+                  const uint8_t  key[32],
+                  const uint8_t  nonce[24],
+                  const uint8_t  mac[16],
+                  const uint8_t *cipher_text, size_t text_size);
+
+// With additional data
+void crypto_lock_aead(uint8_t        mac[16],
+                      uint8_t       *cipher_text,
+                      const uint8_t  key[32],
+                      const uint8_t  nonce[24],
+                      const uint8_t *ad        , size_t ad_size,
+                      const uint8_t *plain_text, size_t text_size);
+int crypto_unlock_aead(uint8_t       *plain_text,
+                       const uint8_t  key[32],
+                       const uint8_t  nonce[24],
+                       const uint8_t  mac[16],
+                       const uint8_t *ad         , size_t ad_size,
+                       const uint8_t *cipher_text, size_t text_size);
+
+
+// General purpose hash (Blake2b)
+// ------------------------------
+
+// Direct interface
+void crypto_blake2b(uint8_t hash[64],
+                    const uint8_t *message, size_t message_size);
+
+void crypto_blake2b_general(uint8_t       *hash   , size_t hash_size,
+                            const uint8_t *key    , size_t key_size, // optional
+                            const uint8_t *message, size_t message_size);
+
+// Incremental interface
+void crypto_blake2b_init  (crypto_blake2b_ctx *ctx);
+void crypto_blake2b_update(crypto_blake2b_ctx *ctx,
+                           const uint8_t *message, size_t message_size);
+void crypto_blake2b_final (crypto_blake2b_ctx *ctx, uint8_t *hash);
+
+void crypto_blake2b_general_init(crypto_blake2b_ctx *ctx, size_t hash_size,
+                                 const uint8_t      *key, size_t key_size);
+
+// vtable for signatures
+extern const crypto_sign_vtable crypto_blake2b_vtable;
+
+
+// Password key derivation (Argon2 i)
+// ----------------------------------
+void crypto_argon2i(uint8_t       *hash,      uint32_t hash_size,     // >= 4
+                    void          *work_area, uint32_t nb_blocks,     // >= 8
+                    uint32_t       nb_iterations,                     // >= 3
+                    const uint8_t *password,  uint32_t password_size,
+                    const uint8_t *salt,      uint32_t salt_size);    // >= 8
+
+void crypto_argon2i_general(uint8_t       *hash,      uint32_t hash_size,// >= 4
+                            void          *work_area, uint32_t nb_blocks,// >= 8
+                            uint32_t       nb_iterations,                // >= 3
+                            const uint8_t *password,  uint32_t password_size,
+                            const uint8_t *salt,      uint32_t salt_size,// >= 8
+                            const uint8_t *key,       uint32_t key_size,
+                            const uint8_t *ad,        uint32_t ad_size);
+
+
+// Key exchange (x25519 + HChacha20)
+// ---------------------------------
+#define crypto_key_exchange_public_key crypto_x25519_public_key
+void crypto_key_exchange(uint8_t       shared_key      [32],
+                         const uint8_t your_secret_key [32],
+                         const uint8_t their_public_key[32]);
+
+
+// Signatures (EdDSA with curve25519 + Blake2b)
+// --------------------------------------------
+
+// Generate public key
+void crypto_sign_public_key(uint8_t        public_key[32],
+                            const uint8_t  secret_key[32]);
+
+// Direct interface
+void crypto_sign(uint8_t        signature [64],
+                 const uint8_t  secret_key[32],
+                 const uint8_t  public_key[32], // optional, may be 0
+                 const uint8_t *message, size_t message_size);
+int crypto_check(const uint8_t  signature [64],
+                 const uint8_t  public_key[32],
+                 const uint8_t *message, size_t message_size);
+
+////////////////////////////
+/// Low level primitives ///
+////////////////////////////
+
+// For experts only.  You have been warned.
+
+// Chacha20
+// --------
+
+// Specialised hash.
+// Used to hash X25519 shared secrets.
+void crypto_hchacha20(uint8_t       out[32],
+                      const uint8_t key[32],
+                      const uint8_t in [16]);
+
+// Unauthenticated stream cipher.
+// Don't forget to add authentication.
+void crypto_chacha20(uint8_t       *cipher_text,
+                     const uint8_t *plain_text,
+                     size_t         text_size,
+                     const uint8_t  key[32],
+                     const uint8_t  nonce[8]);
+void crypto_xchacha20(uint8_t       *cipher_text,
+                      const uint8_t *plain_text,
+                      size_t         text_size,
+                      const uint8_t  key[32],
+                      const uint8_t  nonce[24]);
+void crypto_ietf_chacha20(uint8_t       *cipher_text,
+                          const uint8_t *plain_text,
+                          size_t         text_size,
+                          const uint8_t  key[32],
+                          const uint8_t  nonce[12]);
+uint64_t crypto_chacha20_ctr(uint8_t       *cipher_text,
+                             const uint8_t *plain_text,
+                             size_t         text_size,
+                             const uint8_t  key[32],
+                             const uint8_t  nonce[8],
+                             uint64_t       ctr);
+uint64_t crypto_xchacha20_ctr(uint8_t       *cipher_text,
+                              const uint8_t *plain_text,
+                              size_t         text_size,
+                              const uint8_t  key[32],
+                              const uint8_t  nonce[24],
+                              uint64_t       ctr);
+uint32_t crypto_ietf_chacha20_ctr(uint8_t       *cipher_text,
+                                  const uint8_t *plain_text,
+                                  size_t         text_size,
+                                  const uint8_t  key[32],
+                                  const uint8_t  nonce[12],
+                                  uint32_t       ctr);
+
+// Poly 1305
+// ---------
+
+// This is a *one time* authenticator.
+// Disclosing the mac reveals the key.
+// See crypto_lock() on how to use it properly.
+
+// Direct interface
+void crypto_poly1305(uint8_t        mac[16],
+                     const uint8_t *message, size_t message_size,
+                     const uint8_t  key[32]);
+
+// Incremental interface
+void crypto_poly1305_init  (crypto_poly1305_ctx *ctx, const uint8_t key[32]);
+void crypto_poly1305_update(crypto_poly1305_ctx *ctx,
+                            const uint8_t *message, size_t message_size);
+void crypto_poly1305_final (crypto_poly1305_ctx *ctx, uint8_t mac[16]);
+
+
+// X-25519
+// -------
+
+// Shared secrets are not quite random.
+// Hash them to derive an actual shared key.
+void crypto_x25519_public_key(uint8_t       public_key[32],
+                              const uint8_t secret_key[32]);
+void crypto_x25519(uint8_t       raw_shared_secret[32],
+                   const uint8_t your_secret_key  [32],
+                   const uint8_t their_public_key [32]);
+
+// "Dirty" versions of x25519_public_key()
+// Only use to generate ephemeral keys you want to hide.
+// Note that those functions leaks 3 bits of the private key.
+void crypto_x25519_dirty_small(uint8_t pk[32], const uint8_t sk[32]);
+void crypto_x25519_dirty_fast (uint8_t pk[32], const uint8_t sk[32]);
+
+// scalar "division"
+// Used for OPRF.  Be aware that exponential blinding is less secure
+// than Diffie-Hellman key exchange.
+void crypto_x25519_inverse(uint8_t       blind_salt [32],
+                           const uint8_t private_key[32],
+                           const uint8_t curve_point[32]);
+
+
+// EdDSA to X25519
+// ---------------
+void crypto_from_eddsa_private(uint8_t x25519[32], const uint8_t eddsa[32]);
+void crypto_from_eddsa_public (uint8_t x25519[32], const uint8_t eddsa[32]);
+
+
+// EdDSA -- Incremental interface
+// ------------------------------
+
+// Signing (2 passes)
+// Make sure the two passes hash the same message,
+// else you might reveal the private key.
+void crypto_sign_init_first_pass(crypto_sign_ctx_abstract *ctx,
+                                 const uint8_t  secret_key[32],
+                                 const uint8_t  public_key[32]);
+void crypto_sign_update(crypto_sign_ctx_abstract *ctx,
+                        const uint8_t *message, size_t message_size);
+void crypto_sign_init_second_pass(crypto_sign_ctx_abstract *ctx);
+// use crypto_sign_update() again.
+void crypto_sign_final(crypto_sign_ctx_abstract *ctx, uint8_t signature[64]);
+
+// Verification (1 pass)
+// Make sure you don't use (parts of) the message
+// before you're done checking it.
+void crypto_check_init  (crypto_check_ctx_abstract *ctx,
+                         const uint8_t signature[64],
+                         const uint8_t public_key[32]);
+void crypto_check_update(crypto_check_ctx_abstract *ctx,
+                         const uint8_t *message, size_t message_size);
+int crypto_check_final  (crypto_check_ctx_abstract *ctx);
+
+// Custom hash interface
+void crypto_sign_public_key_custom_hash(uint8_t       public_key[32],
+                                        const uint8_t secret_key[32],
+                                        const crypto_sign_vtable *hash);
+void crypto_sign_init_first_pass_custom_hash(crypto_sign_ctx_abstract *ctx,
+                                             const uint8_t secret_key[32],
+                                             const uint8_t public_key[32],
+                                             const crypto_sign_vtable *hash);
+void crypto_check_init_custom_hash(crypto_check_ctx_abstract *ctx,
+                                   const uint8_t signature[64],
+                                   const uint8_t public_key[32],
+                                   const crypto_sign_vtable *hash);
+
+// Elligator 2
+// -----------
+
+// Elligator mappings proper
+void crypto_hidden_to_curve(uint8_t curve [32], const uint8_t hidden[32]);
+int  crypto_curve_to_hidden(uint8_t hidden[32], const uint8_t curve [32],
+                            uint8_t tweak);
+
+// Easy to use key pair generation
+void crypto_hidden_key_pair(uint8_t hidden[32], uint8_t secret_key[32],
+                            uint8_t seed[32]);
+
+
+#endif // MONOCYPHER_H
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+ *   AP_Common.cpp - common utility functions
+ */
+
+
+#include <AP_HAL/AP_HAL.h>
+#include "AP_Common.h"
+
+extern const AP_HAL::HAL& hal;
+
+/* assert that const vals are float, not double. so 100.0 means 100.0f */
+static_assert(sizeof(1e6) == sizeof(float), "Compilation needs to use single-precision constants");
+
+/*
+  Return true if value is between lower and upper bound inclusive.
+  False otherwise.
+*/
+bool is_bounded_int32(int32_t value, int32_t lower_bound, int32_t upper_bound)
+{
+    if ((lower_bound <= upper_bound) &&
+        (value >= lower_bound) && (value <= upper_bound)) {
+        return true;
+    }
+
+    return false;
+
+}
+
+/**
+ * return the numeric value of an ascii hex character
+ *
+ * @param [in]  a   Hexa character
+ * @param [out] res uint8 value
+ * @retval true  Conversion OK
+ * @retval false Input value error
+ * @Note Input character is 0-9, A-F, a-f
+ *  A 0x41, a 0x61, 0 0x30
+ */
+bool hex_to_uint8(uint8_t a, uint8_t &res)
+{
+    uint8_t nibble_low  = a & 0xf;
+
+    switch (a & 0xf0) {
+    case 0x30:  // 0-
+        if (nibble_low > 9) {
+            return false;
+        }
+        res = nibble_low;
+        break;
+    case 0x40:  // uppercase A-
+    case 0x60:  // lowercase a-
+        if (nibble_low == 0 || nibble_low > 6) {
+            return false;
+        }
+        res = nibble_low + 9;
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
+/*
+  strncpy without the warning for not leaving room for nul termination
+ */
+size_t strncpy_noterm(char *dest, const char *src, size_t n)
+{
+    size_t len = strnlen(src, n);
+    size_t ret = len; // return value is length of src
+    if (len < n) {
+        // include nul term if it fits
+        len++;
+    }
+    memcpy(dest, src, len);
+    return ret;
+}
+
+/**
+ * return the numeric value of an ascii hex character
+ * 
+ * @param[in] a Hexadecimal character 
+ * @return  Returns a binary value
+ */
+int16_t char_to_hex(char a)
+{
+    if (a >= 'A' && a <= 'F') {
+        return a - 'A' + 10;
+    } else if (a >= 'a' && a <= 'f') {
+        return a - 'a' + 10;
+    } else if (a >= '0' && a <= '9') {
+        return a - '0';
+    }
+    return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+///
+/// @file       AP_Common.h
+/// @brief		Common definitions and utility routines for the ArduPilot
+///				libraries.
+///
+
+#pragma once
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <type_traits>
+#include <new>
+
+// used to pack structures
+#define PACKED __attribute__((__packed__))
+
+// used to weaken symbols
+#define WEAK __attribute__((__weak__))
+
+// used to mark a function that may be unused in some builds
+#define UNUSED_FUNCTION __attribute__((unused))
+
+// used to mark an attribute that may be unused in some builds
+#ifdef __clang__
+#define UNUSED_PRIVATE_MEMBER __attribute__((unused))
+#else
+#define UNUSED_PRIVATE_MEMBER
+#endif
+
+// this can be used to optimize individual functions
+#define OPTIMIZE(level) __attribute__((optimize(level)))
+
+// sometimes we need to prevent inlining to prevent large stack usage
+#ifndef NOINLINE
+#define NOINLINE __attribute__((noinline))
+#endif
+
+// used to ignore results for functions marked as warn unused
+#define IGNORE_RETURN(x) do {if (x) {}} while(0)
+
+#define FMT_PRINTF(a,b) __attribute__((format(printf, a, b)))
+#define FMT_SCANF(a,b) __attribute__((format(scanf, a, b)))
+
+// used to forbid copy of objects
+#define CLASS_NO_COPY(c) c(const c &other) = delete; c &operator=(const c&) = delete
+
+#ifdef __has_cpp_attribute
+#  if __has_cpp_attribute(fallthrough)
+#    define FALLTHROUGH [[fallthrough]]
+#  elif __has_cpp_attribute(gnu::fallthrough)
+#    define FALLTHROUGH [[gnu::fallthrough]]
+#  endif
+#endif
+#ifndef FALLTHROUGH
+#  define FALLTHROUGH
+#endif
+
+#ifdef __GNUC__
+ #define WARN_IF_UNUSED __attribute__ ((warn_unused_result))
+#else
+ #define WARN_IF_UNUSED
+#endif
+
+#define NORETURN __attribute__ ((noreturn))
+
+#define ToRad(x) radians(x)	// *pi/180
+#define ToDeg(x) degrees(x)	// *180/pi
+
+/* Declare and implement const and non-const versions of the array subscript
+ * operator. The object is treated as an array of type_ values. */
+#define DEFINE_BYTE_ARRAY_METHODS                                                                   \
+    inline uint8_t &operator[](size_t i) { return reinterpret_cast<uint8_t *>(this)[i]; }           \
+    inline uint8_t operator[](size_t i) const { return reinterpret_cast<const uint8_t *>(this)[i]; }
+
+/*
+  check if bit bitnumber is set in value, returned as a
+  bool. Bitnumber starts at 0 for the first bit
+ */
+#define BIT_IS_SET(value, bitnumber) (((value) & (1U<<(bitnumber))) != 0)
+#define BIT_IS_SET_64(value, bitnumber) (((value) & (uint64_t(1U)<<(bitnumber))) != 0)
+
+// get high or low bytes from 2 byte integer
+#define LOWBYTE(i) ((uint8_t)(i))
+#define HIGHBYTE(i) ((uint8_t)(((uint16_t)(i))>>8))
+
+#define ARRAY_SIZE(_arr) (sizeof(_arr) / sizeof(_arr[0]))
+
+#define UINT16_VALUE(hbyte, lbyte) (static_cast<uint16_t>(((hbyte)<<8)|(lbyte)))
+#define UINT32_VALUE(b3, b2, b1, b0) (static_cast<uint32_t>(((b3)<<24)|((b2)<<16)|((b1)<<8)|(b0)))
+
+/*
+ * See UNUSED_RESULT. The difference is that it receives @uniq_ as the name to
+ * be used for its internal variable.
+ *
+ * @uniq_: a unique name to use for variable name
+ * @expr_: the expression to be evaluated
+ */
+#define _UNUSED_RESULT(uniq_, expr_)                      \
+    do {                                                  \
+        decltype(expr_) uniq_ __attribute__((unused));    \
+        uniq_ = expr_;                                    \
+    } while (0)
+
+/*
+ * Allow to call a function annotated with warn_unused_result attribute
+ * without getting a warning, because sometimes this is what we want to do.
+ *
+ * @expr_: the expression to be evaluated
+ */
+#define UNUSED_RESULT(expr_) _UNUSED_RESULT(__unique_name_##__COUNTER__, expr_)
+
+// @}
+
+// STR_VALUE returns the string equivalent for the passed cpp macro, so e.g.
+// printf("%s", STR_VALUE(EINVAL)); will print "EINVAL"
+#define STR_VALUE(x) #x
+
+// assert_storage_size template: assert that the memory used to store an
+// item is of a specific size.
+// example invocation:
+// assert_storage_size<class Location, 16> _assert_storage_size_Location;
+// templates are used for this because the compiler's output will
+// usually contain details of the template instantiation so you can
+// see how the actual size differs from the expected size.
+template<typename s, size_t s_size, size_t t> struct _assert_storage_size {
+    static_assert(s_size == t, "wrong size");
+};
+template<typename s, size_t t> struct assert_storage_size {
+    _assert_storage_size<s, sizeof(s), t> _member;
+};
+
+#define ASSERT_STORAGE_SIZE_JOIN( name, line ) ASSERT_STORAGE_SIZE_DO_JOIN( name, line )
+#define ASSERT_STORAGE_SIZE_DO_JOIN( name, line )  name ## line
+#define ASSERT_STORAGE_SIZE(structure, size) \
+    do { assert_storage_size<structure, size> ASSERT_STORAGE_SIZE_JOIN(assert_storage_sizex, __LINE__); (void)ASSERT_STORAGE_SIZE_JOIN(assert_storage_sizex, __LINE__); } while(false)
+
+////////////////////////////////////////////////////////////////////////////////
+/// @name	Conversions
+///
+/// Conversion macros and factors.
+///
+//@{
+
+/*
+  Return true if value is between lower and upper bound inclusive.
+  False otherwise.
+*/
+bool is_bounded_int32(int32_t value, int32_t lower_bound, int32_t upper_bound);
+
+bool hex_to_uint8(uint8_t a, uint8_t &res);  // return the uint8 value of an ascii hex character
+
+/*
+  strncpy without the warning for not leaving room for nul termination
+ */
+size_t strncpy_noterm(char *dest, const char *src, size_t n);
+
+// return the numeric value of an ascii hex character
+int16_t char_to_hex(char a);
+
+/*
+  Bit manipulation
+ */
+//#define BIT_SET(value, bitnumber) ((value) |= (((typeof(value))1U) << (bitnumber)))
+template <typename T> void BIT_SET (T& value, uint8_t bitnumber) noexcept {
+     static_assert(std::is_integral<T>::value, "Integral required.");
+     ((value) |= ((T)(1U) << (bitnumber)));
+ }
+//#define BIT_CLEAR(value, bitnumber) ((value) &= ~(((typeof(value))1U) << (bitnumber)))
+template <typename T> void BIT_CLEAR (T& value, uint8_t bitnumber) noexcept {
+     static_assert(std::is_integral<T>::value, "Integral required.");
+     ((value) &= ~((T)(1U) << (bitnumber)));
+ }
+
+/*
+  See the comments in libraries/AP_Common/c++.cpp
+ */
+#ifndef NEW_NOTHROW
+#define NEW_NOTHROW new(std::nothrow)
+#endif
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_ExpandingArray.h"
+#include <AP_HAL/AP_HAL.h>
+
+#ifndef HAL_BOOTLOADER_BUILD
+
+extern const AP_HAL::HAL& hal;
+
+AP_ExpandingArrayGeneric::~AP_ExpandingArrayGeneric(void)
+{
+    // free chunks
+    for (uint16_t i=0; i<chunk_count; i++) {
+        free(chunk_ptrs[i]);
+    }
+    // free chunks_ptrs array
+    free(chunk_ptrs);
+}
+
+// expand the array by specified number of chunks, returns true on success
+bool AP_ExpandingArrayGeneric::expand(uint16_t num_chunks)
+{
+    // expand chunk_ptrs array if necessary
+    if (chunk_count + num_chunks >= chunk_count_max) {
+        uint16_t chunk_ptr_size = chunk_count + num_chunks + chunk_ptr_increment;
+        if (hal.util->available_memory() < 100U + (chunk_ptr_size * sizeof(chunk_ptr_t))) {
+            // fail if reallocating would leave less than 100 bytes of memory free
+            return false;
+        }
+        chunk_ptr_t *chunk_ptrs_new = (chunk_ptr_t*)hal.util->std_realloc((void*)chunk_ptrs, chunk_ptr_size * sizeof(chunk_ptr_t));
+        if (chunk_ptrs_new == nullptr) {
+            return false;
+        }
+
+        // use new pointers array
+        chunk_ptrs = chunk_ptrs_new;
+        chunk_count_max = chunk_ptr_size;
+    }
+
+    // allocate new chunks
+    for (uint16_t i = 0; i < num_chunks; i++) {
+        if (hal.util->available_memory() < 100U + (chunk_size * elem_size)) {
+            // fail if reallocating would leave less than 100 bytes of memory free
+            return false;
+        }
+        uint8_t *new_chunk = (uint8_t *)calloc(chunk_size, elem_size);
+        if (new_chunk == nullptr) {
+            // failed to allocate new chunk
+            return false;
+        }
+        chunk_ptrs[chunk_count] = new_chunk;
+        chunk_count++;
+    }
+    return true;
+}
+
+// expand to hold at least num_items
+bool AP_ExpandingArrayGeneric::expand_to_hold(uint16_t num_items)
+{
+    // check if already big enough
+    if (num_items <= max_items()) {
+        return true;
+    }
+    uint16_t chunks_required = ((num_items - max_items()) / chunk_size) + 1;
+    return expand(chunks_required);
+}
+
+#endif // HAL_BOOTLOADER_BUILD
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * ExpandingArray class description
+ *
+ * ExpandingArrayGeneric implements most of the required functionality and is type agnostic allowing smaller overall code size
+ * ExpandingArray<T> is the template and implements the small number of type specific methods
+ *
+ * Elements are organised into "chunks" with each chunk holding "chunk_size" elements
+ * The "chunk_ptrs" array holds pointers to all allocated chunks
+ *
+ * The "expand" function allows expanding the array by a specified number of chunks
+ * The "expand_to_hold" function expands the array (if necessary) to hold at least the specified number of elements
+ *
+ * When the array is expanded up to two memory allocations are required:
+ *    1. if the chunk_ptrs array (which holds points to all allocated chunks) is full, this array will be re-allocated.
+ *       During this operation a new copy of the chunk_ptr array will be created with "chunk_ptr_increment" more rows,
+ *       the old array's data will be copied to the new array and finally the old array will be freed.
+ *    2. a new chunk will be allocated and a pointer to this new chunk will be added to the chunk_ptrs array
+ *
+ * Warnings:
+ *    1. memset, memcpy, memcmp cannot be used because the individual elements are not guaranteed to be next to each other in memory
+ *    2. operator[] functions do not perform any range checking so max_items() should be used when necessary to avoid out-of-bound memory access
+ *    3. elements_per_chunk (provided in constructor) should be a factor of 2 (i.e. 16, 32, 64) for best performance
+ */
+
+#pragma once
+
+#include <AP_Common/AP_Common.h>
+
+class AP_ExpandingArrayGeneric
+{
+public:
+
+    AP_ExpandingArrayGeneric(uint16_t element_size, uint16_t elements_per_chunk) :
+        elem_size(element_size),
+        chunk_size(elements_per_chunk)
+    {}
+
+    ~AP_ExpandingArrayGeneric(void);
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_ExpandingArrayGeneric);
+
+    // current maximum number of items (using expand may increase this)
+    uint16_t max_items() const { return chunk_size * chunk_count; }
+
+    // expand the array by specified number of chunks, returns true on success
+    bool expand(uint16_t num_chunks = 1);
+
+    // expand to hold at least num_items
+    bool expand_to_hold(uint16_t num_items);
+
+protected:
+
+    const uint16_t elem_size;   // number of bytes for each element
+    const uint16_t chunk_size;  // the number of T elements in each chunk
+    const uint16_t chunk_ptr_increment = 32;    // chunk_ptrs array is grown by this many elements each time it fills
+
+    typedef uint8_t* chunk_ptr_t;   // pointer to a chunk
+
+    chunk_ptr_t *chunk_ptrs;    // array of pointers to allocated chunks
+    uint16_t chunk_count_max;   // number of elements in chunk_ptrs array
+    uint16_t chunk_count;       // number of allocated chunks
+};
+
+template <typename T>
+class AP_ExpandingArray : public AP_ExpandingArrayGeneric
+{
+public:
+
+    AP_ExpandingArray(uint16_t elements_per_chunk) :
+        AP_ExpandingArrayGeneric(sizeof(T), elements_per_chunk)
+    {}
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_ExpandingArray);
+
+    // allow use as an array for assigning to elements. no bounds checking is performed
+    T &operator[](uint16_t i)
+    {
+        const uint16_t chunk_num = i / chunk_size;
+        const uint16_t chunk_index = (i % chunk_size);
+        #pragma GCC diagnostic push
+        #pragma GCC diagnostic ignored "-Wcast-align"
+        T *el_array = (T *)chunk_ptrs[chunk_num];
+        #pragma GCC diagnostic pop
+        return el_array[chunk_index];
+    }
+
+    // allow use as an array for accessing elements. no bounds checking is performed
+    const T &operator[](uint16_t i) const
+    {
+        const uint16_t chunk_num = i / chunk_size;
+        const uint16_t chunk_index = (i % chunk_size);
+        #pragma GCC diagnostic push
+        #pragma GCC diagnostic ignored "-Wcast-align"
+        const T *el_array = (const T *)chunk_ptrs[chunk_num];
+        #pragma GCC diagnostic pop
+        return el_array[chunk_index];
+    }
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "AP_FWVersion.h"
+
+namespace AP {
+
+const AP_FWVersion &fwversion()
+{
+    return AP_FWVersion::get_fwverz();
+}
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include <stdint.h>
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL_Boards.h>
+
+class PACKED AP_FWVersion {
+
+public:
+    /**
+     * @brief Struct to hold infomation about the software version struct
+     *
+     */
+    // First 7 MSBs are a start sequence, LSB is a checksum
+    const uint64_t header;
+    // MSB (major version breaks compatibility), LSB (minor version no compatibility break)
+    const uint16_t header_version;
+    // Pointer size to extract pointer values
+    const uint8_t pointer_size;
+
+    const uint8_t reserved; // padding
+    const uint8_t vehicle_type;
+    const uint8_t board_type;
+    const uint16_t board_subtype;
+    const uint8_t major;
+    const uint8_t minor;
+    const uint8_t patch;
+    const uint8_t fw_type; /*FIRMWARE_VERSION_TYPE*/
+    const uint32_t os_sw_version;
+    const char *fw_string;
+    const char *fw_hash_str;
+    const uint32_t fw_hash;
+    const char *fw_string_original;
+    const char *fw_short_string;
+    const char *middleware_name;
+    const char *middleware_hash_str;
+    const char *os_name;
+    const char *os_hash_str;
+
+    static const AP_FWVersion &get_fwverz() { return fwver; }
+
+private:
+
+    static const AP_FWVersion fwver;
+};
+
+namespace AP {
+    const AP_FWVersion &fwversion();
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+// this include file *defines* the structure holding the version information for the ArduPilot binary.  It must only be 
+// included in a single place, thus the following protection:
+
+#ifndef FORCE_VERSION_H_INCLUDE
+#error AP_FWVersionDefine.h should never be included directly. You probably want to include AP_Common/AP_FWVersion.h
+#endif
+
+#include <AP_Common/AP_FWVersion.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+/*
+  allow vendors to set AP_CUSTOM_FIRMWARE_STRING in hwdef.dat
+ */
+#ifdef AP_CUSTOM_FIRMWARE_STRING
+#define ACTIVE_FWSTR AP_CUSTOM_FIRMWARE_STRING
+#define ORIGINAL_FWSTR THISFIRMWARE
+#else
+#define ACTIVE_FWSTR THISFIRMWARE
+#define ORIGINAL_FWSTR nullptr
+#endif
+
+/**
+ * The version number should be used when the structure is updated
+ * Major: For breaking changes of the structure
+ * Minor: For new fields that does not brake the structure or corrections
+ */
+const AP_FWVersion AP_FWVersion::fwver{
+    // Version header struct
+    .header = 0x61706677766572fb, // First 7 MSBs: "apfwver", LSB is the checksum of the previous string: 0xfb
+    .header_version = 0x0200U, // Major and minor version
+    .pointer_size = static_cast<uint8_t>(sizeof(void*)),
+    .reserved = 0,
+    .vehicle_type = static_cast<uint8_t>(APM_BUILD_DIRECTORY),
+    .board_type = static_cast<uint8_t>(CONFIG_HAL_BOARD),
+    .board_subtype = static_cast<uint16_t>(CONFIG_HAL_BOARD_SUBTYPE),
+    .major = FW_MAJOR,
+    .minor = FW_MINOR,
+    .patch = FW_PATCH,
+    .fw_type = FW_TYPE,
+#ifdef BUILD_DATE_YEAR
+    // encode build date in os_sw_version
+   .os_sw_version = (BUILD_DATE_YEAR*100*100) + (BUILD_DATE_MONTH*100) + BUILD_DATE_DAY,
+#else
+   .os_sw_version = 0,
+#endif
+#ifndef GIT_VERSION
+    .fw_string = ACTIVE_FWSTR,
+    .fw_hash_str = "",
+#else
+    .fw_string = ACTIVE_FWSTR " (" GIT_VERSION ")",
+    .fw_hash_str = GIT_VERSION,
+#endif
+#ifndef GIT_VERSION_INT
+    .fw_hash = 0,
+#else
+    .fw_hash = GIT_VERSION_INT,
+#endif
+    .fw_string_original = ORIGINAL_FWSTR,
+    .fw_short_string = ACTIVE_FWSTR,
+    .middleware_name = nullptr,
+    .middleware_hash_str = nullptr,
+#ifdef CHIBIOS_GIT_VERSION
+    .os_name = "ChibiOS",
+    .os_hash_str = CHIBIOS_GIT_VERSION,
+#else
+    .os_name = nullptr,
+    .os_hash_str = nullptr,
+#endif
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+//
+/// @file   AP_Test.h
+/// @brief  A simple unit test framework.
+///
+/// AP_Test provides the usual test start, condition validation and reporting
+/// functions in a compact form.
+///
+/// Each test must be contained within a block; either a standalone function or
+/// a block within a function.  The TEST macro is used to start a test; it creates
+/// the local object which will track the results of the test and saves the name
+/// for later reporting.  Only one test may be performed within each block.
+///
+/// Within the test, use the REQUIRE macro to describe a condition that must be
+/// met for the test to pass.  If the condition within the macro is not met,
+/// the condition will be output as a diagnostic and the test will be considered
+/// to have failed.
+///
+/// The test ends at the end of the block, and the result of the test will be
+/// output as a diagnostic.
+///
+/// Optionally at the end of the test suite, the Test::report method may be used
+/// to summarize the results of all of the tests that were performed.
+///
+
+/// Unit test state and methods.
+///
+class Test
+{
+public:
+    /// Constructor - creates a new test.
+    ///
+    /// Normally called by the TEST macro.
+    ///
+    /// @param  name    The name of the test being started.
+    ///
+    Test(const char *name);
+
+    /// Destructor - ends the test.
+    ///
+    ~Test();
+
+    /// Perform a success check.
+    ///
+    /// @param  expr    If false, the test has failed.
+    /// @param  source  The expression source; emitted in the diagnostic
+    ///                 indicating test failure.
+    ///
+    void        require(bool expr, const char *source);
+
+    /// Report the overall number of tests/pass/fails.
+    ///
+    static void report();
+
+private:
+    const char  *_name;         ///< name of the current test
+    bool _fail;                 ///< set if any ::require calls indicate the test failed
+    static int16_t _passed;             ///< global pass count
+    static int16_t _failed;             ///< global fail count
+};
+
+/// Constructor
+///
+Test::Test(const char *name) :
+    _name(name),
+    _fail(false)
+{
+}
+
+/// Destructor
+///
+Test::~Test()
+{
+    Serial.printf("%s: %s\n", _fail ? "FAILED" : "passed", _name);
+    if (_fail) {
+        _failed++;
+    } else {
+        _passed++;
+    }
+}
+
+/// Success check
+///
+void
+Test::require(bool expr, const char *source)
+{
+    if (!expr) {
+        _fail = true;
+        Serial.printf("%s: fail: %s\n", _name, source);
+    }
+}
+
+/// Summary report
+///
+void
+Test::report()
+{
+    Serial.printf("\n%d passed  %d failed\n", _passed, _failed);
+}
+
+int16_t Test::_passed = 0;
+int16_t Test::_failed = 0;
+
+/// Start a new test.
+///
+/// This should be invoked at the beginning of a block, before any REQUIRE
+/// statements.  A new test called name is started, and subsequent REQUIRE
+/// statements will be applied to the test.  The test will continue until
+/// the end of the block (or until the _test object that is created otherwise
+/// goes out of scope).
+///
+#define TEST(name)      Test _test(# name)
+
+/// Attach an expression to the test's success criteria.
+///
+/// The expression expr must evaluate true for the test to pass.  If
+/// it does not, the text of the expression is output as a diagnostic
+/// and the test is marked as a failure.
+///
+#define REQUIRE(expr)   _test.require(expr, # expr)
+
+                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simple bitmask class
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <string.h>
+
+#include <AP_InternalError/AP_InternalError.h>
+
+template<uint16_t NUMBITS>
+class Bitmask {
+    static constexpr uint16_t NUMWORDS = ((NUMBITS+31)/32);
+
+    static_assert(NUMBITS > 0, "must store something");
+    // for first_set()'s return value
+    static_assert(NUMBITS <= INT16_MAX, "must fit in int16_t");
+    // so that 1U << bits is in range
+    static_assert(sizeof(unsigned int) >= sizeof(uint32_t), "int too small");
+
+public:
+    Bitmask() {
+        clearall();
+    }
+
+    Bitmask &operator=(const Bitmask&other) {
+        memcpy(bits, other.bits, sizeof(bits[0])*NUMWORDS);
+        return *this;
+    }
+
+    bool operator==(const Bitmask&other) {
+        return memcmp(bits, other.bits, sizeof(bits[0])*NUMWORDS) == 0;
+    }
+
+    bool operator!=(const Bitmask&other) {
+        return !(*this == other);
+    }
+
+    Bitmask(const Bitmask &other) = delete;
+
+    // set given bitnumber
+    void set(uint16_t bit) {
+        if (!validate(bit)) {
+            return; // ignore access of invalid bit
+        }
+        uint16_t word = bit/32;
+        uint8_t ofs = bit & 0x1f;
+        bits[word] |= (1U << ofs);
+    }
+
+    // set all bits
+    void setall(void) {
+        // set all words to 111...
+        for (uint16_t i=0; i<NUMWORDS; i++) {
+            bits[i] = 0xffffffff;
+        }
+        // ensure out-of-range bits in the last word, if any exist, are 0
+        uint16_t num_valid_bits = NUMBITS % 32;
+        if (num_valid_bits) { // word has out of range bits
+            bits[NUMWORDS-1] = (1U << num_valid_bits) - 1;
+        }
+    }
+
+    // clear given bitnumber
+    void clear(uint16_t bit) {
+        if (!validate(bit)) {
+            return; // ignore access of invalid bit
+        }
+        uint16_t word = bit/32;
+        uint8_t ofs = bit & 0x1f;
+        bits[word] &= ~(1U << ofs);
+    }
+
+    // set given bitnumber to on/off
+    void setonoff(uint16_t bit, bool onoff) {
+        if (onoff) {
+            set(bit);
+        } else {
+            clear(bit);
+        }
+    }
+
+    // clear all bits
+    void clearall(void) {
+        memset(bits, 0, NUMWORDS*sizeof(bits[0]));
+    }
+
+    // return true if given bitnumber is set
+    bool get(uint16_t bit) const {
+        if (!validate(bit)) {
+            return false; // pretend invalid bit is not set
+        }
+        uint16_t word = bit/32;
+        uint8_t ofs = bit & 0x1f;
+        return (bits[word] & (1U << ofs)) != 0;
+    }
+
+    // return true if all bits are clear
+    bool empty(void) const {
+        for (uint16_t i=0; i<NUMWORDS; i++) {
+            if (bits[i] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // return number of bits set
+    uint16_t count() const {
+        uint16_t sum = 0;
+        for (uint16_t i=0; i<NUMWORDS; i++) {
+            sum += __builtin_popcount(bits[i]);
+        }
+        return sum;
+    }
+
+    // return first bit set, or -1 if none set
+    int16_t first_set() const {
+        for (uint16_t i=0; i<NUMWORDS; i++) {
+            if (bits[i] != 0) {
+                return i*32 + __builtin_ffs(bits[i]) - 1;
+            }
+        }
+        return -1;
+    }
+
+    // return number of bits available
+    uint16_t size() const {
+        return NUMBITS;
+    }
+
+private:
+    bool validate(uint16_t bit) const {
+        if (bit >= NUMBITS) {
+            INTERNAL_ERROR(AP_InternalError::error_t::bitmask_range);
+            return false;
+        }
+        return true;
+    }
+
+    uint32_t bits[NUMWORDS];
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  expanding string for easy construction of text buffers
+ */
+
+#include "ExpandingString.h"
+#include <AP_HAL/AP_HAL.h>
+
+#ifndef HAL_BOOTLOADER_BUILD
+
+extern const AP_HAL::HAL& hal;
+
+#define EXPAND_INCREMENT 512
+
+ExpandingString::ExpandingString(char* s, uint32_t total_len) : buf(0)
+{
+    set_buffer(s, total_len, 0);
+    memset(buf, 0, buflen);
+}
+
+
+/*
+  expand the string buffer
+ */
+bool ExpandingString::expand(uint32_t min_extra_space_needed)
+{
+    if (external_buffer) {
+        // we can't expand an external buffer
+        return false;
+    }
+    // expand a reasonable amount
+    uint32_t newsize = (5*buflen/4) + EXPAND_INCREMENT;
+    if (newsize - used < min_extra_space_needed) {
+        newsize = used + min_extra_space_needed;
+    }
+    
+    // add one to ensure we are always null terminated
+    void *newbuf = hal.util->std_realloc(buf, newsize+1);
+
+    if (newbuf == nullptr) {
+        allocation_failed = true;
+        return false;
+    }
+
+    buflen = newsize;
+    buf = (char *)newbuf;
+    memset(&buf[used], 0, newsize-used);
+
+    return true;
+}
+
+/*
+  print into the buffer, expanding if needed
+ */
+void ExpandingString::printf(const char *format, ...)
+{
+    if (allocation_failed) {
+        return;
+    }
+    if (buflen == used && !expand(0)) {
+        return;
+    }
+    int n;
+
+    /*
+      print into the buffer, expanding the buffer if needed
+     */
+    while (true) {
+        va_list arg;
+        va_start(arg, format);
+        n = hal.util->vsnprintf(&buf[used], buflen-used, format, arg);
+        va_end(arg);
+        if (n < 0) {
+            return;
+        }
+        if (uint32_t(n) < buflen - used) {
+            break;
+        }
+        if (!expand(n+1)) {            
+            return;
+        }
+    }
+    used += n;
+}
+
+/*
+  print into the buffer, expanding if needed
+ */
+bool ExpandingString::append(const char *s, uint32_t len)
+{
+    if (allocation_failed) {
+        return false;
+    }
+    if (buflen - used < len && !expand(len)) {
+        return false;
+    }
+    if (s != nullptr) {
+        memcpy(&buf[used], s, len);
+    }
+    used += len;
+    return true;
+}
+
+ExpandingString::~ExpandingString()
+{
+    if (!external_buffer) {
+        free(buf);
+    }
+}
+
+
+void ExpandingString::set_buffer(char *s, uint32_t total_len, uint32_t used_len)
+{
+    if (buf != nullptr) {
+        // we need to free previously used buffer
+        free(buf);
+    }
+
+    buf = s;
+    buflen = total_len;
+    used = used_len;
+    allocation_failed = false;
+    external_buffer = true;
+}
+
+#endif // HAL_BOOTLOADER_BUILD
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  expanding string for easy construction of text buffers
+ */
+
+#pragma once
+
+#include <AP_Common/AP_Common.h>
+
+#include <stdint.h>
+
+class ExpandingString {
+public:
+    ExpandingString() : buf(0), buflen(0), used(0), allocation_failed(false), external_buffer(false) {}
+    ExpandingString(char* s, uint32_t total_len);
+
+    const char *get_string(void) const {
+        return buf;
+    }
+    uint32_t get_length(void) const {
+        return used;
+    }
+    char *get_writeable_string(void) const {
+        return buf;
+    }
+
+    // print into the string
+    void printf(const char *format, ...) FMT_PRINTF(2,3);
+
+    // append data to the string. s can be null for zero fill
+    bool append(const char *s, uint32_t len);
+
+    // set address to custom external buffer
+    void set_buffer(char *s, uint32_t total_len, uint32_t used_len);
+    // zero out the string
+    void reset() { used = 0; }
+
+    // destructor
+    ~ExpandingString();
+
+    bool has_failed_allocation() const {
+        return allocation_failed;
+    }
+
+private:
+    char *buf;
+    uint32_t buflen;
+    uint32_t used;
+    bool allocation_failed;
+    bool external_buffer;
+
+    // try to expand the buffer
+    bool expand(uint32_t min_needed) WARN_IF_UNUSED;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Location.cpp
+ */
+
+#include "Location.h"
+
+#ifndef HAL_BOOTLOADER_BUILD
+
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Terrain/AP_Terrain.h>
+
+/// constructors
+Location::Location()
+{
+    zero();
+}
+
+const Location definitely_zero{};
+bool Location::is_zero(void) const
+{
+    return !memcmp(this, &definitely_zero, sizeof(*this));
+}
+
+void Location::zero(void)
+{
+    memset(this, 0, sizeof(*this));
+}
+
+// Construct location using position (NEU) from ekf_origin for the given altitude frame
+Location::Location(int32_t latitude, int32_t longitude, int32_t alt_in_cm, AltFrame frame)
+{
+    // make sure we know what size the Location object is:
+    ASSERT_STORAGE_SIZE(Location, 16);
+
+    zero();
+    lat = latitude;
+    lng = longitude;
+    set_alt_cm(alt_in_cm, frame);
+}
+
+#if AP_AHRS_ENABLED
+Location::Location(const Vector3f &ekf_offset_neu, AltFrame frame)
+{
+    zero();
+
+    // store alt and alt frame
+    set_alt_cm(ekf_offset_neu.z, frame);
+
+    // calculate lat, lon
+    Location ekf_origin;
+    if (AP::ahrs().get_origin(ekf_origin)) {
+        lat = ekf_origin.lat;
+        lng = ekf_origin.lng;
+        offset(ekf_offset_neu.x * 0.01, ekf_offset_neu.y * 0.01);
+    }
+}
+#endif  // AP_AHRS_ENABLED
+
+void Location::set_alt_cm(int32_t alt_cm, AltFrame frame)
+{
+    alt = alt_cm;
+    relative_alt = false;
+    terrain_alt = false;
+    origin_alt = false;
+    switch (frame) {
+        case AltFrame::ABSOLUTE:
+            // do nothing
+            break;
+        case AltFrame::ABOVE_HOME:
+            relative_alt = true;
+            break;
+        case AltFrame::ABOVE_ORIGIN:
+            origin_alt = true;
+            break;
+        case AltFrame::ABOVE_TERRAIN:
+            // we mark it as a relative altitude, as it doesn't have
+            // home alt added
+            relative_alt = true;
+            terrain_alt = true;
+            break;
+    }
+}
+
+// converts altitude to new frame
+bool Location::change_alt_frame(AltFrame desired_frame)
+{
+    int32_t new_alt_cm;
+    if (!get_alt_cm(desired_frame, new_alt_cm)) {
+        return false;
+    }
+    set_alt_cm(new_alt_cm, desired_frame);
+    return true;
+}
+
+// get altitude frame
+Location::AltFrame Location::get_alt_frame() const
+{
+    if (terrain_alt) {
+        return AltFrame::ABOVE_TERRAIN;
+    }
+    if (origin_alt) {
+        return AltFrame::ABOVE_ORIGIN;
+    }
+    if (relative_alt) {
+        return AltFrame::ABOVE_HOME;
+    }
+    return AltFrame::ABSOLUTE;
+}
+
+/// get altitude in desired frame
+bool Location::get_alt_cm(AltFrame desired_frame, int32_t &ret_alt_cm) const
+{
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    if (!initialised()) {
+        AP_HAL::panic("Should not be called on invalid location: Location cannot be (0, 0, 0)");
+    }
+#endif
+    Location::AltFrame frame = get_alt_frame();
+
+    // shortcut if desired and underlying frame are the same
+    if (desired_frame == frame) {
+        ret_alt_cm = alt;
+        return true;
+    }
+
+    // check for terrain altitude
+    float alt_terr_cm = 0;
+    if (frame == AltFrame::ABOVE_TERRAIN || desired_frame == AltFrame::ABOVE_TERRAIN) {
+#if AP_TERRAIN_AVAILABLE
+        AP_Terrain *terrain = AP::terrain();
+        if (terrain == nullptr) {
+            return false;
+        }
+        if (!terrain->height_amsl(*this, alt_terr_cm)) {
+            return false;
+        }
+        // convert terrain alt to cm
+        alt_terr_cm *= 100.0f;
+#else
+        return false;
+#endif
+    }
+
+    // convert alt to absolute
+    int32_t alt_abs = 0;
+    switch (frame) {
+        case AltFrame::ABSOLUTE:
+            alt_abs = alt;
+            break;
+        case AltFrame::ABOVE_HOME:
+#if AP_AHRS_ENABLED
+            if (!AP::ahrs().home_is_set()) {
+                return false;
+            }
+            alt_abs = alt + AP::ahrs().get_home().alt;
+#else
+            return false;
+#endif  // AP_AHRS_ENABLED
+            break;
+        case AltFrame::ABOVE_ORIGIN:
+#if AP_AHRS_ENABLED
+            {
+                // fail if we cannot get ekf origin
+                Location ekf_origin;
+                if (!AP::ahrs().get_origin(ekf_origin)) {
+                    return false;
+                }
+                alt_abs = alt + ekf_origin.alt;
+            }
+            break;
+#else
+            return false;
+#endif  // AP_AHRS_ENABLED
+        case AltFrame::ABOVE_TERRAIN:
+            alt_abs = alt + alt_terr_cm;
+            break;
+    }
+
+    // convert absolute to desired frame
+    switch (desired_frame) {
+        case AltFrame::ABSOLUTE:
+            ret_alt_cm = alt_abs;
+            return true;
+        case AltFrame::ABOVE_HOME:
+#if AP_AHRS_ENABLED
+            if (!AP::ahrs().home_is_set()) {
+                return false;
+            }
+            ret_alt_cm = alt_abs - AP::ahrs().get_home().alt;
+#else
+            return false;
+#endif  // AP_AHRS_ENABLED
+            return true;
+        case AltFrame::ABOVE_ORIGIN:
+#if AP_AHRS_ENABLED
+            {
+                // fail if we cannot get ekf origin
+                Location ekf_origin;
+                if (!AP::ahrs().get_origin(ekf_origin)) {
+                    return false;
+                }
+                ret_alt_cm = alt_abs - ekf_origin.alt;
+                return true;
+            }
+#else
+            return false;
+#endif  // AP_AHRS_ENABLED
+        case AltFrame::ABOVE_TERRAIN:
+            ret_alt_cm = alt_abs - alt_terr_cm;
+            return true;
+    }
+    return false;  // LCOV_EXCL_LINE  - not reachable
+}
+bool Location::get_alt_m(AltFrame desired_frame, float &ret_alt) const
+{
+    int32_t ret_alt_cm;
+    if (!get_alt_cm(desired_frame, ret_alt_cm)) {
+        return false;
+    }
+    ret_alt = ret_alt_cm * 0.01;
+    return true;
+}
+
+#if AP_AHRS_ENABLED
+// converts location to a vector from origin; if this method returns
+// false then vec_ne is unmodified
+template<typename T>
+bool Location::get_vector_xy_from_origin_NE(T &vec_ne) const
+{
+    Location ekf_origin;
+    if (!AP::ahrs().get_origin(ekf_origin)) {
+        return false;
+    }
+    vec_ne.x = (lat-ekf_origin.lat) * LATLON_TO_CM;
+    vec_ne.y = diff_longitude(lng,ekf_origin.lng) * LATLON_TO_CM * longitude_scale((lat+ekf_origin.lat)/2);
+    return true;
+}
+
+// define for float and position vectors
+template bool Location::get_vector_xy_from_origin_NE<Vector2f>(Vector2f &vec_ne) const;
+#if HAL_WITH_POSTYPE_DOUBLE
+template bool Location::get_vector_xy_from_origin_NE<Vector2p>(Vector2p &vec_ne) const;
+#endif
+
+// converts location to a vector from origin; if this method returns
+// false then vec_neu is unmodified
+template<typename T>
+bool Location::get_vector_from_origin_NEU(T &vec_neu) const
+{
+    // convert altitude
+    int32_t alt_above_origin_cm = 0;
+    if (!get_alt_cm(AltFrame::ABOVE_ORIGIN, alt_above_origin_cm)) {
+        return false;
+    }
+
+    // convert lat, lon
+    if (!get_vector_xy_from_origin_NE(vec_neu.xy())) {
+        return false;
+    }
+
+    vec_neu.z = alt_above_origin_cm;
+
+    return true;
+}
+
+// define for float and position vectors
+template bool Location::get_vector_from_origin_NEU<Vector3f>(Vector3f &vec_neu) const;
+#if HAL_WITH_POSTYPE_DOUBLE
+template bool Location::get_vector_from_origin_NEU<Vector3p>(Vector3p &vec_neu) const;
+#endif
+
+#endif  // AP_AHRS_ENABLED
+
+// return horizontal distance in meters between two locations
+ftype Location::get_distance(const Location &loc2) const
+{
+    ftype dlat = (ftype)(loc2.lat - lat);
+    ftype dlng = ((ftype)diff_longitude(loc2.lng,lng)) * longitude_scale((lat+loc2.lat)/2);
+    return norm(dlat, dlng) * LOCATION_SCALING_FACTOR;
+}
+
+// return the altitude difference in meters taking into account alt frame.
+bool Location::get_alt_distance(const Location &loc2, ftype &distance) const
+{
+    int32_t alt1, alt2;
+    if (!get_alt_cm(AltFrame::ABSOLUTE, alt1) || !loc2.get_alt_cm(AltFrame::ABSOLUTE, alt2)) {
+        return false;
+    }
+    distance = (alt1 - alt2) * 0.01;
+    return true;
+}
+
+/*
+  return the distance in meters in North/East plane as a N/E vector
+  from loc1 to loc2
+ */
+Vector2f Location::get_distance_NE(const Location &loc2) const
+{
+    return Vector2f((loc2.lat - lat) * LOCATION_SCALING_FACTOR,
+                    diff_longitude(loc2.lng,lng) * LOCATION_SCALING_FACTOR * longitude_scale((loc2.lat+lat)/2));
+}
+
+// return the distance in meters in North/East/Down plane as a N/E/D vector to loc2, NOT CONSIDERING ALT FRAME!
+Vector3f Location::get_distance_NED(const Location &loc2) const
+{
+    return Vector3f((loc2.lat - lat) * LOCATION_SCALING_FACTOR,
+                    diff_longitude(loc2.lng,lng) * LOCATION_SCALING_FACTOR * longitude_scale((lat+loc2.lat)/2),
+                    (alt - loc2.alt) * 0.01);
+}
+
+// return the distance in meters in North/East/Down plane as a N/E/D vector to loc2
+Vector3d Location::get_distance_NED_double(const Location &loc2) const
+{
+    return Vector3d((loc2.lat - lat) * double(LOCATION_SCALING_FACTOR),
+                    diff_longitude(loc2.lng,lng) * LOCATION_SCALING_FACTOR * longitude_scale((lat+loc2.lat)/2),
+                    (alt - loc2.alt) * 0.01);
+}
+
+// return the distance in meters in North/East/Down plane as a N/E/D vector to loc2 considering alt frame, if altitude cannot be resolved down distance is 0
+Vector3f Location::get_distance_NED_alt_frame(const Location &loc2) const
+{
+    int32_t alt1, alt2 = 0;
+    if (!get_alt_cm(AltFrame::ABSOLUTE, alt1) || !loc2.get_alt_cm(AltFrame::ABSOLUTE, alt2)) {
+        // one or both of the altitudes are invalid, don't do alt distance calc
+        alt1 = 0, alt2 = 0;
+    }
+    return Vector3f((loc2.lat - lat) * LOCATION_SCALING_FACTOR,
+                    diff_longitude(loc2.lng,lng) * LOCATION_SCALING_FACTOR * longitude_scale((loc2.lat+lat)/2),
+                    (alt1 - alt2) * 0.01);
+}
+
+Vector2d Location::get_distance_NE_double(const Location &loc2) const
+{
+    return Vector2d((loc2.lat - lat) * double(LOCATION_SCALING_FACTOR),
+                    diff_longitude(loc2.lng,lng) * double(LOCATION_SCALING_FACTOR) * longitude_scale((lat+loc2.lat)/2));
+}
+
+Vector2F Location::get_distance_NE_ftype(const Location &loc2) const
+{
+    return Vector2F((loc2.lat - lat) * ftype(LOCATION_SCALING_FACTOR),
+                    diff_longitude(loc2.lng,lng) * ftype(LOCATION_SCALING_FACTOR) * longitude_scale((lat+loc2.lat)/2));
+}
+
+// extrapolate latitude/longitude given distances (in meters) north and east
+void Location::offset_latlng(int32_t &lat, int32_t &lng, ftype ofs_north, ftype ofs_east)
+{
+    const int32_t dlat = ofs_north * LOCATION_SCALING_FACTOR_INV;
+    const int64_t dlng = (ofs_east * LOCATION_SCALING_FACTOR_INV) / longitude_scale(lat+dlat/2);
+    lat += dlat;
+    lat = limit_lattitude(lat);
+    lng = wrap_longitude(dlng+lng);
+}
+
+// extrapolate latitude/longitude given distances (in meters) north and east
+void Location::offset(ftype ofs_north, ftype ofs_east)
+{
+    offset_latlng(lat, lng, ofs_north, ofs_east);
+}
+
+// extrapolate latitude/longitude given distances (in meters) north
+// and east. Note that this is metres, *even for the altitude*.
+void Location::offset(const Vector3p &ofs_ned)
+{
+    offset_latlng(lat, lng, ofs_ned.x, ofs_ned.y);
+    alt += -ofs_ned.z * 100;  // m -> cm
+}
+
+/*
+ *  extrapolate latitude/longitude given bearing and distance
+ * Note that this function is accurate to about 1mm at a distance of
+ * 100m. This function has the advantage that it works in relative
+ * positions, so it keeps the accuracy even when dealing with small
+ * distances and floating point numbers
+ */
+void Location::offset_bearing(ftype bearing_deg, ftype distance)
+{
+    const ftype ofs_north = cosF(radians(bearing_deg)) * distance;
+    const ftype ofs_east  = sinF(radians(bearing_deg)) * distance;
+    offset(ofs_north, ofs_east);
+}
+
+// extrapolate latitude/longitude given bearing, pitch and distance
+void Location::offset_bearing_and_pitch(ftype bearing_deg, ftype pitch_deg, ftype distance)
+{
+    const ftype ofs_north =  cosF(radians(pitch_deg)) * cosF(radians(bearing_deg)) * distance;
+    const ftype ofs_east  =  cosF(radians(pitch_deg)) * sinF(radians(bearing_deg)) * distance;
+    offset(ofs_north, ofs_east);
+    const int32_t dalt =  sinF(radians(pitch_deg)) * distance *100.0f;
+    alt += dalt; 
+}
+
+
+ftype Location::longitude_scale(int32_t lat)
+{
+    ftype scale = cosF(lat * (1.0e-7 * DEG_TO_RAD));
+    return MAX(scale, 0.01);
+}
+
+/*
+ * convert invalid waypoint with useful data. return true if location changed
+ */
+bool Location::sanitize(const Location &defaultLoc)
+{
+    bool has_changed = false;
+    // convert lat/lng=0 to mean current point
+    if (lat == 0 && lng == 0) {
+        lat = defaultLoc.lat;
+        lng = defaultLoc.lng;
+        has_changed = true;
+    }
+
+    // convert relative alt=0 to mean current alt
+    if (alt == 0 && relative_alt) {
+        int32_t defaultLoc_alt;
+        if (defaultLoc.get_alt_cm(get_alt_frame(), defaultLoc_alt)) {
+            alt = defaultLoc_alt;
+            has_changed = true;
+        }
+    }
+
+    // limit lat/lng to appropriate ranges
+    if (!check_latlng()) {
+        lat = defaultLoc.lat;
+        lng = defaultLoc.lng;
+        has_changed = true;
+    }
+
+    return has_changed;
+}
+
+// return bearing in radians from location to loc2, return is 0 to 2*Pi
+ftype Location::get_bearing(const Location &loc2) const
+{
+    const int32_t off_x = diff_longitude(loc2.lng,lng);
+    const int32_t off_y = (loc2.lat - lat) / loc2.longitude_scale((lat+loc2.lat)/2);
+    ftype bearing = (M_PI*0.5) + atan2F(-off_y, off_x);
+    if (bearing < 0) {
+        bearing += 2*M_PI;
+    }
+    return bearing;
+}
+
+/*
+  return true if lat and lng match. Ignores altitude and options
+ */
+bool Location::same_latlon_as(const Location &loc2) const
+{
+    return (lat == loc2.lat) && (lng == loc2.lng);
+}
+
+bool Location::same_alt_as(const Location &loc2) const
+{
+    // fast path if the altitude frame is the same
+    if (this->get_alt_frame() == loc2.get_alt_frame()) {
+        return this->alt == loc2.alt;
+    }
+
+    ftype alt_diff;
+    bool have_diff = this->get_alt_distance(loc2, alt_diff);
+
+    const ftype tolerance = FLT_EPSILON;
+    return have_diff && (fabsF(alt_diff) < tolerance);
+}
+
+// return true when lat and lng are within range
+bool Location::check_latlng() const
+{
+    return check_lat(lat) && check_lng(lng);
+}
+
+// see if location is past a line perpendicular to
+// the line between point1 and point2 and passing through point2.
+// If point1 is our previous waypoint and point2 is our target waypoint
+// then this function returns true if we have flown past
+// the target waypoint
+bool Location::past_interval_finish_line(const Location &point1, const Location &point2) const
+{
+    return this->line_path_proportion(point1, point2) >= 1.0f;
+}
+
+/*
+  return the proportion we are along the path from point1 to
+  point2, along a line parallel to point1<->point2.
+
+  This will be more than 1 if we have passed point2
+ */
+float Location::line_path_proportion(const Location &point1, const Location &point2) const
+{
+    const Vector2f vec1 = point1.get_distance_NE(point2);
+    const Vector2f vec2 = point1.get_distance_NE(*this);
+    const ftype dsquared = sq(vec1.x) + sq(vec1.y);
+    if (dsquared < 0.001f) {
+        // the two points are very close together
+        return 1.0f;
+    }
+    return (vec1 * vec2) / dsquared;
+}
+
+/*
+  wrap longitude for -180e7 to 180e7
+ */
+int32_t Location::wrap_longitude(int64_t lon)
+{
+    if (lon > 1800000000L) {
+        lon = int32_t(lon-3600000000LL);
+    } else if (lon < -1800000000L) {
+        lon = int32_t(lon+3600000000LL);
+    }
+    return int32_t(lon);
+}
+
+/*
+  get lon1-lon2, wrapping at -180e7 to 180e7
+ */
+int32_t Location::diff_longitude(int32_t lon1, int32_t lon2)
+{
+    if ((lon1 & 0x80000000) == (lon2 & 0x80000000)) {
+        // common case of same sign
+        return lon1 - lon2;
+    }
+    int64_t dlon = int64_t(lon1)-int64_t(lon2);
+    if (dlon > 1800000000LL) {
+        dlon -= 3600000000LL;
+    } else if (dlon < -1800000000LL) {
+        dlon += 3600000000LL;
+    }
+    return int32_t(dlon);
+}
+
+/*
+  limit latitude to -90e7 to 90e7
+ */
+int32_t Location::limit_lattitude(int32_t lat)
+{
+    if (lat > 900000000L) {
+        lat = 1800000000LL - lat;
+    } else if (lat < -900000000L) {
+        lat = -(1800000000LL + lat);
+    }
+    return lat;
+}
+
+// update altitude and alt-frame base on this location's horizontal position between point1 and point2
+// this location's lat,lon is used to calculate the alt of the closest point on the line between point1 and point2
+// origin and destination's altitude frames must be the same
+// this alt-frame will be updated to match the destination alt frame
+void Location::linearly_interpolate_alt(const Location &point1, const Location &point2)
+{
+    // new target's distance along the original track and then linear interpolate between the original origin and destination altitudes
+    set_alt_cm(point1.alt + (point2.alt - point1.alt) * constrain_float(line_path_proportion(point1, point2), 0.0f, 1.0f), point2.get_alt_frame());
+}
+
+#endif // HAL_BOOTLOADER_BUILD
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #pragma once
+
+#include <AP_Math/AP_Math.h>
+
+#define LOCATION_ALT_MAX_M  83000   // maximum altitude (in meters) that can be fit into Location structure's alt field
+
+class Location
+{
+public:
+
+    uint8_t relative_alt : 1;           // 1 if altitude is relative to home
+    uint8_t loiter_ccw   : 1;           // 0 if clockwise, 1 if counter clockwise
+    uint8_t terrain_alt  : 1;           // this altitude is above terrain
+    uint8_t origin_alt   : 1;           // this altitude is above ekf origin
+    uint8_t loiter_xtrack : 1;          // 0 to crosstrack from center of waypoint, 1 to crosstrack from tangent exit location
+
+    // note that mission storage only stores 24 bits of altitude (~ +/- 83km)
+    int32_t alt; // in cm
+    int32_t lat; // in 1E7 degrees
+    int32_t lng; // in 1E7 degrees
+
+    /// enumeration of possible altitude types
+    enum class AltFrame {
+        ABSOLUTE = 0,
+        ABOVE_HOME = 1,
+        ABOVE_ORIGIN = 2,
+        ABOVE_TERRAIN = 3
+    };
+
+    /// constructors
+    Location();
+    Location(int32_t latitude, int32_t longitude, int32_t alt_in_cm, AltFrame frame);
+    Location(const Vector3f &ekf_offset_neu, AltFrame frame);
+    Location(const Vector3d &ekf_offset_neu, AltFrame frame);
+
+    // set altitude
+    void set_alt_cm(int32_t alt_cm, AltFrame frame);
+
+    // get altitude (in cm) in the desired frame
+    // returns false on failure to get altitude in the desired frame which can only happen if the original frame or desired frame is:
+    // - above-terrain and the terrain database can't supply terrain height amsl
+    // - above-home and home is not set
+    // - above-origin and origin is not set
+    bool get_alt_cm(AltFrame desired_frame, int32_t &ret_alt_cm) const WARN_IF_UNUSED;
+    // same as get_alt_cm but in metres:
+    bool get_alt_m(AltFrame desired_frame, float &ret_alt) const WARN_IF_UNUSED;
+
+    // get altitude frame
+    AltFrame get_alt_frame() const;
+
+    // converts altitude to new frame
+    // returns false on failure to convert which can only happen if the original frame or desired frame is:
+    // - above-terrain and the terrain database can't supply terrain height amsl
+    // - above-home and home is not set
+    // - above-origin and origin is not set
+    bool change_alt_frame(AltFrame desired_frame);
+
+    // get position as a vector (in cm) from origin (x,y only or
+    // x,y,z) return false on failure to get the vector which can only
+    // happen if the EKF origin has not been set yet x, y and z are in
+    // centimetres.  If this method returns false then vec_ne is
+    // unmodified.
+    template<typename T>
+    bool get_vector_xy_from_origin_NE(T &vec_ne) const WARN_IF_UNUSED;
+    // converts location to a vector from origin; if this method returns
+    // false then vec_neu is unmodified
+    template<typename T>
+    bool get_vector_from_origin_NEU(T &vec_neu) const WARN_IF_UNUSED;
+
+    // return horizontal distance in meters between two locations
+    ftype get_distance(const Location &loc2) const;
+
+    // return the altitude difference in meters taking into account alt frame.
+    bool get_alt_distance(const Location &loc2, ftype &distance) const WARN_IF_UNUSED;
+
+    // return the distance in meters in North/East/Down plane as a N/E/D vector to loc2
+    // NOT CONSIDERING ALT FRAME!
+    Vector3f get_distance_NED(const Location &loc2) const;
+    Vector3d get_distance_NED_double(const Location &loc2) const;
+
+    // return the distance in meters in North/East/Down plane as a N/E/D vector to loc2 considering alt frame, if altitude cannot be resolved down distance is 0
+    Vector3f get_distance_NED_alt_frame(const Location &loc2) const;
+
+    // return the distance in meters in North/East plane as a N/E vector to loc2
+    Vector2f get_distance_NE(const Location &loc2) const;
+    Vector2d get_distance_NE_double(const Location &loc2) const;
+    Vector2F get_distance_NE_ftype(const Location &loc2) const;
+
+    // extrapolate latitude/longitude given distances (in meters) north and east
+    static void offset_latlng(int32_t &lat, int32_t &lng, ftype ofs_north, ftype ofs_east);
+    void offset(ftype ofs_north, ftype ofs_east);
+    // extrapolate latitude/longitude given distances (in meters) north
+    // and east. Note that this is metres, *even for the altitude*.
+    void offset(const Vector3p &ofs_ned);
+
+    // extrapolate latitude/longitude given bearing and distance
+    void offset_bearing(ftype bearing_deg, ftype distance);
+    
+    // extrapolate latitude/longitude given bearing, pitch and distance
+    void offset_bearing_and_pitch(ftype bearing_deg, ftype pitch_deg, ftype distance);
+
+    // longitude_scale - returns the scaler to compensate for
+    // shrinking longitude as you move north or south from the equator
+    // Note: this does not include the scaling to convert
+    // longitude/latitude points to meters or centimeters
+    static ftype longitude_scale(int32_t lat);
+
+    bool is_zero(void) const WARN_IF_UNUSED;
+
+    void zero(void);
+
+    // return the bearing in radians, from 0 to 2*Pi
+    ftype get_bearing(const Location &loc2) const;
+
+    // return bearing in centi-degrees from location to loc2, return is 0 to 35999
+    int32_t get_bearing_to(const Location &loc2) const {
+        return int32_t(get_bearing(loc2) * DEGX100 + 0.5);
+    }
+
+    // check if lat and lng match. Ignore altitude and options
+    bool same_latlon_as(const Location &loc2) const;
+
+    // check if altitude matches.
+    bool same_alt_as(const Location &loc2) const;
+
+    // check if lat, lng, and alt match.
+    bool same_loc_as(const Location &loc2) const {
+        return same_latlon_as(loc2) && same_alt_as(loc2);
+    }
+
+    /*
+     * convert invalid waypoint with useful data. return true if location changed
+     */
+    bool sanitize(const Location &defaultLoc);
+
+    // return true when lat and lng are within range
+    bool check_latlng() const;
+
+    // see if location is past a line perpendicular to
+    // the line between point1 and point2 and passing through point2.
+    // If point1 is our previous waypoint and point2 is our target waypoint
+    // then this function returns true if we have flown past
+    // the target waypoint
+    bool past_interval_finish_line(const Location &point1, const Location &point2) const;
+
+    /*
+      return the proportion we are along the path from point1 to
+      point2, along a line parallel to point1<->point2.
+      This will be more than 1 if we have passed point2
+     */
+    float line_path_proportion(const Location &point1, const Location &point2) const;
+
+    // update altitude and alt-frame base on this location's horizontal position between point1 and point2
+    // this location's lat,lon is used to calculate the alt of the closest point on the line between point1 and point2
+    // origin and destination's altitude frames must be the same
+    // this alt-frame will be updated to match the destination alt frame
+    void linearly_interpolate_alt(const Location &point1, const Location &point2);
+
+    bool initialised() const { return (lat !=0 || lng != 0 || alt != 0); }
+
+    // wrap longitude at -180e7 to 180e7
+    static int32_t wrap_longitude(int64_t lon);
+
+    // limit latitude to -90e7 to 90e7
+    static int32_t limit_lattitude(int32_t lat);
+    
+    // get lon1-lon2, wrapping at -180e7 to 180e7
+    static int32_t diff_longitude(int32_t lon1, int32_t lon2);
+
+private:
+
+    // scaling factor from 1e-7 degrees to meters at equator
+    // == 1.0e-7 * DEG_TO_RAD * RADIUS_OF_EARTH
+    static constexpr float LOCATION_SCALING_FACTOR = LATLON_TO_M;
+    // inverse of LOCATION_SCALING_FACTOR
+    static constexpr float LOCATION_SCALING_FACTOR_INV = LATLON_TO_M_INV;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+  multiple heap interface, allowing for an allocator that uses
+  multiple underlying heaps to cope with multiple memory regions on
+  STM32 boards
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/Util.h>
+#include <AP_Math/AP_Math.h>
+
+#include "MultiHeap.h"
+
+#ifndef HAL_BOOTLOADER_BUILD
+
+/*
+  on ChibiOS allow up to 4 heaps. On other HALs only allow a single
+  heap. This is needed as hal.util->heap_realloc() needs to have the
+  property that heap_realloc(heap, ptr, 0) must not care if ptr comes
+  from the given heap. This is true on ChibiOS, but is not true on
+  other HALs
+ */
+#ifndef MAX_HEAPS
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+#define MAX_HEAPS 4
+#else
+#define MAX_HEAPS 1
+#endif
+#endif
+
+extern const AP_HAL::HAL &hal;
+
+/*
+  create heaps with a total memory size, splitting over at most
+  max_heaps
+ */
+bool MultiHeap::create(uint32_t total_size, uint8_t max_heaps)
+{
+    max_heaps = MIN(MAX_HEAPS, max_heaps);
+    if (heaps != nullptr) {
+        // don't allow double allocation
+        return false;
+    }
+    heaps = NEW_NOTHROW void*[max_heaps];
+    if (heaps == nullptr) {
+        return false;
+    }
+    num_heaps = max_heaps;
+    for (uint8_t i=0; i<max_heaps; i++) {
+        uint32_t alloc_size = total_size;
+        while (alloc_size > 0) {
+            heaps[i] = hal.util->allocate_heap_memory(alloc_size);
+            if (heaps[i] != nullptr) {
+                total_size -= alloc_size;
+                break;
+            }
+            alloc_size *= 0.9;
+        }
+        if (total_size == 0) {
+            break;
+        }
+    }
+    if (total_size != 0) {
+        destroy();
+        return false;
+    }
+    return true;
+}
+
+// destroy heap
+void MultiHeap::destroy(void)
+{
+    if (!available()) {
+        return;
+    }
+    for (uint8_t i=0; i<num_heaps; i++) {
+        if (heaps[i] != nullptr) {
+            free(heaps[i]);
+            heaps[i] = nullptr;
+        }
+    }
+    delete[] heaps;
+    heaps = nullptr;
+    num_heaps = 0;
+}
+
+// return true if heap is available for operations
+bool MultiHeap::available(void) const
+{
+    return heaps != nullptr && heaps[0] != nullptr;
+}
+
+/*
+  allocate memory from a heap
+ */
+void *MultiHeap::allocate(uint32_t size)
+{
+    if (!available()) {
+        return nullptr;
+    }
+    for (uint8_t i=0; i<num_heaps; i++) {
+        if (heaps[i] == nullptr) {
+            break;
+        }
+        void *newptr = hal.util->heap_realloc(heaps[i], nullptr, 0, size);
+        if (newptr != nullptr) {
+            return newptr;
+        }
+    }
+    return nullptr;
+}
+
+/*
+  free memory from a heap
+ */
+void MultiHeap::deallocate(void *ptr)
+{
+    if (!available()) {
+        return;
+    }
+    // NOTE! this relies on either there being a single heap or heap_realloc()
+    // not using the first argument when size is zero.
+    hal.util->heap_realloc(heaps[0], ptr, 0, 0);
+}
+
+/*
+  change size of an allocation
+ */
+void *MultiHeap::change_size(void *ptr, uint32_t old_size, uint32_t new_size)
+{
+    if (new_size == 0) {
+        deallocate(ptr);
+        return nullptr;
+    }
+    if (old_size == 0 || ptr == nullptr) {
+        return allocate(new_size);
+    }
+    /*
+      we cannot know which heap this came from, so we rely on the fact
+      that on ChibiOS the underlying call doesn't use the heap
+      argument and on other HALs we only have one heap. We pass
+      through old_size and new_size so that we can validate the lua
+      old_size value
+    */
+    return hal.util->heap_realloc(heaps[0], ptr, old_size, new_size);
+}
+
+#endif // HAL_BOOTLOADER_BUILD
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+  multiple heap interface, allowing for an allocator that uses
+  multiple underlying heaps to cope with multiple memory regions on
+  STM32 boards
+ */
+
+class MultiHeap {
+public:
+    /*
+      allocate/deallocate heaps
+     */
+    bool create(uint32_t total_size, uint8_t max_heaps);
+    void destroy(void);
+
+    // return true if the heap is available for operations
+    bool available(void) const;
+
+    // allocate memory within heaps
+    void *allocate(uint32_t size);
+    void deallocate(void *ptr);
+
+    // change allocated size of a pointer - this requires the old
+    // size, unlike realloc()
+    void *change_size(void *ptr, uint32_t old_size, uint32_t new_size);
+
+private:
+    uint8_t num_heaps;
+    void **heaps;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+
+#include "NMEA.h"
+
+extern const AP_HAL::HAL &hal;
+
+/*
+  formatted print of NMEA message to an allocated string, with
+  checksum appended
+ */
+char *nmea_vaprintf(const char *fmt, va_list ap)
+{
+    va_list ap_copy;
+
+    // we print once to nullptr to get the length
+    va_copy(ap_copy, ap);
+    int len = hal.util->vsnprintf(nullptr, 0, fmt, ap_copy);
+    va_end(ap_copy);
+    if (len <= 0) {
+        // can't print this format
+        return nullptr;
+    }
+
+    // now allocate the right length, including trailer
+    char *s = (char *)malloc(len+6);
+    if (s == nullptr) {
+        // allocation failed
+        return nullptr;
+    }
+
+    if (hal.util->vsnprintf(s, len+5, fmt, ap) < len) {
+        free(s);
+        // inconsistent formatting
+        return nullptr;
+    }
+
+    // calculate the checksum
+    uint8_t cs = 0;
+    const uint8_t *b = (const uint8_t *)s+1;
+    while (*b) {
+        cs ^= *b++;
+    }
+
+    hal.util->snprintf(s+len, 6, "*%02X\r\n", (unsigned)cs);
+    return s;
+}
+
+/*
+  formatted print of NMEA message to the port, with checksum appended
+ */
+bool nmea_printf(AP_HAL::UARTDriver *uart, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    char *s = nmea_vaprintf(fmt, ap);
+    va_end(ap);
+    if (s == nullptr) {
+        return false;
+    }
+
+    size_t len = strlen(s);
+    if (uart->txspace() < len) {
+        free(s);
+        return false;
+    }
+    uart->write((const uint8_t*)s, len);
+    free(s);
+    return true;
+}
+
+
+/*
+  formatted print of NMEA message to a buffer, with checksum appended.
+  Returns the length of the string filled into buf. If the NMEA string does not fit in the buffer, returns 0
+ */
+uint16_t nmea_printf_buffer(char* buf, const uint16_t buf_max_len, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    char *s = nmea_vaprintf(fmt, ap);
+    va_end(ap);
+    if (s == nullptr) {
+        return 0;
+    }
+
+    size_t len = strlen(s);
+    if (len > buf_max_len) {
+        // our string is larger than the buffer we've supplied.
+        // Instead of populating the buffer with a partial message, just quietly fail and do nothing
+        len = 0;
+    } else {
+        strncpy(buf, s, buf_max_len);
+    }
+    free(s);
+    
+    return len;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <AP_HAL/AP_HAL.h>
+
+/*
+  formatted print of NMEA message to an allocated string, with
+  checksum appended
+ */
+char *nmea_vaprintf(const char *fmt, va_list ap);
+
+/*
+  formatted print of NMEA message to a uart, with checksum appended
+ */
+bool nmea_printf(AP_HAL::UARTDriver *uart, const char *fmt, ...) FMT_PRINTF(2,3);
+
+/*
+  formatted print of NMEA message to a buffer, with checksum appended.
+  Returns the length of the string filled into buf. If the NMEA string does not fit in the buffer, returns 0
+ */
+uint16_t nmea_printf_buffer(char* buf, const uint16_t buf_max_len, const char *fmt, ...);
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#define DECLARE_TYPESAFE_INDEX(NAME, TYPE) typedef typesafe_index<TYPE, class TAG_##NAME> NAME
+
+/// This template allows for indexing with compile time check and generating
+/// error for using one index variable for another array that is to be indexed
+/// with different variable.
+/// base_type specifies
+///
+/// @param  base_type      Base integral type
+///
+/// @param tag             Tag Name to prevent copy from one type to other
+///
+template <class base_type, class tag> class typesafe_index
+{
+public:
+    explicit typesafe_index(base_type i = base_type()) : p(i) {}
+
+    void operator=(const base_type& val)
+    {
+        p = val;
+    }
+
+    constexpr base_type get_int() const
+    {
+        return p;
+    }
+
+    typesafe_index operator++()
+    {
+        return typesafe_index(++p);
+    }
+
+    typesafe_index operator++(int)
+    {
+        return typesafe_index(p++);
+    }
+
+    typesafe_index operator%(const base_type& val)
+    {
+        return typesafe_index(p % val);
+    }
+
+    bool operator<(const base_type& val) const
+    {
+        return (p<val);
+    }
+
+    bool operator<=(const base_type& val) const
+    {
+        return (p<=val);
+    }
+
+    bool operator>=(const base_type& val) const
+    {
+        return (p>=val);
+    }
+
+
+    bool operator>(const base_type& val) const
+    {
+        return (p>val);
+    }
+
+    bool operator!=(const base_type& val) const
+    {
+        return (p!=val);
+    }
+
+    bool operator==(const base_type& val) const
+    {
+        return (p==val);
+    }
+
+    explicit constexpr operator base_type() const
+    {
+        return p;
+    }
+
+    typesafe_index operator+(const base_type& val) const
+    {
+        return typesafe_index(p+val);
+    }
+private:
+    base_type p;
+};
+
+/// This template associates the base_type array with accessor_type(index).
+/// So the elements can be accessed using [] only using accessor_type index
+/// _priv_instance is kept public for use in Parameter declaration.
+///
+template <class base_type, uint32_t num_instances, typename accessor_type> class RestrictIDTypeArray
+{
+public:
+    base_type _priv_instance[num_instances];
+    base_type& operator[](const accessor_type& index)
+    {
+        return _priv_instance[index.get_int()];
+    }
+
+    constexpr const base_type& operator[](const accessor_type& index) const
+    {
+        return _priv_instance[index.get_int()];
+    }
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+  wrapper around new for C++ to ensure we always get zero filled memory
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <stdlib.h>
+#include <new>
+#include <AP_InternalError/AP_InternalError.h>
+
+/*
+  globally override new and delete to ensure that we always start with
+  zero memory. This ensures consistent behaviour.
+
+  Note that new comes in multiple different variants. When new is used
+  without std::nothrow the compiler is free to assume it will not fail
+  as it assumes exceptions are enabled. This makes code like this
+  unsafe when using -fno-exceptions:
+
+    a = new b;
+    if (a == nullptr) {
+      handle_error()
+    }
+
+  the compiler may remove the error handling. With g++ you can use
+  -fcheck-new to avoid this, but on clang++ the compiler accepts
+  -fcheck-new as a valid flag, but doesn't implement it, and may elide
+  the error checking. That makes using clang++ unsafe with
+  -fno-exceptions if you ever call new without std::nothrow.
+
+  To avoid this we define NEW_NOTHROW as new(std::nothrow) and use it
+  everywhere in ArduPilot, then we catch any missing cases with both
+  an internal error and with a check of the elf for the symbols we
+  want to avoid
+*/
+
+/*
+  variant for new(std::nothrow), which is all that should be used in
+  ArduPilot
+ */
+void * operator new(size_t size, std::nothrow_t const &nothrow)
+{
+    if (size < 1) {
+        size = 1;
+    }
+    return(calloc(size, 1));
+}
+
+void * operator new[](size_t size, std::nothrow_t const &nothrow)
+{
+    if (size < 1) {
+        size = 1;
+    }
+    return(calloc(size, 1));
+}
+
+/*
+  These variants are for new without std::nothrow. We don't want to ever
+  use this from ArduPilot code
+ */
+void * operator new(size_t size)
+{
+    if (size < 1) {
+        size = 1;
+    }
+    return(calloc(size, 1));
+}
+
+
+void * operator new[](size_t size)
+{
+    if (size < 1) {
+        size = 1;
+    }
+    return(calloc(size, 1));
+}
+
+void operator delete(void *p)
+{
+    if (p) free(p);
+}
+
+void operator delete[](void * ptr)
+{
+    if (ptr) free(ptr);
+}
+
+#ifdef CYGWIN_BUILD
+/*
+  wrapper around malloc to ensure all memory is initialised as zero
+  cygwin needs to wrap _malloc_r
+ */
+#undef _malloc_r
+extern "C" {
+    void *__wrap__malloc_r(_reent *r, size_t size);
+    void *__real__malloc_r(_reent *r, size_t size);
+    void *_malloc_r(_reent *r, size_t size);
+}
+void *__wrap__malloc_r(_reent *r, size_t size)
+{
+    void *ret = __real__malloc_r(r, size);
+    if (ret != nullptr) {
+        memset(ret, 0, size);
+    }
+    return ret;
+}
+void *_malloc_r(_reent *x, size_t size)
+{
+    void *ret = __real__malloc_r(x, size);
+    if (ret != nullptr) {
+        memset(ret, 0, size);
+    }
+    return ret;
+}
+
+#elif CONFIG_HAL_BOARD != HAL_BOARD_CHIBIOS && CONFIG_HAL_BOARD != HAL_BOARD_QURT
+/*
+  wrapper around malloc to ensure all memory is initialised as zero
+  ChibiOS and QURT have their own wrappers
+ */
+extern "C" {
+    void *__wrap_malloc(size_t size);
+    void *__real_malloc(size_t size);
+}
+void *__wrap_malloc(size_t size)
+{
+    void *ret = __real_malloc(size);
+    if (ret != nullptr) {
+        memset(ret, 0, size);
+    }
+    return ret;
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                

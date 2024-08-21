@@ -1,0 +1,2742 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
+/*
+   This driver supports communicating with Torqeedo motors that implement the "TQ Bus" protocol
+   which includes the Ultralight, Cruise 2.0 R, Cruise 4.0 R, Travel 503, Travel 1003 and Cruise 10kW
+
+   The autopilot should be connected either to the battery's tiller connector or directly to the motor
+   as described on the ArduPilot wiki. https://ardupilot.org/rover/docs/common-torqeedo.html
+   TQ Bus is a serial protocol over RS-485 meaning that a serial to RS-485 converter is required.
+
+       Tiller connection: Autopilot <-> Battery (master) <-> Motor
+       Motor connection:  Autopilot (master) <-> Motor
+
+    Communication between the components is always initiated by the master with replies sent within 25ms
+
+    Example "Remote (0x01)" reply message to allow tiller to control motor speed
+    Byte        Field Definition    Example Value   Comments
+    ---------------------------------------------------------------------------------
+    byte 0      Header              0xAC
+    byte 1      TargetAddress       0x00            see MsgAddress enum
+    byte 2      Message ID          0x00            only master populates this. replies have this set to zero
+    byte 3      Flags               0x05            bit0=pin present, bit2=motor speed valid
+    byte 4      Status              0x00            0x20 if byte3=4, 0x0 is byte3=5
+    byte 5      Motor Speed MSB     ----            Motor Speed MSB (-1000 to +1000)
+    byte 6      Motor Speed LSB     ----            Motor Speed LSB (-1000 to +1000)
+    byte 7      CRC-Maxim           ----            CRC-Maxim value
+    byte 8      Footer              0xAD
+
+   More details of the TQ Bus protocol are available from Torqeedo after signing an NDA.
+ */
+
+#pragma once
+
+#include "AP_Torqeedo_config.h"
+
+#if HAL_TORQEEDO_ENABLED
+
+#include "AP_Torqeedo_Backend.h"
+
+#define TORQEEDO_MESSAGE_LEN_MAX    35  // messages are no more than 35 bytes
+
+class AP_Torqeedo_TQBus : public AP_Torqeedo_Backend {
+public:
+
+    // constructor
+    using AP_Torqeedo_Backend::AP_Torqeedo_Backend;
+
+    CLASS_NO_COPY(AP_Torqeedo_TQBus);
+
+    // initialise driver
+    void init() override;
+
+    // returns true if communicating with the motor
+    bool healthy() override;
+
+    // clear motor errors
+    void clear_motor_error() override { _motor_clear_error = true; }
+
+    // get latest battery status info.  returns true on success and populates arguments
+    bool get_batt_info(float &voltage, float &current_amps, float &temp_C, uint8_t &pct_remaining) const override;
+    bool get_batt_capacity_Ah(uint16_t &amp_hours) const override;
+
+private:
+
+    // consume incoming messages from motor, reply with latest motor speed
+    // runs in background thread
+    void thread_main();
+
+    // report changes in error codes to user
+    void report_error_codes();
+
+    // message addresses
+    enum class MsgAddress : uint8_t {
+        BUS_MASTER = 0x00,
+        REMOTE1 = 0x14,
+        DISPLAY = 0x20,
+        MOTOR = 0x30,
+        BATTERY = 0x80
+    };
+
+    // Remote specific message ids
+    enum class RemoteMsgId : uint8_t {
+        INFO = 0x00,
+        REMOTE = 0x01,
+        SETUP = 0x02
+    };
+
+    // Display specific message ids
+    enum class DisplayMsgId : uint8_t {
+        INFO = 0x00,
+        SYSTEM_STATE = 0x41,
+        SYSTEM_SETUP = 0x42
+    };
+
+    // Motor specific message ids
+    enum class MotorMsgId : uint8_t {
+        INFO = 0x00,
+        STATUS = 0x01,
+        PARAM = 0x03,
+        CONFIG = 0x04,
+        DRIVE = 0x82
+    };
+
+    enum class ParseState {
+        WAITING_FOR_HEADER = 0,
+        WAITING_FOR_FOOTER,
+    };
+
+    // initialise serial port and gpio pins (run from background thread)
+    // returns true on success
+    bool init_internals();
+
+    // process a single byte received on serial port
+    // return true if a complete message has been received (the message will be held in _received_buff)
+    bool parse_byte(uint8_t b);
+
+    // process message held in _received_buff
+    void parse_message();
+
+    // returns true if it is safe to send a message
+    bool safe_to_send() const { return ((_send_delay_us == 0) && (_reply_wait_start_ms == 0)); }
+
+    // set pin to enable sending a message
+    void send_start();
+
+    // check for timeout after sending a message and unset pin if required
+    void check_for_send_end();
+
+    // calculate delay required to allow message to be completely sent
+    uint32_t calc_send_delay_us(uint8_t num_bytes);
+
+    // record msgid of message to wait for and set timer for reply timeout handling
+    void set_expected_reply_msgid(uint8_t msg_id);
+
+    // check for timeout waiting for reply
+    void check_for_reply_timeout();
+
+    // mark reply received. should be called whenever a message is received regardless of whether we are actually waiting for a reply
+    void set_reply_received();
+
+    // send a message to the motor with the specified message contents
+    // msg_contents should not include the header, footer or CRC
+    // returns true on success
+    bool send_message(const uint8_t msg_contents[], uint8_t num_bytes);
+
+    // add a byte to a message buffer including adding the escape character (0xAE) if necessary
+    // this should only be used when adding the contents to the buffer, not the header and footer
+    // num_bytes is updated to the next free byte
+    bool add_byte_to_message(uint8_t byte_to_add, uint8_t msg_buff[], uint8_t msg_buff_size, uint8_t &num_bytes) const;
+
+    // send a motor speed command as a value from -1000 to +1000
+    // value is taken directly from SRV_Channel
+    void send_motor_speed_cmd();
+
+    // send request to motor to reply with a particular message
+    // msg_id can be INFO, STATUS or PARAM
+    void send_motor_msg_request(MotorMsgId msg_id);
+
+    // calculate the limited motor speed that is sent to the motors
+    // desired_motor_speed argument and returned value are in the range -1000 to 1000
+    int16_t calc_motor_speed_limited(int16_t desired_motor_speed);
+    int16_t get_motor_speed_limited() const { return (int16_t)_motor_speed_limited; }
+
+    // log TRQD message which holds high level status and latest desired motors peed
+    // force_logging should be true to immediately write log bypassing timing check to avoid spamming
+    void log_TRQD(bool force_logging);
+
+    // send ESC telemetry
+    void update_esc_telem(float rpm, float voltage, float current_amps, float esc_tempC, float motor_tempC);
+
+    // members
+    AP_HAL::UARTDriver *_uart;      // serial port to communicate with motor
+    bool _initialised;              // true once driver has been initialised
+    bool _send_motor_speed;         // true if motor speed should be sent at next opportunity
+    int16_t _motor_speed_desired;   // desired motor speed (set from within update method)
+    uint32_t _last_send_motor_ms;   // system time (in millis) last motor speed command was sent (used for health reporting)
+    bool _motor_clear_error;        // true if the motor error should be cleared (sent in "Drive" message)
+    uint32_t _send_start_us;        // system time (in micros) when last message started being sent (used for timing to unset DE pin)
+    uint32_t _send_delay_us;        // delay (in micros) to allow bytes to be sent after which pin can be unset.  0 if not delaying
+
+    // motor speed limit variables
+    float _motor_speed_limited;     // limited desired motor speed. this value is actually sent to the motor
+    uint32_t _motor_speed_limited_ms; // system time that _motor_speed_limited was last updated
+    int8_t _dir_limit;              // acceptable directions for output to motor (+1 = positive OK, -1 = negative OK, 0 = either positive or negative OK)
+    uint32_t _motor_speed_zero_ms;  // system time that _motor_speed_limited reached zero.  0 if currently not zero
+
+    // health reporting
+    HAL_Semaphore _last_healthy_sem;// semaphore protecting reading and updating of _last_send_motor_ms and _last_received_ms
+    uint32_t _last_log_TRQD_ms;     // system time (in millis) that TRQD was last logged
+
+    // message parsing members
+    ParseState _parse_state;        // current state of parsing
+    bool _parse_escape_received;    // true if the escape character has been received so we must XOR the next byte
+    uint32_t _parse_error_count;    // total number of parsing errors (for reporting)
+    uint32_t _parse_success_count;  // number of messages successfully parsed (for reporting)
+    uint8_t _received_buff[TORQEEDO_MESSAGE_LEN_MAX];   // characters received
+    uint8_t _received_buff_len;     // number of characters received
+    uint32_t _last_received_ms;     // system time (in millis) that a message was successfully parsed (for health reporting)
+
+    // reply message handling
+    uint8_t _reply_msgid;           // replies expected msgid (reply often does not specify the msgid so we must record it)
+    uint32_t _reply_wait_start_ms;  // system time that we started waiting for a reply message
+
+    // Display system state flags
+    typedef union PACKED {
+        struct {
+            uint8_t set_throttle_stop   : 1;    // 0, warning that user must set throttle to stop before motor can run
+            uint8_t setup_allowed       : 1;    // 1, remote is allowed to enter setup mode
+            uint8_t in_charge           : 1;    // 2, master is in charging state
+            uint8_t in_setup            : 1;    // 3, master is in setup state
+            uint8_t bank_available      : 1;    // 4
+            uint8_t no_menu             : 1;    // 5
+            uint8_t menu_off            : 1;    // 6
+            uint8_t reserved7           : 1;    // 7, unused
+            uint8_t temp_warning        : 1;    // 8, motor or battery temp warning
+            uint8_t batt_charge_valid   : 1;    // 9, battery charge valid
+            uint8_t batt_nearly_empty   : 1;    // 10, battery nearly empty
+            uint8_t batt_charging       : 1;    // 11, battery charging
+            uint8_t gps_searching       : 1;    // 12, gps searching for satellites
+            uint8_t gps_speed_valid     : 1;    // 13, gps speed is valid
+            uint8_t range_miles_valid   : 1;    // 14, range (in miles) is valid
+            uint8_t range_minutes_valid : 1;    // 15, range (in minutes) is valid
+        };
+        uint16_t value;
+    } DisplaySystemStateFlags;
+
+    // Display system state
+    struct DisplaySystemState {
+        DisplaySystemStateFlags flags;  // flags, see above for individual bit definitions
+        uint8_t master_state;           // deprecated
+        uint8_t master_error_code;      // error code (0=no error)
+        float motor_voltage;            // motor voltage in volts
+        float motor_current;            // motor current in amps
+        uint16_t motor_power;           // motor power in watts
+        int16_t motor_rpm;              // motor speed in rpm
+        uint8_t motor_pcb_temp;         // motor pcb temp in C
+        uint8_t motor_stator_temp;      // motor stator temp in C
+        uint8_t batt_charge_pct;        // battery state of charge (0 to 100%)
+        float batt_voltage;             // battery voltage in volts
+        float batt_current;             // battery current in amps
+        uint16_t gps_speed;             // gps speed in knots * 100
+        uint16_t range_miles;           // range in nautical miles * 10
+        uint16_t range_minutes;         // range in minutes (at current speed and current draw)
+        uint8_t temp_sw;                // master PCB temp in C (close to motor power switches)
+        uint8_t temp_rp;                // master PCB temp in C (close to reverse voltage protection)
+        uint32_t last_update_ms;        // system time that system state was last updated
+    } _display_system_state;
+
+    // Display system setup
+    struct DisplaySystemSetup {
+        uint8_t flags;              // 0 : battery config valid, all other bits unused
+        uint8_t motor_type;         // motor type (0 or 3:Unknown, 1:Ultralight, 2:Cruise2, 4:Cruise4, 5:Travel503, 6:Travel1003, 7:Cruise10kW)
+        uint16_t motor_sw_version;  // motor software version
+        uint16_t batt_capacity;     // battery capacity in amp hours
+        uint8_t batt_charge_pct;    // battery state of charge (0 to 100%)
+        uint8_t batt_type;          // battery type (0:lead acid, 1:Lithium)
+        uint16_t master_sw_version; // master software version
+    } _display_system_setup;
+
+    // Motor status
+    struct MotorStatus {
+        union PACKED {
+            struct {
+                uint8_t temp_limit_motor    : 1;    // 0, motor speed limited due to motor temp
+                uint8_t temp_limit_pcb      : 1;    // 1, motor speed limited tue to PCB temp
+                uint8_t emergency_stop      : 1;    // 2, motor in emergency stop (must be cleared by master)
+                uint8_t running             : 1;    // 3, motor running
+                uint8_t power_limit         : 1;    // 4, motor power limited
+                uint8_t low_voltage_limit   : 1;    // 5, motor speed limited because of low voltage
+                uint8_t tilt                : 1;    // 6, motor is tilted
+                uint8_t reserved7           : 1;    // 7, unused (always zero)
+            } status_flags;
+            uint8_t status_flags_value;
+        };
+        union PACKED {
+            struct {
+                uint8_t overcurrent         : 1;    // 0, motor stopped because of overcurrent
+                uint8_t blocked             : 1;    // 1, motor stopped because it is blocked
+                uint8_t overvoltage_static  : 1;    // 2, motor stopped because voltage too high
+                uint8_t undervoltage_static : 1;    // 3, motor stopped because voltage too low
+                uint8_t overvoltage_current : 1;    // 4, motor stopped because voltage spiked high
+                uint8_t undervoltage_current: 1;    // 5, motor stopped because voltage spiked low
+                uint8_t overtemp_motor      : 1;    // 6, motor stopped because stator temp too high
+                uint8_t overtemp_pcb        : 1;    // 7, motor stopped because pcb temp too high
+                uint8_t timeout_rs485       : 1;    // 8, motor stopped because Drive message not received for too long
+                uint8_t temp_sensor_error   : 1;    // 9, motor temp sensor is defective (motor will not stop)
+                uint8_t tilt                : 1;    // 10, motor stopped because it was tilted
+                uint8_t unused11to15        : 5;    // 11 ~ 15 (always zero)
+            } error_flags;
+            uint16_t error_flags_value;
+        };
+    } _motor_status;
+    uint32_t _last_send_motor_status_request_ms;    // system time (in milliseconds) that last motor status request was sent
+
+    // Motor params
+    struct MotorParam {
+        int16_t rpm;            // motor rpm
+        uint16_t power;         // motor power consumption in Watts
+        float voltage;          // motor voltage in volts
+        float current;          // motor current in amps
+        float pcb_temp;         // pcb temp in C
+        float stator_temp;      // stator temp in C
+        uint32_t last_update_ms;// system time that above values were updated
+    } _motor_param;
+    uint32_t _last_send_motor_param_request_ms;     // system time (in milliseconds) that last motor param request was sent
+
+    // error reporting
+    DisplaySystemStateFlags _display_system_state_flags_prev;   // backup of display system state flags
+    uint8_t _display_system_state_master_error_code_prev;       // backup of display system state master_error_code
+    uint32_t _last_error_report_ms;                             // system time that flag changes were last reported (used to prevent spamming user)
+    MotorStatus _motor_status_prev;                             // backup of motor status
+
+    // returns a human-readable string corresponding the passed-in
+    // master error code (see page 93 of https://media.torqeedo.com/downloads/manuals/torqeedo-Travel-manual-DE-EN.pdf)
+    // If no conversion is available then nullptr is returned
+    const char *map_master_error_code_to_string(uint8_t code) const;
+};
+
+#endif // HAL_TORQEEDO_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef HAL_TORQEEDO_ENABLED
+#define HAL_TORQEEDO_ENABLED BOARD_FLASH_SIZE > 1024
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #include "AP_Tuning_config.h"
+
+#if AP_TUNING_ENABLED
+
+#include "AP_Tuning.h"
+
+#include <AP_Logger/AP_Logger.h>
+#include <GCS_MAVLink/GCS.h>
+#include <RC_Channel/RC_Channel.h>
+#include <AP_Notify/AP_Notify.h>
+
+extern const AP_HAL::HAL& hal;
+
+const AP_Param::GroupInfo AP_Tuning::var_info[] = {
+    // @Param: CHAN
+    // @DisplayName: Transmitter tuning channel
+    // @Description: This sets the channel for transmitter tuning. This should be connected to a knob or slider on your transmitter. It needs to be setup to use the PWM range given by TUNE_CHAN_MIN to TUNE_CHAN_MAX
+    // @Values: 0:Disable,5:Chan5,6:Chan6,7:Chan7,8:Chan8,9:Chan9,10:Chan10,11:Chan11,12:Chan12,13:Chan13,14:Chan14,15:Chan15,16:Chan16
+    // @User: Standard
+    AP_GROUPINFO("CHAN", 1, AP_Tuning, channel, 0),
+    
+    // @Param: CHAN_MIN
+    // @DisplayName: Transmitter tuning channel minimum pwm
+    // @Description: This sets the PWM lower limit for the tuning channel
+    // @Range: 900 2100
+    // @User: Standard
+    AP_GROUPINFO("CHAN_MIN", 2, AP_Tuning, channel_min, 1000),
+
+    // @Param: CHAN_MAX
+    // @DisplayName: Transmitter tuning channel maximum pwm
+    // @Description: This sets the PWM upper limit for the tuning channel
+    // @Range: 900 2100
+    // @User: Standard
+    AP_GROUPINFO("CHAN_MAX", 3, AP_Tuning, channel_max, 2000),
+
+    // @Param: SELECTOR
+    // @DisplayName: Transmitter tuning selector channel
+    // @Description: This sets the channel for the transmitter tuning selector switch. This should be a 2 position switch, preferably spring loaded. A PWM above 1700 means high, below 1300 means low. If no selector is set then you won't be able to switch between parameters during flight or re-center the tuning knob
+    // @Values: 0:Disable,1:Chan1,2:Chan3,3:Chan3,4:Chan4,5:Chan5,6:Chan6,7:Chan7,8:Chan8,9:Chan9,10:Chan10,11:Chan11,12:Chan12,13:Chan13,14:Chan14,15:Chan15,16:Chan16
+    // @User: Standard
+    AP_GROUPINFO("SELECTOR", 4, AP_Tuning, selector, 0),
+    
+    // @Param: RANGE
+    // @DisplayName: Transmitter tuning range
+    // @Description: This sets the range over which tuning will change a parameter. A value of 2 means the tuning parameter will go from 0.5 times the start value to 2x the start value over the range of the tuning channel
+    // @User: Standard
+    AP_GROUPINFO("RANGE", 5, AP_Tuning, range, 2.0f),
+
+    // @Param: MODE_REVERT
+    // @DisplayName: Revert on mode change
+    // @Description: This controls whether tuning values will revert on a flight mode change.
+    // @Values: 0:Disable,1:Enable
+    // @User: Standard
+    AP_GROUPINFO("MODE_REVERT", 6, AP_Tuning, mode_revert, 1),
+
+    // @Param: ERR_THRESH
+    // @DisplayName: Controller error threshold
+    // @Description: This sets the controller error threshold above which an alarm will sound and a message will be sent to the GCS to warn of controller instability while tuning. The error is the rms value of the P+D corrections in the loop. High values in hover indicate possible instability due to too high PID gains or excessively high D to P gain ratios.-1 will disable this message.
+    // @Range: 0 1
+    // @User: Standard
+    AP_GROUPINFO("ERR_THRESH", 7, AP_Tuning, error_threshold, 0.15f),
+    
+    AP_GROUPEND
+};
+
+/*
+  handle selector switch input
+*/
+void AP_Tuning::check_selector_switch(void)
+{
+    if (selector == 0) {
+        // no selector switch enabled
+        return;
+    }
+    if (!rc().has_valid_input()) {
+        selector_start_ms = 0;
+        return;
+    }
+    RC_Channel *selchan = rc().channel(selector-1);
+    if (selchan == nullptr) {
+        return;
+    }
+    uint16_t selector_in = selchan->get_radio_in();
+    if (selector_in >= RC_Channel::AUX_PWM_TRIGGER_HIGH) {
+        // high selector
+        if (selector_start_ms == 0) {
+            selector_start_ms = AP_HAL::millis();
+        }
+        uint32_t hold_time = AP_HAL::millis() - selector_start_ms;
+        if (hold_time > 5000 && changed) {
+            // save tune
+            save_parameters();
+            re_center();
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Tuning: Saved");
+            AP_Notify::events.tune_save = 1;
+            changed = false;
+            need_revert = 0;
+        }
+    } else if (selector_in <= RC_Channel::AUX_PWM_TRIGGER_LOW) {
+        // low selector
+        if (selector_start_ms != 0) {
+            uint32_t hold_time = AP_HAL::millis() - selector_start_ms;
+            if (hold_time < 200) {
+                // debounce!
+            } else if (hold_time < 2000) {
+                // re-center the value
+                re_center();
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Tuning: recentered %s", get_tuning_name(current_parm));
+            } else if (hold_time < 5000) {
+                // change parameter
+                next_parameter();
+            }
+            selector_start_ms = 0;
+        }
+    }
+}
+
+/*
+  re-center the tuning value
+ */
+void AP_Tuning::re_center(void)
+{
+    AP_Float *f = get_param_pointer(current_parm);
+    if (f != nullptr) {
+        center_value = f->get();
+    }
+    mid_point_wait = true;
+}
+
+/*
+  check for changed tuning input
+ */
+void AP_Tuning::check_input(uint8_t flightmode)
+{
+    if (channel <= 0 || parmset <= 0) {
+        // disabled
+        return;
+    }
+
+    // check for revert on changed flightmode
+    if (flightmode != last_flightmode) {
+        if (need_revert != 0 && mode_revert != 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Tuning: reverted");
+            revert_parameters();
+            re_center();
+        }
+        last_flightmode = flightmode;
+    }
+    
+    // only adjust values at 10Hz
+    uint32_t now = AP_HAL::millis();
+    uint32_t dt_ms = now - last_check_ms;
+    if (dt_ms < 100) {
+        return;
+    }
+    last_check_ms = now;
+
+    if (channel > RC_Channels::get_valid_channel_count()) {
+        // not valid channel
+        return;
+    }
+
+    // check for invalid range
+    if (range < 1.1f) {
+        range.set(1.1f);
+    }
+
+    if (current_parm == 0) {
+        next_parameter();
+    }
+
+    // cope with user changing parmset while tuning
+    if (current_set != parmset) {
+        re_center();
+    }
+    current_set = parmset;
+    
+    check_selector_switch();
+
+    if (selector_start_ms) {
+        // no tuning while selector high
+        return;
+    }
+
+    if (current_parm == 0) {
+        return;
+    }
+    
+    RC_Channel *chan = rc().channel(channel-1);
+    if (chan == nullptr) {
+        return;
+    }
+    float chan_value = linear_interpolate(-1, 1, chan->get_radio_in(), channel_min, channel_max);
+    if (dt_ms > 500) {
+        last_channel_value = chan_value;
+    }
+
+    if (fabsf(chan_value - last_channel_value) < 0.01) {
+        // ignore changes of less than 1%
+        return;
+    }
+
+    //hal.console->printf("chan_value %.2f last_channel_value %.2f\n", chan_value, last_channel_value);
+
+    if (mid_point_wait) {
+        // see if we have crossed the mid-point. We use a small deadzone to make it easier
+        // to move to the "indent" portion of a slider to start tuning
+        const float dead_zone = 0.02;
+        if ((chan_value > dead_zone && last_channel_value > 0) ||
+            (chan_value < -dead_zone && last_channel_value < 0)) {
+            // still waiting
+            return;
+        }
+        // starting tuning
+        mid_point_wait = false;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Tuning: mid-point %s", get_tuning_name(current_parm));
+        AP_Notify::events.tune_started = 1;
+    }
+    last_channel_value = chan_value;
+
+    float new_value;
+    if (chan_value > 0) {
+        new_value = linear_interpolate(center_value, range*center_value, chan_value, 0, 1);
+    } else {
+        new_value = linear_interpolate(center_value/range, center_value, chan_value, -1, 0);
+    }
+    changed = true;
+    need_revert |= (1U << current_parm_index);
+    set_value(current_parm, new_value);
+
+#if HAL_LOGGING_ENABLED
+    Log_Write_Parameter_Tuning(new_value);
+#endif
+}
+
+
+#if HAL_LOGGING_ENABLED
+/*
+  log a tuning change
+ */
+void AP_Tuning::Log_Write_Parameter_Tuning(float value)
+{
+// @LoggerMessage: PRTN
+// @Description: Plane Parameter Tuning data
+// @Field: TimeUS: Time since system startup
+// @Field: Set: Parameter set being tuned
+// @Field: Parm: Parameter being tuned
+// @Field: Value: Current parameter value
+// @Field: CenterValue: Center value (startpoint of current modifications) of parameter being tuned
+    AP::logger().Write("PRTN", "TimeUS,Set,Parm,Value,CenterValue", "QBBff",
+                                           AP_HAL::micros64(),
+                                           parmset,
+                                           current_parm,
+                                           (double)value,
+                                           (double)center_value);
+}
+#endif
+
+/*
+  save parameters in the set
+ */
+void AP_Tuning::save_parameters(void)
+{
+    uint8_t set = (uint8_t)parmset.get();
+    if (set < set_base) {
+        // single parameter tuning
+        save_value(set);
+        return;
+    }
+    // multiple parameter tuning
+    for (uint8_t i=0; tuning_sets[i].num_parms != 0; i++) {
+        if (tuning_sets[i].set+set_base == set) {
+            for (uint8_t p=0; p<tuning_sets[i].num_parms; p++) {
+                save_value(tuning_sets[i].parms[p]);
+            }
+            break;
+        }
+    }
+}
+
+
+/*
+  save parameters in the set
+ */
+void AP_Tuning::revert_parameters(void)
+{
+    uint8_t set = (uint8_t)parmset.get();
+    if (set < set_base) {
+        // single parameter tuning
+        reload_value(set);
+        return;
+    }
+    for (uint8_t i=0; tuning_sets[i].num_parms != 0; i++) {
+        if (tuning_sets[i].set+set_base == set) {
+            for (uint8_t p=0; p<tuning_sets[i].num_parms; p++) {
+                if (p >= 32 || (need_revert & (1U<<p))) {
+                    reload_value(tuning_sets[i].parms[p]);
+                }
+            }
+            need_revert = 0;
+            break;
+        }
+    }
+}
+
+/*
+  switch to the next parameter in the set
+ */
+void AP_Tuning::next_parameter(void)
+{
+    uint8_t set = (uint8_t)parmset.get();
+    if (set < set_base) {
+        // nothing to do but re-center
+        current_parm = set;
+        re_center();        
+        return;
+    }
+    for (uint8_t i=0; tuning_sets[i].num_parms != 0; i++) {
+        if (tuning_sets[i].set+set_base == set) {
+            if (current_parm == 0) {
+                current_parm_index = 0;
+            } else {
+                current_parm_index = (current_parm_index + 1) % tuning_sets[i].num_parms;
+            }
+            current_parm = tuning_sets[i].parms[current_parm_index];
+            re_center();
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Tuning: started %s", get_tuning_name(current_parm));
+            AP_Notify::events.tune_next = current_parm_index+1;
+            break;
+        }
+    }
+}
+
+/*
+  return a string representing a tuning parameter
+ */
+const char *AP_Tuning::get_tuning_name(uint8_t parm)
+{
+    for (uint8_t i=0; tuning_names[i].name != nullptr; i++) {
+        if (parm == tuning_names[i].parm) {
+            return tuning_names[i].name;
+        }
+    }
+    return "UNKNOWN";
+}
+
+#endif  // AP_TUNING_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #pragma once
+
+#include "AP_Tuning_config.h"
+
+#if AP_TUNING_ENABLED
+
+#include <AP_Param/AP_Param.h>
+
+#include "stdint.h"
+
+/*
+  transmitter tuning library. Meant to be subclassed per vehicle type
+ */
+class AP_Tuning
+{
+public:
+    struct tuning_set {
+        uint8_t set;
+        uint8_t num_parms;
+        const uint8_t *parms;
+    };
+
+    struct tuning_name {
+        uint8_t parm;
+        const char *name;
+    };
+
+    // constructor
+    AP_Tuning(const struct tuning_set *sets, const struct tuning_name *names) :
+        tuning_sets(sets),
+        tuning_names(names) {
+        AP_Param::setup_object_defaults(this, var_info);
+    }
+    
+    // var_info for holding Parameter information
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // update function called on new radio frames
+    void check_input(uint8_t flightmode);
+
+    // base parameter number for tuning sets of parameters in one flight
+    const uint8_t set_base = 100;
+    
+private:
+    AP_Int8 channel;
+    AP_Int16 channel_min;
+    AP_Int16 channel_max;
+    AP_Int8 selector;
+    AP_Float range;
+    AP_Int8 mode_revert;
+    AP_Float error_threshold;
+
+    // when selector was triggered
+    uint32_t selector_start_ms;
+
+    // are we waiting for channel mid-point?
+    bool mid_point_wait;
+
+    // last input from tuning channel
+    float last_channel_value;
+    
+    // mid-value for current parameter
+    float center_value;
+
+    uint32_t last_check_ms;
+
+    void Log_Write_Parameter_Tuning(float value);
+    
+    // the parameter we are tuning
+    uint8_t current_parm;
+
+    // current index into the parameter set
+    uint8_t current_parm_index;
+
+    // current parameter set
+    uint8_t current_set;
+
+    // true if tune has changed
+    bool changed:1;
+
+    // mask of params in set that need reverting
+    uint32_t need_revert;
+    
+    // last flight mode we were tuning in
+    uint8_t last_flightmode;
+
+    const tuning_set *tuning_sets;
+    const tuning_name *tuning_names;
+    
+    void check_selector_switch(void);
+    void re_center(void);
+    void next_parameter(void);
+    void save_parameters(void);
+    void revert_parameters(void);
+    const char *get_tuning_name(uint8_t parm);
+
+protected:
+    // virtual functions that must be implemented in vehicle subclass
+    virtual AP_Float *get_param_pointer(uint8_t parm) = 0;
+    virtual void save_value(uint8_t parm) = 0;
+    virtual void reload_value(uint8_t parm) = 0;
+    virtual void set_value(uint8_t parm, float value) = 0;
+
+    // parmset is in vehicle subclass var table
+    AP_Int16 parmset;
+};
+
+#endif  // AP_TUNING_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_TUNING_ENABLED
+#define AP_TUNING_ENABLED 1
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_Vehicle_config.h"
+
+#if AP_VEHICLE_ENABLED
+
+/*
+  this header holds a parameter structure for each vehicle type for
+  parameters needed by multiple libraries
+ */
+
+#include "ModeReason.h" // reasons can't be defined in this header due to circular loops
+
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_AccelCal/AP_AccelCal.h>
+#include <AP_Airspeed/AP_Airspeed.h>
+#include <AP_Baro/AP_Baro.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>     // board configuration library
+#include <AP_CANManager/AP_CANManager.h>
+#include <AP_Button/AP_Button.h>
+#include <AP_Compass/AP_Compass.h>
+#include <AP_EFI/AP_EFI.h>
+#include <AP_ExternalControl/AP_ExternalControl_config.h>
+#include <AP_GPS/AP_GPS.h>
+#include <AP_Generator/AP_Generator.h>
+#include <AP_Logger/AP_Logger.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
+#include <AP_Notify/AP_Notify.h>                    // Notify library
+#include <AP_Param/AP_Param.h>
+#include <AP_RangeFinder/AP_RangeFinder.h>
+#include <AP_Relay/AP_Relay.h>                      // APM relay
+#include <AP_RSSI/AP_RSSI.h>                        // RSSI Library
+#include <AP_Scheduler/AP_Scheduler.h>
+#include <AP_SerialManager/AP_SerialManager.h>      // Serial manager library
+#include <AP_ServoRelayEvents/AP_ServoRelayEvents.h>
+#include <AP_Camera/AP_RunCam.h>
+#include <AP_OpenDroneID/AP_OpenDroneID.h>
+#include <AP_Hott_Telem/AP_Hott_Telem.h>
+#include <AP_ESC_Telem/AP_ESC_Telem.h>
+#include <AP_GyroFFT/AP_GyroFFT.h>
+#include <AP_Networking/AP_Networking.h>
+#include <AP_VisualOdom/AP_VisualOdom.h>
+#include <AP_VideoTX/AP_VideoTX.h>
+#include <AP_MSP/AP_MSP.h>
+#include <AP_Frsky_Telem/AP_Frsky_Parameters.h>
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+#include <AP_VideoTX/AP_SmartAudio.h>
+#include <AP_VideoTX/AP_Tramp.h>
+#include <AP_TemperatureSensor/AP_TemperatureSensor.h>
+#include <SITL/SITL.h>
+#include <AP_CustomRotations/AP_CustomRotations.h>
+#include <AP_AIS/AP_AIS.h>
+#include <AP_NMEA_Output/AP_NMEA_Output.h>
+#include <AC_Fence/AC_Fence.h>
+#include <AP_CheckFirmware/AP_CheckFirmware.h>
+#include <Filter/LowPassFilter.h>
+#include <AP_KDECAN/AP_KDECAN.h>
+#include <Filter/AP_Filter.h>
+#include <AP_Stats/AP_Stats.h>              // statistics library
+#if AP_SCRIPTING_ENABLED
+#include <AP_Scripting/AP_Scripting.h>
+#endif
+
+#include <AP_Gripper/AP_Gripper_config.h>
+#if AP_GRIPPER_ENABLED
+#include <AP_Gripper/AP_Gripper.h>
+#endif
+
+#include <AP_IBus_Telem/AP_IBus_Telem.h>
+
+class AP_DDS_Client;
+
+class AP_Vehicle : public AP_HAL::HAL::Callbacks {
+
+public:
+
+    AP_Vehicle() {
+        if (_singleton) {
+            AP_HAL::panic("Too many Vehicles");
+        }
+        AP_Param::setup_object_defaults(this, var_info);
+        _singleton = this;
+    }
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_Vehicle);
+
+    static AP_Vehicle *get_singleton();
+
+    // setup() is called once during vehicle startup to initialise the
+    // vehicle object and the objects it contains.  The
+    // AP_HAL_MAIN_CALLBACKS pragma creates a main(...) function
+    // referencing an object containing setup() and loop() functions.
+    // A vehicle is not expected to override setup(), but
+    // subclass-specific initialisation can be done in init_ardupilot
+    // which is called from setup().
+    void setup(void) override final;
+
+    // HAL::Callbacks implementation.
+    void loop() override final;
+
+    // set_mode *must* set control_mode_reason
+    virtual bool set_mode(const uint8_t new_mode, const ModeReason reason) = 0;
+    virtual uint8_t get_mode() const = 0;
+
+    ModeReason get_control_mode_reason() const {
+        return control_mode_reason;
+    }
+
+    virtual bool current_mode_requires_mission() const { return false; }
+
+    // perform any notifications required to indicate a mode change
+    // failed due to a bad mode number being supplied.  This can
+    // happen for many reasons - bad mavlink packet and bad mode
+    // parameters for example.
+    void notify_no_such_mode(uint8_t mode_number);
+
+#if AP_SCHEDULER_ENABLED
+    void get_common_scheduler_tasks(const AP_Scheduler::Task*& tasks, uint8_t& num_tasks);
+    // implementations *MUST* fill in all passed-in fields or we get
+    // Valgrind errors
+    virtual void get_scheduler_tasks(const AP_Scheduler::Task *&tasks, uint8_t &task_count, uint32_t &log_bit) = 0;
+#endif
+
+    /*
+      set the "likely flying" flag. This is not guaranteed to be
+      accurate, but is the vehicle codes best guess as to the whether
+      the vehicle is currently flying
+    */
+    void set_likely_flying(bool b) {
+        if (b && !likely_flying) {
+            _last_flying_ms = AP_HAL::millis();
+        }
+        likely_flying = b;
+    }
+
+    /*
+      get the likely flying status. Returns true if the vehicle code
+      thinks we are flying at the moment. Not guaranteed to be
+      accurate
+    */
+    bool get_likely_flying(void) const {
+        return likely_flying;
+    }
+
+    /*
+      return time in milliseconds since likely_flying was set
+      true. Returns zero if likely_flying is currently false
+    */
+    uint32_t get_time_flying_ms(void) const {
+        if (!likely_flying) {
+            return 0;
+        }
+        return AP_HAL::millis() - _last_flying_ms;
+    }
+
+    // returns true if the vehicle has crashed
+    virtual bool is_crashed() const;
+
+#if AP_SCRIPTING_ENABLED || AP_EXTERNAL_CONTROL_ENABLED
+    // Method to control vehicle position for use by external control
+    virtual bool set_target_location(const Location& target_loc) { return false; }
+#endif // AP_SCRIPTING_ENABLED || AP_EXTERNAL_CONTROL_ENABLED
+#if AP_SCRIPTING_ENABLED
+    /*
+      methods to control vehicle for use by scripting
+    */
+    virtual bool start_takeoff(float alt) { return false; }
+    virtual bool set_target_pos_NED(const Vector3f& target_pos, bool use_yaw, float yaw_deg, bool use_yaw_rate, float yaw_rate_degs, bool yaw_relative, bool terrain_alt) { return false; }
+    virtual bool set_target_posvel_NED(const Vector3f& target_pos, const Vector3f& target_vel) { return false; }
+    virtual bool set_target_posvelaccel_NED(const Vector3f& target_pos, const Vector3f& target_vel, const Vector3f& target_accel, bool use_yaw, float yaw_deg, bool use_yaw_rate, float yaw_rate_degs, bool yaw_relative) { return false; }
+    virtual bool set_target_velocity_NED(const Vector3f& vel_ned) { return false; }
+    virtual bool set_target_velaccel_NED(const Vector3f& target_vel, const Vector3f& target_accel, bool use_yaw, float yaw_deg, bool use_yaw_rate, float yaw_rate_degs, bool yaw_relative) { return false; }
+    virtual bool set_target_angle_and_climbrate(float roll_deg, float pitch_deg, float yaw_deg, float climb_rate_ms, bool use_yaw_rate, float yaw_rate_degs) { return false; }
+
+    // command throttle percentage and roll, pitch, yaw target
+    // rates. For use with scripting controllers
+    virtual void set_target_throttle_rate_rpy(float throttle_pct, float roll_rate_dps, float pitch_rate_dps, float yaw_rate_dps) {}
+    virtual void set_rudder_offset(float rudder_pct, bool run_yaw_rate_controller) {}
+    virtual bool nav_scripting_enable(uint8_t mode) {return false;}
+
+    // get target location (for use by scripting)
+    virtual bool get_target_location(Location& target_loc) { return false; }
+    virtual bool update_target_location(const Location &old_loc, const Location &new_loc) { return false; }
+
+    // circle mode controls (only used by scripting with Copter)
+    virtual bool get_circle_radius(float &radius_m) { return false; }
+    virtual bool set_circle_rate(float rate_dps) { return false; }
+
+    // get or set steering and throttle (-1 to +1) (for use by scripting with Rover)
+    virtual bool set_steering_and_throttle(float steering, float throttle) { return false; }
+    virtual bool get_steering_and_throttle(float& steering, float& throttle) { return false; }
+
+    // set turn rate in deg/sec and speed in meters/sec (for use by scripting with Rover)
+    virtual bool set_desired_turn_rate_and_speed(float turn_rate, float speed) { return false; }
+
+   // set auto mode speed in meters/sec (for use by scripting with Copter/Rover)
+    virtual bool set_desired_speed(float speed) { return false; }
+
+    // support for NAV_SCRIPT_TIME mission command
+    virtual bool nav_script_time(uint16_t &id, uint8_t &cmd, float &arg1, float &arg2, int16_t &arg3, int16_t &arg4) { return false; }
+    virtual void nav_script_time_done(uint16_t id) {}
+
+    // allow for VTOL velocity matching of a target
+    virtual bool set_velocity_match(const Vector2f &velocity) { return false; }
+
+    // returns true if the EKF failsafe has triggered
+    virtual bool has_ekf_failsafed() const { return false; }
+
+    // allow for landing descent rate to be overridden by a script, may be -ve to climb
+    virtual bool set_land_descent_rate(float descent_rate) { return false; }
+
+    // Allow for scripting to have control over the crosstracking when exiting and resuming missions or guided flight
+    // It's up to the Lua script to ensure the provided location makes sense
+    virtual bool set_crosstrack_start(const Location &new_start_location) { return false; }
+
+    // control outputs enumeration
+    enum class ControlOutput {
+        Roll = 1,
+        Pitch = 2,
+        Throttle = 3,
+        Yaw = 4,
+        Lateral = 5,
+        MainSail = 6,
+        WingSail = 7,
+        Walking_Height = 8,
+        Last_ControlOutput  // place new values before this
+    };
+
+    // get control output (for use in scripting)
+    // returns true on success and control_value is set to a value in the range -1 to +1
+    virtual bool get_control_output(AP_Vehicle::ControlOutput control_output, float &control_value) { return false; }
+
+#endif // AP_SCRIPTING_ENABLED
+
+    // returns true if vehicle is in the process of landing
+    virtual bool is_landing() const { return false; }
+
+    // returns true if vehicle is in the process of taking off
+    virtual bool is_taking_off() const { return false; }
+
+    // zeroing the RC outputs can prevent unwanted motor movement:
+    virtual bool should_zero_rc_outputs_on_reboot() const { return false; }
+
+    // reboot the vehicle in an orderly manner, doing various cleanups
+    // and flashing LEDs as appropriate
+    void reboot(bool hold_in_bootloader);
+
+    /*
+      get the distance to next wp in meters
+      return false if failed or n/a
+     */
+    virtual bool get_wp_distance_m(float &distance) const { return false; }
+
+    /*
+      get the current wp bearing in degrees
+      return false if failed or n/a
+     */
+    virtual bool get_wp_bearing_deg(float &bearing) const { return false; }
+
+    /*
+      get the current wp crosstrack error in meters
+      return false if failed or n/a
+     */
+    virtual bool get_wp_crosstrack_error_m(float &xtrack_error) const { return false; }
+
+#if HAL_WITH_FRSKY_TELEM_BIDIRECTIONAL
+    AP_Frsky_Parameters frsky_parameters;
+#endif
+
+    /*
+      Returns the pan and tilt for use by onvif camera in scripting
+     */
+    virtual bool get_pan_tilt_norm(float &pan_norm, float &tilt_norm) const { return false; }
+
+    // Returns roll and  pitch for OSD Horizon, Plane overrides to correct for VTOL view and fixed wing PTCH_TRIM_DEG
+    virtual void get_osd_roll_pitch_rad(float &roll, float &pitch) const;
+
+    /*
+     get the target earth-frame angular velocities in rad/s (Z-axis component used by some gimbals)
+     */
+    virtual bool get_rate_ef_targets(Vector3f& rate_ef_targets) const { return false; }
+
+#if AP_AHRS_ENABLED
+    virtual bool set_home_to_current_location(bool lock) WARN_IF_UNUSED { return false; }
+    virtual bool set_home(const Location& loc, bool lock) WARN_IF_UNUSED { return false; }
+#endif
+
+protected:
+
+    virtual void init_ardupilot() = 0;
+    virtual void load_parameters() = 0;
+    void load_parameters(AP_Int16 &format_version, const uint16_t expected_format_version);
+
+    virtual void set_control_channels() {}
+
+    // board specific config
+    AP_BoardConfig BoardConfig;
+
+#if HAL_CANMANAGER_ENABLED
+    // board specific config for CAN bus
+    AP_CANManager can_mgr;
+#endif
+
+#if AP_SCHEDULER_ENABLED
+    // main loop scheduler
+    AP_Scheduler scheduler;
+#endif
+
+    // IMU variables
+    // Integration time; time last loop took to run
+    float G_Dt;
+
+    // sensor drivers
+#if AP_GPS_ENABLED
+    AP_GPS gps;
+#endif
+    AP_Baro barometer;
+#if AP_COMPASS_ENABLED
+    Compass compass;
+#endif
+#if AP_INERTIALSENSOR_ENABLED
+    AP_InertialSensor ins;
+#endif
+#if HAL_BUTTON_ENABLED
+    AP_Button button;
+#endif
+#if AP_RANGEFINDER_ENABLED
+    RangeFinder rangefinder;
+#endif
+
+#if HAL_LOGGING_ENABLED
+    AP_Logger logger;
+    AP_Int32 bitmask_unused;
+    // method supplied by vehicle to provide log bitmask:
+    virtual const AP_Int32 &get_log_bitmask() { return bitmask_unused; }
+    virtual const struct LogStructure *get_log_structures() const { return nullptr; }
+    virtual uint8_t get_num_log_structures() const { return 0; }
+#endif
+
+#if AP_GRIPPER_ENABLED
+    AP_Gripper gripper;
+#endif
+
+#if AP_IBUS_TELEM_ENABLED
+    AP_IBus_Telem ibus_telem;
+#endif
+
+#if AP_RSSI_ENABLED
+    AP_RSSI rssi;
+#endif
+
+#if HAL_RUNCAM_ENABLED
+    AP_RunCam runcam;
+#endif
+#if HAL_GYROFFT_ENABLED
+    AP_GyroFFT gyro_fft;
+#endif
+#if AP_VIDEOTX_ENABLED
+    AP_VideoTX vtx;
+#endif
+
+#if AP_SERIALMANAGER_ENABLED
+    AP_SerialManager serial_manager;
+#endif
+
+#if AP_RELAY_ENABLED
+    AP_Relay relay;
+#endif
+
+#if AP_SERVORELAYEVENTS_ENABLED
+    AP_ServoRelayEvents ServoRelayEvents;
+#endif
+
+    // notification object for LEDs, buzzers etc (parameter set to
+    // false disables external leds)
+    AP_Notify notify;
+
+#if AP_AHRS_ENABLED
+    // Inertial Navigation EKF
+    AP_AHRS ahrs;
+#endif
+
+#if HAL_HOTT_TELEM_ENABLED
+    AP_Hott_Telem hott_telem;
+#endif
+
+#if HAL_VISUALODOM_ENABLED
+    AP_VisualOdom visual_odom;
+#endif
+
+#if HAL_WITH_ESC_TELEM
+    AP_ESC_Telem esc_telem;
+#endif
+
+#if AP_OPENDRONEID_ENABLED
+    AP_OpenDroneID opendroneid;
+#endif
+
+#if HAL_MSP_ENABLED
+    AP_MSP msp;
+#endif
+
+#if HAL_GENERATOR_ENABLED
+    AP_Generator generator;
+#endif
+
+#if HAL_EXTERNAL_AHRS_ENABLED
+    AP_ExternalAHRS externalAHRS;
+#endif
+
+#if AP_SMARTAUDIO_ENABLED
+    AP_SmartAudio smartaudio;
+#endif
+
+#if AP_TRAMP_ENABLED
+    AP_Tramp tramp;
+#endif
+
+#if AP_NETWORKING_ENABLED
+    AP_Networking networking;
+#endif
+
+#if HAL_EFI_ENABLED
+    // EFI Engine Monitor
+    AP_EFI efi;
+#endif
+
+#if AP_AIRSPEED_ENABLED
+    AP_Airspeed airspeed;
+#endif
+
+#if AP_STATS_ENABLED
+    // vehicle statistics
+    AP_Stats stats;
+#endif
+
+#if AP_AIS_ENABLED
+    // Automatic Identification System - for tracking sea-going vehicles
+    AP_AIS ais;
+#endif
+
+#if HAL_NMEA_OUTPUT_ENABLED
+    AP_NMEA_Output nmea;
+#endif
+
+#if AP_KDECAN_ENABLED
+    AP_KDECAN kdecan;
+#endif
+
+#if AP_FENCE_ENABLED
+    AC_Fence fence;
+#endif
+
+#if AP_TEMPERATURE_SENSOR_ENABLED
+    AP_TemperatureSensor temperature_sensor;
+#endif
+
+#if AP_SCRIPTING_ENABLED
+    AP_Scripting scripting;
+#endif
+
+    static const struct AP_Param::GroupInfo var_info[];
+#if AP_SCHEDULER_ENABLED
+    static const struct AP_Scheduler::Task scheduler_tasks[];
+#endif
+
+#if OSD_ENABLED
+    void publish_osd_info();
+#endif
+
+#if HAL_INS_ACCELCAL_ENABLED
+    // update accel calibration
+    void accel_cal_update();
+#endif
+
+    // call the arming library's update function
+    void update_arming();
+
+    // check for motor noise at a particular frequency
+    void check_motor_noise();
+
+    ModeReason control_mode_reason = ModeReason::UNKNOWN;
+
+#if AP_SIM_ENABLED
+    SITL::SIM sitl;
+#endif
+
+#if AP_DDS_ENABLED
+    // Declare the dds client for communication with ROS2 and DDS(common for all vehicles)
+    AP_DDS_Client *dds_client;
+    bool init_dds_client() WARN_IF_UNUSED;
+#endif
+
+    // Check if this mode can be entered from the GCS
+    bool block_GCS_mode_change(uint8_t mode_num, const uint8_t *mode_list, uint8_t mode_list_length) const;
+
+private:
+
+#if AP_SCHEDULER_ENABLED
+    // delay() callback that processing MAVLink packets
+    static void scheduler_delay_callback();
+#endif
+
+    // if there's been a watchdog reset, notify the world via a
+    // statustext:
+    void send_watchdog_reset_statustext();
+
+#if AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
+    // update the harmonic notch for throttle based notch
+    void update_throttle_notch(AP_InertialSensor::HarmonicNotch &notch);
+
+    // update the harmonic notch
+    void update_dynamic_notch(AP_InertialSensor::HarmonicNotch &notch);
+
+    // run notch update at either loop rate or 200Hz
+    void update_dynamic_notch_at_specified_rate();
+#endif  // AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
+
+    // decimation for 1Hz update
+    uint8_t one_Hz_counter;
+    void one_Hz_update();
+
+    bool likely_flying;         // true if vehicle is probably flying
+    uint32_t _last_flying_ms;   // time when likely_flying last went true
+#if AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
+    uint32_t _last_notch_update_ms[HAL_INS_NUM_HARMONIC_NOTCH_FILTERS]; // last time update_dynamic_notch() was run
+#endif
+
+    static AP_Vehicle *_singleton;
+
+#if HAL_GYROFFT_ENABLED && HAL_WITH_ESC_TELEM
+    LowPassFilterFloat esc_noise[ESC_TELEM_MAX_ESCS];
+    uint32_t last_motor_noise_ms;
+#endif
+
+    bool done_safety_init;
+
+
+    uint32_t _last_internal_errors;  // backup of AP_InternalError::internal_errors bitmask
+
+#if AP_CUSTOMROTATIONS_ENABLED
+    AP_CustomRotations custom_rotations;
+#endif
+
+#if AP_FILTER_ENABLED
+    AP_Filters filters;
+#endif
+
+    // Bitmask of modes to disable from gcs
+    AP_Int32 flight_mode_GCS_block;
+};
+
+namespace AP {
+    AP_Vehicle *vehicle();
+};
+
+extern const AP_HAL::HAL& hal;
+
+extern const AP_Param::Info vehicle_var_info[];
+
+#include "AP_Vehicle_Type.h"
+
+#endif  // AP_VEHICLE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+/*
+  define common vehicle build types.
+  Also note that code needs to support other APM_BUILD_DIRECTORY
+  values for example sketches
+ */
+#define APM_BUILD_Rover      1
+#define APM_BUILD_ArduCopter     2
+#define APM_BUILD_ArduPlane      3
+#define APM_BUILD_AntennaTracker 4
+#define APM_BUILD_UNKNOWN        5
+#define APM_BUILD_Replay         6
+#define APM_BUILD_ArduSub        7
+#define APM_BUILD_iofirmware     8
+#define APM_BUILD_AP_Periph      9
+#define APM_BUILD_AP_DAL_Standalone 10
+#define APM_BUILD_AP_Bootloader  11
+#define APM_BUILD_Blimp      12
+#define APM_BUILD_Heli       13
+
+#ifdef APM_BUILD_DIRECTORY
+/*
+  using this macro catches cases where we try to check vehicle type on
+  build systems that don't support it
+ */
+#define APM_BUILD_TYPE(type) ((type) == APM_BUILD_DIRECTORY)
+
+/*
+  Copter and heli share a lot of code. This macro makes it easier to check for both
+*/
+#define APM_BUILD_COPTER_OR_HELI (APM_BUILD_TYPE(APM_BUILD_ArduCopter) || APM_BUILD_TYPE(APM_BUILD_Heli))
+
+#else 
+#define APM_BUILD_TYPE(type) @Invalid_use_of_APM_BUILD_TYPE
+#define APM_BUILD_COPTER_OR_HELI @Invalid_use_of_APM_BUILD_COPTER_OR_HELI
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_VEHICLE_ENABLED
+#define AP_VEHICLE_ENABLED 1
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+// interface to set the vehicles mode
+enum class ModeReason : uint8_t {
+  UNKNOWN = 0,
+  RC_COMMAND = 1,
+  GCS_COMMAND = 2,
+  RADIO_FAILSAFE = 3,
+  BATTERY_FAILSAFE = 4,
+  GCS_FAILSAFE = 5,
+  EKF_FAILSAFE = 6,
+  GPS_GLITCH = 7,
+  MISSION_END = 8,
+  THROTTLE_LAND_ESCAPE = 9,
+  FENCE_BREACHED = 10,
+  TERRAIN_FAILSAFE = 11,
+  BRAKE_TIMEOUT = 12,
+  FLIP_COMPLETE = 13,
+  AVOIDANCE = 14,
+  AVOIDANCE_RECOVERY = 15,
+  THROW_COMPLETE = 16,
+  TERMINATE = 17,
+  TOY_MODE = 18,
+  CRASH_FAILSAFE = 19,
+  SOARING_FBW_B_WITH_MOTOR_RUNNING = 20,
+  SOARING_THERMAL_DETECTED = 21,
+  SOARING_THERMAL_ESTIMATE_DETERIORATED = 22,
+  VTOL_FAILED_TRANSITION = 23,
+  VTOL_FAILED_TAKEOFF = 24,
+  FAILSAFE = 25, // general failsafes, prefer specific failsafes over this as much as possible
+  INITIALISED = 26,
+  SURFACE_COMPLETE = 27,
+  BAD_DEPTH = 28,
+  LEAK_FAILSAFE = 29,
+  SERVOTEST = 30,
+  STARTUP = 31,
+  SCRIPTING = 32,
+  UNAVAILABLE = 33,
+  AUTOROTATION_START = 34,
+  AUTOROTATION_BAILOUT = 35,
+  SOARING_ALT_TOO_HIGH = 36,
+  SOARING_ALT_TOO_LOW = 37,
+  SOARING_DRIFT_EXCEEDED = 38,
+  RTL_COMPLETE_SWITCHING_TO_VTOL_LAND_RTL = 39,
+  RTL_COMPLETE_SWITCHING_TO_FIXEDWING_AUTOLAND = 40,
+  MISSION_CMD = 41,
+  FRSKY_COMMAND = 42,
+  FENCE_RETURN_PREVIOUS_MODE = 43,
+  QRTL_INSTEAD_OF_RTL = 44,
+  AUTO_RTL_EXIT = 45,
+  LOITER_ALT_REACHED_QLAND = 46,
+  LOITER_ALT_IN_VTOL = 47,
+  RADIO_FAILSAFE_RECOVERY = 48,
+  QLAND_INSTEAD_OF_RTL = 49,
+  DEADRECKON_FAILSAFE = 50,
+  MODE_TAKEOFF_FAILSAFE = 51,
+  DDS_COMMAND = 52,
+  AUX_FUNCTION = 53,
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #include "AP_Vehicle.h"
+
+#if AP_VEHICLE_ENABLED
+
+#include <AP_Param/AP_Param.h>
+#include <StorageManager/StorageManager.h>
+
+void AP_Vehicle::load_parameters(AP_Int16 &format_version, const uint16_t expected_format_version)
+{
+    if (!format_version.load() ||
+        format_version != expected_format_version) {
+
+        // erase all parameters
+        hal.console->printf("Firmware change: erasing EEPROM...\n");
+        StorageManager::erase();
+        AP_Param::erase_all();
+
+        // save the current format version
+        format_version.set_and_save(expected_format_version);
+        hal.console->printf("done.\n");
+    }
+    format_version.set_default(expected_format_version);
+
+    // Load all auto-loaded EEPROM variables
+    AP_Param::load_all();
+}
+
+#endif  // AP_VEHICLE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+   SmartAudio protocol parsing and data structures taken from betaflight
+ */
+
+#include "AP_SmartAudio.h"
+#include <AP_Math/crc.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+
+#if AP_SMARTAUDIO_ENABLED
+
+#ifdef SA_DEBUG
+# define debug(fmt, args...)	do { hal.console->printf("SA: " fmt "\n", ##args); } while (0)
+#else
+# define debug(fmt, args...)	do {} while(0)
+#endif
+
+extern const AP_HAL::HAL &hal;
+
+AP_SmartAudio::AP_SmartAudio()
+{
+    _singleton = this;
+}
+
+AP_SmartAudio *AP_SmartAudio::_singleton;
+
+// initialization start making a request settings to the vtx
+bool AP_SmartAudio::init()
+{
+    debug("SmartAudio init");
+
+    if (AP::vtx().get_enabled()==0) {
+        debug("SmartAudio protocol it's not active");
+        return false;
+    }
+
+    // init uart
+    _port = AP::serialmanager().find_serial(AP_SerialManager::SerialProtocol_SmartAudio, 0);
+    if (_port!=nullptr) {
+        _port->configure_parity(0);
+        _port->set_stop_bits(AP::vtx().has_option(AP_VideoTX::VideoOptions::VTX_SA_ONE_STOP_BIT) ? 1 : 2);
+        _port->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
+        _port->set_options((_port->get_options() & ~AP_HAL::UARTDriver::OPTION_RXINV)
+            | AP_HAL::UARTDriver::OPTION_HDPLEX | AP_HAL::UARTDriver::OPTION_PULLDOWN_TX | AP_HAL::UARTDriver::OPTION_PULLDOWN_RX);
+        if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_SmartAudio::loop, void),
+                                          "SmartAudio",
+                                          768, AP_HAL::Scheduler::PRIORITY_IO, -1)) {
+            return false;
+        }
+
+        AP::vtx().set_provider_enabled(AP_VideoTX::VTXType::SmartAudio);
+
+        return true;
+    }
+    return false;
+}
+
+void AP_SmartAudio::loop()
+{
+    AP_VideoTX &vtx = AP::vtx();
+
+    while (!hal.scheduler->is_system_initialized()) {
+        hal.scheduler->delay(100);
+    }
+
+    // allocate response buffer
+    uint8_t _response_buffer[AP_SMARTAUDIO_MAX_PACKET_SIZE];
+
+    // initialise uart (this must be called from within tick b/c the UART begin must be called from the same thread as it is used from)
+    _port->begin(_smartbaud, AP_SMARTAUDIO_UART_BUFSIZE_RX, AP_SMARTAUDIO_UART_BUFSIZE_TX);
+
+
+    while (true) {
+        // now time to control loop switching
+        uint32_t now = AP_HAL::millis();
+
+        // when pending request and last request sended is timeout, take another packet to send
+        if (!_is_waiting_response) {
+            // command to process
+            Packet current_command;
+
+            // repeatedly initialize UART until we know what the VTX is
+            if (!_initialised) {
+                // request settings every second
+                if (requests_queue.is_empty() && !hal.util->get_soft_armed() && now - _last_request_sent_ms > 1000) {
+                    request_settings();
+                }
+            }
+
+            if (requests_queue.pop(current_command)) {
+                // send the popped command from bugger
+                send_request(current_command.frame, current_command.frame_size);
+
+                now = AP_HAL::millis();
+                // it takes roughly 15ms to send a request, don't turn around and try and read until
+                // this time has elapsed
+                hal.scheduler->delay(20);
+
+                _last_request_sent_ms = now;
+
+                // next loop we expect a response
+                _is_waiting_response = true;
+            }
+        }
+
+        // nothing going on so give CPU to someone else
+        if (!_is_waiting_response || !_initialised) {
+            hal.scheduler->delay(100);
+        }
+
+        // On my Unify Pro32 the SmartAudio response is sent exactly 100ms after the request
+        // and the initial response is 40ms long so we should wait at least 140ms before giving up
+        if (now - _last_request_sent_ms < 200 && _is_waiting_response) {
+
+            // setup scheduler delay to 50 ms again after response processes
+            if (!read_response(_response_buffer)) {
+                hal.scheduler->delay(10);
+            } else {
+                // successful response, wait another 100ms to give the VTX a chance to recover
+                // before sending another command. This is needed on the Atlatl v1.
+                hal.scheduler->delay(100);
+            }
+
+        } else if (_is_waiting_response) { // timeout
+            // process autobaud routine
+            update_baud_rate();
+            _port->discard_input();
+            _inline_buffer_length = 0;
+            _is_waiting_response = false;
+            debug("response timeout");
+        } else if (_initialised) {
+            if (AP::vtx().have_params_changed() ||_vtx_power_change_pending
+                || _vtx_freq_change_pending || _vtx_options_change_pending) {
+                update_vtx_params();
+                set_configuration_pending(true);
+                vtx.set_configuration_finished(false);
+                // we've tried to update something, re-request the settings so that they
+                // are reflected correctly
+                request_settings();
+            } else if (is_configuration_pending()) {
+                AP::vtx().announce_vtx_settings();
+                set_configuration_pending(false);
+                vtx.set_configuration_finished(true);
+            }
+        }
+    }
+}
+
+// send requests to the VTX to match the configured VTX parameters
+void AP_SmartAudio::update_vtx_params()
+{
+    AP_VideoTX& vtx = AP::vtx();
+
+    _vtx_freq_change_pending = vtx.update_band() || vtx.update_channel() || vtx.update_frequency() || _vtx_freq_change_pending;
+    _vtx_power_change_pending = vtx.update_power() || _vtx_power_change_pending;
+    _vtx_options_change_pending = vtx.update_options() || _vtx_options_change_pending;
+
+    if (_vtx_freq_change_pending || _vtx_power_change_pending || _vtx_options_change_pending) {
+        // make the desired frequency match the desired band and channel
+        if (_vtx_freq_change_pending) {
+            if (vtx.update_band() || vtx.update_channel()) {
+                vtx.update_configured_frequency();
+            } else {
+                vtx.update_configured_channel_and_band();
+            }
+        }
+
+        debug("update_params(): freq %d->%d, chan: %d->%d, band: %d->%d, pwr: %d->%d, opts: %d->%d",
+            vtx.get_frequency_mhz(),  vtx.get_configured_frequency_mhz(),
+            vtx.get_channel(), vtx.get_configured_channel(),
+            vtx.get_band(), vtx.get_configured_band(),
+            vtx.get_power_mw(), vtx.get_configured_power_mw(),
+            vtx.get_options() & 0xF, vtx.get_configured_options() & 0xF);
+
+        uint8_t opts = vtx.get_configured_options();
+        uint8_t pitMode = vtx.get_configured_pitmode();
+        uint8_t mode;
+        // check if we are turning pitmode on or off, but only on SA 2.0+
+        if (pitMode != vtx.get_pitmode() && _protocol_version >= SMARTAUDIO_SPEC_PROTOCOL_v2) {
+            if (vtx.get_pitmode()) {
+                debug("Turning OFF pitmode");
+                // turn it off
+                mode = 0x04 | ((opts & uint8_t(AP_VideoTX::VideoOptions::VTX_UNLOCKED)) << 2);
+            } else {
+                debug("Turning ON pitmode");
+                // turn it on (in range pitmode flag)
+                mode = 0x01 | ((opts & uint8_t(AP_VideoTX::VideoOptions::VTX_UNLOCKED)) << 2);
+            }
+        } else {
+            mode = ((opts & uint8_t(AP_VideoTX::VideoOptions::VTX_UNLOCKED)) << 2);
+            if (pitMode) {
+                mode |= 0x01;
+            }
+        }
+
+        if (pitMode) {// prevent power changes in pitmode as this takes the VTX out of pitmode
+            _vtx_power_change_pending = false;
+        }
+
+        // prioritize pitmode changes
+        if (_vtx_options_change_pending) {
+            debug("update mode '%c%c%c%c'", (mode & 0x8) ? 'U' : 'L',
+                (mode & 0x4) ? 'N' : ' ', (mode & 0x2) ? 'O' : ' ', (mode & 0x1) ? 'I' : ' ');
+            set_operation_mode(mode);
+        } else if (_vtx_freq_change_pending) {
+            debug("update frequency");
+            if (_vtx_use_set_freq) {
+                set_frequency(vtx.get_configured_frequency_mhz(), false);
+            } else {
+                set_channel(vtx.get_configured_band() * VTX_MAX_CHANNELS + vtx.get_configured_channel());
+            }
+        } else if (_vtx_power_change_pending) {
+            debug("update power (ver %u)", _protocol_version);
+            switch (_protocol_version) {
+            case SMARTAUDIO_SPEC_PROTOCOL_v21:
+                set_power(vtx.get_configured_power_dbm() | 0x80);
+                break;
+            case SMARTAUDIO_SPEC_PROTOCOL_v2:
+                set_power(vtx.get_configured_power_level());
+                break;
+            default:    // v1
+                switch(vtx.get_configured_power_level()) {
+                    case 1: set_power(16); break; // 200mw
+                    case 2: set_power(25); break; // 500mw
+                    case 3: set_power(40); break; // 800mw
+                    default: set_power(7); break; // 25mw
+                }
+                break;
+            }
+        }
+    } else {
+        vtx.set_configuration_finished(true);
+    }
+}
+/**
+ * Sends an SmartAudio Command to the vtx, waits response on the update event
+ * @param frameBuffer frameBuffer to send over the wire
+ * @param size  size of the framebuffer wich needs to be sended
+ */
+void AP_SmartAudio::send_request(const Frame& requestFrame, uint8_t size)
+{
+    AP_VideoTX &vtx = AP::vtx();
+
+    if (size <= 0 || _port == nullptr) {
+        return;
+    }
+
+    const uint8_t *request = reinterpret_cast<const uint8_t*>(&requestFrame);
+
+    // write request
+    if (vtx.has_option(AP_VideoTX::VideoOptions::VTX_PULLDOWN)) {
+        _port->write((uint8_t)0x00);
+    }
+    _port->write(request, size);
+    _port->flush();
+
+    _packets_sent++;
+#ifdef SA_DEBUG
+    print_bytes_to_hex_string("send_request():", request, size);
+#endif
+}
+
+/**
+ * Reads the response from vtx in the wire
+ * - response_buffer, response buffer to fill in
+ * - inline_buffer_length , used to passthrought the response lenght in case the response where splitted
+ **/
+bool AP_SmartAudio::read_response(uint8_t *response_buffer)
+{
+    int16_t incoming_bytes_count = _port->available();
+
+    const uint8_t response_header_size= sizeof(FrameHeader);
+
+    // check if it is a response in the wire
+    if (incoming_bytes_count <= 0) {
+        return false;
+    }
+
+    // wait until we have enough bytes to read a header
+    if (incoming_bytes_count < response_header_size && _inline_buffer_length == 0) {
+        return false;
+    }
+
+    // now have at least the header, read it if necessary
+    if (_inline_buffer_length == 0) {
+        uint8_t b = _port->read();
+        // didn't see a sync byte, discard and go around again
+        if (b != SMARTAUDIO_SYNC_BYTE) {
+            return false;
+        }
+        response_buffer[_inline_buffer_length++] = b;
+
+        b = _port->read();
+        // didn't see a header byte, discard and reset
+        if (b != SMARTAUDIO_HEADER_BYTE) {
+            _inline_buffer_length = 0;
+            return false;
+        }
+
+        response_buffer[_inline_buffer_length++] = b;
+
+        // read the rest of the header
+        for (; _inline_buffer_length < response_header_size; _inline_buffer_length++) {
+            b = _port->read();
+            response_buffer[_inline_buffer_length] = b;
+        }
+
+        FrameHeader* header = (FrameHeader*)response_buffer;
+        incoming_bytes_count -= response_header_size;
+
+        // implementations that ignore the CRC also appear to not account for it in the frame length
+        if (ignore_crc()) {
+            header->length++;
+        }
+        _packet_size = header->length;
+    }
+
+    // read the rest of the packet
+    for (uint8_t i= 0; i < incoming_bytes_count && _inline_buffer_length < _packet_size + response_header_size; i++) {
+        uint8_t response_in_bytes = _port->read();
+
+        // check for overflow
+        if (_inline_buffer_length >= AP_SMARTAUDIO_MAX_PACKET_SIZE) {
+            _inline_buffer_length = 0;
+            _is_waiting_response = false;
+            return false;
+        }
+
+        response_buffer[_inline_buffer_length++] = response_in_bytes;
+    }
+
+    // didn't get the whole packet
+    if (_inline_buffer_length < _packet_size + response_header_size) {
+        return false;
+    }
+
+#ifdef SA_DEBUG
+    print_bytes_to_hex_string("read_response():", response_buffer, _inline_buffer_length);
+#endif
+    _is_waiting_response = false;
+
+    bool correct_parse = parse_response_buffer(response_buffer);
+    response_buffer = nullptr;
+    _inline_buffer_length=0;
+    _packet_size = 0;
+    _packets_rcvd++;
+    // reset the lost packets to 0
+    _packets_sent =_packets_rcvd;
+    return correct_parse;
+}
+
+// format a simple command and push into the request queue
+void AP_SmartAudio::push_command_only_frame(uint8_t cmd_id)
+{
+    Packet command;
+    // according to the spec the length should include the CRC, but no implementation appears to
+    // do this
+    command.frame.header.init(cmd_id, 0);
+    command.frame_size = SMARTAUDIO_COMMAND_FRAME_SIZE;
+    command.frame.payload[0] = crc8_dvb_s2_update(0, &command.frame, SMARTAUDIO_COMMAND_FRAME_SIZE - 1);
+    requests_queue.push_force(command);
+}
+
+// format an 8-bit command and push into the request queue
+void AP_SmartAudio::push_uint8_command_frame(uint8_t cmd_id, uint8_t data)
+{
+    Packet command;
+    command.frame.header.init(cmd_id, sizeof(uint8_t));
+    command.frame_size = SMARTAUDIO_U8_COMMAND_FRAME_SIZE;
+
+    command.frame.payload[0] = data;
+    command.frame.payload[1] = crc8_dvb_s2_update(0, &command.frame, SMARTAUDIO_U8_COMMAND_FRAME_SIZE - 1);
+    requests_queue.push_force(command);
+}
+
+// format an 16-bit command and push into the request queue
+void AP_SmartAudio::push_uint16_command_frame(uint8_t cmd_id, uint16_t data)
+{
+    Packet command;
+    command.frame.header.init(cmd_id, sizeof(uint16_t));
+    command.frame_size = SMARTAUDIO_U16_COMMAND_FRAME_SIZE;
+    put_be16_ptr(command.frame.payload, data);
+    command.frame.payload[2] = crc8_dvb_s2_update(0, &command.frame, SMARTAUDIO_U16_COMMAND_FRAME_SIZE - 1);
+    requests_queue.push_force(command);
+}
+
+/**
+ * Sends get settings command.
+ * */
+void AP_SmartAudio::request_settings()
+{
+    debug("request_settings()");
+    push_command_only_frame(SMARTAUDIO_CMD_GET_SETTINGS);
+}
+
+void AP_SmartAudio::set_operation_mode(uint8_t mode)
+{
+    debug("Setting mode to 0x%x", mode);
+    push_uint8_command_frame(SMARTAUDIO_CMD_SET_MODE, mode);
+}
+
+/**
+     * Sets the frequency to transmit in the vtx.
+     * When isPitModeFreq active the freq will be set to be used when in pitmode (in range)
+     */
+void AP_SmartAudio::set_frequency(uint16_t frequency, bool isPitModeFreq)
+{
+    debug("Setting frequency to %d with pitmode == %d", frequency, isPitModeFreq);
+    push_uint16_command_frame(SMARTAUDIO_CMD_SET_FREQUENCY,
+        frequency | (isPitModeFreq ? SMARTAUDIO_SET_PITMODE_FREQ : 0x00));
+}
+
+// enqueue a set channel request
+void AP_SmartAudio::set_channel(uint8_t channel)
+{
+    debug("Setting channel to %d", channel);
+    push_uint8_command_frame(SMARTAUDIO_CMD_SET_CHANNEL, channel);
+}
+
+/**
+ * Request pitMode Frequency setted into the vtx hardware
+ * */
+void AP_SmartAudio::request_pit_mode_frequency()
+{
+    debug("Requesting pit mode frequency");
+    push_uint16_command_frame(SMARTAUDIO_CMD_SET_FREQUENCY, SMARTAUDIO_GET_PITMODE_FREQ);
+}
+
+// send vtx request to set power
+void AP_SmartAudio::set_power(uint8_t power_level)
+{
+    debug("Setting power to %d", power_level);
+    push_uint8_command_frame(SMARTAUDIO_CMD_SET_POWER, power_level);
+}
+
+
+void AP_SmartAudio::set_band_channel(const uint8_t band, const uint8_t channel)
+{
+    debug("Setting band/channel to %d/%d", band, channel);
+    push_uint16_command_frame(SMARTAUDIO_CMD_SET_CHANNEL, SMARTAUDIO_BANDCHAN_TO_INDEX(band, channel));
+}
+
+void AP_SmartAudio::unpack_frequency(AP_SmartAudio::Settings *settings, const uint16_t frequency)
+{
+    if (frequency & SMARTAUDIO_GET_PITMODE_FREQ) {
+        settings->pitmodeFrequency = frequency;
+    } else {
+        settings->frequency = frequency;
+    }
+}
+
+// SmartAudio v1/v2
+void AP_SmartAudio::unpack_settings(Settings *settings, const SettingsResponseFrame *frame)
+{
+    settings->channel = frame->channel % VTX_MAX_CHANNELS;
+    settings->band = frame->channel / VTX_MAX_CHANNELS;
+    settings->power = frame->power;
+    settings->mode = frame->operationMode;
+    settings->num_power_levels = 0;
+    unpack_frequency(settings, be16toh(frame->frequency));
+}
+
+// SmartAudio v2.1
+void AP_SmartAudio::unpack_settings(Settings *settings, const SettingsExtendedResponseFrame *frame)
+{
+    unpack_settings(settings, &frame->settings);
+    settings->power_in_dbm = frame->power_dbm;
+    settings->num_power_levels = frame->num_power_levels + 1;
+    memcpy(settings->power_levels, frame->power_levels, frame->num_power_levels + 1);
+}
+
+#ifdef SA_DEBUG
+void AP_SmartAudio::print_bytes_to_hex_string(const char* msg, const uint8_t buf[], uint8_t len)
+{
+    hal.console->printf("SA: %s ", msg);
+    for (uint8_t i = 0; i < len; i++) {
+        hal.console->printf("0x%02X ", buf[i]);
+    }
+    hal.console->printf("\n");
+}
+#endif
+
+void AP_SmartAudio::print_settings(const Settings* settings)
+{
+    debug("SETTINGS: VER: %u, MD: '%c%c%c%c%c', CH: %u, PWR: %u, DBM: %u FREQ: %u, BND: %u",
+            settings->version,
+            (settings->mode & 0x10) ? 'U' : 'L',// (L)ocked or (U)nlocked
+            (settings->mode & 0x8) ? 'O' : ' ', // (O)ut-range pitmode
+            (settings->mode & 0x4) ? 'I' : ' ', // (I)n-range pitmode
+            (settings->mode & 0x2) ? 'P' : ' ', // (P)itmode running
+            (settings->mode & 0x1) ? 'F' : 'C', // Set (F)requency or (C)hannel
+            settings->channel, settings->power, settings->power_in_dbm, settings->frequency, settings->band);
+}
+
+void AP_SmartAudio::update_vtx_settings(const Settings& settings)
+{
+    AP_VideoTX& vtx = AP::vtx();
+
+    vtx.set_enabled(true);
+    vtx.set_frequency_mhz(settings.frequency);
+    vtx.set_band(settings.band);
+    vtx.set_channel(settings.channel);
+    // SA21 sends us a complete packet with the supported power levels
+    if (settings.version == SMARTAUDIO_SPEC_PROTOCOL_v21) {
+        vtx.set_power_dbm(settings.power_in_dbm);
+        // learn them all
+        vtx.update_all_power_dbm(settings.num_power_levels, settings.power_levels);
+    } else if (settings.version == SMARTAUDIO_SPEC_PROTOCOL_v2) {
+        vtx.set_power_level(settings.power, AP_VideoTX::PowerActive::Active);
+        // learn them all - it's not possible to know the mw values in v2.0 so just have to go from the spec
+        uint8_t power[] { 0, 14, 23, 27, 29 };
+        vtx.update_all_power_dbm(5, power);
+    } else {
+        vtx.set_power_level(settings.power, AP_VideoTX::PowerActive::Active);
+    }
+    // it seems like the spec is wrong, on a unify pro32 this setting is inverted
+    _vtx_use_set_freq = !(settings.mode & 1);
+
+    // PITMODE | UNLOCKED
+    // SmartAudio 2.1 dropped support for outband pitmode so we won't support it
+    uint8_t opts = ((settings.mode & 0x2) >> 1) | ((settings.mode & 0x10) >> 1);
+    vtx.set_options(opts);
+
+    // make sure the configured values now reflect reality
+    vtx.set_defaults();
+
+    _initialised = true;
+
+    _vtx_power_change_pending = _vtx_freq_change_pending = _vtx_options_change_pending = false;
+}
+
+bool  AP_SmartAudio::parse_response_buffer(const uint8_t *buffer)
+{
+    const FrameHeader *header = (const FrameHeader *)buffer;
+    const uint8_t fullFrameLength = sizeof(FrameHeader) + header->length;
+    const uint8_t headerPayloadLength = fullFrameLength - 1; // subtract crc byte from length
+    const uint8_t *startPtr = buffer + 2;
+    const uint8_t *endPtr = buffer + headerPayloadLength;
+
+    if ((crc8_dvb_s2_update(0x00, startPtr, headerPayloadLength-2)!=*(endPtr) && !ignore_crc())
+        || header->headerByte != SMARTAUDIO_HEADER_BYTE
+        || header->syncByte != SMARTAUDIO_SYNC_BYTE) {
+        debug("parse_response_buffer() failed - invalid CRC or header");
+        return false;
+    }
+    // SEND TO GCS A MESSAGE TO UNDERSTAND WHATS HAPPENING
+    AP_VideoTX& vtx = AP::vtx();
+    Settings settings {};
+
+    switch (header->command) {
+    case SMARTAUDIO_RSP_GET_SETTINGS_V1:
+        _protocol_version = SMARTAUDIO_SPEC_PROTOCOL_v1;
+        unpack_settings(&settings, (const SettingsResponseFrame *)buffer);
+        settings.version = SMARTAUDIO_SPEC_PROTOCOL_v1;
+        print_settings(&settings);
+        update_vtx_settings(settings);
+        break;
+
+    case SMARTAUDIO_RSP_GET_SETTINGS_V2:
+        _protocol_version = SMARTAUDIO_SPEC_PROTOCOL_v2;
+        unpack_settings(&settings, (const SettingsResponseFrame *)buffer);
+        settings.version = SMARTAUDIO_SPEC_PROTOCOL_v2;
+        print_settings(&settings);
+        update_vtx_settings(settings);
+        break;
+
+    case SMARTAUDIO_RSP_GET_SETTINGS_V21:
+        _protocol_version = SMARTAUDIO_SPEC_PROTOCOL_v21;
+        unpack_settings(&settings, (const SettingsExtendedResponseFrame *)buffer);
+        settings.version = SMARTAUDIO_SPEC_PROTOCOL_v21;
+        print_settings(&settings);
+        update_vtx_settings(settings);
+        break;
+
+    case SMARTAUDIO_RSP_SET_FREQUENCY: {
+        const U16ResponseFrame *resp = (const U16ResponseFrame *)buffer;
+        unpack_frequency(&settings, resp->payload);
+        vtx.set_frequency_mhz(settings.frequency);
+        vtx.set_configured_frequency_mhz(vtx.get_frequency_mhz());
+        vtx.update_configured_channel_and_band();
+        debug("Frequency was set to %d", settings.frequency);
+    }
+        break;
+
+    case SMARTAUDIO_RSP_SET_CHANNEL: {
+        const U8ResponseFrame *resp = (const U8ResponseFrame *)buffer;
+        vtx.set_band(resp->payload / VTX_MAX_CHANNELS);
+        vtx.set_channel(resp->payload % VTX_MAX_CHANNELS);
+        vtx.set_configured_channel(vtx.get_channel());
+        vtx.set_configured_band(vtx.get_band());
+        vtx.update_configured_frequency();
+        debug("Channel was set to %d", resp->payload);
+    }
+        break;
+
+    case SMARTAUDIO_RSP_SET_POWER: {
+        const U16ResponseFrame *resp = (const U16ResponseFrame *)buffer;
+        const uint8_t power = resp->payload & 0xFF;
+        switch (_protocol_version) {
+        case SMARTAUDIO_SPEC_PROTOCOL_v21:
+            if (vtx.get_configured_power_dbm() != power) {
+                vtx.update_power_dbm(vtx.get_configured_power_dbm(), AP_VideoTX::PowerActive::Inactive);
+            }
+            vtx.set_power_dbm(power);
+            vtx.set_configured_power_mw(vtx.get_power_mw());
+            break;
+        case SMARTAUDIO_SPEC_PROTOCOL_v2:
+            if (vtx.get_configured_power_level() != power) {
+                vtx.update_power_dbm(vtx.get_configured_power_dbm(), AP_VideoTX::PowerActive::Inactive);
+            }
+            vtx.set_power_level(power);
+            vtx.set_configured_power_mw(vtx.get_power_mw());
+            break;
+        default:
+            if (vtx.get_configured_power_dac() != power) {
+                vtx.update_power_dbm(vtx.get_configured_power_dbm(), AP_VideoTX::PowerActive::Inactive);
+            }
+            vtx.set_power_dac(power);
+            vtx.set_configured_power_mw(vtx.get_power_mw());
+            break;
+        }
+        debug("Power was set to %d", power);
+    }
+        break;
+
+    case SMARTAUDIO_RSP_SET_MODE: {
+        vtx.set_options(vtx.get_configured_options()); // easiest to just make them match
+        debug("Mode was set to 0x%x", buffer[4]);
+    }
+        break;
+
+    default:
+        return false;
+    }
+    return true;
+}
+
+// we missed a response too many times - update the baud rate in case the temperature has increased
+void AP_SmartAudio::update_baud_rate()
+{
+    // on my Unify Pro32 the VTX will respond immediately on power up to a settings request, so 10 packets is easily more than enough
+    // we want to bias autobaud to only frequency hop when the current frequency is clearly exhausted, but after that hop quickly
+    if (_packets_sent - _packets_rcvd < 10) {
+        return;
+    }
+
+    if ((_smartbaud_direction == 1) && (_smartbaud == AP_SMARTAUDIO_SMARTBAUD_MAX)) {
+        _smartbaud_direction = -1;
+    } else if ((_smartbaud_direction == -1 && _smartbaud == AP_SMARTAUDIO_SMARTBAUD_MIN)) {
+        _smartbaud_direction = 1;
+    }
+
+    _smartbaud += AP_SMARTAUDIO_SMARTBAUD_STEP * _smartbaud_direction;
+
+    debug("autobaud: %d", int(_smartbaud));
+
+    _port->begin(_smartbaud);
+}
+
+#endif // AP_SMARTAUDIO_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "AP_VideoTX_config.h"
+
+#if AP_SMARTAUDIO_ENABLED
+
+#include <AP_Param/AP_Param.h>
+#include <AP_HAL/utility/RingBuffer.h>
+#include "AP_VideoTX.h"
+
+#define SMARTAUDIO_BUFFER_CAPACITY 5
+
+// SmartAudio Serial Protocol
+#define AP_SMARTAUDIO_UART_BAUD            4800
+#define AP_SMARTAUDIO_SMARTBAUD_MIN        4560     // -5%
+#define AP_SMARTAUDIO_SMARTBAUD_MAX        5040     // +5%
+#define AP_SMARTAUDIO_SMARTBAUD_STEP       60
+#define AP_SMARTAUDIO_UART_BUFSIZE_RX      16
+#define AP_SMARTAUDIO_UART_BUFSIZE_TX      16
+#define AP_SMARTAUDIO_MAX_PACKET_SIZE      32
+
+#define SMARTAUDIO_SYNC_BYTE            0xAA
+#define SMARTAUDIO_HEADER_BYTE          0x55
+#define SMARTAUDIO_START_CODE           SMARTAUDIO_SYNC_BYTE + SMARTAUDIO_HEADER_BYTE
+#define SMARTAUDIO_GET_PITMODE_FREQ     (1 << 14)
+#define SMARTAUDIO_SET_PITMODE_FREQ     (1 << 15)
+#define SMARTAUDIO_FREQUENCY_MASK       0x3FFF
+
+#define SMARTAUDIO_CMD_GET_SETTINGS     0x03
+#define SMARTAUDIO_CMD_SET_POWER        0x05
+#define SMARTAUDIO_CMD_SET_CHANNEL      0x07
+#define SMARTAUDIO_CMD_SET_FREQUENCY    0x09
+#define SMARTAUDIO_CMD_SET_MODE         0x0B
+
+#define SMARTAUDIO_COMMAND_FRAME_SIZE   (sizeof(FrameHeader) + 1)
+#define SMARTAUDIO_U8_COMMAND_FRAME_SIZE   (sizeof(FrameHeader) + 2)
+#define SMARTAUDIO_U16_COMMAND_FRAME_SIZE   (sizeof(FrameHeader) + 3)
+
+#define SMARTAUDIO_RSP_GET_SETTINGS_V1  SMARTAUDIO_CMD_GET_SETTINGS >> 1
+#define SMARTAUDIO_RSP_GET_SETTINGS_V2  (SMARTAUDIO_CMD_GET_SETTINGS >> 1) | 0x08
+#define SMARTAUDIO_RSP_GET_SETTINGS_V21 (SMARTAUDIO_CMD_GET_SETTINGS >> 1) | 0x10
+#define SMARTAUDIO_RSP_SET_POWER        SMARTAUDIO_CMD_SET_POWER >> 1
+#define SMARTAUDIO_RSP_SET_CHANNEL      SMARTAUDIO_CMD_SET_CHANNEL >> 1
+#define SMARTAUDIO_RSP_SET_FREQUENCY    SMARTAUDIO_CMD_SET_FREQUENCY >> 1
+#define SMARTAUDIO_RSP_SET_MODE         SMARTAUDIO_CMD_SET_MODE >> 1
+
+#define SMARTAUDIO_BANDCHAN_TO_INDEX(band, channel) (band * VTX_MAX_CHANNELS + (channel))
+
+//#define SA_DEBUG
+
+class AP_SmartAudio
+{
+public:
+    enum ProtocolVersion {
+        SMARTAUDIO_SPEC_PROTOCOL_v1 = 0,
+        SMARTAUDIO_SPEC_PROTOCOL_v2 = 1,
+        SMARTAUDIO_SPEC_PROTOCOL_v21 = 2
+    };
+
+    struct Settings {
+        uint8_t  version;
+        uint8_t  mode;
+        uint8_t  channel;
+        uint8_t  power;
+        uint16_t frequency;
+        uint8_t  band;
+
+        uint8_t num_power_levels;
+        uint8_t power_levels[8];
+        uint8_t  power_in_dbm;
+
+        uint16_t pitmodeFrequency;
+        bool userFrequencyMode;     // user is setting freq
+        bool initialized;
+    };
+
+    struct FrameHeader {
+        uint8_t syncByte;
+        uint8_t headerByte;
+        uint8_t command;
+        uint8_t length;
+
+        void init(uint8_t cmd, uint8_t payloadLength) {
+            syncByte = SMARTAUDIO_SYNC_BYTE;
+            headerByte= SMARTAUDIO_HEADER_BYTE;
+            length = payloadLength;
+            command = cmd;
+        }
+    } PACKED;
+
+    struct Frame {
+        FrameHeader header;
+        uint8_t payload[3];
+    } PACKED;
+
+    struct U8ResponseFrame {
+        FrameHeader header;
+        uint8_t payload;
+        //uint8_t reserved;
+        //uint8_t crc;
+    } PACKED;
+
+    struct U16ResponseFrame {
+        FrameHeader header;
+        uint16_t payload;
+        //uint8_t reserved;
+        //uint8_t crc;
+    } PACKED;
+
+    struct SettingsResponseFrame {
+        FrameHeader header;
+        uint8_t channel;
+        uint8_t power;
+        uint8_t operationMode;
+        uint16_t frequency;
+        //uint8_t crc;
+    } PACKED;
+
+    struct SettingsExtendedResponseFrame {
+        SettingsResponseFrame settings;
+        uint8_t power_dbm;  // current power
+        uint8_t num_power_levels;
+        uint8_t power_levels[8];   // first in the list of dbm levels
+        //uint8_t crc;
+    } PACKED;
+
+    // v 2.1 additions to response frame
+    //0x0E (current power in dBm) 0x03 (amount of power levels) 0x00(dBm level 1) 0x0E (dBm level 2) 0x14 (dBm level 3) 0x1A (dBm level 4) 0x01(CRC8)
+
+    // request packet to be processed
+    struct Packet {
+        Frame frame;
+        uint8_t frame_size;
+    } PACKED;
+
+    AP_SmartAudio();
+
+    static AP_SmartAudio *get_singleton(void)
+    {
+        return _singleton;
+    }
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_SmartAudio);
+
+    // init threads and lookup for io uart.
+    bool init();
+
+private:
+    // serial interface
+    AP_HAL::UARTDriver *_port;                  // UART used to send data to SmartAudio VTX
+
+    //Pointer to singleton
+    static AP_SmartAudio* _singleton;
+
+    // response buffer length, permit splitted responses
+    uint8_t _inline_buffer_length;
+    // expected packet size
+    uint8_t _packet_size;
+
+    ProtocolVersion _protocol_version;
+    // statistics
+    uint16_t _packets_sent;
+    uint16_t _packets_rcvd;
+
+    bool _vtx_freq_change_pending; // a vtx command has been issued but not confirmed by a vtx broadcast frame
+    bool _vtx_power_change_pending;
+    bool _vtx_options_change_pending;
+    bool _vtx_changes_pending;
+    bool _vtx_use_set_freq; // should frequency set by band/channel or frequency
+
+    // value for current baud adjust
+    int32_t _smartbaud = AP_SMARTAUDIO_UART_BAUD;
+    int32_t _smartbaud_direction = 1;
+
+    // hw vtx state control with 2 elements array use methods _push _peek
+    uint8_t _vtx_state_idx;
+    Settings _vtx_states_buffer[2];
+    Settings *_vtx_current_state;
+
+    // ready to go
+    volatile bool _initialised;
+
+    // RingBuffer to store outgoing request.
+    ObjectBuffer<Packet> requests_queue{SMARTAUDIO_BUFFER_CAPACITY};
+
+    // time the last_request is process
+    uint32_t _last_request_sent_ms;
+
+    // loops is waiting a response after a request
+    bool _is_waiting_response;
+
+#ifdef SA_DEBUG
+    // utility method for debugging.
+    void print_bytes_to_hex_string(const char* msg, const uint8_t buf[], uint8_t length);
+#endif
+    void print_settings(const Settings* settings);
+
+    void update_vtx_params();
+    void update_vtx_settings(const Settings& settings);
+
+    bool ignore_crc() const { return AP::vtx().has_option(AP_VideoTX::VideoOptions::VTX_SA_IGNORE_CRC); }
+
+    // looping over requests
+    void loop();
+    // send a frame over the wire
+    void send_request(const Frame& requestFrame, uint8_t size);
+    // receive a frame response over the wire
+    bool read_response(uint8_t *response_buffer);
+    // parses the response and updates the vtx settings
+    bool parse_frame_response(const uint8_t *buffer);
+    bool parse_response_buffer(const uint8_t *buffer);
+    // get last reading from the fifo queue
+    bool get_readings(AP_VideoTX *vtx_dest);
+
+    // command functions
+    // request settings
+    void request_settings();
+    // change the mode
+    void set_operation_mode(uint8_t mode);
+    // change the frequency
+    void set_frequency(uint16_t frequency, bool isPitModeFreq);
+    // change the channel
+    void set_channel(uint8_t chan);
+    // get the pitmode frequency
+    void request_pit_mode_frequency();
+    // set the power
+    void set_power(uint16_t power_mw, uint16_t dbm);
+    // set the power using power_level, spec versions 1 and 2 or dbm value for spec version 2.1
+    void set_power(uint8_t power_level);
+    // set the band and channel
+    void set_band_channel(const uint8_t band, const uint8_t channel);
+
+    // command functions
+    void push_command_only_frame(uint8_t command);
+    void push_uint8_command_frame(uint8_t command, uint8_t data);
+    void push_uint16_command_frame(uint8_t command, uint16_t data);
+
+    static void unpack_frequency(Settings *settings, const uint16_t frequency);
+    static void unpack_settings(Settings *settings, const SettingsResponseFrame *frame);
+    static void unpack_settings(Settings *settings, const SettingsExtendedResponseFrame *frame);
+
+    // change baud automatically when request-response fails many times
+    void update_baud_rate();
+
+    void set_configuration_pending(bool pending) { _vtx_changes_pending = pending; }
+    bool is_configuration_pending(){ return _vtx_changes_pending;}
+};
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+   Code by Andy Piper, ported from betaflight vtx_tramp
+*/
+
+#include "AP_Tramp.h"
+#include <AP_Math/crc.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+
+#if AP_TRAMP_ENABLED
+
+#define AP_TRAMP_UART_BAUD            9600
+// request and response size is 16 bytes
+#define AP_TRAMP_UART_BUFSIZE_RX      32
+#define AP_TRAMP_UART_BUFSIZE_TX      32
+
+// Define periods between requests
+#define TRAMP_MIN_REQUEST_PERIOD_US (200 * 1000) // 200ms
+#define TRAMP_STATUS_REQUEST_PERIOD_US (1000 * 1000) // 1s
+
+//#define TRAMP_DEBUG
+#ifdef TRAMP_DEBUG
+# define debug(fmt, args...)	do { hal.console->printf("TRAMP: " fmt "\n", ##args); } while (0)
+#else
+# define debug(fmt, args...)	do {} while(0)
+#endif
+
+extern const AP_HAL::HAL &hal;
+
+AP_Tramp::AP_Tramp()
+{
+    singleton = this;
+}
+
+AP_Tramp *AP_Tramp::singleton;
+
+// Calculate tramp protocol checksum of provided buffer
+uint8_t AP_Tramp::checksum(uint8_t *buf)
+{
+    uint8_t cksum = 0;
+
+    for (int i = 1 ; i < TRAMP_BUF_SIZE - 2; i++) {
+        cksum += buf[i];
+    }
+
+    return cksum;
+}
+
+// Send tramp protocol frame to device
+void AP_Tramp::send_command(uint8_t cmd, uint16_t param)
+{
+    if (port == nullptr) {
+        return;
+    }
+
+    memset(request_buffer, 0, ARRAY_SIZE(request_buffer));
+    request_buffer[0] = 0x0F;
+    request_buffer[1] = cmd;
+    request_buffer[2] = param & 0xFF;
+    request_buffer[3] = (param >> 8) & 0xFF;
+    request_buffer[14] = checksum(request_buffer);
+
+    port->write(request_buffer, TRAMP_BUF_SIZE);
+    port->flush();
+
+    _packets_sent++;
+
+    debug("send command '%c': %u", cmd, param);
+}
+
+// Process response and return code if valid else 0
+char AP_Tramp::handle_response(void)
+{
+    _packets_rcvd++;
+    _packets_sent = _packets_rcvd;
+
+    const uint8_t respCode = response_buffer[1];
+
+    switch (respCode) {
+    case 'r': {
+        const uint16_t min_freq = response_buffer[2]|(response_buffer[3] << 8);
+        // Check we're not reading the request (indicated by freq zero)
+        if (min_freq != 0) {
+            // Got response, update device limits
+            device_limits.rf_freq_min = min_freq;
+            device_limits.rf_freq_max = response_buffer[4]|(response_buffer[5] << 8);
+            device_limits.rf_power_max = response_buffer[6]|(response_buffer[7] << 8);
+            debug("device limits: min freq: %u, max freq: %u, max power %u",
+                unsigned(device_limits.rf_freq_min), unsigned(device_limits.rf_freq_max), unsigned(device_limits.rf_power_max));
+            return 'r';
+        }
+        break;
+    }
+    case 'v': {
+        const uint16_t freq = response_buffer[2]|(response_buffer[3] << 8);
+        // Check we're not reading the request (indicated by freq zero)
+        if (freq != 0) {
+            // Got response, update device status
+            const uint16_t power = response_buffer[4]|(response_buffer[5] << 8);
+            cur_control_mode = response_buffer[6]; // Currently only used for race lock
+            const bool pit_mode = response_buffer[7];
+            cur_act_power = response_buffer[8]|(response_buffer[9] << 8);
+
+            // update the vtx
+            AP_VideoTX& vtx = AP::vtx();
+            bool update_pending = vtx.have_params_changed();
+            vtx.set_frequency_mhz(freq);
+
+            AP_VideoTX::VideoBand band;
+            uint8_t channel;
+            if (vtx.get_band_and_channel(freq, band, channel)) {
+                vtx.set_band(band);
+                vtx.set_channel(channel);
+            }
+
+            vtx.set_power_mw(power);
+            if (pit_mode) {
+                vtx.set_options(vtx.get_options() | uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+            } else {
+                vtx.set_options(vtx.get_options() & ~uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+            }
+
+            // make sure the configured values now reflect reality
+            // if they do then announce if there were changes
+            if (!vtx.set_defaults() && update_pending && !vtx.have_params_changed()) {
+                vtx.announce_vtx_settings();
+            }
+
+            debug("device config: freq: %u, cfg pwr: %umw, act pwr: %umw, pitmode: %u",
+                unsigned(freq), unsigned(power), unsigned(cur_act_power), unsigned(pit_mode));
+
+
+            return 'v';
+        }
+        break;
+    }
+    case 's': {
+        const uint16_t temp = (int16_t)(response_buffer[6]|(response_buffer[7] << 8));
+        // Check we're not reading the request (indicated by temp zero)
+        if (temp != 0) {
+            // Got response, update device status
+            cur_temp = temp;
+            return 's';
+        }
+        break;
+    }
+    }
+
+    // Likely reading a request, return zero to indicate not accepted
+    return 0;
+}
+
+// Reset receiver state machine
+void AP_Tramp::reset_receiver(void)
+{
+    port->discard_input();
+    receive_state = ReceiveState::S_WAIT_LEN;
+    receive_pos = 0;
+}
+
+// returns completed response code or 0
+char AP_Tramp::receive_response()
+{
+    if (port == nullptr) {
+        return 0;
+    }
+
+    // wait for complete packet
+    const uint16_t bytesNeeded = TRAMP_BUF_SIZE - receive_pos;
+    if (port->available() < bytesNeeded) {
+        return 0;
+    }
+
+    // sanity check
+    if (bytesNeeded == 0) {
+        reset_receiver();
+        return 0;
+    }
+
+    for (uint16_t i = 0; i < bytesNeeded; i++) {
+        const int16_t b = port->read();
+        if (b < 0) {
+            // uart claimed bytes available, but there were none
+            return 0;
+        }
+        const uint8_t c = uint8_t(b);
+        response_buffer[receive_pos++] = c;
+
+        switch (receive_state) {
+        case ReceiveState::S_WAIT_LEN: {
+            if (c == 0x0F) {
+                // Found header byte, advance to wait for code
+                receive_state = ReceiveState::S_WAIT_CODE;
+            } else {
+                // Unexpected header, reset state machine
+                reset_receiver();
+            }
+            break;
+        }
+        case ReceiveState::S_WAIT_CODE: {
+            if (c == 'r' || c == 'v' || c == 's') {
+                // Code is for response is one we're interested in, advance to data
+                receive_state = ReceiveState::S_DATA;
+            } else {
+                // Unexpected code, reset state machine
+                reset_receiver();
+            }
+            break;
+        }
+        case ReceiveState::S_DATA: {
+            if (receive_pos == TRAMP_BUF_SIZE) {
+                // Buffer is full, calculate checksum
+                const uint8_t cksum = checksum(response_buffer);
+
+                // Reset state machine ready for next response
+                reset_receiver();
+
+                if ((response_buffer[TRAMP_BUF_SIZE-2] == cksum) && (response_buffer[TRAMP_BUF_SIZE-1] == 0)) {
+                    // Checksum is correct, process response
+                    const char r = handle_response();
+
+                    // Check response valid else keep on reading
+                    if (r != 0) {
+                        return r;
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            // Invalid state, reset state machine
+            reset_receiver();
+            break;
+        }
+    }
+
+    return 0;
+}
+
+void AP_Tramp::send_query(uint8_t cmd)
+{
+    // Reset receive buffer and issue command
+    reset_receiver();
+    send_command(cmd, 0);
+}
+
+void AP_Tramp::set_status(TrampStatus _status)
+{
+    status = _status;
+#ifdef TRAMP_DEBUG
+    switch (status) {

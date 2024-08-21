@@ -1,0 +1,3189 @@
+e'''
+        return
+
+    def probably_vehicle_heartbeat(self, msg):
+        if msg.get_srcComponent() == mavlink.MAV_COMP_ID_GIMBAL:
+            return False
+        if msg.type in (mavlink.MAV_TYPE_GCS,
+                        mavlink.MAV_TYPE_GIMBAL,
+                        mavlink.MAV_TYPE_ADSB,
+                        mavlink.MAV_TYPE_ONBOARD_CONTROLLER):
+            return False
+        if msg.autopilot in frozenset([
+                mavlink.MAV_AUTOPILOT_INVALID
+                ]):
+            return False
+        return True
+
+    def post_message(self, msg):
+        '''default post message call'''
+        if '_posted' in msg.__dict__:
+            return
+        msg._posted = True
+        msg._timestamp = time.time()
+        type = msg.get_type()
+
+        if 'usec' in msg.__dict__:
+            self.uptime = msg.usec * 1.0e-6
+        if 'time_boot_ms' in msg.__dict__:
+            self.uptime = msg.time_boot_ms * 1.0e-3
+
+        if self._timestamp is not None:
+            if self.notimestamps:
+                msg._timestamp = self.uptime
+            else:
+                msg._timestamp = self._timestamp
+
+        src_system = msg.get_srcSystem()
+        src_component = msg.get_srcComponent()
+        src_tuple = (src_system, src_component)
+
+        radio_tuple = (ord('3'), ord('D'))
+
+        if not src_system in self.sysid_state:
+            # we've seen a new system
+            self.sysid_state[src_system] = mavfile_state()
+
+        add_message(self.sysid_state[src_system].messages, type, msg)
+
+        if src_tuple == radio_tuple:
+            # as a special case radio msgs are added for all sysids
+            for s in self.sysid_state.keys():
+                self.sysid_state[s].messages[type] = msg
+
+        if not (src_tuple == radio_tuple or msg.get_msgId() < 0):
+            # Don't use unknown messages to calculate number of lost packets
+            if not src_tuple in self.last_seq:
+                last_seq = -1
+            else:
+                last_seq = self.last_seq[src_tuple]
+            seq = (last_seq+1) % 256
+            seq2 = msg.get_seq()
+            if seq != seq2 and last_seq != -1:
+                diff = (seq2 - seq) % 256
+                self.mav_loss += diff
+                #print("lost %u seq=%u seq2=%u last_seq=%u src_tupe=%s %s" % (diff, seq, seq2, last_seq, str(src_tuple), msg.get_type()))
+            self.last_seq[src_tuple] = seq2
+            self.mav_count += 1
+        
+        self.timestamp = msg._timestamp
+        if type == 'HEARTBEAT' and self.probably_vehicle_heartbeat(msg):
+            if self.sysid == 0:
+                # lock onto id tuple of first vehicle heartbeat
+                self.sysid = src_system
+            if float(mavlink.WIRE_PROTOCOL_VERSION) >= 1:
+                self.flightmode = mode_string_v10(msg)
+                self.mav_type = msg.type
+                self.base_mode = msg.base_mode
+                self.sysid_state[self.sysid].armed = (msg.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                self.sysid_state[self.sysid].mav_type = msg.type
+                self.sysid_state[self.sysid].mav_autopilot = msg.autopilot
+        elif type == 'HIGH_LATENCY2':
+            if self.sysid == 0:
+                # lock onto id tuple of first vehicle heartbeat
+                self.sysid = src_system
+            self.flightmode = mode_string_v10(msg)
+            self.mav_type = msg.type
+            if msg.autopilot == mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA:
+                self.base_mode = msg.custom0
+                self.sysid_state[self.sysid].armed = (msg.custom0 & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            self.sysid_state[self.sysid].mav_type = msg.type
+            self.sysid_state[self.sysid].mav_autopilot = msg.autopilot
+
+        elif type == 'PARAM_VALUE':
+            if not src_tuple in self.param_state:
+                self.param_state[src_tuple] = param_state()
+            self.param_state[src_tuple].params[msg.param_id] = msg.param_value
+        elif type == 'SYS_STATUS' and mavlink.WIRE_PROTOCOL_VERSION == '0.9':
+            self.flightmode = mode_string_v09(msg)
+        elif type == 'GPS_RAW':
+            if self.sysid_state[src_system].messages['HOME'].fix_type < 2:
+                self.sysid_state[src_system].messages['HOME'] = msg
+        elif type == 'GPS_RAW_INT':
+            if self.sysid_state[src_system].messages['HOME'].fix_type < 3:
+                self.sysid_state[src_system].messages['HOME'] = msg
+        for hook in self.message_hooks:
+            hook(self, msg)
+
+        if (msg.get_signed() and
+            self.mav.signing.link_id == 0 and
+            msg.get_link_id() != 0 and
+            self.target_system == msg.get_srcSystem() and
+            self.target_component == msg.get_srcComponent()):
+            # change to link_id from incoming packet
+            self.mav.signing.link_id = msg.get_link_id()
+
+
+    def packet_loss(self):
+        '''packet loss as a percentage'''
+        if self.mav_count == 0:
+            return 0
+        return (100.0*self.mav_loss)/(self.mav_count+self.mav_loss)
+
+
+    def recv_msg(self):
+        '''message receive routine'''
+        self.pre_message()
+        while True:
+            n = self.mav.bytes_needed()
+            s = self.recv(n)
+            numnew = len(s)
+
+            if numnew != 0:
+                if self.logfile_raw:
+                    if is_py3:
+                        self.logfile_raw.write(s)
+                    else:
+                        self.logfile_raw.write(str(s))
+                if self.first_byte:
+                    self.auto_mavlink_version(s)
+
+            # We always call parse_char even if the new string is empty, because the existing message buf might already have some valid packet
+            # we can extract
+            msg = self.mav.parse_char(s)
+            if msg:
+                if self.logfile and  msg.get_type() != 'BAD_DATA' :
+                    usec = int(time.time() * 1.0e6) & ~3
+                    if is_py3:
+                        self.logfile.write(struct.pack('>Q', usec) + msg.get_msgbuf())
+                    else:
+                        self.logfile.write(str(struct.pack('>Q', usec) + msg.get_msgbuf()))
+                self.post_message(msg)
+                return msg
+            else:
+                # if we failed to parse any messages _and_ no new bytes arrived, return immediately so the client has the option to
+                # timeout
+                if numnew == 0:
+                    return None
+                
+    def recv_match(self, condition=None, type=None, blocking=False, timeout=None):
+        '''recv the next MAVLink message that matches the given condition
+        type can be a string or a list of strings'''
+        if type is not None and not isinstance(type, list) and not isinstance(type, set):
+            type = [type]
+        start_time = time.time()
+        while True:
+            if timeout is not None:
+                now = time.time()
+                if now < start_time:
+                    start_time = now # If an external process rolls back system time, we should not spin forever.
+                if start_time + timeout < time.time():
+                    return None
+            m = self.recv_msg()
+            if m is None:
+                if blocking:
+                    for hook in self.idle_hooks:
+                        hook(self)
+                    if timeout is None:
+                        self.select(0.05)
+                    else:
+                        self.select(timeout/2)
+                    continue
+                return None
+            if type is not None and not m.get_type() in type:
+                continue
+            if not evaluate_condition(condition, self.messages):
+                continue
+            return m
+
+    def check_condition(self, condition):
+        '''check if a condition is true'''
+        return evaluate_condition(condition, self.messages)
+
+    def mavlink10(self):
+        '''return True if using MAVLink 1.0 or later'''
+        return float(self.WIRE_PROTOCOL_VERSION) >= 1
+
+    def mavlink20(self):
+        '''return True if using MAVLink 2.0 or later'''
+        return float(self.WIRE_PROTOCOL_VERSION) >= 2
+
+    def setup_logfile(self, logfile, mode='wb'):
+        '''start logging to the given logfile, with timestamps'''
+        self.logfile = open(logfile, mode=mode)
+
+    def setup_logfile_raw(self, logfile, mode='wb'):
+        '''start logging raw bytes to the given logfile, without timestamps'''
+        self.logfile_raw = open(logfile, mode=mode)
+
+    def wait_heartbeat(self, blocking=True, timeout=None):
+        '''wait for a heartbeat so we know the target system IDs'''
+        return self.recv_match(type='HEARTBEAT', blocking=blocking, timeout=timeout)
+
+    def param_fetch_all(self):
+        '''initiate fetch of all parameters'''
+        if time.time() - self.param_fetch_start < 2.0:
+            # don't fetch too often
+            return
+        self.param_fetch_start = time.time()
+        self.mav.param_request_list_send(self.target_system, self.target_component)
+
+    def param_fetch_one(self, name):
+        '''initiate fetch of one parameter'''
+        try:
+            idx = int(name)
+            self.mav.param_request_read_send(self.target_system, self.target_component, b"", idx)
+        except Exception:
+            if sys.version_info.major >= 3 and not isinstance(name, bytes):
+                name = bytes(name,'ascii')
+            self.mav.param_request_read_send(self.target_system, self.target_component, name, -1)
+
+    def time_since(self, mtype):
+        '''return the time since the last message of type mtype was received'''
+        if not mtype in self.messages:
+            return time.time() - self.start_time
+        return time.time() - self.messages[mtype]._timestamp
+
+    def param_set_send(self, parm_name, parm_value, parm_type=None):
+        '''wrapper for parameter set'''
+        if self.mavlink10():
+            if parm_type is None:
+                parm_type = mavlink.MAVLINK_TYPE_FLOAT
+            self.mav.param_set_send(self.target_system, self.target_component,
+                                    parm_name.encode('utf8'), parm_value, parm_type)
+        else:
+            self.mav.param_set_send(self.target_system, self.target_component,
+                                    parm_name.encode('utf8'), parm_value)
+
+    def waypoint_request_list_send(self):
+        '''wrapper for waypoint_request_list_send'''
+        if self.mavlink10():
+            self.mav.mission_request_list_send(self.target_system, self.target_component)
+        else:
+            self.mav.waypoint_request_list_send(self.target_system, self.target_component)
+
+    def waypoint_clear_all_send(self):
+        '''wrapper for waypoint_clear_all_send'''
+        if self.mavlink10():
+            self.mav.mission_clear_all_send(self.target_system, self.target_component)
+        else:
+            self.mav.waypoint_clear_all_send(self.target_system, self.target_component)
+
+    def waypoint_request_send(self, seq):
+        '''wrapper for waypoint_request_send'''
+        if self.mavlink10():
+            self.mav.mission_request_send(self.target_system, self.target_component, seq)
+        else:
+            self.mav.waypoint_request_send(self.target_system, self.target_component, seq)
+
+    def waypoint_set_current_send(self, seq):
+        '''wrapper for waypoint_set_current_send'''
+        if self.mavlink10():
+            self.mav.mission_set_current_send(self.target_system, self.target_component, seq)
+        else:
+            self.mav.waypoint_set_current_send(self.target_system, self.target_component, seq)
+
+    def waypoint_current(self):
+        '''return current waypoint'''
+        if self.mavlink10():
+            m = self.recv_match(type='MISSION_CURRENT', blocking=True)
+        else:
+            m = self.recv_match(type='WAYPOINT_CURRENT', blocking=True)
+        return m.seq
+
+    def waypoint_count_send(self, seq):
+        '''wrapper for waypoint_count_send'''
+        if self.mavlink10():
+            self.mav.mission_count_send(self.target_system, self.target_component, seq)
+        else:
+            self.mav.waypoint_count_send(self.target_system, self.target_component, seq)
+
+    def set_mode_flag(self, flag, enable):
+        '''
+        Enables/ disables MAV_MODE_FLAG
+        @param flag The mode flag, 
+          see MAV_MODE_FLAG enum
+        @param enable Enable the flag, (True/False)
+        '''
+        if self.mavlink10():
+            mode = self.base_mode
+            if enable:
+                mode = mode | flag
+            elif not enable:
+                mode = mode & ~flag
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                           mavlink.MAV_CMD_DO_SET_MODE, 0,
+                                           mode,
+                                           0, 0, 0, 0, 0, 0)
+        else:
+            print("Set mode flag not supported")
+
+    def set_mode_auto(self):
+        '''enter auto mode'''
+        if self.mavlink10():
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_MISSION_START, 0, 0, 0, 0, 0, 0, 0, 0)
+        else:
+            MAV_ACTION_SET_AUTO = 13
+            self.mav.action_send(self.target_system, self.target_component, MAV_ACTION_SET_AUTO)
+
+    def mode_mapping(self):
+        '''return dictionary mapping mode names to numbers, or None if unknown'''
+        mav_type = self.sysid_state[self.sysid].mav_type
+        mav_autopilot = self.sysid_state[self.sysid].mav_autopilot
+        if mav_autopilot == mavlink.MAV_AUTOPILOT_PX4:
+            return px4_map
+        if mav_type is None:
+            return None
+        return mode_mapping_byname(mav_type)
+
+    def set_mode_apm(self, mode, custom_mode = 0, custom_sub_mode = 0):
+        '''enter arbitrary mode'''
+        if isinstance(mode, str):
+            mode_map = self.mode_mapping()
+            if mode_map is None or mode not in mode_map:
+                print("Unknown mode '%s'" % mode)
+                return
+            mode = mode_map[mode]
+        # set mode by integer mode number for ArduPilot
+        self.mav.command_long_send(self.target_system,
+                                   self.target_component,
+                                   mavlink.MAV_CMD_DO_SET_MODE,
+                                   0,
+                                   mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                                   mode,
+                                   0,
+                                   0,
+                                   0,
+                                   0,
+                                   0)
+
+    def set_mode_px4(self, mode, custom_mode, custom_sub_mode):
+        '''enter arbitrary mode'''
+        if isinstance(mode, str):
+            mode_map = self.mode_mapping()
+            if mode_map is None or mode not in mode_map:
+                print("Unknown mode '%s'" % mode)
+                return
+            # PX4 uses two fields to define modes
+            mode, custom_mode, custom_sub_mode = px4_map[mode]
+        self.mav.command_long_send(self.target_system, self.target_component,
+                                   mavlink.MAV_CMD_DO_SET_MODE, 0, mode, custom_mode, custom_sub_mode, 0, 0, 0, 0)
+
+    def set_mode(self, mode, custom_mode = 0, custom_sub_mode = 0):
+        '''set arbitrary flight mode'''
+        mav_autopilot = self.field('HEARTBEAT', 'autopilot', None)
+        if mav_autopilot == mavlink.MAV_AUTOPILOT_PX4:
+            self.set_mode_px4(mode, custom_mode, custom_sub_mode)
+        else:
+            self.set_mode_apm(mode)
+        
+    def set_mode_rtl(self):
+        '''enter RTL mode'''
+        if self.mavlink10():
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0, 0, 0, 0, 0, 0)
+        else:
+            MAV_ACTION_RETURN = 3
+            self.mav.action_send(self.target_system, self.target_component, MAV_ACTION_RETURN)
+
+    def set_mode_manual(self):
+        '''enter MANUAL mode'''
+        if self.mavlink10():
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_DO_SET_MODE, 0,
+                                       mavlink.MAV_MODE_MANUAL_ARMED,
+                                       0, 0, 0, 0, 0, 0)
+        else:
+            MAV_ACTION_SET_MANUAL = 12
+            self.mav.action_send(self.target_system, self.target_component, MAV_ACTION_SET_MANUAL)
+
+    def set_mode_fbwa(self):
+        '''enter FBWA mode'''
+        if self.mavlink10():
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_DO_SET_MODE, 0,
+                                       mavlink.MAV_MODE_STABILIZE_ARMED,
+                                       0, 0, 0, 0, 0, 0)
+        else:
+            print("Forcing FBWA not supported")
+
+    def set_mode_loiter(self):
+        '''enter LOITER mode'''
+        if self.mavlink10():
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_NAV_LOITER_UNLIM, 0, 0, 0, 0, 0, 0, 0, 0)
+        else:
+            MAV_ACTION_LOITER = 27
+            self.mav.action_send(self.target_system, self.target_component, MAV_ACTION_LOITER)
+
+    def set_servo(self, channel, pwm):
+        '''set a servo value'''
+        self.mav.command_long_send(self.target_system, self.target_component,
+                                   mavlink.MAV_CMD_DO_SET_SERVO, 0,
+                                   channel, pwm,
+                                   0, 0, 0, 0, 0)
+
+
+    def set_relay(self, relay_pin=0, state=True):
+        '''Set relay_pin to value of state'''
+        if self.mavlink10():
+            self.mav.command_long_send(
+                self.target_system,  # target_system
+                self.target_component, # target_component
+                mavlink.MAV_CMD_DO_SET_RELAY, # command
+                0, # Confirmation
+                relay_pin, # Relay Number
+                int(state), # state (1 to indicate arm)
+                0, # param3 (all other params meaningless)
+                0, # param4
+                0, # param5
+                0, # param6
+                0) # param7
+        else:
+            print("Setting relays not supported.")
+
+    def calibrate_level(self):
+        '''calibrate accels (1D version)'''
+        self.mav.command_long_send(self.target_system, self.target_component,
+                                   mavlink.MAV_CMD_PREFLIGHT_CALIBRATION, 0,
+                                   1, 1, 0, 0, 0, 0, 0)
+
+    def calibrate_pressure(self):
+        '''calibrate pressure'''
+        if self.mavlink10():
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_PREFLIGHT_CALIBRATION, 0,
+                                       0, 0, 1, 0, 0, 0, 0)
+        else:
+            MAV_ACTION_CALIBRATE_PRESSURE = 20
+            self.mav.action_send(self.target_system, self.target_component, MAV_ACTION_CALIBRATE_PRESSURE)
+
+    def reboot_autopilot(self, hold_in_bootloader=False, force=False):
+        '''reboot the autopilot'''
+        if self.mavlink10():
+            if hold_in_bootloader:
+                param1 = 3
+            else:
+                param1 = 1
+            if force:
+                param6 = 20190226
+            else:
+                param6 = 0
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 0,
+                                       param1, 0, 0, 0, 0, param6, 0)
+
+    def wait_gps_fix(self):
+        self.recv_match(type='VFR_HUD', blocking=True)
+        if self.mavlink10():
+            self.recv_match(type='GPS_RAW_INT', blocking=True,
+                            condition='GPS_RAW_INT.fix_type>=3 and GPS_RAW_INT.lat != 0')
+        else:
+            self.recv_match(type='GPS_RAW', blocking=True,
+                            condition='GPS_RAW.fix_type>=2 and GPS_RAW.lat != 0')
+
+    def location(self, relative_alt=False):
+        '''return current location'''
+        self.wait_gps_fix()
+        # wait for another VFR_HUD, to ensure we have correct altitude
+        self.recv_match(type='VFR_HUD', blocking=True)
+        self.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        if relative_alt:
+            alt = self.messages['GLOBAL_POSITION_INT'].relative_alt*0.001
+        else:
+            alt = self.messages['VFR_HUD'].alt
+        return location(self.messages['GPS_RAW_INT'].lat*1.0e-7,
+                        self.messages['GPS_RAW_INT'].lon*1.0e-7,
+                        alt,
+                        self.messages['VFR_HUD'].heading)
+
+    def arducopter_arm(self):
+        '''arm motors (arducopter only)'''
+        if self.mavlink10():
+            self.mav.command_long_send(
+                self.target_system,  # target_system
+                self.target_component,
+                mavlink.MAV_CMD_COMPONENT_ARM_DISARM, # command
+                0, # confirmation
+                1, # param1 (1 to indicate arm)
+                0, # param2 (all other params meaningless)
+                0, # param3
+                0, # param4
+                0, # param5
+                0, # param6
+                0) # param7
+
+    def arducopter_disarm(self):
+        '''disarm motors (arducopter only)'''
+        if self.mavlink10():
+            self.mav.command_long_send(
+                self.target_system,  # target_system
+                self.target_component,
+                mavlink.MAV_CMD_COMPONENT_ARM_DISARM, # command
+                0, # confirmation
+                0, # param1 (0 to indicate disarm)
+                0, # param2 (all other params meaningless)
+                0, # param3
+                0, # param4
+                0, # param5
+                0, # param6
+                0) # param7
+
+    def motors_armed(self):
+        '''return true if motors armed'''
+        return self.sysid_state[self.sysid].armed
+
+    def motors_armed_wait(self):
+        '''wait for motors to be armed'''
+        while True:
+            m = self.wait_heartbeat()
+            if self.motors_armed():
+                return
+
+    def motors_disarmed_wait(self):
+        '''wait for motors to be disarmed'''
+        while True:
+            m = self.wait_heartbeat()
+            if not self.motors_armed():
+                return
+
+
+    def field(self, type, field, default=None):
+        '''convenient function for returning an arbitrary MAVLink
+           field with a default'''
+        if not type in self.messages:
+            return default
+        return getattr(self.messages[type], field, default)
+
+    def param(self, name, default=None):
+        '''convenient function for returning an arbitrary MAVLink
+           parameter with a default'''
+        if not name in self.params:
+            return default
+        return self.params[name]
+
+    def setup_signing(self, secret_key, sign_outgoing=True, allow_unsigned_callback=None, initial_timestamp=None, link_id=None):
+        '''setup for MAVLink2 signing'''
+        self.mav.signing.secret_key = secret_key
+        self.mav.signing.sign_outgoing = sign_outgoing
+        self.mav.signing.allow_unsigned_callback = allow_unsigned_callback
+        if link_id is None:
+            # auto-increment the link_id for each link
+            global global_link_id
+            link_id = global_link_id
+            global_link_id = min(global_link_id + 1, 255)
+        self.mav.signing.link_id = link_id
+        if initial_timestamp is None:
+            # timestamp is time since 1/1/2015
+            epoch_offset = 1420070400
+            now = max(time.time(), epoch_offset)
+            initial_timestamp = now - epoch_offset
+            initial_timestamp = int(initial_timestamp * 100 * 1000)
+        # initial_timestamp is in 10usec units
+        self.mav.signing.timestamp = initial_timestamp
+
+    def disable_signing(self):
+        '''disable MAVLink2 signing'''
+        self.mav.signing.secret_key = None
+        self.mav.signing.sign_outgoing = False
+        self.mav.signing.allow_unsigned_callback = None
+        self.mav.signing.link_id = 0
+        self.mav.signing.timestamp = 0
+
+def set_close_on_exec(fd):
+    '''set the close on exec flag on a file descriptor. Ignore exceptions'''
+    try:
+        import fcntl
+        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        flags |= fcntl.FD_CLOEXEC
+        fcntl.fcntl(fd, fcntl.F_SETFD, flags)
+    except Exception:
+        pass
+
+class FakeSerial():
+    def __init__(self):
+        pass
+    def read(self, len):
+        return ""
+    def write(self, buf):
+        raise Exception("write always fails")
+    def inWaiting(self):
+        return 0
+    def close(self):
+        pass
+
+class mavserial(mavfile):
+    '''a serial mavlink port'''
+    def __init__(self, device, baud=115200, autoreconnect=False, source_system=255, source_component=0, use_native=default_native, force_connected=False):
+        import serial
+        if ',' in device and not os.path.exists(device):
+            device, baud = device.split(',')
+        self.baud = baud
+        self.device = device
+        self.autoreconnect = autoreconnect
+        self.force_connected = force_connected
+        # we rather strangely set the baudrate initially to 1200, then change to the desired
+        # baudrate. This works around a kernel bug on some Linux kernels where the baudrate
+        # is not set correctly
+        try:
+            self.port = serial.Serial(self.device, 1200, timeout=0,
+                                      dsrdtr=False, rtscts=False, xonxoff=False)
+        except serial.SerialException as e:
+            if not force_connected:
+                raise e
+            self.port = FakeSerial()
+
+        try:
+            fd = self.port.fileno()
+            set_close_on_exec(fd)
+        except Exception:
+            fd = None
+        self.set_baudrate(self.baud)
+        mavfile.__init__(self, fd, device, source_system=source_system, source_component=source_component, use_native=use_native)
+        self.rtscts = False
+
+    def set_rtscts(self, enable):
+        '''enable/disable RTS/CTS if applicable'''
+        try:
+            self.port.setRtsCts(enable)
+        except Exception:
+            self.port.rtscts = enable
+        self.rtscts = enable
+
+    def set_baudrate(self, baudrate):
+        '''set baudrate'''
+        try:
+            self.port.setBaudrate(baudrate)
+        except Exception:
+            # for pySerial 3.0, which doesn't have setBaudrate()
+            self.port.baudrate = baudrate
+    
+    def close(self):
+        self.port.close()
+
+    def recv(self,n=None):
+        if n is None:
+            n = self.mav.bytes_needed()
+        if self.fd is None:
+            waiting = self.port.inWaiting()
+            if waiting < n:
+                n = waiting
+        ret = self.port.read(n)
+        return ret
+
+    def write(self, buf):
+        try:
+            return self.port.write(bytes(buf))
+        except Exception:
+            if not self.portdead:
+                print("Device %s is dead" % self.device)
+            self.portdead = True
+            if self.autoreconnect:
+                self.reset()
+            return -1
+            
+    def reset(self):
+        import serial
+        try:
+            try:
+                newport = serial.Serial(self.device, self.baud, timeout=0,
+                                        dsrdtr=False, rtscts=False, xonxoff=False)
+            except serial.SerialException as e:
+                if not self.force_connected:
+                    raise e
+                newport = FakeSerial()
+                return False
+            self.port.close()
+            self.port = newport
+            print("Device %s reopened OK" % self.device)
+            self.portdead = False
+            try:
+                self.fd = self.port.fileno()
+            except Exception:
+                self.fd = None
+            self.set_baudrate(self.baud)
+            if self.rtscts:
+                self.set_rtscts(self.rtscts)
+            return True
+        except Exception:
+            return False
+        
+
+class mavudp(mavfile):
+    '''a UDP mavlink socket'''
+    def __init__(self, device, input=True, broadcast=False, source_system=255, source_component=0, use_native=default_native, timeout=0):
+        a = device.split(':')
+        if len(a) != 2:
+            raise ValueError("UDP ports must be specified as host:port")
+        self.port = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_server = input
+        self.broadcast = False
+        if input:
+            self.port.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.port.bind((a[0], int(a[1])))
+        else:
+            self.destination_addr = (a[0], int(a[1]))
+            if broadcast:
+                self.port.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                self.broadcast = True
+        set_close_on_exec(self.port.fileno())
+        self.port.setblocking(0)
+        self.last_address = None
+        self.timeout = timeout
+        self.clients = set()
+        self.clients_last_alive = {}
+        self.resolved_destination_addr = None
+        mavfile.__init__(self, self.port.fileno(), device, source_system=source_system, source_component=source_component, input=input, use_native=use_native)
+
+    def close(self):
+        self.port.close()
+
+    def recv(self,n=None):
+        try:
+            data, new_addr = self.port.recvfrom(UDP_MAX_PACKET_LEN)
+        except socket.error as e:
+            if e.errno in [ errno.EAGAIN, errno.EWOULDBLOCK, errno.ECONNREFUSED ]:
+                return ""
+            raise
+        if self.udp_server:
+            self.clients.add(new_addr)
+            self.clients_last_alive[new_addr] = time.time()
+        elif self.broadcast:
+            self.last_address = new_addr
+        return data
+
+    def write(self, buf):
+        try:
+            if self.udp_server:
+                current_time = time.time()
+                to_remove = set()
+                for address in self.clients:
+                    if len(self.clients) == 1 or self.timeout <= 0 or self.clients_last_alive[address] + self.timeout > current_time:
+                        self.port.sendto(buf, address)
+                    elif len(self.clients) > 1 and len(to_remove) < len(self.clients) - 1:
+                        # we keep always at least 1 client, so we don't break old behavior
+                        to_remove.add(address)
+                        self.clients_last_alive.pop(address)
+                self.clients -= to_remove
+            else:
+                if self.last_address and self.broadcast:
+                    self.destination_addr = self.last_address
+                    self.broadcast = False
+                    self.port.connect(self.destination_addr)
+                # turn a (possible) hostname into an IP address to
+                # avoid resolving the hostname for every packet sent:
+                if self.destination_addr[0] != self.resolved_destination_addr:
+                    self.resolved_destination_addr = self.destination_addr[0]
+                    self.destination_addr = (socket.gethostbyname(self.destination_addr[0]), self.destination_addr[1])
+                self.port.sendto(buf, self.destination_addr)
+        except socket.error:
+            pass
+
+    def recv_msg(self):
+        '''message receive routine for UDP link'''
+        self.pre_message()
+        s = self.recv()
+        if len(s) > 0:
+            if self.first_byte:
+                self.auto_mavlink_version(s)
+
+        m = self.mav.parse_char(s)
+        if m is not None:
+            self.post_message(m)
+
+        return m
+
+class mavmcast(mavfile):
+    '''a UDP multicast mavlink socket'''
+    def __init__(self, device, broadcast=False, source_system=255, source_component=0, use_native=default_native):
+        a = device.split(':')
+        mcast_ip = "239.255.145.50"
+        mcast_port = 14550
+        if len(a) == 1 and len(a[0]) > 0:
+            mcast_port = int(a[0])
+        elif len(a) > 1:
+            mcast_ip = a[0]
+            mcast_port = int(a[1])
+
+        # first the receiving socket. We use separate sending and receiving
+        # sockets so we can use the port number of the sending socket to detect
+        # packets from ourselves
+        self.port = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.port.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if platform.system() == "Windows":
+            # on windows we need to bind to INADDR_ANY first, then use multicast join for address
+            self.port.bind(("0.0.0.0", mcast_port))
+        else:
+            self.port.bind((mcast_ip, mcast_port))
+        mreq = struct.pack("4sl", socket.inet_aton(mcast_ip), socket.INADDR_ANY)
+        self.port.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        self.port.setblocking(0)
+        set_close_on_exec(self.port.fileno())
+
+        # now the sending socket
+        self.port_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.port_out.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.port_out.setblocking(0)
+        self.port_out.connect((mcast_ip, mcast_port))
+        set_close_on_exec(self.port_out.fileno())
+        self.myport = None
+
+        mavfile.__init__(self, self.port.fileno(), device,
+                         source_system=source_system, source_component=source_component,
+                         input=False, use_native=use_native)
+
+    def close(self):
+        self.port.close()
+        self.port_out.close()
+
+    def recv(self,n=None):
+        try:
+            data, new_addr = self.port.recvfrom(UDP_MAX_PACKET_LEN)
+            if self.myport is None:
+                try:
+                    (myaddr,self.myport) = self.port_out.getsockname()
+                except Exception:
+                    pass
+        except socket.error as e:
+            if e.errno in [ errno.EAGAIN, errno.EWOULDBLOCK, errno.ECONNREFUSED ]:
+                return ""
+            raise
+        if self.myport == new_addr[1]:
+            # data from ourselves, discard
+            return ''
+        return data
+
+    def write(self, buf):
+        try:
+            self.port_out.send(buf)
+        except socket.error as e:
+            pass
+
+    def recv_msg(self):
+        '''message receive routine for UDP link'''
+        self.pre_message()
+        s = self.recv()
+        if len(s) > 0:
+            if self.first_byte:
+                self.auto_mavlink_version(s)
+
+        m = self.mav.parse_char(s)
+        if m is not None:
+            self.post_message(m)
+
+        return m
+    
+
+class mavtcp(mavfile):
+    '''a TCP mavlink socket'''
+    def __init__(self,
+                 device,
+                 autoreconnect=False,
+                 source_system=255,
+                 source_component=0,
+                 retries=6,
+                 use_native=default_native):
+        a = device.split(':')
+        if len(a) != 2:
+            raise ValueError("TCP ports must be specified as host:port")
+        self.destination_addr = (a[0], int(a[1]))
+
+        self.autoreconnect = autoreconnect
+
+        self.retries = retries
+        self.do_connect()
+
+        mavfile.__init__(self, self.port.fileno(), "tcp:" + device, source_system=source_system, source_component=source_component, use_native=use_native)
+
+    def do_connect(self):
+        if sys.platform != 'darwin':
+            self.port = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        retries = self.retries
+        if retries <= 0:
+            # try to connect at least once:
+            retries = 1
+        while retries >= 0:
+            retries -= 1
+            try:
+                if sys.platform == 'darwin':
+                    self.port = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.port.connect(self.destination_addr)
+                break
+            except Exception as e:
+                if retries == 0:
+                    if self.port is not None:
+                        self.port.close()
+                        self.port = None
+                    raise e
+                print(e, "sleeping")
+                time.sleep(1)
+        self.port.setblocking(0)
+        set_close_on_exec(self.port.fileno())
+        self.port.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+
+    def close(self):
+        self.port.close()
+
+    def handle_disconnect(self):
+        print("Connection reset or closed by peer on TCP socket")
+        self.reconnect()
+
+    def handle_eof(self):
+        # EOF
+        print("EOF on TCP socket")
+        self.reconnect()
+
+    def recv(self,n=None):
+        if self.port is None:
+            self.reconnect()
+        if n is None:
+            n = self.mav.bytes_needed()
+        try:
+            data = self.port.recv(n)
+        except socket.error as e:
+            if e.errno in [ errno.EAGAIN, errno.EWOULDBLOCK ]:
+                return ""
+            if e.errno in [ errno.ECONNRESET, errno.EPIPE ]:
+                self.handle_disconnect()
+            raise
+        if len(data) == 0:
+            self.handle_eof()
+
+        return data
+
+    def write(self, buf):
+        if self.port is None:
+            try:
+                self.reconnect()
+            except socket.error as e:
+                pass
+        if self.port is None:
+            return
+        try:
+            self.port.send(buf)
+        except socket.error as e:
+            if e.errno in [ errno.ECONNRESET, errno.EPIPE ]:
+                self.handle_disconnect()
+            pass
+
+    def reconnect(self):
+        if self.autoreconnect:
+            print("Attempting reconnect")
+            if self.port is not None:
+                self.port.close()
+                self.port = None
+            self.do_connect()
+
+
+class mavtcpin(mavfile):
+    '''a TCP input mavlink socket'''
+    def __init__(self, device, source_system=255, source_component=0, retries=3, use_native=default_native):
+        a = device.split(':')
+        if len(a) != 2:
+            raise ValueError("TCP ports must be specified as host:port")
+        self.listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listen_addr = (a[0], int(a[1]))
+        self.listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listen.bind(self.listen_addr)
+        self.listen.listen(1)
+        self.listen.setblocking(0)
+        set_close_on_exec(self.listen.fileno())
+        self.listen.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+        mavfile.__init__(self, self.listen.fileno(), "tcpin:" + device, source_system=source_system, source_component=source_component, use_native=use_native)
+        self.port = None
+
+    def close(self):
+        if self.port is not None:
+            self.port.close()
+        self.listen.close()
+
+    def recv(self,n=None):
+        if not self.port:
+            try:
+                (self.port, addr) = self.listen.accept()
+            except Exception:
+                return ''
+            self.port.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1) 
+            self.port.setblocking(0) 
+            set_close_on_exec(self.port.fileno())
+            self.fd = self.port.fileno()
+
+        if n is None:
+            n = self.mav.bytes_needed()
+        try:
+            data = self.port.recv(n)
+        except socket.error as e:
+            if e.errno in [ errno.EAGAIN, errno.EWOULDBLOCK ]:
+                return ""
+            self.port.close()
+            self.port = None
+            self.fd = self.listen.fileno()
+            return ''
+        return data
+
+    def write(self, buf):
+        if self.port is None:
+            return
+        try:
+            self.port.send(buf)
+        except socket.error as e:
+            if e.errno in [ errno.EPIPE ]:
+                self.port.close()
+                self.port = None
+                self.fd = self.listen.fileno()
+            pass
+
+
+class mavlogfile(mavfile):
+    '''a MAVLink logfile reader/writer'''
+    def __init__(self, filename, planner_format=None,
+                 write=False, append=False,
+                 robust_parsing=True, notimestamps=False, source_system=255, source_component=0, use_native=default_native):
+        self.filename = filename
+        self.writeable = write
+        self.robust_parsing = robust_parsing
+        self.planner_format = planner_format
+        self._two64 = math.pow(2.0, 63)
+        mode = 'rb'
+        if self.writeable:
+            if append:
+                mode = 'ab'
+            else:
+                mode = 'wb'
+        self.f = open(filename, mode)
+        self.filesize = os.path.getsize(filename)
+        self.percent = 0
+        mavfile.__init__(self, None, filename, source_system=source_system, source_component=source_component, notimestamps=notimestamps, use_native=use_native)
+        if self.notimestamps:
+            self._timestamp = 0
+        else:
+            self._timestamp = time.time()
+        self.stop_on_EOF = True
+        self._last_message = None
+        self._last_timestamp = None
+        self._link = 0
+
+    def close(self):
+        self.f.close()
+
+    def recv(self,n=None):
+        if n is None:
+            n = self.mav.bytes_needed()
+        return self.f.read(n)
+
+    def write(self, buf):
+        self.f.write(buf)
+
+    def scan_timestamp(self, tbuf):
+        '''scan forward looking in a tlog for a timestamp in a reasonable range'''
+        while True:
+            (tusec,) = struct.unpack('>Q', tbuf)
+            t = tusec * 1.0e-6
+            if abs(t - self._last_timestamp) <= 3*24*60*60:
+                break
+            c = self.f.read(1)
+            if len(c) != 1:
+                break
+            tbuf = tbuf[1:] + c
+        return t
+
+
+    def pre_message(self):
+        '''read timestamp if needed'''
+        # read the timestamp
+        if self.filesize != 0:
+            self.percent = (100.0 * self.f.tell()) / self.filesize
+        if self.notimestamps:
+            return
+        if self.planner_format:
+            tbuf = self.f.read(21)
+            if len(tbuf) != 21 or tbuf[0] != '-' or tbuf[20] != ':':
+                raise RuntimeError('bad planner timestamp %s' % tbuf)
+            hnsec = self._two64 + float(tbuf[0:20])
+            t = hnsec * 1.0e-7         # convert to seconds
+            t -= 719163 * 24 * 60 * 60 # convert to 1970 base
+            self._link = 0
+        else:
+            tbuf = self.f.read(8)
+            if len(tbuf) != 8:
+                return
+            (tusec,) = struct.unpack('>Q', tbuf)
+            t = tusec * 1.0e-6
+            if (self._last_timestamp is not None and
+                self._last_message.get_type() == "BAD_DATA" and
+                abs(t - self._last_timestamp) > 3*24*60*60):
+                t = self.scan_timestamp(tbuf)
+            self._link = tusec & 0x3
+        self._timestamp = t
+
+    def post_message(self, msg):
+        '''add timestamp to message'''
+        # read the timestamp
+        super(mavlogfile, self).post_message(msg)
+        if self.planner_format:
+            self.f.read(1) # trailing newline
+        self.timestamp = msg._timestamp
+        self._last_message = msg
+        if msg.get_type() != "BAD_DATA":
+            self._last_timestamp = msg._timestamp
+        msg._link = self._link
+
+
+class mavmmaplog(mavlogfile):
+    '''a MAVLink log file accessed via mmap. Used for fast read-only
+    access with low memory overhead where particular message types are wanted'''
+    def __init__(self, filename, progress_callback=None):
+        import mmap
+        mavlogfile.__init__(self, filename)
+        self.f.seek(0, 2)
+        self.data_len = self.f.tell()
+        self.f.seek(0)
+        if platform.system() == "Windows":
+            self.data_map = mmap.mmap(self.f.fileno(), self.data_len, None, mmap.ACCESS_READ)
+        else:
+            self.data_map = mmap.mmap(self.f.fileno(), self.data_len, mmap.MAP_PRIVATE, mmap.PROT_READ)
+        self._rewind()
+        self.init_arrays(progress_callback)
+        self._flightmodes = None
+
+    def _rewind(self):
+        '''rewind to start of log'''
+        self.flightmode = "UNKNOWN"
+        self.offset = 0
+        self.type_nums = None
+        self.f.seek(0)
+
+    def rewind(self):
+        '''rewind to start of log'''
+        self._rewind()
+
+    def close(self):
+        super(mavmmaplog, self).close()
+        self.data_map.close()
+
+    def init_arrays(self, progress_callback=None):
+        '''initialise arrays for fast recv_match()'''
+
+        # dictionary indexed by msgid, mapping to arrays of file offsets where
+        # each instance of a msg type is found
+        self.offsets = {}
+
+        # number of msgs of each msg type
+        self.counts = {}
+        self._count = 0
+
+        # mapping from msg name to msg id
+        self.name_to_id = {}
+
+        # mapping from msg id to name
+        self.id_to_name = {}
+
+        self.instance_offsets = {}
+        self.instance_lengths = {}
+
+        self.type_nums = None
+
+        ofs = 0
+        pct = 0
+
+        MARKER_V1 = 0xFE
+        MARKER_V2 = 0xFD
+        
+        while ofs+8+6 < self.data_len:
+            marker = u_ord(self.data_map[ofs+8])
+            mlen = u_ord(self.data_map[ofs+9]) + 8
+            if marker == MARKER_V1:
+                mtype = u_ord(self.data_map[ofs+13])
+                mlen += 8
+                data_ofs = 14
+            elif marker == MARKER_V2:
+                if ofs+8+10 > self.data_len:
+                    break
+                mtype = u_ord(self.data_map[ofs+15]) | (u_ord(self.data_map[ofs+16])<<8) | (u_ord(self.data_map[ofs+17])<<16)
+                mlen += 12
+                data_ofs = 18
+                incompat_flags = u_ord(self.data_map[ofs+10])
+                if incompat_flags & mavlink.MAVLINK_IFLAG_SIGNED:
+                    mlen += mavlink.MAVLINK_SIGNATURE_BLOCK_LEN
+            else:
+                # unrecognised marker; probably a malformed log
+                ofs += 1
+                continue
+
+            if not mtype in self.offsets:
+                if not mtype in mavlink.mavlink_map:
+                    ofs += mlen
+                    continue
+                self.offsets[mtype] = []
+                self.counts[mtype] = 0
+                msg = mavlink.mavlink_map[mtype]
+                self.name_to_id[msg.msgname] = mtype
+                self.id_to_name[mtype] = msg.msgname
+                self.f.seek(ofs)
+                m = self.recv_msg()
+                add_message(self.messages, msg.msgname, m)
+                if m._instance_field is not None:
+                    instance_idx = m.ordered_fieldnames.index(m._instance_field)
+                    self.instance_offsets[mtype] = m._instance_offset
+                    alen = m.array_lengths[instance_idx]
+                    if alen > 0:
+                        self.instance_lengths[mtype] = alen
+                    else:
+                        self.instance_lengths[mtype] = 1
+
+            if mtype in self.instance_offsets:
+                # populate the messages array with a new instance. This assumes we can get the instance
+                # as a single byte integer
+                instance_field_ofs = ofs + data_ofs + self.instance_offsets[mtype]
+                if instance_field_ofs >= self.data_len:
+                    # truncated log
+                    break
+                self.f.seek(instance_field_ofs)
+                ilen = self.instance_lengths[mtype]
+                ipad = 0
+                if ilen + (instance_field_ofs - ofs) > mlen-2:
+                    # message is MAVLink2.0 zero truncated
+                    ipad = ilen + (instance_field_ofs - ofs) - (mlen-2)
+                    ilen -= ipad
+                if ilen > 0:
+                    b = self.f.read(ilen)
+                else:
+                    b = bytes([0]*ilen)
+                if ipad > 0:
+                    b += bytes([0]*ipad)
+                if ilen+ipad > 1:
+                    # assume string
+                    while len(b) > 0 and b[-1] == 0:
+                        b = b[:-1]
+                    instance = b.decode('ASCII',errors='ignore').rstrip()
+                else:
+                    instance, = struct.unpack('b', b[:1])
+                mname = self.id_to_name[mtype]
+                if mname in self.messages:
+                    iname = "%s[%s]" % (mname, str(instance))
+                    self.messages[iname] = self.messages[mname]
+
+            self.offsets[mtype].append(ofs)
+            self.counts[mtype] += 1
+
+            ofs += mlen
+            new_pct = (100 * ofs) // self.data_len
+            if progress_callback is not None and new_pct != pct:
+                progress_callback(new_pct)
+                pct = new_pct
+
+        for mtype in self.counts:
+            self._count += self.counts[mtype]
+        self.offset = 0
+        self._rewind()
+
+    def skip_to_type(self, type):
+        '''skip fwd to next msg matching given type set'''
+        if self.type_nums is None:
+            # always add some key msg types so we can track flightmode, params etc
+            type = type.copy()
+            type.update(set(['HEARTBEAT','PARAM_VALUE']))
+            self.indexes = []
+            self.type_nums = []
+            for t in type:
+                if not t in self.name_to_id:
+                    continue
+                self.type_nums.append(self.name_to_id[t])
+                self.indexes.append(0)
+        smallest_index = -1
+        smallest_offset = self.data_len
+        for i in range(len(self.type_nums)):
+            mtype = self.type_nums[i]
+            if self.indexes[i] >= self.counts[mtype]:
+                continue
+            ofs = self.offsets[mtype][self.indexes[i]]
+            if ofs < smallest_offset:
+                smallest_offset = ofs
+                smallest_index = i
+        if smallest_index >= 0:
+            self.indexes[smallest_index] += 1
+            self.offset = smallest_offset
+            self.f.seek(smallest_offset)
+
+    def recv_match(self, condition=None, type=None, blocking=False, timeout=None):
+        '''recv the next message that matches the given condition
+        type can be a string or a list of strings'''
+        if type is not None:
+            if isinstance(type, str):
+                type = set([type])
+            elif isinstance(type, list):
+                type = set(type)
+        while True:
+            if type is not None:
+                self.skip_to_type(type)
+            m = self.recv_msg()
+            if m is None:
+                if blocking:
+                    for hook in self.idle_hooks:
+                        hook(self)
+                    if timeout is None:
+                        self.select(0.05)
+                    else:
+                        self.select(timeout/2)
+                    continue
+                return None
+            if type is not None and not m.get_type() in type:
+                continue
+            if not evaluate_condition(condition, self.messages):
+                continue
+            return m
+        
+    def flightmode_list(self):
+        '''return an array of tuples for all flightmodes in log. Tuple is (modestring, t0, t1)'''
+        tstamp = None
+        fmode = None
+        if self._flightmodes is None:
+            self._rewind()
+            self._flightmodes = []
+            types = set(['HEARTBEAT'])
+            while True:
+                m = self.recv_match(type=types)
+                if m is None:
+                    break
+                tstamp = m._timestamp
+                if self.flightmode == fmode:
+                    continue
+                if len(self._flightmodes) > 0:
+                    (mode, t0, t1) = self._flightmodes[-1]
+                    self._flightmodes[-1] = (mode, t0, tstamp)
+                self._flightmodes.append((self.flightmode, tstamp, None))
+                fmode = self.flightmode
+        if tstamp is not None:
+            (mode, t0, t1) = self._flightmodes[-1]
+            self._flightmodes[-1] = (mode, t0, tstamp)
+
+        self._rewind()
+        return self._flightmodes
+
+class mavchildexec(mavfile):
+    '''a MAVLink child processes reader/writer'''
+    def __init__(self, filename, source_system=255, source_component=0, use_native=default_native):
+        from subprocess import Popen, PIPE
+        import fcntl
+        
+        self.filename = filename
+        self.child = Popen(filename, shell=False, stdout=PIPE, stdin=PIPE, bufsize=0)
+        self.fd = self.child.stdout.fileno()
+
+        fl = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        fl = fcntl.fcntl(self.child.stdout.fileno(), fcntl.F_GETFL)
+        fcntl.fcntl(self.child.stdout.fileno(), fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        mavfile.__init__(self, self.fd, filename, source_system=source_system, source_component=source_component, use_native=use_native)
+
+    def close(self):
+        self.child.close()
+
+    def recv(self,n=None):
+        try:
+            x = self.child.stdout.read(1)
+        except Exception:
+            re'''
+module for loading/saving waypoints
+
+Copyright the ArduPilot Project
+Released under GNU LGPL version 3 or later
+'''
+from __future__ import print_function
+from builtins import range
+from builtins import object
+
+import time, copy
+import logging
+import re
+
+from . import mavutil
+try:
+    from google.protobuf import text_format
+    import mission_pb2
+    HAVE_PROTOBUF = True
+except ImportError:
+    HAVE_PROTOBUF = False
+
+
+class MAVWPError(Exception):
+    '''MAVLink WP error class'''
+    def __init__(self, msg):
+        Exception.__init__(self, msg)
+        self.message = msg
+
+
+class MissionItemProtocol(object):
+    '''Base class for transfering items based on the MISSION_ITEM protocol'''
+    def __init__(self, target_system=0, target_component=0):
+        self.wpoints = []
+        self.target_system = target_system
+        self.target_component = target_component
+        self.last_change = 0
+        self.colour_for_polygon = {
+            mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION : (255,0,0),
+            mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION : (0,255,0)
+        }
+
+    def count(self):
+        '''return number of waypoints'''
+        return len(self.wpoints)
+
+    def wp(self, i):
+        '''alias for backwards compatability'''
+        return self.item(i)
+
+    def item(self, i):
+        '''return an item'''
+        try:
+            the_wp = self.wpoints[i]
+        except:
+            the_wp = None
+
+        return the_wp
+
+    def add(self, w, comment=''):
+        '''add a waypoint'''
+        if type(w) == list:
+            w = copy.deepcopy(w)
+            n = self.count()
+            for p in w:
+                p.seq = n
+                n += 1
+            self.wpoints.extend(w)
+        else:
+            w = copy.copy(w)
+            if comment:
+                w.comment = comment
+            w.seq = self.count()
+            self.wpoints.append(w)
+        self.last_change = time.time()
+
+    def insert(self, idx, w, comment=''):
+        '''insert a waypoint'''
+        if idx >= self.count():
+            self.add(w, comment)
+            return
+        if idx < 0:
+            return
+        w = copy.copy(w)
+        if comment:
+            w.comment = comment
+        w.seq = idx
+        self.wpoints.insert(idx, w)
+        self.last_change = time.time()
+        self.reindex()
+
+    def reindex(self):
+        '''reindex waypoints'''
+        for i in range(self.count()):
+            w = self.wpoints[i]
+            w.seq = i
+        self.last_change = time.time()
+
+    def set(self, w, idx):
+        '''set a waypoint'''
+        w.seq = idx
+        if w.seq == self.count():
+            return self.add(w)
+        if self.count() <= idx:
+            raise MAVWPError('adding waypoint at idx=%u past end of list (count=%u)' % (idx, self.count()))
+        self.wpoints[idx] = w
+        self.last_change = time.time()
+
+    def remove(self, w):
+        '''remove a waypoint'''
+        if isinstance(w, list):
+            for point in w:
+                self.wpoints.remove(point)
+        else:
+            self.wpoints.remove(w)
+        self.last_change = time.time()
+        self.reindex()
+
+    def clear(self):
+        '''clear waypoint list'''
+        self.wpoints = []
+        self.last_change = time.time()
+
+    def _read_waypoints_v110(self, file):
+        '''read a version 110 waypoint'''
+        comment = ''
+        for line in file:
+            if line.startswith('#'):
+                comment = line[1:].lstrip()
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            a = line.split()
+            if len(a) != 12:
+                raise MAVWPError("invalid waypoint line with %u values" % len(a))
+            args = [
+                self.target_system,
+                self.target_component,
+                int(a[0]),    # seq
+                int(a[2]),    # frame
+                int(a[3]),    # command
+                int(a[1]),    # current
+                int(a[11]),   # autocontinue
+                float(a[4]),  # param1,
+                float(a[5]),  # param2,
+                float(a[6]),  # param3
+                float(a[7]),  # param4
+                float(a[8]),  # x (latitude)
+                float(a[9]),  # y (longitude)
+                float(a[10]), # z (altitude)
+            ]
+            if mavutil.mavlink20():
+                fn = mavutil.mavlink.MAVLink_mission_item_message
+                args.append(self.mav_mission_type())
+            elif mavutil.mavlink10():
+                fn = mavutil.mavlink.MAVLink_mission_item_message
+                if self.mav_mission_type() != mavutil.mavlink.MAV_MISSION_TYPE_MISSION:
+                    raise ValueError("Not using mavlink2")
+            else:
+                fn = mavutil.mavlink.MAVLink_waypoint_message
+            w = fn(*args)
+            if w.command == 0 and w.seq == 0 and self.count() == 0:
+                # special handling for Mission Planner created home wp
+                w.command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+            self.add(w, comment)
+            comment = ''
+
+    def _read_waypoints_pb_110(self, file):
+        if not HAVE_PROTOBUF:
+            raise MAVWPError(
+                'Cannot read mission file in protobuf format without protobuf '
+                'library. Try "easy_install protobuf".')
+        explicit_seq = False
+        warned_seq = False
+        mission = mission_pb2.Mission()
+        text_format.Merge(file.read(), mission)
+        defaults = mission_pb2.Waypoint()
+        # Set defaults (may be overridden in file).
+        defaults.current = False
+        defaults.autocontinue = True
+        defaults.param1 = 0.0
+        defaults.param2 = 0.0
+        defaults.param3 = 0.0
+        defaults.param4 = 0.0
+        defaults.x = 0.0
+        defaults.y = 0.0
+        defaults.z = 0.0
+        # Use defaults specified in mission file, if there are any.
+        if mission.defaults:
+            defaults.MergeFrom(mission.defaults)
+        for seq, waypoint in enumerate(mission.waypoint):
+            # Consecutive sequence numbers are automatically assigned
+            # UNLESS the mission file specifies sequence numbers of
+            # its own.
+            if waypoint.seq:
+                explicit_seq = True
+            else:
+                if explicit_seq and not warned_seq:
+                    logging.warn(
+                            'Waypoint file %s: mixes explicit and implicit '
+                            'sequence numbers' % (file,))
+                    warned_seq = True
+            # The first command has current=True, the rest have current=False.
+            if seq > 0:
+                current = defaults.current
+            else:
+                current = True
+            w = mavutil.mavlink.MAVLink_mission_item_message(
+                self.target_system, self.target_component,
+                   waypoint.seq or seq,
+                   waypoint.frame,
+                   waypoint.command,
+                   waypoint.current or current,
+                   waypoint.autocontinue or defaults.autocontinue,
+                   waypoint.param1 or defaults.param1,
+                   waypoint.param2 or defaults.param2,
+                   waypoint.param3 or defaults.param3,
+                   waypoint.param4 or defaults.param4,
+                   waypoint.x or defaults.x,
+                   waypoint.y or defaults.y,
+                   waypoint.z or defaults.z)
+            self.add(w)
+
+    def load(self, filename):
+        '''load waypoints from a file.
+        returns number of waypoints loaded'''
+        f = open(filename, mode='r')
+        version_line = f.readline().strip()
+        if version_line == "QGC WPL 100":
+            readfn = self._read_waypoints_v100
+        elif version_line == "QGC WPL 110":
+            readfn = self._read_waypoints_v110
+        elif version_line == "QGC WPL PB 110":
+            readfn = self._read_waypoints_pb_110
+        else:
+            f.close()
+            raise MAVWPError("Unsupported waypoint format '%s'" % version_line)
+
+        self.clear()
+        readfn(f)
+        f.close()
+
+        return len(self.wpoints)
+
+    def save_as_pb(self, filename):
+        mission = mission_pb2.Mission()
+        for w in self.wpoints:
+            waypoint = mission.waypoint.add()
+            waypoint.command = w.command
+            waypoint.frame = w.frame
+            waypoint.seq = w.seq
+            waypoint.current = w.current
+            waypoint.autocontinue = w.autocontinue
+            waypoint.param1 = w.param1
+            waypoint.param2 = w.param2
+            waypoint.param3 = w.param3
+            waypoint.param4 = w.param4
+            waypoint.x = w.x
+            waypoint.y = w.y
+            waypoint.z = w.z
+        with open(filename, 'w') as f:
+            f.write('QGC WPL PB 110\n')
+            f.write(text_format.MessageToString(mission))
+
+    def save(self, filename):
+        '''save waypoints to a file'''
+        f = open(filename, mode='w')
+        f.write("QGC WPL 110\n")
+        for w in self.wpoints:
+            if getattr(w, 'comment', None):
+                f.write("# %s\n" % w.comment)
+            f.write("%u\t%u\t%u\t%u\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%u\n" % (
+                w.seq, w.current, w.frame, w.command,
+                w.param1, w.param2, w.param3, w.param4,
+                w.x, w.y, w.z, w.autocontinue))
+        f.close()
+
+    def view_indexes(self, done=None):
+        '''return a list waypoint indexes in view order'''
+        ret = []
+        if done is None:
+            done = set()
+        idx = 0
+
+        # find first point not done yet
+        while idx < self.count():
+            if not idx in done:
+                break
+            idx += 1
+
+        exclusion_start = -1
+        exclusion_count = -1
+        inclusion_start = -1
+        inclusion_count = -1
+        while idx < self.count():
+            w = self.wp(idx)
+            if idx in done:
+                if self.is_location_wp(w):
+                    ret.append(idx)
+                break
+            done.add(idx)
+            if w.command == mavutil.mavlink.MAV_CMD_DO_JUMP:
+                idx = int(w.param1)
+                w = self.wp(idx)
+                if self.is_location_wp(w):
+                    ret.append(idx)
+                continue
+            # display loops for exclusion and inclusion zones
+            if w.command == mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION:
+                if exclusion_start == -1:
+                    exclusion_count = int(w.param1)
+                    exclusion_start = idx
+                if idx == exclusion_start + exclusion_count - 1:
+                    ret.append(idx)
+                    ret.append(exclusion_start)
+                    return ret
+            if w.command == mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION:
+                if inclusion_start == -1:
+                    inclusion_count = int(w.param1)
+                    inclusion_start = idx
+                if idx == inclusion_start + inclusion_count - 1:
+                    ret.append(idx)
+                    ret.append(inclusion_start)
+                    return ret
+            if self.is_location_wp(w):
+                ret.append(idx)
+            if w.command in [ mavutil.mavlink.MAV_CMD_NAV_LAND,
+                              mavutil.mavlink.MAV_CMD_NAV_VTOL_LAND ]:
+                # stop at landing points
+                return ret
+            exc_zones = [mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION,
+                         mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION]
+            w2 = self.wp(idx+1)
+            if w2 is not None and w.command not in exc_zones and w2.command in exc_zones:
+                # don't draw a line from last WP to first exc zone
+                return ret
+            idx += 1
+        return ret
+
+    def polygon(self, done=None):
+        '''return a polygon for the waypoints'''
+        indexes = self.view_indexes(done)
+        points = []
+        for idx in indexes:
+            w = self.wp(idx)
+            if w.command in self.colour_for_polygon:
+                points.append((w.x, w.y, self.colour_for_polygon[w.command]))
+            else:
+                points.append((w.x, w.y))
+        return points
+
+    def polygon_list(self):
+        '''return a list of polygons for the waypoints'''
+        done = set()
+        ret = []
+        while len(done) != self.count():
+            p = self.polygon(done)
+            if len(p) > 0:
+                ret.append(p)
+        return ret
+
+    def view_list(self):
+        '''return a list of polygon indexes lists for the waypoints'''
+        done = set()
+        ret = []
+        while len(done) != self.count():
+            p = self.view_indexes(done)
+            if len(p) > 0:
+                ret.append(p)
+        return ret
+
+class MAVWPLoader(MissionItemProtocol):
+    '''MAVLink waypoint loader'''
+    def mav_mission_type(self):
+        '''returns type of mission this object transfers'''
+        return mavutil.mavlink.MAV_MISSION_TYPE_MISSION
+
+    def wp_is_loiter(self, i):
+        '''return true if waypoint is a loiter waypoint'''
+        loiter_cmds = [mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM,
+                mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS,
+                mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME,
+                mavutil.mavlink.MAV_CMD_NAV_LOITER_TO_ALT]
+
+        if (self.wpoints[i].command in loiter_cmds):
+            return True
+
+        return False
+
+    def add_latlonalt(self, lat, lon, altitude, terrain_alt=False):
+        '''add a point via latitude/longitude/altitude'''
+        if terrain_alt:
+            frame = mavutil.mavlink.MAV_FRAME_GLOBAL_TERRAIN_ALT
+        else:
+            frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+        p = mavutil.mavlink.MAVLink_mission_item_message(self.target_system,
+                                                         self.target_component,
+                                                         0,
+                                                         frame,
+                                                         mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                                                         0, 0, 0, 0, 0, 0,
+                                                         lat, lon, altitude)
+        self.add(p)
+
+    def _read_waypoints_v100(self, file):
+        '''read a version 100 waypoint'''
+        cmdmap = {
+            2 : mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            3 : mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+            4 : mavutil.mavlink.MAV_CMD_NAV_LAND,
+            24: mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            26: mavutil.mavlink.MAV_CMD_NAV_LAND,
+            25: mavutil.mavlink.MAV_CMD_NAV_WAYPOINT ,
+            27: mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM
+            }
+        comment = ''
+        for line in file:
+            if line.startswith('#'):
+                comment = line[1:].lstrip()
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            a = line.split()
+            if len(a) != 13:
+                raise MAVWPError("invalid waypoint line with %u values" % len(a))
+            if mavutil.mavlink10():
+                fn = mavutil.mavlink.MAVLink_mission_item_message
+            else:
+                fn = mavutil.mavlink.MAVLink_waypoint_message
+            w = fn(self.target_system, self.target_component,
+                   int(a[0]),    # seq
+                   int(a[1]),    # frame
+                   int(a[2]),    # action
+                   int(a[7]),    # current
+                   int(a[12]),   # autocontinue
+                   float(a[5]),  # param1,
+                   float(a[6]),  # param2,
+                   float(a[3]),  # param3
+                   float(a[4]),  # param4
+                   float(a[9]),  # x, latitude
+                   float(a[8]),  # y, longitude
+                   float(a[10])  # z
+                   )
+            if not w.command in cmdmap:
+                raise MAVWPError("Unknown v100 waypoint action %u" % w.command)
+
+            if self.mav_mission_type() != mavutil.mavlink.MAV_MISSION_TYPE_MISSION:
+                w.mission_type = self.mav_mission_type()
+
+            w.command = cmdmap[w.command]
+            self.add(w, comment)
+            comment = ''
+
+    def is_location_command(self, cmd):
+        '''see if cmd is a MAV_CMD with a latitude/longitude'''
+        mav_cmd = mavutil.mavlink.enums['MAV_CMD']
+        if not cmd in mav_cmd:
+            return False
+        return getattr(mav_cmd[cmd],'has_location',True)
+
+    def is_location_wp(self, w):
+        '''see if w.command is a MAV_CMD with a latitude/longitude'''
+        if w.x == 0 and w.y == 0:
+            return False
+        return self.is_location_command(w.command)
+
+
+def get_first_line_from_file(filename):
+    '''return line from filename that doesn't start with a #'''
+    f = open(filename, mode='r')
+    while True:
+        line = f.readline().strip()
+        if len(line) == 0:
+            return None
+        if not line.startswith("#"):
+            break
+
+    f.close()
+    return line
+
+class MissionItemProtocol_Fence(MissionItemProtocol):
+    '''New mission-item-protocol-based class for sending fence points to
+    autopilot'''
+
+    def mav_mission_type(self):
+        '''returns type of mission this object transfers'''
+        return mavutil.mavlink.MAV_MISSION_TYPE_FENCE
+
+    def is_location_command(self, cmd):
+        '''returns true if cmd nominates a location in param5/param6/param7'''
+        return True
+
+    def load(self, filename):
+        '''try to load from an old "FENCE_POINT" format file (just a list of
+        latlon pairs - or fall back to QGC formats'''
+
+        if not mavutil.mavlink20():
+            raise ValueError("Must be using mavlink2")
+
+        version_line = get_first_line_from_file(filename)
+
+        if (version_line is None or
+            not re.match("[-0-9.]+\s+[-0-9.]+", version_line)):
+            return super(MissionItemProtocol_Fence, self).load(filename)
+
+        # shamelessly copy-and-pasted from traditional loader, below
+        f = open(filename, mode='r')
+        points = []
+        for line in f:
+            if line.startswith('#'):
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            a = line.split()
+            if len(a) != 2:
+                raise MAVFenceError("invalid fence point line: %s" % line)
+            points.append((float(a[0]),float(a[1])))
+        f.close()
+
+        # 1 return point
+        # at least 3 vertex points
+        # 1 closing point
+        if len(points) < 5:
+            print("Insufficient points in file")
+            return
+
+        items = []
+        # return point:
+        (ret_lat, ret_lng) = points[0]
+        items.append(
+            mavutil.mavlink.MAVLink_mission_item_int_message(
+                self.target_system,
+                self.target_component,
+                0,    # seq
+                mavutil.mavlink.MAV_FRAME_GLOBAL,  # frame
+                mavutil.mavlink.MAV_CMD_NAV_FENCE_RETURN_POINT, # command
+                0,  # current
+                0,  # autocontinue
+                0,  # param1,
+                0,  # param2,
+                0,  # param3
+                0,  # param4
+                int(ret_lat * 1e7),  # x (latitude)
+                int(ret_lng * 1e7),  # y (longitude)
+                0,      # z (altitude)
+                self.mav_mission_type(),
+            ))
+        for i in range(1, len(points)-1):
+            (lat, lng) = points[i]
+            item = mavutil.mavlink.MAVLink_mission_item_int_message(
+                self.target_system,
+                self.target_component,
+                0,    # seq
+                mavutil.mavlink.MAV_FRAME_GLOBAL,  # frame
+                mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION, # command
+                0,  # current
+                0,  # autocontinue
+                len(points)-2,  # param1,
+                0,  # param2,
+                0,  # param3
+                0,  # param4
+                int(lat * 1e7),  # x (latitude)
+                int(lng * 1e7),  # y (longitude)
+                0,      # z (altitude)
+                self.mav_mission_type(),
+            )
+            items.append(item)
+
+        self.clear()
+        self.add(items)
+
+class MissionItemProtocol_Rally(MissionItemProtocol):
+    '''New mission-item-protocol-based class for sending rally points to
+    autopilot'''
+
+    def mav_mission_type(self):
+        '''returns type of mission this object transfers'''
+        return mavutil.mavlink.MAV_MISSION_TYPE_RALLY
+
+    def is_location_command(self, cmd):
+        '''returns true if cmd nominates a location in param5/param6/param7'''
+        return True
+
+    def load(self, filename):
+        '''attempts to load from legacy rally file'''
+        if not mavutil.mavlink20():
+            raise ValueError("Must be using mavlink2")
+
+        version_line = get_first_line_from_file(filename)
+        if version_line is None or not re.match("^RALLY ", version_line):
+            return super(MissionItemProtocol_Rally, self).load(filename)
+
+        points = []
+        # this code shamelessly copy-and-pasted from the old
+        # MAVWPLoader, below
+        seq = 0
+        f = open(filename, mode='r')
+        for line in f:
+            if line.startswith('#'):
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            a = line.split()
+            if len(a) != 7:
+                raise MAVRallyError("invalid rally file line: %s" % line)
+
+            if (a[0].lower() == "rally"):
+                lat_deg = float(a[1])
+                lng_deg = float(a[2])
+                alt = float(a[3])
+#                break_alt = float(a[4])
+#                land_dir = float(a[5])
+#                flags = int(a[6])
+                w = mavutil.mavlink.MAVLink_mission_item_int_message(
+                    self.target_system, self.target_component,
+                    seq,    # seq
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,  # frame
+                    mavutil.mavlink.MAV_CMD_NAV_RALLY_POINT,        # command
+                    0,  # current
+                    0,  # autocontinue
+                    0,  # param1,
+                    0,  # param2,
+                    0,  # param3
+                    0,  # param4
+                    int(lat_deg * 1e7),  # x (latitude)
+                    int(lng_deg * 1e7),  # y (longitude)
+                    alt * 1e3,      # z (altitude)
+                    self.mav_mission_type()
+                )
+                points.append(w)
+                seq += 1
+        f.close()
+
+        self.clear()
+        for point in points:
+            self.add(point)
+
+
+class MAVRallyError(Exception):
+    '''MAVLink rally point error class'''
+    def __init__(self, msg):
+        Exception.__init__(self, msg)
+        self.message = msg
+
+
+class MAVRallyLoader(object):
+    '''MAVLink Rally points and Rally Land points loader'''
+    def __init__(self, target_system=0, target_component=0):
+        self.rally_points = []
+        self.target_system = target_system
+        self.target_component = target_component
+        self.last_change = time.time()
+
+    def rally_count(self):
+        '''return number of rally points'''
+        return len(self.rally_points)
+
+    def rally_point(self, i):
+        '''return rally point i'''
+        return self.rally_points[i]
+
+    def reindex(self):
+        '''reset counters and indexes'''
+        for i in range(self.rally_count()):
+            self.rally_points[i].count = self.rally_count()
+            self.rally_points[i].idx = i
+        self.last_change = time.time()
+            
+    def append_rally_point(self, p):
+        '''add rallypoint to end of list'''
+        if (self.rally_count() > 9):
+           print("Can't have more than 10 rally points, not adding.")
+           return
+
+        self.rally_points.append(p)
+        self.reindex()
+
+    def create_and_append_rally_point(self, lat, lon, alt, break_alt, land_dir, flags):
+        '''add a point via latitude/longitude'''
+        p = mavutil.mavlink.MAVLink_rally_point_message(self.target_system, self.target_component,
+                                                        self.rally_count(), 0, int(lat), int(lon), int(alt), int(break_alt), int(land_dir), flags)
+        self.append_rally_point(p)
+
+    def clear(self):
+        '''clear all point lists (rally and rally_land)'''
+        self.rally_points = []
+        self.last_change = time.time()
+
+    def remove(self, i):
+        '''remove a rally point'''
+        if i < 1 or i > self.rally_count():
+            print("Invalid rally point number %u" % i)
+        self.rally_points.pop(i-1)
+        self.reindex()
+
+    def move(self, i, lat, lng, change_time=True):
+        '''move a rally point'''
+        if i < 1 or i > self.rally_count():
+            print("Invalid rally point number %u" % i)
+        self.rally_points[i-1].lat = int(lat*1e7)
+        self.rally_points[i-1].lng = int(lng*1e7)
+        if change_time:
+            self.last_change = time.time()
+
+    def set_alt(self, i, alt, break_alt=None, change_time=True):
+        '''set rally point altitude(s)'''
+        if i < 1 or i > self.rally_count():
+            print("Invalid rally point number %u" % i)
+            return
+        self.rally_points[i-1].alt = int(alt)
+        if break_alt is not None:
+            self.rally_points[i-1].break_alt = break_alt
+        if change_time:
+            self.last_change = time.time()
+
+    def load(self, filename):
+        '''load rally and rally_land points from a file.
+         returns number of points loaded'''
+        f = open(filename, mode='r')
+        self.clear()
+        for line in f:
+            if line.startswith('#'):
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            a = line.split()
+            if len(a) != 7:
+                raise MAVRallyError("invalid rally file line: %s" % line)
+
+            if (a[0].lower() == "rally"):
+                self.create_and_append_rally_point(float(a[1]) * 1e7, float(a[2]) * 1e7,
+                                                   float(a[3]), float(a[4]), float(a[5]) * 100.0, int(a[6]))
+        f.close()
+        return len(self.rally_points)
+
+    def save(self, filename):
+        '''save fence points to a file'''
+        f = open(filename, mode='w')
+        for p in self.rally_points:
+            f.write("RALLY %f\t%f\t%f\t%f\t%f\t%d\n" % (p.lat * 1e-7, p.lng * 1e-7, p.alt,
+                                                        p.break_alt, p.land_dir, p.flags))
+        f.close()
+
+class MAVFenceError(Exception):
+        '''MAVLink fence error class'''
+        def __init__(self, msg):
+            Exception.__init__(self, msg)
+            self.message = msg
+
+class MAVFenceLoader(object):
+    '''MAVLink geo-fence loader'''
+    def __init__(self, target_system=0, target_component=0):
+        self.points = []
+        self.target_system = target_system
+        self.target_component = target_component
+        self.last_change = time.time()
+
+    def count(self):
+        '''return number of points'''
+        return len(self.points)
+
+    def point(self, i):
+        '''return a point'''
+        return self.points[i]
+
+    def add(self, p):
+        '''add a point'''
+        self.points.append(p)
+        self.reindex()
+
+    def reindex(self):
+        '''reindex waypoints'''
+        for i in range(self.count()):
+            w = self.points[i]
+            w.idx = i
+            w.count = self.count()
+            w.target_system = self.target_system
+            w.target_component = self.target_component
+        self.last_change = time.time()
+
+    def add_latlon(self, lat, lon):
+        '''add a point via latitude/longitude'''
+        p = mavutil.mavlink.MAVLink_fence_point_message(self.target_system, self.target_component,
+                                                        self.count(), 0, lat, lon)
+        self.add(p)
+
+    def clear(self):
+        '''clear point list'''
+        self.points = []
+        self.last_change = time.time()
+
+    def load(self, filename):
+        '''load points from a file.
+        returns number of points loaded'''
+        f = open(filename, mode='r')
+        self.clear()
+        for line in f:
+            if line.startswith('#'):
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            a = line.split()
+            if len(a) != 2:
+                raise MAVFenceError("invalid fence point line: %s" % line)
+            self.add_latlon(float(a[0]), float(a[1]))
+        f.close()
+        return len(self.points)
+
+    def save(self, filename):
+        '''save fence points to a file'''
+        f = open(filename, mode='w')
+        for p in self.points:
+            f.write("%f\t%f\n" % (p.lat, p.lng))
+        f.close()
+
+    def move(self, i, lat, lng, change_time=True):
+        '''move a fence point'''
+        if i < 0 or i >= self.count():
+            print("Invalid fence point number %u" % i)
+        self.points[i].lat = lat
+        self.points[i].lng = lng
+        # ensure we close the polygon
+        if i == 1:
+                self.points[self.count()-1].lat = lat
+                self.points[self.count()-1].lng = lng
+        if i == self.count() - 1:
+                self.points[1].lat = lat
+                self.points[1].lng = lng
+        if change_time:
+            self.last_change = time.time()
+
+    def remove(self, i, change_time=True):
+        '''remove a fence point'''
+        if i < 0 or i >= self.count():
+            print("Invalid fence point number %u" % i)
+        self.points.pop(i)
+         # ensure we close the polygon
+        if i == 1:
+                self.points[self.count()-1].lat = self.points[1].lat
+                self.points[self.count()-1].lng = self.points[1].lng
+        if i == self.count():
+                self.points[1].lat = self.points[self.count()-1].lat
+                self.points[1].lng = self.points[self.count()-1].lng
+        if change_time:
+            self.last_change = time.time()
+
+    def polygon(self):
+            '''return a polygon for the fence'''
+            points = []
+            for fp in self.points[1:]:
+                    points.append((fp.lat, fp.lng))
+            return points
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /* Protobuf definitions for defining a mavlink 1.0 mission. */
+
+package mavlink;
+
+enum CoordFrameType {
+  FRAME_GLOBAL = 0;
+  FRAME_LOCAL_NED = 1;
+  FRAME_MISSION = 2;
+  FRAME_GLOBAL_RELATIVE_ALT = 3;
+  FRAME_LOCAL_ENU = 4;
+  FRAME_ENUM_END = 5;
+}
+
+enum CommandType {
+  CMD_NAV_WAYPOINT = 16;
+  CMD_NAV_LOITER_UNLIM = 17;
+  CMD_NAV_LOITER_TURNS = 18;
+  CMD_NAV_LOITER_TIME = 19;
+  CMD_NAV_RETURN_TO_LAUNCH = 20;
+  CMD_NAV_LAND = 21;
+  CMD_NAV_TAKEOFF = 22;
+  CMD_NAV_ROI = 80;
+  CMD_NAV_PATHPLANNING = 81;
+  CMD_NAV_LAST = 95;
+  CMD_CONDITION_DELAY = 112;
+  CMD_CONDITION_CHANGE_ALT = 113;
+  CMD_CONDITION_DISTANCE = 114;
+  CMD_CONDITION_YAW = 115;
+  CMD_CONDITION_LAST = 159;
+  CMD_DO_SET_MODE = 176;
+  CMD_DO_JUMP = 177;
+  CMD_DO_CHANGE_SPEED = 178;
+  CMD_DO_SET_HOME = 179;
+  CMD_DO_SET_PARAMETER = 180;
+  CMD_DO_SET_RELAY = 181;
+  CMD_DO_REPEAT_RELAY = 182;
+  CMD_DO_SET_SERVO = 183;
+  CMD_DO_REPEAT_SERVO = 184;
+  CMD_DO_CONTROL_VIDEO = 200;
+  CMD_DO_DIGICAM_CONFIGURE = 202;
+  CMD_DO_DIGICAM_CONTROL = 203;
+  CMD_DO_MOUNT_CONFIGURE = 204;
+  CMD_DO_MOUNT_CONTROL = 205;
+  CMD_DO_LAST = 240;
+  CMD_PREFLIGHT_CALIBRATION = 241;
+  CMD_PREFLIGHT_SET_SENSOR_OFFSETS = 242;
+  CMD_PREFLIGHT_STORAGE = 245;
+  CMD_PREFLIGHT_REBOOT_SHUTDOWN = 246;
+  CMD_OVERRIDE_GOTO = 252;
+  CMD_MISSION_START = 300;
+  CMD_COMPONENT_ARM_DISARM = 400;
+}
+
+message Waypoint {
+  optional int32 seq = 1;
+  optional bool current = 2;
+  required CommandType command = 3;
+  optional CoordFrameType frame = 4;
+  optional bool autocontinue = 5;
+  optional float param1 = 6;
+  optional float param2 = 7;
+  optional float param3 = 8;
+  optional float param4 = 9;
+  optional float x = 10;
+  optional float y = 11;
+  optional float z = 12;
+}
+
+message Mission {
+  optional Waypoint defaults = 1;
+  repeated Waypoint waypoint = 2;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           QGC WPL PB 110
+defaults {
+  # Default coordinate frame for this mission.
+  frame: FRAME_GLOBAL_RELATIVE_ALT
+}
+waypoint {
+  command: CMD_NAV_WAYPOINT
+  x: -35.362881
+  y: 149.165222
+  z: 582.0
+}
+waypoint {
+  command: CMD_NAV_TAKEOFF
+  x: -35.362881
+  y: 149.165222
+  z: 20.0
+}
+waypoint {
+  command: CMD_NAV_WAYPOINT
+  param2: 3.0  # Hit radius
+  x: -35.363949
+  y: 149.164151
+  z: 20.0
+}
+waypoint {
+  command: CMD_CONDITION_YAW
+  param1: 640.0  # Target angle
+  param2: 20.0  # Degrees / second
+  param3: 1.0  # Clockwise
+  param4: 1.0  # target angle is delta
+}
+waypoint {
+  command: CMD_NAV_LOITER_TIME
+  param1: 35.0  # Seconds
+  param4: 1.0  # Desired yaw
+  x: 0.0
+  y: 0.0
+  z: 20.0
+}
+waypoint {
+  command: CMD_NAV_WAYPOINT
+  param2: 3.0  # Hit radius
+  x: -35.363287
+  y: 149.164958
+  z: 20.0
+}
+waypoint {
+  command: CMD_NAV_LOITER_TURNS
+  param1: 18.0
+  param2: 2.0  # Turns
+  z: 20.0
+}
+waypoint {
+  command: CMD_NAV_WAYPOINT
+  param2: 3.0  # Hit radius
+  x: -35.364865
+  y: 149.164952
+  z: 20.0
+}
+waypoint {
+  command: CMD_CONDITION_DISTANCE
+  param1: 100.0  # Distance (meters)
+}
+waypoint {
+  command: CMD_CONDITION_CHANGE_ALT
+  z: 40.0  # Finish altitude
+}
+waypoint {
+  command: CMD_NAV_WAYPOINT
+  param2: 3.0  # Hit radius
+  x: -35.363165
+  y: 149.163905
+  z: 20.0
+}
+waypoint {
+  command: CMD_NAV_WAYPOINT
+  param2: 3.0  # Hit radius
+  x: -35.363611
+  y: 149.163583
+  z: 20.0
+}
+waypoint {
+  command: CMD_DO_JUMP
+  param1: 11.0  # Sequence number
+  param2: 3.0  # Repeat count
+}
+waypoint {
+  command: CMD_NAV_RETURN_TO_LAUNCH
+}
+waypoint {
+  command: CMD_NAV_LAND
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          # modern build tools use this file: https://packaging.python.org/en/latest/tutorials/packaging-projects/ 
+# you need to drop setup_requires from setup.py as well.
+# https://peps.python.org/pep-0518/#rationale
+[build-system]
+requires = ["setuptools>=42","future","lxml"]
+build-backend = "setuptools.build_meta"
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          # Filter pytest to only running files with the following pattern
+[pytest]
+python_files = test_*.py
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #!/usr/bin/env python
+
+
+"""
+Quaternion implementation for use in pymavlink
+"""
+
+from __future__ import absolute_import, division, print_function
+
+from builtins import object
+import numpy as np
+from .rotmat import Vector3, Matrix3
+
+__author__ = "Thomas Gubler"
+__copyright__ = "Copyright (C) 2014 Thomas Gubler"
+__license__ = "GNU Lesser General Public License v3"
+__email__ = "thomasgubler@gmail.com"
+
+
+class QuaternionBase(object):
+
+    """
+    Quaternion class, this is the version which supports numpy arrays
+    If you need support for Matrix3 look at the Quaternion class
+
+    Usage:
+        >>> from quaternion import QuaternionBase
+        >>> import numpy as np
+        >>> q = QuaternionBase([np.radians(20), np.radians(20), np.radians(20)])
+        >>> print(q)
+        [ 0.9603483   0.13871646  0.19810763  0.13871646]
+        >>> print(q.dcm)
+        [[ 0.88302222 -0.21147065  0.41898917]
+         [ 0.3213938   0.92303098 -0.21147065]
+         [-0.34202014  0.3213938   0.88302222]]
+        >>> q = QuaternionBase([1, 0, 0, 0])
+        >>> print(q.euler)
+        [ 0. -0.  0.]
+        >>> m = [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
+        >>> q = QuaternionBase(m)
+        >>> vector = [0, 1, 0]
+        >>> vector2 = q.transform(vector)
+    """
+
+    def __init__(self, attitude=[1, 0, 0, 0]):
+        """
+        Construct a quaternion from an attitude
+
+        :param attitude: another QuaternionBase,
+            3 element list [roll, pitch, yaw],
+            4 element list [w, x, y ,z], DCM (3x3 array)
+        """
+        if isinstance(attitude, QuaternionBase):
+            self.q = attitude.q
+        elif np.array(attitude).shape == (3, 3):
+            self.dcm = attitude
+        elif len(attitude) == 4:
+            self.q = attitude
+        elif len(attitude) == 3:
+            self.euler = attitude
+        else:
+            raise TypeError("attitude is not valid")
+
+    @property
+    def q(self):
+        """
+        Get the quaternion
+        :returns: array containing the quaternion elements
+        """
+        if self._q is None:
+            if self._euler is not None:
+                # get q from euler
+                self._q = self._euler_to_q(self.euler)
+            elif self._dcm is not None:
+                # get q from DCM
+                self._q = self._dcm_to_q(self.dcm)
+        return self._q
+
+    def __getitem__(self, index):
+        """Returns the quaternion entry at index"""
+        return self.q[index]
+
+    @q.setter
+    def q(self, q):
+        """
+        Set the quaternion
+        :param q: list or array of quaternion values [w, x, y, z]
+        """
+        self._q = np.array(q)
+
+        # mark other representations as outdated, will get generated on next
+        # read
+        self._euler = None
+        self._dcm = None
+
+    @property
+    def euler(self):
+        """
+        Get the euler angles.
+        The convention is Tait-Bryan (ZY'X'')
+
+        :returns: array containing the euler angles [roll, pitch, yaw]
+        """
+        if self._euler is None:
+            if self._q is not None:
+                # try to get euler angles from q via DCM
+                self._dcm = self._q_to_dcm(self.q)
+                self._euler = self._dcm_to_euler(self.dcm)
+            elif self._dcm is not None:
+                # get euler angles from DCM
+                self._euler = self._dcm_to_euler(self.dcm)
+        return self._euler
+
+    @euler.setter
+    def euler(self, euler):
+        """
+        Set the euler angles
+        :param euler: list or array of the euler angles [roll, pitch, yaw]
+
+        """
+        assert(len(euler) == 3)
+        self._euler = np.array(euler)
+
+        # mark other representations as outdated, will get generated on next
+        # read
+        self._q = None
+        self._dcm = None
+
+    @property
+    def dcm(self):
+        """
+        Get the DCM
+
+        :returns: 3x3 array
+        """
+        if self._dcm is None:
+            if self._q is not None:
+                # try to get dcm from q
+                self._dcm = self._q_to_dcm(self.q)
+            elif self._euler is not None:
+                # try to get get dcm from euler
+                self._dcm = self._euler_to_dcm(self._euler)
+        return self._dcm
+
+    @dcm.setter
+    def dcm(self, dcm):
+        """
+        Set the DCM
+        :param dcm: 3x3 array
+
+        """
+        assert(len(dcm) == 3)
+        for sub in dcm:
+            assert(len(sub) == 3)
+
+        self._dcm = np.array(dcm)
+
+        # mark other representations as outdated, will get generated on next
+        # read
+        self._q = None
+        self._euler = None
+
+    def transform(self, v):
+        """
+        Calculates the vector transformed by this quaternion
+        :param v: array with len 3 to be transformed
+        :returns: transformed vector
+        """
+        assert(len(v) == 3)
+        assert(np.allclose(self.norm, 1))
+        # perform transformation t = q * [0, v] * q^-1 but avoid multiplication
+        # because terms cancel out
+        q0 = self.q[0]
+        qi = self.q[1:4]
+        ui = np.array(v)
+        a = q0 * ui + np.cross(qi, ui)
+        t = np.dot(qi, ui) * qi + q0 * a - np.cross(a, qi)
+        return t
+
+    @property
+    def norm(self):
+        """
+        Returns norm of quaternion
+
+        :returns: norm (scalar)
+        """
+        return QuaternionBase.norm_array(self.q)
+
+    def normalize(self):
+        """Normalizes the quaternion"""
+        self.q = QuaternionBase.normalize_array(self.q)
+
+    @property
+    def inversed(self):
+        """
+        Get inversed quaternion
+
+        :returns: inversed quaternion
+        """
+        q_inv = self._q_inversed(self.q)
+        return QuaternionBase(q_inv)
+
+    def __eq__(self, other):
+        """
+        Equality test (same orientation, not necessarily same rotation)
+
+        :param other: a QuaternionBase
+        :returns: true if the quaternions are equal
+        """
+        if isinstance(other, QuaternionBase):
+            return abs(self.q.dot(other.q)) > 1 - np.finfo(float).eps
+        return NotImplemented
+
+    def close(self, other):
+        """
+        Equality test with tolerance
+        (same orientation, not necessarily same rotation)
+
+
+        :param other: a QuaternionBase
+        :returns: true if the quaternions are almost equal
+        """
+        if isinstance(other, QuaternionBase):
+            return np.allclose(self.q, other.q) or np.allclose(self.q, -other.q)
+        return NotImplemented
+
+    def __mul__(self, other):
+        """
+        :param other: QuaternionBase
+        :returns: multiplaction of this Quaternion with other
+        """
+        if isinstance(other, QuaternionBase):
+            o = other.q
+        elif len(other) == 4:
+            o = other
+        else:
+            return NotImplemented
+
+        return QuaternionBase(self._mul_array(self.q, o))
+
+    def __truediv__(self, other):
+        """
+        :param other: QuaternionBase
+        :returns: division of this Quaternion with other
+        """
+        if isinstance(other, QuaternionBase):
+            o = other
+        elif len(other) == 4:
+            o = QuaternionBase(other)
+        else:
+            return NotImplemented
+        return self * o.inversed
+
+    @staticmethod
+    def normalize_array(q):
+        """
+        Normalizes the list with len 4 so that it can be used as quaternion
+        :param q: array of len 4
+        :returns: normalized array
+        """
+        assert(len(q) == 4)
+        q = np.array(q)
+        n = QuaternionBase.norm_array(q)
+        return q / n
+
+    @staticmethod
+    def norm_array(q):
+        """
+        Calculate quaternion norm on array q
+        :param quaternion: array of len 4
+        :returns: norm (scalar)
+        """
+        assert(len(q) == 4)
+        return np.sqrt(np.dot(q, q))
+
+    def _mul_array(self, p, q):
+        """
+        Performs multiplication of the 2 quaterniona arrays p and q
+        :param p: array of len 4
+        :param q: array of len 4
+        :returns: array of len, result of p * q (with p, q quaternions)
+        """
+        assert(len(q) == len(p) == 4)
+        p0 = p[0]
+        pi = p[1:4]
+        q0 = q[0]
+        qi = q[1:4]
+
+        res = np.zeros(4)
+        res[0] = p0 * q0 - np.dot(pi, qi)
+        res[1:4] = p0 * qi + q0 * pi + np.cross(pi, qi)
+
+        return res
+
+    def _euler_to_q(self, euler):
+        """
+        Create q array from euler angles
+        :param euler: array [roll, pitch, yaw] in rad
+        :returns: array q which represents a quaternion [w, x, y, z]
+        """
+        assert(len(euler) == 3)
+        phi = euler[0]
+        theta = euler[1]
+        psi = euler[2]
+        c_phi_2 = np.cos(phi / 2)
+        s_phi_2 = np.sin(phi / 2)
+        c_theta_2 = np.cos(theta / 2)
+        s_theta_2 = np.sin(theta / 2)
+        c_psi_2 = np.cos(psi / 2)
+        s_psi_2 = np.sin(psi / 2)
+        q = np.zeros(4)
+        q[0] = (c_phi_2 * c_theta_2 * c_psi_2 +
+                s_phi_2 * s_theta_2 * s_psi_2)
+        q[1] = (s_phi_2 * c_theta_2 * c_psi_2 -
+                c_phi_2 * s_theta_2 * s_psi_2)
+        q[2] = (c_phi_2 * s_theta_2 * c_psi_2 +
+                s_phi_2 * c_theta_2 * s_psi_2)
+        q[3] = (c_phi_2 * c_theta_2 * s_psi_2 -
+                s_phi_2 * s_theta_2 * c_psi_2)
+        return q
+
+    def _q_to_dcm(self, q):
+        """
+        Create DCM from q
+        :param q: array q which represents a quaternion [w, x, y, z]
+        :returns: 3x3 dcm array
+        """
+        assert(len(q) == 4)
+        assert(np.allclose(QuaternionBase.norm_array(q), 1))
+        dcm = np.zeros([3, 3])
+        a = q[0]
+        b = q[1]
+        c = q[2]
+        d = q[3]
+        a_sq = a * a
+        b_sq = b * b
+        c_sq = c * c
+        d_sq = d * d
+        dcm[0][0] = a_sq + b_sq - c_sq - d_sq
+        dcm[0][1] = 2 * (b * c - a * d)
+        dcm[0][2] = 2 * (a * c + b * d)
+        dcm[1][0] = 2 * (b * c + a * d)
+        dcm[1][1] = a_sq - b_sq + c_sq - d_sq
+        dcm[1][2] = 2 * (c * d - a * b)
+        dcm[2][0] = 2 * (b * d - a * c)
+        dcm[2][1] = 2 * (a * b + c * d)
+        dcm[2][2] = a_sq - b_sq - c_sq + d_sq
+        return dcm
+
+    def _dcm_to_q(self, dcm):
+        """
+        Create q from dcm
+        Reference:
+            - Shoemake, Quaternions,
+            http://www.cs.ucr.edu/~vbz/resources/quatut.pdf
+
+        :param dcm: 3x3 dcm array
+        returns: quaternion array
+        """
+        assert(dcm.shape == (3, 3))
+        q = np.zeros(4)
+
+        tr = np.trace(dcm)
+        if tr > 0:
+            s = np.sqrt(tr + 1.0)
+            q[0] = s * 0.5
+            s = 0.5 / s
+            q[1] = (dcm[2][1] - dcm[1][2]) * s
+            q[2] = (dcm[0][2] - dcm[2][0]) * s
+            q[3] = (dcm[1][0] - dcm[0][1]) * s
+        else:
+            dcm_i = np.argmax(np.diag(dcm))
+            dcm_j = (dcm_i + 1) % 3
+            dcm_k = (dcm_i + 2) % 3
+
+            s = np.sqrt((dcm[dcm_i][dcm_i] - dcm[dcm_j][dcm_j] -
+                         dcm[dcm_k][dcm_k]) + 1.0)
+            q[dcm_i + 1] = s * 0.5
+            s = 0.5 / s
+            q[dcm_j + 1] = (dcm[dcm_i][dcm_j] + dcm[dcm_j][dcm_i]) * s
+            q[dcm_k + 1] = (dcm[dcm_k][dcm_i] + dcm[dcm_i][dcm_k]) * s
+            q[0] = (dcm[dcm_k][dcm_j] - dcm[dcm_j][dcm_k]) * s
+
+        return q
+
+    def _euler_to_dcm(self, euler):
+        """
+        Create DCM from euler angles
+        :param euler: array [roll, pitch, yaw] in rad
+        :returns: 3x3 dcm array
+        """
+        assert(len(euler) == 3)
+        phi = euler[0]
+        theta = euler[1]
+        psi = euler[2]
+        dcm = np.zeros([3, 3])
+        c_phi = np.cos(phi)
+        s_phi = np.sin(phi)
+        c_theta = np.cos(theta)
+        s_theta = np.sin(theta)
+        c_psi = np.cos(psi)
+        s_psi = np.sin(psi)
+
+        dcm[0][0] = c_theta * c_psi
+        dcm[0][1] = -c_phi * s_psi + s_phi * s_theta * c_psi
+        dcm[0][2] = s_phi * s_psi + c_phi * s_theta * c_psi
+
+        dcm[1][0] = c_theta * s_psi
+        dcm[1][1] = c_phi * c_psi + s_phi * s_theta * s_psi
+        dcm[1][2] = -s_phi * c_psi + c_phi * s_theta * s_psi
+
+        dcm[2][0] = -s_theta
+        dcm[2][1] = s_phi * c_theta
+        dcm[2][2] = c_phi * c_theta
+        return dcm
+
+    def _dcm_to_euler(self, dcm):
+        """
+        Create DCM from euler angles
+        :param dcm: 3x3 dcm array
+        :returns: array [roll, pitch, yaw] in rad
+        """
+        assert(dcm.shape == (3, 3))
+        theta = np.arcsin(min(1, max(-1, -dcm[2][0])))
+
+        if abs(theta - np.pi/2) < 1.0e-3:
+            phi = 0.0
+            psi = (np.arctan2(dcm[1][2] - dcm[0][1],
+                              dcm[0][2] + dcm[1][1]) + phi)
+        elif abs(theta + np.pi/2) < 1.0e-3:
+            phi = 0.0
+            psi = np.arctan2(dcm[1][2] - dcm[0][1],
+                             dcm[0][2] + dcm[1][1] - phi)
+        else:
+            phi = np.arctan2(dcm[2][1], dcm[2][2])
+            psi = np.arctan2(dcm[1][0], dcm[0][0])
+
+        return np.array([phi, theta, psi])
+
+    def _q_inversed(self, q):
+        """
+        Returns inversed quaternion q
+        :param q: array q which represents a quaternion [w, x, y, z]
+        :returns: inversed array q which is a quaternion [w, x, y ,z]
+        """
+        assert(len(q) == 4)
+        return np.hstack([q[0], -q[1:4]])
+
+    def __str__(self):
+        """String of quaternion values"""
+        return str(self.q)
+
+
+class Quaternion(QuaternionBase):
+
+    """
+    Quaternion class that supports pymavlink's Vector3 and Matrix3
+
+    Usage:
+        >>> from quaternion import Quaternion
+        >>> from rotmat import Vector3, Matrix3
+        >>> m = Matrix3()
+        >>> m.from_euler(45, 0, 0)
+        >>> print(m)
+        Matrix3((1.00, 0.00, 0.00), (0.00, 0.53, -0.85), (-0.00, 0.85, 0.53))
+        >>> q = Quaternion(m)
+        >>> print(q)
+        [ 0.87330464  0.48717451  0.          0.        ]
+        >>> print(q.dcm)
+        Matrix3((1.00, 0.00, 0.00), (0.00, 0.53, -0.85), (-0.00, 0.85, 0.53))
+        >>> v = Vector3(0, 1, 0)
+        >>> v2 = q.transform(v)
+        >>> print(v2)
+        Vector3(0.00, 0.53, 0.85)
+    """
+
+    def __init__(self, attitude):
+        """
+        Construct a quaternion from an attitude
+
+        :param attitude: another Quaternion, QuaternionBase,
+            3 element list [roll, pitch, yaw],
+            4 element list [w, x, y ,z], DCM (3x3 array or Matrix3)
+        """
+        if isinstance(attitude, Quaternion):
+            self.q = attitude.q
+        if isinstance(attitude, Matrix3):
+            self.dcm = attitude
+        elif np.array(attitude).shape == (3, 3):
+            # convert dcm array to Matrix3
+            self.dcm = self._dcm_array_to_matrix3(attitude)
+        elif isinstance(attitude, Vector3):
+            # provided euler angles
+            euler = [attitude.x, attitude.y, attitude.z]
+            super(Quaternion, self).__init__(euler)
+        else:
+            super(Quaternion, self).__init__(attitude)
+
+    @property
+    def dcm(self):
+        """
+        Get the DCM
+
+        :returns: Matrix3
+        """
+        if self._dcm is None:
+            if self._q is not None:
+                # try to get dcm from q
+                self._dcm = self._q_to_dcm(self.q)
+            elif self._euler is not None:
+                # try to get get dcm from euler
+                self._dcm = self._euler_to_dcm(self._euler)
+        return self._dcm
+
+    @dcm.setter
+    def dcm(self, dcm):
+        """
+        Set the DCM
+        :param dcm: Matrix3
+
+        """
+        assert(isinstance(dcm, Matrix3))
+        self._dcm = dcm.copy()
+
+        # mark other representations as outdated, will get generated on next
+        # read
+        self._q = None
+        self._euler = None
+
+    @property
+    def inversed(self):
+        """
+        Get inversed quaternion
+
+        :returns: inversed quaternion
+        """
+        return Quaternion(super(Quaternion, self).inversed)
+
+    def transform(self, v3):
+        """
+        Calculates the vector transformed by this quaternion
+        :param v3: Vector3 to be transformed
+        :returns: transformed vector
+        """
+        if isinstance(v3, Vector3):
+            t = super(Quaternion, self).transform([v3.x, v3.y, v3.z])
+            return Vector3(t[0], t[1], t[2])
+        elif len(v3) == 3:
+            return super(Quaternion, self).transform(v3)
+        else:
+            raise TypeError("param v3 is not a vector type")
+
+    def _dcm_array_to_matrix3(self, dcm):
+        """
+        Converts dcm array into Matrix3
+        :param dcm: 3x3 dcm array
+        :returns: Matrix3
+        """
+        assert(dcm.shape == (3, 3))
+        a = Vector3(dcm[0][0], dcm[0][1], dcm[0][2])
+        b = Vector3(dcm[1][0], dcm[1][1], dcm[1][2])
+        c = Vector3(dcm[2][0], dcm[2][1], dcm[2][2])
+        return Matrix3(a, b, c)
+
+    def _matrix3_to_dcm_array(self, m):
+        """
+        Converts Matrix3 in an array
+        :param m: Matrix3
+        :returns: 3x3 array
+        """
+        assert(isinstance(m, Matrix3))
+        return np.array([[m.a.x, m.a.y, m.a.z],
+                         [m.b.x, m.b.y, m.b.z],
+                         [m.c.x, m.c.y, m.c.z]])
+
+    def _q_to_dcm(self, q):
+        """
+        Create DCM (Matrix3) from q
+        :param q: array q which represents a quaternion [w, x, y, z]
+        :returns: Matrix3
+        """
+        assert(len(q) == 4)
+        arr = super(Quaternion, self)._q_to_dcm(q)
+        return self._dcm_array_to_matrix3(arr)
+
+    def _dcm_to_q(self, dcm):
+        """
+        Create q from dcm (Matrix3)
+        :param dcm: Matrix3
+        :returns: array q which represents a quaternion [w, x, y, z]
+        """
+        assert(isinstance(dcm, Matrix3))
+        arr = self._matrix3_to_dcm_array(dcm)
+        return super(Quaternion, self)._dcm_to_q(arr)
+
+    def _euler_to_dcm(self, euler):
+        """
+        Create DCM (Matrix3) from euler angles
+        :param euler: array [roll, pitch, yaw] in rad
+        :returns: Matrix3
+        """
+        assert(len(euler) == 3)
+        m = Matrix3()
+        m.from_euler(*euler)
+        return m
+
+    def _dcm_to_euler(self, dcm):
+        """
+        Create DCM from euler angles
+        :param dcm: Matrix3
+        :returns: array [roll, pitch, yaw] in rad
+        """
+        assert(isinstance(dcm, Matrix3))
+        return np.array(dcm.to_euler())
+    
+    def __mul__(self, other):
+        """
+        :param other: Quaternion
+        :returns: multiplaction of this Quaternion with other
+        """
+        return Quaternion(super(Quaternion, self).__mul__(other))
+
+    def __truediv__(self, other):
+        """
+        :param other: Quaternion
+        :returns: division of this Quaternion with other
+        """
+        return Quaternion(super(Quaternion, self).__truediv__(other))
+
+if __name__ == "__main__":
+    import doctest
+    doctest.testmod()
+    import unittest
+    unittest.main('quaterniontest')
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           lxml>=3.6.0
+future>=0.15.2
+wheel>=0.37.1
+setuptools>=42
+fastcrc
+
+# dev dependencies:
+pytest<=7.4.4
+syrupy; python_version>='3.6'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #!/usr/bin/env python
+#
+# vector3 and rotation matrix classes
+# This follows the conventions in the ArduPilot code,
+# and is essentially a python version of the AP_Math library
+#
+# Andrew Tridgell, March 2012
+#
+# This library is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation; either version 2.1 of the License, or (at your
+# option) any later version.
+#
+# This library is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this library; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+
+'''rotation matrix class
+'''
+from __future__ import print_function
+
+from math import sin, cos, sqrt, asin, atan2, pi, acos, radians
+
+
+class Vector3(object):
+    '''a vector'''
+    def __init__(self, x=None, y=None, z=None):
+        if x is not None and y is not None and z is not None:
+            self.x = float(x)
+            self.y = float(y)
+            self.z = float(z)
+        elif x is not None and len(x) == 3:
+            self.x = float(x[0])
+            self.y = float(x[1])
+            self.z = float(x[2])
+        elif x is not None:
+            raise ValueError('bad initialiser')
+        else:
+            self.x = float(0)
+            self.y = float(0)
+            self.z = float(0)
+
+    def __repr__(self):
+        return 'Vector3(%.2f, %.2f, %.2f)' % (self.x,
+                                              self.y,
+                                              self.z)
+
+    def __eq__(self, v):
+        return self.x == v.x and self.y == v.y and self.z == v.z
+
+    def __ne__(self, v):
+        return not self == v
+
+    def close(self, v, tol=1e-7):
+        return abs(self.x - v.x) < tol and \
+            abs(self.y - v.y) < tol and \
+            abs(self.z - v.z) < tol
+
+    def __add__(self, v):
+        return Vector3(self.x + v.x,
+                       self.y + v.y,
+                       self.z + v.z)
+
+    __radd__ = __add__
+
+    def __sub__(self, v):
+        return Vector3(self.x - v.x,
+                       self.y - v.y,
+                       self.z - v.z)
+
+    def __neg__(self):
+        return Vector3(-self.x, -self.y, -self.z)
+
+    def __rsub__(self, v):
+        return Vector3(v.x - self.x,
+                       v.y - self.y,
+                       v.z - self.z)
+
+    def __mul__(self, v):
+        if isinstance(v, Vector3):
+            '''dot product'''
+            return self.x*v.x + self.y*v.y + self.z*v.z
+        return Vector3(self.x * v,
+                       self.y * v,
+                       self.z * v)
+
+    __rmul__ = __mul__
+
+    def __div__(self, v):
+        return Vector3(self.x / v,
+                       self.y / v,
+                       self.z / v)
+
+    def __truediv__(self, v):
+        return Vector3(self.x / v,
+                       self.y / v,
+                       self.z / v)
+
+    def __floordiv__(self, v):
+        return Vector3(self.x // v,
+                       self.y // v,
+                       self.z // v)
+
+    def __mod__(self, v):
+        '''cross product'''
+        return Vector3(self.y*v.z - self.z*v.y,
+                       self.z*v.x - self.x*v.z,
+                       self.x*v.y - self.y*v.x)
+
+    def __copy__(self):
+        return Vector3(self.x, self.y, self.z)
+
+    copy = __copy__
+
+    def length(self):
+        return sqrt(self.x**2 + self.y**2 + self.z**2)
+
+    def zero(self):
+        self.x = self.y = self.z = 0
+
+    def angle(self, v):
+        '''return the angle between this vector and another vector'''
+        return acos((self * v) / (self.length() * v.length()))
+
+    def normalized(self):
+        return self.__div__(self.length())
+
+    def normalize(self):
+        v = self.normalized()
+        self.x = v.x
+        self.y = v.y
+        self.z 

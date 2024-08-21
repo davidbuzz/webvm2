@@ -1,0 +1,1295 @@
+/*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+/*
+ * Adapted from Pierre Kancir's ArduPilot plugin for Gazebo
+ */
+
+#include "libAP_JSON.h"
+
+#define DEBUG_ENABLED 0
+
+// SITL JSON interface supplies 16 servo channels
+#define MAX_SERVO_CHANNELS 16
+
+// The servo packet received from ArduPilot SITL. Defined in SIM_JSON.h.
+struct servo_packet {
+    uint16_t magic; // 18458 expected magic value
+    uint16_t frame_rate;
+    uint32_t frame_count;
+    uint16_t pwm[16];
+};
+
+bool libAP_JSON::InitSockets(const char *fdm_address, const uint16_t fdm_port_in) {
+    // configure port
+    sock.set_blocking(false);
+    sock.reuseaddress();
+
+    // bind the socket
+    if (!sock.bind(fdm_address, fdm_port_in))
+    {
+        std::cout << "[libAP_JSON] " << "failed to bind with "
+                  << fdm_address << ":" << fdm_port_in << std::endl;
+        return false;
+    }
+    std::cout << "[libAP_JSON] " << "flight dynamics model at "
+              << fdm_address << ":" << fdm_port_in << std::endl;
+    return true;
+}
+
+bool libAP_JSON::ReceiveServoPacket(uint16_t servo_out[]) {
+    // Added detection for whether ArduPilot is online or not.
+    // If ArduPilot is detected (receive of fdm packet from someone),
+    // then socket receive wait time is increased from 1ms to 1 sec
+    // to accommodate network jitter.
+    // If ArduPilot is not detected, receive call blocks for 1ms
+    // on each call.
+    // Once ArduPilot presence is detected, it takes this many
+    // missed receives before declaring the FCS offline.
+
+    uint32_t waitMs;
+    if (ap_online) {
+        // Increase timeout for recv once we detect a packet from ArduPilot FCS.
+        // If this value is too high then it will block the main Gazebo update loop
+        // and adversely affect the RTF.
+        waitMs = 10;
+    } else {
+        // Otherwise skip quickly and do not set control force.
+        waitMs = 1;
+    }
+
+    servo_packet pkt;
+    auto recvSize = sock.recv(&pkt, sizeof(servo_packet), waitMs);
+    // libAP_JSON::fcu_address = fcu_address;
+    // libAP_JSON::fcu_port_out = fcu_port_out;
+
+    sock.last_recv_address(fcu_address, fcu_port_out);
+
+    // drain the socket in the case we're backed up
+    int counter = 0;
+    while (true) {
+        servo_packet last_pkt;
+        auto recvSize_last = sock.recv(&last_pkt, sizeof(servo_packet), 0ul);
+        if (recvSize_last == -1) {
+            break;
+        }
+        counter++;
+        pkt = last_pkt;
+        recvSize = recvSize_last;
+    }
+    if (counter > 0) {
+        std::cout << "[libAP_JSON] " << "Drained n packets: " << counter << std::endl;
+    }
+
+    // didn't receive a packet, increment timeout count if online, then return
+    if (recvSize == -1) {
+        if (ap_online) {
+            if (++connectionTimeoutCount > connectionTimeoutMaxCount) {
+                connectionTimeoutCount = 0;
+                ap_online = false;
+                std::cout << "[libAP_JSON] " << "Broken ArduPilot connection (no packets received)" << std::endl;
+            }
+        }
+        return false;
+    }
+
+#if DEBUG_ENABLED
+    // debug: inspect SITL packet
+    std::cout << "recv " << recvSize << " bytes from " << fcu_address << ":" << fcu_port_out << "\n";
+    std::cout << "magic: " << pkt.magic << "\n";
+    std::cout << "frame_rate: " << pkt.frame_rate << "\n";
+    std::cout << "frame_count: " << pkt.frame_count << "\n";
+    std::cout << "pwm: [";
+    for (auto i = 0; i < MAX_SERVO_CHANNELS - 1; ++i) {
+        std::cout << pkt.pwm[i] << ", ";
+    }
+    std::cout << pkt.pwm[MAX_SERVO_CHANNELS - 1] << "]\n";
+    std::cout << "\n";
+#endif
+
+    // check magic, return if invalid
+    const uint16_t magic = 18458;
+    if (magic != pkt.magic) {
+        std::cout << "[libAP_JSON] Incorrect protocol magic " << pkt.magic << " should be " << magic << "\n";
+        return false;
+    }
+
+    // check frame rate and frame order
+    fcu_frame_rate = pkt.frame_rate;
+    if (pkt.frame_count < fcu_frame_count) {
+        // @TODO - implement re-initialisation
+        std::cout << "[libAP_JSON] ArduPilot controller has reset\n";
+    }
+    else if (pkt.frame_count == fcu_frame_count) {
+        // received duplicate frame, skip
+        std::cout << "[libAP_JSON] Duplicate input frame count" << fcu_frame_count << "\n";
+        return false;
+    }
+    else if (pkt.frame_count != fcu_frame_count + 1 && ap_online) {
+        // missed frames, warn only
+        std::cout << "[libAP_JSON] Missed " << fcu_frame_count - pkt.frame_count << " input frames\n";
+    }
+    fcu_frame_count = pkt.frame_count;
+
+    // always reset the connection timeout so we don't accumulate
+    connectionTimeoutCount = 0;
+    if (!ap_online) {
+        ap_online = true;
+
+        std::cout << "[libAP_JSON] " << "Connected to ArduPilot controller @ "
+                  << fcu_address << ":" << fcu_port_out << "\n";
+    }
+
+    for (int i = 0; i < MAX_SERVO_CHANNELS - 1; i++) {
+        servo_out[i] = pkt.pwm[i];
+    }
+
+    return true;
+}
+
+void libAP_JSON::SendState(double timestamp, // seconds
+                           double gyro_x, double gyro_y, double gyro_z, // rad/sec
+                           double accel_x, double accel_y, double accel_z, // m/s^2
+                           double pos_x, double pos_y, double pos_z, // m in inertial frame
+                           double phi, double theta, double psi, // attitude radians
+                           double V_x, double V_y, double V_z) // m/s (standard fixed wing frame is negative)
+{
+    // it is assumed that the imu orientation is NED, i.e.:
+    //   x forward
+    //   y right
+    //   z down
+
+    // Example ArduPilot JSON interface messages. Preceed and terminate with \n
+    // {"timestamp":2500,"imu":{"gyro":[0,0,0],"accel_body":[0,0,0]},"position":[0,0,0],"attitude":[0,0,0],"velocity":[0,0,0]}
+
+    // using namespace rapidjson;
+
+    // build JSON string
+    // all the required pieces first
+    std::string s =  "\n{\"timestamp\":" + std::to_string(timestamp)
+                    + ",\"imu\":{"
+                        + "\"gyro\":[" + std::to_string(gyro_x) + "," + std::to_string(gyro_y) + "," + std::to_string(gyro_z) + "]"
+                        + ",\"accel_body\":[" + std::to_string(accel_x) + "," + std::to_string(accel_y) + "," + std::to_string(accel_z) + "]"
+                        + "}"
+                    + ",\"position\":[" + std::to_string(pos_x) + "," + std::to_string(pos_y) + "," + std::to_string(pos_z) + "]"
+                    + ",\"attitude\":[" + std::to_string(phi) + "," + std::to_string(theta) + "," + std::to_string(psi) + "]"
+                    + ",\"velocity\":[" + std::to_string(V_x) + "," + std::to_string(V_y) + "," + std::to_string(V_z) + "]";
+    
+    // handle the optional JSON data
+    if (set_airspeed_flag) {
+        s = s + ",\"airspeed\":" + std::to_string(airspeed);
+    }
+    if (set_windvane_flag) {
+        s = s + ",\"windvane\":{\"direction\":" + std::to_string(windvane_direction) + ",\"speed\":" + std::to_string(windvane_speed) + "}";
+    }
+    if (rangefinder_count > 0) {
+        for (int i = 0; i < rangefinder_count; i++) {
+            // rangefinder data is 1 indexed
+            s = s + ",\"rng_" + std::to_string(i + 1) + "\":" + std::to_string(rangefinder[i]);
+        }
+    }
+
+    s = s + "}\n"; // close the JSON
+    
+    // send JSON string to ArduPilot
+    auto bytes_sent = sock.sendto(
+        s.c_str(), s.size(),
+        fcu_address,
+        fcu_port_out);
+
+#if DEBUG_ENABLED
+    std::cout << s << std::endl;
+#endif
+}
+
+void libAP_JSON::setAirspeed(double airspeed_in)
+{
+    airspeed = airspeed_in;
+    set_airspeed_flag = true;
+}
+
+void libAP_JSON::setWindvane(double direction, double speed)
+{
+    windvane_direction = direction;
+    windvane_speed = speed;
+    set_windvane_flag = true;
+}
+
+void libAP_JSON::setRangefinder(double *rangefinder_in, uint8_t n)
+{
+    if (n <= 6) {
+        rangefinder_count = n;
+        for (int i = 0; i < n; i++) {
+            rangefinder[i] = rangefinder_in[i];
+        }
+    } else {
+        std::cout << "[libAP_JSON] Too many rangerfinder values!" << std::endl;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include <iostream>
+#include <string>
+
+#include "SocketExample.cpp"
+
+class libAP_JSON {
+public:
+    bool InitSockets(const char *fdm_address, const uint16_t fdm_port_in);
+    bool ReceiveServoPacket(uint16_t servo_out[]);
+    void SendState(double timestamp,
+                   double gyro_x, double gyro_y, double gyro_z, // rad/sec
+                   double accel_x, double accel_y, double accel_z, // m/s^2
+                   double pos_x, double pos_y, double pos_z, // m in inertial frame
+                   double phi, double theta, double psi, // attitude radians
+                   double V_x, double V_y, double V_z); // m/s in inertial frame
+    void setAirspeed(double airspeed_in); // m/s
+    void setWindvane(double direction, // radians clockwise to the front (0 is head to wind)
+                     double speed); // m/s
+    void setRangefinder(double *rangefinder_in, uint8_t n);
+    bool ap_online;
+private:
+    // Socket manager
+    SocketExample sock = SocketExample(true);
+
+    // The address for the flight dynamics model
+    // const char *libAP_JSON::fdm_address;
+
+    // The address for the SITL flight controller - auto detected
+    const char *fcu_address;
+
+    // The port for the flight dynamics model
+    // uint16_t libAP_JSON::fdm_port_in;
+
+    // The port for the SITL flight controller - auto detected
+    uint16_t fcu_port_out;
+
+    // Number of consecutive missed ArduPilot controller messages
+    int connectionTimeoutCount;
+
+    // Max number of consecutive missed ArduPilot controller messages before timeout
+    int connectionTimeoutMaxCount = 10;
+
+    // Last received frame rate from the ArduPilot controller
+    uint16_t fcu_frame_rate;
+
+    // Last received frame count from the ArduPilot controller
+    uint32_t fcu_frame_count = -1;
+
+    // optional JSON data
+    double airspeed;
+    bool set_airspeed_flag = false;
+    double windvane_direction;
+    double windvane_speed;
+    bool set_windvane_flag = false;
+    double rangefinder[6];
+    uint8_t rangefinder_count = 0;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+// This is very minimal example of using libAP_JSON to send simulator data to ArduPilot SITL
+
+#include <time.h>
+#include <chrono>
+#include <stdlib.h>
+
+#include "libAP_JSON.cpp"
+
+uint16_t servo_out[16];
+
+uint64_t micros() {
+    uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::
+                  now().time_since_epoch()).count();
+    return us; 
+}
+
+int main() {
+    // init the ArduPilot connection
+    libAP_JSON ap;
+    if (ap.InitSockets("127.0.0.1", 9002))
+    {
+        std::cout << "started socket" << std::endl;
+    }
+
+    // send and receive data from AP
+    while (true)
+    {
+        double timestamp = (double) micros() / 1000000.0;
+
+        if (ap.ReceiveServoPacket(servo_out))
+        {
+#if DEBUG_ENABLED
+            std::cout << "servo_out PWM: [";
+            for (int i = 0; i < MAX_SERVO_CHANNELS - 1; ++i)
+            {
+                std::cout << servo_out[i] << ", ";
+            }
+            std::cout << servo_out[MAX_SERVO_CHANNELS - 1] << "]" << std::endl;
+#endif
+        }
+
+        if (!ap.ap_online) {
+            continue;
+        }
+
+        // example rangefinder data
+        double rangefinder_example[] = {1, 2, 3, 4, 5, 6};
+
+        // set the optionals
+        ap.setAirspeed(1);
+        ap.setWindvane(1 , 1);
+        ap.setRangefinder(rangefinder_example, 6);
+
+        // send with the required
+        ap.SendState(timestamp,
+                     0, 0, 0,    // gyro
+                     0, 0, -9.81, // accel
+                     0, 0, 0,    // position
+                     0, 0, 0,    // attitude
+                     0, 0, 0);    // velocity
+
+        usleep(1000); // run this example at about 1000 Hz. Realistically it is about 800 Hz.
+    }
+    return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         # C++
+
+This library links a simulator written in C++ with ArduPilot through a UDP JSON interface. This simplifies adding support for ArduPilot to a simulator. A minimal example is included in `minimal.cpp`. This can be built-in Linux with the command `g++ minimal.cpp -o minimal.o`. The minimal example shows how each method in the library is used and can be used to test the library as well. The `simpleRover.cpp` example is a 1-D model of a rover that shows how a physics model can be integrated with this library.
+
+Connection to SITL is made via a UDP link. The physics backend should listen for incoming messages on port 9002. The sim should then reply to the IP and port the messages were received from. This is handled by libAP_JSON. This removes the need to configure the target IP and port for SITL in the physics backend. ArduPilot SITL will send an output message every 10 seconds allowing the physics backend to auto-detect.
+
+After a connection has been made, the optional values should be set. Then the vehicle state can be sent with `SendState`. This call includes all of the required values. The `servo_out` array supports 16 servo outputs from ArduPilot.
+
+### Running the `simpleRover` example
+
+The examples can be built using `cmake`:
+
+```bash
+$ mkdir build && cd build
+$ cmake ..
+$ make
+```
+
+Run the `simpleRover` physics engine:
+
+```bash
+$ ./simpleRover
+```
+
+Run SITL with the JSON backend:
+
+```bash
+sim_vehicle.py -v Rover -f JSON --console --map
+```
+
+The rover responds to throttle commands on RC channel 3:
+
+```bash
+# arm throttle
+MANUAL> arm throttle
+
+# move forwards at max throttle (expected velocity 1 m/s)
+MANUAL> rc 3 1900
+
+# move backwards at max throttle (expected velocity -1 m/s)
+MANUAL> rc 3 1100
+
+# stop
+MANUAL> rc 3 1500
+```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+// This is a very simple 1-D rover model using libAP_JSON for C++
+
+#include <math.h>
+#include <time.h>
+#include <chrono>
+#include <stdlib.h>
+
+#include "libAP_JSON.cpp"
+#include "simpleRover.h"
+
+uint16_t servo_out[16];
+
+uint64_t micros() {
+    uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::
+                  now().time_since_epoch()).count();
+    return us; 
+}
+
+bool simpleRover::update(simpleRover &rover, uint16_t servo_out[]) {
+    // returns true is the update went well. false means something went wrong and the physics model should exit
+    // this is main portion of the physics
+
+    // ideal vehicle model
+    /* servos are defined as
+        1. throttle (really just velocity control)
+        2. steering (really just turn rate omega)
+     */
+
+    double timestep = rover.state.timestamp - rover.old_state.timestamp;
+    if (timestep < 0) {
+        // the sim is trying to go backwards in time
+        std::cout << "[simpleRover] Error: Time went backwards" << std::endl;
+        return false;
+    } else if (timestep == 0) {
+        // time did not advance. no physics step
+        std::cout << "[simpleRover] Warning: Time did not step forward" << std::endl;
+        return true;
+    } else if (timestep > 60) {
+        // limiting timestep to less than 1 minute
+        std::cout << "[simpleRover] Warning: Time step was very large" << std::endl;
+        return true;
+    }
+
+    // how fast is the rover moving
+    double max_velocity = 1; // m/s
+    double body_v = _interp1D(servo_out[2], 1100, 1900, -max_velocity, max_velocity);
+
+    // how fast is the rover turning
+    // Just doing 1-D right now. This Needs a bit of system dynamics math and geometry to get to 2-D.
+    // double max_turn_rate = 5 * M_PI / 180;
+    // double body_omega_z = _interp1D(servo_out[1], 1100, 1900, -max_turn_rate, max_turn_rate);
+
+    // update the state
+    rover.state.V_x = body_v;
+    rover.state.accel_x = (rover.state.V_x - rover.old_state.V_x) / timestep; // derivative for accel
+    double delta_pos_x = (rover.state.V_x) * timestep; // integrate for position change
+    rover.state.pos_x = delta_pos_x + rover.old_state.pos_x; // plus c
+
+    // update successful
+    return true;
+}
+
+int main() {
+    // init the ArduPilot connection
+    libAP_JSON ap;
+    if (ap.InitSockets("127.0.0.1", 9002))
+    {
+        std::cout << "started socket" << std::endl;
+    }
+
+    // init a simpleRover
+    simpleRover rover;
+
+    // send and receive data from AP
+    while (true)
+    {
+        rover.state.timestamp = (double) micros() / 1000000.0;
+
+        if (ap.ReceiveServoPacket(servo_out))
+        {
+#if DEBUG_ENABLED
+            std::cout << "servo_out PWM: [";
+            for (int i = 0; i < MAX_SERVO_CHANNELS - 1; ++i)
+            {
+                std::cout << servo_out[i] << ", ";
+            }
+            std::cout << servo_out[MAX_SERVO_CHANNELS - 1] << "]" << std::endl;
+#endif
+        }
+
+        if (!ap.ap_online) {
+            continue;
+        }
+
+        // calc rover physics
+        if (!rover.update(rover, servo_out)) {
+            // something went wrong with the physics
+            std::cout << "[simpleRover] Error: Physics update has caused an exit" << std::endl;
+            return 1;
+        };
+
+        // step the sim forward
+        rover.old_state = rover.state;
+
+        // send with the required state
+        ap.SendState(rover.state.timestamp,
+                     0, 0, 0,    // gyro
+                     rover.state.accel_x, 0, -9.81, // accel
+                     rover.state.pos_x, 0, 0,    // position
+                     0, 0, 0,    // attitude
+                     rover.state.V_x, 0, 0);    // velocity
+    }
+    return 0;
+}
+
+double simpleRover::_interp1D(const double &x, const double &x0, const double &x1, const double &y0, const double &y1)
+{
+    return ((y0 * (x1 - x)) + (y1 * (x - x0))) / (x1 - x0);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+class simpleRover {
+public:
+    struct simpleRoverState {
+        double timestamp = 0;
+        double gyro_x, gyro_y, gyro_z = 0; // rad/sec
+        double accel_x, accel_y, accel_z = 0; // m/s^2
+        double pos_x, pos_y, pos_z = 0; // m in inertial frame
+        double phi, theta, psi = 0; // attitude radians
+        double V_x, V_y, V_z = 0; // m/s in inertial frame
+    } state, old_state;
+
+    bool update(simpleRover &rover, uint16_t servo_out[]);
+private:
+    double _interp1D(const double &x, const double &x0, const double &x1, const double &y0, const double &y1);
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                PK    wİPºÔvzÜ  ²	     [Content_Types].xmlÅ–]oÓ0†ÿJ”[Ô8l!ÔtšZ&!M£¢C\Ns’Xõ—|œeå×sÒ–P(‘ÂZÈ¥í÷¼ÏëÏdzõ¬Uô¥5Yü:IãŒ°¹4e¹¿™¼‹#Üä\YY¼Œ£«Ùô~ã #*6˜ÅUî=c(*ĞëÀĞHa½æš¾d‹5/]¤é[&¬	`Â$´ñlº€‚×*Dó]kÅR·zgÊ8úğLİ»€m›õTpç”<=™ü·“}„ÄƒÚj°’_‘à â`ùVõkLPêZI³Nt®<Û6Y~¢eö2‡¥ÖÃÄyõAÂ>÷’ûpÇ5¹0ç<pÖ
+—.ù+öÏùb—¨ºù—Ün-‡èJÎ›ä3(àMa‡g9(zišî|Ñİ)d¹‚p„ÿ!a$=í>&eŠºHûQÚæ R´ÜoN†9U—Ò‰8Á~òN‰ìÚĞÓÔZ.·#$XH^‹AŠUíœDëGˆqkK)®W›oàG[Œ; G£¯nçóÑà_áq%è‘Á‡[Óú‡2ğ …²M"*÷Gè„l+|¸xóß‘——§#5•40º—¼ÍÊŠu{ƒiŸû¹4¹mğğ=eÛ_®ÙwPK    wİP'âo b  b     _rels/.rels¥ÔQOƒ0ğ¯Bú>
+¸5c{™&{01:?À­Ü ¶¤íÜöí-°bØ|„ãş÷W˜-¢
+>P®dJâ0"J¦2.ó”¼¯Ÿ&w$0d•’˜’#,æ³W¬ÀºSğÚ.Dš”ÖÖ”V  ª¥«l•`İ¥Îi¬„iE·T·3H73Xe)Y;±‘À+¬AçhS"ĞB¨ı©…µÌ]ıXãÿ ô<šPjS)V.9äÄÉe¸ØU\–ô«œ}—C7|€æ@Å^éÒ„L	úÛDqÔcuæù@LÉ-ÏßĞ®äVyDúU¤iÔè3	•aµä¬¹	úèQõ¸ØõÜô7¸³5öFûxz•Å3%öLi|ÑîÜhËÑŒFNUœœ½«vâ&¡y<X”Íwzë|…Şè!ßÍŸëC0xÑ)k	ïÿ¶Â‡ŒSqô>¯üU4ù“º³^Úù5Î?PK    wİP¹ğî£Y  º     metadata/coreProperties.xmlRÑNƒ0ıÒw(…‰®–¨Ù“KÅh|«å5B!mãï-0pê|kÏ9÷ÜÓÛ¯Ué@iQËÏGH^çB	zÎÖîr´a2ge-!Ahä¬Ò˜7”×
+¶ªn@Ú±FRSŞ$hoLC1Ö|ÓUHKîjU1c¯ªÀã¬ ø~„+0,g†áŞĞmfGt²ÌùlÙ|ªr0È9†*Fcâü­­„é¸X1‘gjªÒÅ3+ZÌª¶m½6t6?Á¯›‡§á©®ı¨8 q>Ì@Q«.-Å»bª‹ñ9ŸšS®Àb¹c[Ğ1úÄ¼„w÷Ù¥ø®¹$ÌÈ5]ø4ßbü«¾7ÏµJ·`¹^2#} ’i³±_»ßv“è/1G«NØ?²ËŒ„ô*¢‹åY¶É`h¯à ú5K‰DCßééÓ¦½%ø	'÷cİÒ/PK    wİPWç+Å   G     metadata/mwcoreProperties.xmle1nÃ0E¯"h¯åx*
+YÙ²¥(Òô ¬DÄ‚%RÕ¤¾}=t°Û‘ßûŸöø“ºc•È4êC×k…ä9DºúãzzzÖJP€Ä„£^P´::›+¾U.X[DQ«‡dÔSkåÅñf.C›\gé<gSÀÏpC3ô‡Áìyí¬gjHíºtPJŠÚÚÊÜ)l<óWŠ4w™&k¶ÔVqª)¤å2º÷_HÿA»;»æ$ø¼`Bt—¡z°f¿]ç?Ï»PK    wİPÎBéV¼     &   metadata/mwcorePropertiesExtension.xml]»rÃ …¡ç)
+x\ÅuŠ$ı\[Ğ ~äï£$•SŸ=;k÷÷°+æ2§ØSÅ%%]òs<õôãıÀ4%¥Bô°¤ˆ=ıÂBÉ~°áæRÆ·œVÌuÆB6O,=j]wB7a€ÂÔé–ò¹p—‚XÁá„âIªV<ş_ïãOİÜP?ÿ¢Ã5—\5ÊÈN[ñ8ÚËeöÃÑkã4ì¨;ÃÚöÙ3èÀ±F×ø—FVü¢›à_ùğPK    wİPÖš×º   .  (   metadata/mwcorePropertiesReleaseInfo.xmluK‚0„ïüŠ•{¡H0)åÆÍñq$V!¼L‹ÆŸ/•G¼xÛ™ofwyòîZx¡ÒõĞÇ¶çP°/†²îï±}:¦$²añ!pSP÷·Aur4ó4ÁAÕeP†ŒQF%dØ¢Ô„LÍæË•Üô…ÀCìÈ¡ç3?¤Œ»«m"j^%æÍÜ]µa%êBÕó‡àî¯úR9¢Hñ
+,SÆ1¨¨°hô³~àQº÷i0ÑÍ´¸ûïçPK    wİPåZ #  £     metadata/thumbnail.pngİx‡;Õoø?)3É	++ÙÂAf™!û(+${¯
+YeÓÉ•½gfYÇ–½I²’=ñ½}~ÿÃï{]_×u×ñ~Ÿ÷óÜ÷ë~'TCM‘”˜‡TYIî1¼·Ÿ¿ñáw^a*¼9(é;ãàN¿pÓ–M$ppèu”åd´=’×§İ¨–NĞ›ûÔ)˜œšrüO¿¾_¡aù®MÕMÈı}÷ÍÅIz[ÿ ÛßQ¡üc‚è»”œü­4_?Ş#RøŒ‘%"§Ä-Íá°aOQ3Æb8ckµôS¤•²°‰ß©UUa	×—şO/aóÕ4©.İßQÆ¹1•pQ”âêA%éÀŸ,¸ä²ÿ—>(É¹Æâ÷IÂãûúdUR9éuq—t‹®¼¸äª–«#ÜÆ5q?~d?©÷öÜŸvŒ,r¥'
+±º'œŞúvûhµH¤c»»Šn&BE›]í·êMCôekfVûˆã<É«5Ôv¿v›%C3EÊ7‘ü–BöGw
+¸ìho½«ÁÛŞÙiÚBşçÏA×XÌm4\N/ä‹İ#¿~]UVöBâL‡••µû·ö£
+›„„„ÇbÂs:Q–qWÓ]ÌğÅK—O=ÙT>~¾¥¨Aõ¶?SQÀmmŒ}yˆOŞËD>=C™ø)kkS½:ì2©v˜» _od”ğˆr[Ÿˆ‰iÊ+jxèå%~K1Â¼5ŒÚv¢|%´JçÂÍ)Y$’©¡¡ÁÃÃã×êê£ı¿ÓÊªªßßà©$
+½®|9iZ¢Gxå
+¾tÑ«­Ú"—¹LXæFHDD[_Ÿú‰¾‘#	÷S¸SÒñóÓe5µ¶ÁA-c»Î8Î4z°ŞÛê€m™¼ƒKŞÉAÃcp•šúË©OxuµhÛzgg<'‹ˆje0¯ØcÓÔuú¥edô…¥´ÿï¡b¯Në"ÌĞäTTŸh˜˜z§kİ÷&íæ#;ÚÛÓaÃB~–]jˆÚEB¬ÌÉÉÉ}öÆŸ»¬O¯,á¼™=İ«Âl¿~Sã²20Ö“§pá&ƒêlƒ¯˜Ïƒ–H&òó;Ö@|¢«·Yd­¢^~’¹póü+AU™D¼Áº¿F&®Ãtï¾Zˆ¹­éÕÏ</çàáaea‘v{×êL %%9¨o)XcYİ`”ÃO£ŠF’Q\¿ŞB~+$,,C+KMˆ7):úG¡qmHx¸Åh¡ñ{ÀÃÔ”ÑŞú$:†õ‘Ít[oÊı•/$ 9û(áøŸs^­vÅ3˜õ—Ûä”p#ëè’zÚÒe889Ÿõ¥JÒ]Æß[àá!:>>Î(êğßáäÈ•†[ï{Õ¬ß#==:zzzF„_òŸ?æ‹=IèÍyô!qú&+‹ıO“ù=ÉÇŞB‘2SŸ`ÑÄÄÄ‰5DW„†ô¸iØÔS»‡r´Æ+_^{tùÙŸöèóå?~,kgÇë{´sƒ-ˆK·'>€ÑÙÉi¬Ô‚„ÙwêOs>`cczşşşcßœ—nUé\xk¨¤¦fyr´«WğD…R<åŠôÉhï©‘&NXXØëÎ#œOŸ>áÄ}ø“ <Yùre¦{«ê´+ÅL2$ƒƒ#LVS“¼µµ5YÒ›&©GAZG1’éKuõÇLÅÈ˜””ğr›á°ğk"44mÇ‡Û‡ X˜š¥TïˆıïÈÀÀ‹Œû:b×¦¾Zß×avş–¡9¬M–ÁA<|>VüÌÃÛ;/Ş?44
+»kR»µåtO8IUÒš^YF&ãœÔÔaŞd%XC”xÜç`;ÛP¯ŸòüŒµ?— ÷ßî®ëÌŠà&~Æˆ¾¼ÔÎŠàæ^4š ss³/Q‚ELLì6;»óú„”›ƒ‹kşG ô‚~¹÷ş_Üxßµ5[À‡‚¾~ÂÑiî3¥G^<Ùæ=““sXã¯`ú\Y¨n&‰øƒ;^ç)æwÄ‰İß`çå€?C=·qÿí7¥è—YâÆ/U©§Iõüú ¬¢rñ×ÖBÆZ¶¶#–=o›WYiê]=Óg›’8®ûNnnÂ•è%#»zzZMKªwÚ;:Å±¡Yøï"—¾-¥Îw'Ø¤ñsr†¦JzCÉ{ÆËëWÚÒCËÏÁGDÉVì¾ºLÿ»¼P-E\Ìø½Óq9Åß‚ââ¨Ç;^õƒWäåå¡¸ğğp“Ù’ËÆmatm¦+&ş,.ä©Ú‘G-t¡¶P&¦eãz%¦—ÄS"¡xŸİK ²¡RŒ`üT^N…@ |||²³³Ó?<>>ffë+‹¼~ÿ°yl\ÜíZi‹ğ °wïJô¸1Àë¤õÈ¢ ï›»ÇÇ>uõõ«õªèW kh¢Â;œœŸ_‘^ğQ*³ìùı–©a²1Ûˆàz’Ï".ØŞ®4ã³­šuİgªÚ‘[¿4ğ|Ê–zS‚¨å(/‡œ°Ôb®Ø')?z¤…¾Äp¿Û²ì(qØ¦`T?WŒPÙ9Â¯›ùõëiÖ>WXSV–^™%)‰”ğ9ˆš=ùëYo7;=>¼ÍÊZh°Y­J{h;YYàR’ˆ‹¾^™MÛ¡½ŞßØØxDjÚÈ¶•=™Ûç½z9„‹+ßŞl}µ»½ıéH¾~àÛ·:†‹0ë˜R€†¢&ÕÀÀÀy%¡ÇÉ÷İ¯$õ|EÒ•òyÏ·‘fi…RD,Şşş]º´´4¹MmáÏŸ_+++C­¥g=Ìé½å·«©¢ÂÂˆ{,îÜ¹ƒ¡êáØM×È;88Tì‹ï!®O:îbt€[3ğóóó»s^†eüë™ı™«ÃE|MüÕ©ÄFİvÄ`9"‚ù»e=å¸­qüb0[ZYÉajÑõí¡&iÍ­Éhj’Íò3õm”ññõ%"%eÔ®_œk·Î3³a¬°à,Æø4Q	äĞıºÍh—ûÕë*vV£ht~cccG VÓÉµ¢ÃG<SëŞ÷ÅÎÏ·VÏIã%u4×‡BÅFG¿Éà ¢¥E¡–¶ğó
+Ë ;;.YŠª“®Ç­;^’^õm£ëƒºÄûZ£'2¶Â×.]ºt>eãCÁõ]Ã5®/ªì
+®”ŒÛš[Z>ÖÖnÁn4ÉMmğ>‘—¿tzz
+W;úÂ­œœœ»ü+ÕjĞ¼Ø±şóªÂÊ]âı'0Ìî3aşÃ6ÍdˆË²Íãí>JZZ4Ìj¸‡¦@"‰İ!­|ƒŠ0ÿ3ó¤L’ Öı—Šê÷~Í6ÊÔêé4ÆŸœ(««ë)ãD
+ªçÎ‹C…Vw&n­¯QD-şØ÷=+ v-õ9tºpá‚hdhXØo“³#Ú¼'¦3uT441qq-¡”ì«Uzµn<€È¼Ñ½´eş~«Ïòïhvg4TWó×iŒ„v)×C©7ÿı“Ö¤ï‚É×¤éi®x1:VbF lŠ¶Œ‰—•ãgÿØcILB²2^Æöêšˆİ¯¹9™'Oh¢££#x–ÃÄñkjnÊõšÆ£PÎ€¦‰Šºë‚övvv/ï„5}y„Z-bæ1(O¯«K”ÙL#æNsg˜[üNš-ËWX·¶·Cß¿7ïÏ_›®Eıü©ajjúñ¾;ï“¼xp8 «hø:Ë÷]“vÿVYöâ¥zWu2äIdeeÛ{{÷j7nÜö“òÚ±êìì
+”)„+V	€X»¿ö‘ß,$$DcUÄEüz’ˆı×ââ«ÌÌÌ°9Ï•/¨×ı´·Ş³ ÌÀQPCh¨±]3¥$~ÿDzã¨5 H@×maa¡¢pĞñ£Œêôİ¹†Ü‘ Û±bÜƒ³Æ$3ßà“ç33 
+pg©‹ÚÚUUUƒ¯ÛÓEâwjjx-Ë††´Q"6Ì„?¿ª&1 ¢ËôÎ’lj„ÚH“Á—¸¸8ÑáZ**˜äœ^÷©©…HÛJ=nõÑr™½ÃÃÃ]&n¶ûÛ|êªûS´°jjjºp…,’~&&&5æl±Ê¾ÓÍÍ™3ëV;¼ÀÜ¨KîRá(++_$ mèü;R`8\(|‘ÈxÛü¬V,5ÜéØ0Q…ºĞÑİ}1¹ö[lhLLŒâD*—QMŒ"Vg²yóa%˜/_¾T ‰ªƒ¥L	*ùèÄKMªs)äá)ØK·mëê"áã+bßš3HÂG(¹/48©ç¾³`ŞäŠì	oĞĞÓSzú”HJ­Êodëß\³WOëZu=»°Ş¦£¹´Ôñ¿4¼FÙRi÷€ QQ‚”XŠ–æ|ıÕubèÌÖÖ¸s'kOl²áŞËÑ/2¼T|[Õ¹˜»»Àt¿ççùTêNö&ó«®¤¨¡×ÆË¾9Îã£#®?Ğ¤:=@#J_N
+Z~%ÅÃ¿üÖ ’,â£¥©yCh¥'j>ƒ¾A¦µ~¥{€ÅŠ¬ñI®Bx ƒØ®®®oîLç–é| —~zOÇïßxº[Ä(æKNMİ
+†XÌsë68œÅ`f?–»w£õ^ıyº|Y&R#ìà¦á±]ü¡Ii €ê‘ë^S?ÀlşrÕ~®¬LX“SP¨u·/DÖwb†ó<PÃâ ÙêQ4=%ƒî°×UİÚIp°ÔjQà¥€Ÿ‡Š¸&_F•é‘n¾î,/(æñ…€ŒésyyÁ‡£kÒó©VÈŒ~u†e”òÑ+Æb7RÚÄF>w½gû›YéUãÅ–Qì¶nğw¶±è[w$âTÉÏOê-Ÿ›uJ¡U”}Úâ.øˆ°Œ».ËødL*ç¨G[C#½wü¨ƒ=íi…Áæî®|ÖàæáRÚı“Ç±g`n¸Ê	__¿ïö¯‰„ïg©Å#a»©öÏÊ±Cfı³Ç‹"ìh¡¢¥%5—à¢†£°¸8*q·µó› {àj(ğo/ö˜mÌÔï€èè¿åbøC÷ù3~€Œ¤Õ%ğ
+®/a^LSLFh»‘YŸ[sÎû%gªi¾{ún3ª¦¦7a!Ú‘ò`R`Á>şSßœƒÛ3ŞÑ		oIh«ˆA)¤^N”ß¢ø!M¸ûì‚ˆıL‹M…ÓÎ²fSSÓŠaËË=R×O_¬‘k÷1}llî°«%ÿj¥5‡ ß]¼c¿LEGŞø">~Ì‡ç–8,#[ I”)R)ôbäga•â_ËáZ¶éif¨Ú)Tmlwe0Ñ{…[çQ±¥E®³«wy¤àšnÒb8WgªÎ3¶Ä“šÚ[jÑ5Öà[[“
+´JAA<{vzÒÒÖ&åd8ı
+%ˆr;v{uõ{N¥˜èËLÁ9×ÕÕ}´¦ÀÉÓ-rKÔy¾ĞÎ?«˜Ç¨:
+ş®„î9!XşÈ:{Ávw÷¸ö=¬|q®…·1ØûÍtwLLfmº–w½ÀN¶BA_7raÅ^"o4‚‹%rN^`†r"ëız^ƒÙk8ÂäYRF;}n­ê´DŒÌTŠ¥t³$PâğáTô=¿ãüÚ7uVŒªï±cÆù2ø¬#½ú’Ç´AG-Ò-¿ê´ÌÎš¤pé„˜Ü¬ªn;°p^2›òšmŠ‡¸š×8$$4ôä]•$ápJv5A½y Bø×k¶¾M'‚»oj†î³$	¿„˜å­Mwbš69ÁèBşˆm<Y·ïNC˜ƒ¯™Ê?P~øğñµ'šš?ZßÑÛn§e÷\¦“şQ“¿¥A¯Uu“ÛÖ0”©ÂÃĞŸ×³áìÔû·~ÓÑîj^½]…AŠÍ``ÍVÚqÈeìê©æ ğçAĞK™]W»Ôc!^WIYùYÛ{údQGÿÙ³Ó}£j‡7E§‰](>çE•ô­;k§kõ¿9±‚l›CzN,”jô·2İóŠBó$vöö>aÁ³©ëSy­+MAI	sº \lÀMÈ28µ¾›wPHa×²öåäå70ûxÒ‹
+’ÅœƒVG‹(©¨Z ½ãßœÙYYY¾9]Ê~¨¤DhXi›c›ìƒ`{~¼qßmíW¼.òÌ+xŠnKÃ*»—égÄ›Ÿ!Æme§Òò!o#i]4‘È^èTZ{•Rı•°nà€Íííùa]‹æ R—åŸoFM^¥@„=`ò®/î·ºy¬Â`¦"Œ¡ûøÓõŞ(p†ÀípsGGÇÓÌ'eorGg<WNv6‹¨(]Ùx7dãŸ+.;Ëı™ÿÌÂŒçÒu*ù9¸
+ôƒ@]]Ÿ”¡åû¼óZÏ™·_­q]m"½!Ğ¬7YÌÜÂb:€2CGğû{ UöÁìü~Ç_Üı‘?€ÙïàM0³vï¥ßÉª‰îµ–‰t\Ğ[ (;Ş÷âgÍç‡GÎK½®+'ö'Â¯Ó–ÇJnçZ^¶’}ğ 42’ğ&m Á×û¯ñC ¾W ±á}©“AÈ¥yhçÅîg?ü/-»ˆß¼yÓè„:0É¡b‰XëŒ4ÚycFXº”/\V?œ¢bæèê7×Uš |ÒŒç}©.3)|ş`V@CEKdR,‚‚qš™
+ünkzççPåúIŒ“48°ƒ%ÄY”H‚ŠQ‡æ¶$ -Ó¤Ñ'08¸"eş“¼£‚RÓV0
+ÄCşÙêˆ*2½ÿ¦_½r5Ş‹½ !†q(·‹Æ²m5ŒÕŞ—‘‘s]åãS¯–§–•i?Û ¿ìy”şkCßæÉ^Â¯O[É¥î‚†ARO™Ê•q7®à4ÈíYm®¢!#‹TLDéJ¢½®¢çß×ºmn÷!Îa“ÓÃúÈãh%k8ÁºÒ~V¼	aåPe‡ùˆ“J¾ú
+ZŞ–ææ€±1=@Ø’K¾¦KáE…¬êm†MD–¤vo=Aø%ÃóŞä9¸ù=3¹N>PY9T¼+Ã÷ÊL®óÁ0¤‰gCdàzdä§Ùe<DDDÀªR§ó¨œ}×«7˜t†½¢ÒÓYv+Î‘œ¥ÎœÅ[¦–åœè?d~O§v:Q-K«7^’D·iî½ÍM¸ü*VDÈĞRø—êÛÄ›¢ @¦Àõ‰¶Ü#{ë“«ùÌ1¯CØÌŠD@~“Ì±…Cd25V÷ Sêq`Ë)%³wùï öyÉ§°vŸlRúO°û	¢7KJJ@.FD½5S$½?€Ú >Ä¿&¬Ò¨èÍ†ìRä¶>Ñ
+ÃØ;ÿæ¶XS×j:÷»õ&*&·BŒÉy:Ü²Ø½`fmÍ‰â5ş›º@qS––‹ÍËëm÷Û¿‡•o†ùû÷ïƒM4sØ?é
+ƒÕ$aşç½ŒW˜¥ºã8µ^wNnÃ*”ƒhÄz¸^º* 7Ş¦!†A6¿® ¹Ã|eàËç¯_:©½v1_F(`p"ôË,ùm†8®\oéIY™ú&`_·‰C›5Á†K®ZøU<séF±Ò¦‹––¶Ì²‡ û_®jğñ¯ÛÃ<	øñl)dKŒùXaTXÇ0¥geğ…/4÷Ù«¼¹¹¹ÀÀÀ«LLÈ<ÑÆ«#@`ÿÀ¨—Õ´»^íçæ“õók”—BdLh§5ğ†·ësÿïÄÿÿûàŒ`‹ëÀ«Àgd~”åÕä
+eŸúÿPK    wİP7ªp—  ·  $   simulink/_rels/blockdiagram.xml.rels½ÕmKÃ0 à¿Ròİ¥¾Ì7¬"AEœâÇ‘¥·6,É•\êœ¿ŞlN×ÍVP´{w¹{8šöìâÅèè)´	ÛíÄ,+1U6KØãÃ`ç˜Eä…M…F	›±èâüì´ğáåª (4±”°Üûâ”s’9A,À†Ì><ºŒBNE|/¹«ö`›=£«4a—V™eäN—™²,z.Ÿ°bùL|« ¦…¢y_,¡,Ÿ¡›RG¢á¤L©•Ş`
+:`v61ü}ÀpÂ€Ûa¼†×W"³H^ÉaYˆĞ}5ÖUµ½ÆLÉK+ôü\Ó.kŠZfŞ¢jâU’-³†×½^“jkõã¡ŒF,Ãíüî–4×¶Œk”ÓÅ}U}˜ˆR{ZsÇiºŠı˜µm‰j‡Õ©ÂçÍÃDãld„Ì•…5é3ÅW©¿[Øgë›ÕĞZÚœ<˜Ñ^\!-CáüGêWËŠ·5Ënßö»†ınK‡è‹ä;fÊ¦8£+;Áµ£üıëq²…¨N
+¾ñ¿=PK    wİP¹ï‹´     %   simulink/_rels/configSetInfo.xml.relseÁjÃ0†_Åè¾(£Œ§·Á®kû ÆQ“X6–×­o_JÃú…¾OÿpøK«¹R•˜ÙÂ®ëÁû<EÎ§Ï—w0ÒOnÍLn$`ãğM«kz#s,bÂban­| ŠŸ)9ér!ÖÍ%×äš5`q~qğµï÷XŸ°eš¯É‚Ï|‰áHM¿:¹¨=g²5¿úgVßü›ë"Ï	%¦Ÿ5ò¢ÖİÛÖŠà8à¦ÕxPK    wİPI¹/–  ¹     simulink/bddefaults.xmlíYİo*7ï_1š‡>ím’ÕVêv	p)”á©UU™™¸ñØ³¶‡„û×ï9ö@€±In¿Ô‡ÍÁ3?ÛçówMç‡—R$kĞ†+y™^|s& sUp¹¼Lk»øğ]úC÷«Î•PùÓ€³¥få ¬Öt¿J’N¶1áÃIrÏJ¸L'¬=Ö¤e7H»‚ÉÂäø¸s6	'ÊpBTi—ÕVE€ÓM…€Ú°tôIrkÒ.—ù
+L3å
+1½ä¡?óí9ıı#9õíçèbKÈr&P´‹6$[©gB\©ZÍ‚ªÅ¢$íÅ•VÏô#7|Î·ËÓØ/ì*íşóü<°y®d_	¥ÓîóŠÛ€~Tª²Üä"´ÈDiëBÁ|2ĞWe…à{µunP—q¯:gíiÂ+DC¥a©ÉdğsÁò§öFWøô Qr U•­X¡#ÓçÊ¥æÊZU¶QC%-}K»7 Ö`yÎÂ Œ¦pX“ŞÎ€/W6íJ¥K&Â˜\RDÅ V^’P|Üğz˜G%ê“ÇaÎ;W¤uˆ×šl»ïÏ–ó:=)›•">½QšFÍ˜è	¾”%r,l{ÛGĞdÛ} UUÈPq˜ü} Ùë©®<#–Dm¦ë€›J°Í^lÏôÏŸúLˆ9š#¢à«ıÒ8‚_Øîa@TşÅM£OØf„hX*¸•Èæ•ü<²pHuî¸„(o|‘şıÇº§sv,ZgÄÌ.M’Ä©›/8›\uM›¥G%·¹’CívÁ”tÃqÅş[ÓØıO“‡ZŞbÃØ§·Phö|™2ÉÄurS\Nã©$>!ß>)¼,æJ%NE¦0®€5ÒÔFb O’ë5µ›M"MkÙHƒ{À6"cëF™Ä¹%i†ÀŠ±›fxíf~ª«qÛu¦J‰)¯Üàlg&Ô²¶ÖJøgø´+
+s¸ÊÁú
+­"á9M^‰'³eùÊ&k™İ’şeŠ“&{ËeºÚMLWá/SfÆŒ¢Áò(—nŒ¼TØë4ÚE¹@ƒøı|'Ğõ~çâ™ÒÅL3¯{âÏKfü:[sœµìÑ9Û®×šºÛä(IÜËÄ}zÑûô5İ™vÇ‚ipW7ö2v9/›º±Ïr¾0Ä6@Y¿´7×¶ª©iûWp+/÷8R<Ó!ÔUm0½ m$¸æ´\×ktúÇE¯í^{>¤ÌC? {„„xÄIµZó¾ñaÚmÆ!èG“n¢¡Ò*c”Æy…ë”™8î"Oë÷ÑÕ¾](µŞßÊ
+9¢­øÄ=½ÉGüÑx&í.‘u9‡ o¼‡µtŞ¡
+µBG½üÓÏ±·ìåÄÛ³ŒTÂD'_­@sû}rp¤Ø›€¹ÿÔtîq0ª¼ğ=ƒKÖyÜµÄ¥têp[† d£¦”¤SºïCĞ¬Tš2¾ÜÉ‚e¬¬ø/„+`˜ø éïVÁC_ààµo%†”yµ ºÁhƒí¥_?j7	Ãª¦:5(¨çğsLt’o”À°?lXOG÷¨7½ë]sÙà½W†Ëxl¾í{U=òbp ÂÛ¾{CIZõOÎÑÿ'Şß+ñ®¥©54¿5\ÛúDÊeªÖ9ŒM‰òæ{ÄÖ·ğ½C<Zg+ HqíSÚ](Âù¹·r,Fµ±`¶ßSå1ÿ
+'<ø*Â'‰%N"–¤x:ß¢5ÏƒºÜpM‘é™‹Ò¸µÀ—ğÍòÓT3éo­ÚI4¶ÔÇ—7Íò\É%6<cïj~D;T…ü5.±OJ»Y…ıÙbó®	#lyux}u
+ÿ%¬•}ØVı¶™¶oüyÍ¸¢`\o˜-µ û³¯Y¥Ìüg,ãûØñPKRÔyºÒx>éc–Ç×ohUÏı}V[)×äãöwlTé†ØÊÓ˜¨8(*‚i˜‰K3½3qŒ´7»B¯èvÄeYíÛ"4iŠ"…ö¬*yî™2’VHş=±¼Sªçy­5Èüøªr_Í|äŒB|d$C#u–z›7¦3í;RìEHaXÎé;º9ãŞn£Ë5–åNÚ]+^üB§æÌ¸]eP1jÔ©Æ­KíĞG<å9Çí¶ŠâQúrÚ‰˜`ŠŞß¦dQ•ŞúÄ&_¿@^[øâ¹¤r±Ì¥Ño˜½½øM“wgØwïYüÈá«ê Öü„m{èº5`pº‰p›†f¼­9Eä'ãnˆEÖâ.æ=³zÖy0Så2ô¾.Q‘œ ÁÙ˜ƒØeÑÜ…PÏwj¹Ä}Ş·±¿$:æ‰.…éä	Î¡±Äîx.íŞï¯ÿ1×79×/•Gt¿ÿ´»ïL–ú´:Ü3>a¢UÅ–¸Õë¿K|JC¢tˆ®  Æa»z#´LPÅÆô¨áÃ´¹ªŠ…ÌæWş~&
+¹•¿ºŞ&ËNÃÉ7‘æ8Ñİ6Rë‹çò¼Ÿu‚bM˜„£^ôª9u=£šÎüõUì¶jûóÂñOÿPK    wİPÉ^½Ì  u     simulink/blockdiagram.xmlX[oâ8~ï¯@‘vŞ¦@/³«š·ªHPIË¾­Üä$X8vd;æ×ï±“²¡äÒ·¾sÿ|Îq¿	ëìA**øƒÓ¿î9à)œLGßÿr~¹Wƒ…Íx$dB4B;¯e÷ªÓÌé›$òhñ×ªóLxp<²‡p¼%’ä´Pí¸ï”‡â]}ïßÜßº«OR….ÿ˜‚ã˜vÅ›Kè”“7Ã  ¥|1"
+6BîTJüRÀ›ÿ3I*ä&M\¬ˆÖ!xëÓ‘½ëŞí}¯×»Ä.1‹’†p)SåÅ„*ë7c¯E—°Ç•¿Î¸yv\|èô/!rXLæ”Áœr˜õÖqû7.Î‰Ò¶ Cl©†@gl-~Ü]¢Ÿ0˜a¦…©x`^©óPÆ‚G4^Nbh…Uù%-/iH4<Q¥…<:îÙÏgÀœ–cB–DÂÑñÑ2ÎqÿøÆôOãÍ·Xÿl™ ú/­ıÍ‡œ)•§I’:î}ÿşöîö®÷g`û?ìô¯O–f< ×ßü8³:è6äk0)&¤6‰úÅÀ¸8LÈOl©9ÚÕztq¨7;äcÊ(Ì‰Vá7ÈC²û[ñnô€«FãºRcÁˆ9…ÍH<(+)RcyCÆœ°9yV/UÖ]D÷Q¯!£D™÷KÎuMIL"§RæçmÈ‘Ü”ï+Øa¸§JÈñ‚]{^8ÕÍ¨	(LÊšğ¸­:B¤jÉmTuÎb.$ŒhH%ö¬"&»µì™=fD5}Pz%(×³ çGm²ò:¯A	–7Z^)¼ƒl†a:!\Êd­—¯DRÂ5X¬Úm¥;âÛ³v~êüTaô7Ì¸ãÏÚ5áDî²´a¤y´t§i­»¸ÂYœ cõ%8+45!yZ"½¿$õ9ƒmB¾lDj	‰Ygª0’¸L`Wµõ85µz>fÜäHñ¦–Z¨Æs³{áÈšQŠÓÔßJ áXx49™İª>?@XÆ,iêÀ	bæãòó…¥ÜöH¦ì @ï« ÏYòryRÄô+óÍIª¶B²(Â¬"QØkBÎ82jOXîÃª]A
+´^‰=;Q›p9T+E„‹Oı0\?íƒÈ¤Ù
+C>^—ÊSW‰Áô€áa/2Ù¿°‚š÷#¢ƒm^w
+`¾²>2A´İ…«)]€}Iã|IMÏªk^‚¶Ñ£5ƒ¥¦ş%Ô”ÙuÆq	¯•%è$“$o—ıò†Üş?×§¡'ÁÂeÕğ¦¬ì2Ó
+ûp+©B/Zğs\XY³Z»Zïá+<(öÅ%ì[ºHtw³>”I«ê0ôğìÒƒ/^Iı +Ğ‰—Ü°l—›úîvŠ11~Í³…ÀŞ¦ñÎ±Îá¹T£¹ˆÑ£İ&ƒù"Ÿc3{>·Ü‹£›ßfñŠïºPßtÍä=ƒæ³-_ş—‚
+±Ù²VÂn#Z¡¡Œ3sà>]¶ºM>›«XIüGOd£dzH¨ÆŞ¨ílÎ{PùöÙmÕ7ğJCÒA‡eŸÿ•IÜµßº§…ã¥OîÕPK    wİP5ëÔÉ  +…     simulink/configSet0.xmlÍ=koãÈ‘ßó+apH‚yyfwn7ë@–íå$[å™ÃÑ&[R¯I¶¶Ij¬üú«ªnR¢Ä~ÈÉå²»ªÕõ®êæ§¿<eioÃU!dşsÿìõÛ~ç±LD¾ü¹_•‹Wû9ÿÃ§¡Ìbñòü½Ş§Û‡_y\ö¾ÖhïŞ¾~ûú¬ß¦¬(nXÆîG"«R‘?¾n0ûˆ
+ÈÓ†¸{Hy2Ur]ÜŸû‰¬à—ıó¿ııÓ›é!/b%Ö%ÌÙcş6PŠm{8††Êl-s—0ä|»†ß|ay#ö.EÆs³Í?ÿdV³ÛŒşÏèvÓÛY$S ÜpØõœÍù6Øúûşæ‡ŒJ¦Ê9l½[±ÁÈµ9³ÂŠ¹Lûç¬*¥şÅ,å5¨Ì»¯ÅO¢’¯]£rQ
+–úÀ&ìéV%\õÏìø%¯/V2M\ã —<®J±á¿œuÆSÚÅÙÛ?Ÿ½ûøg¾.¬+h##Ê[¯JÅÖ2exÄfá?tƒŞTÙW7ü{)óQÉ¡ààÖexi%ò rîm¦A°ÌÙˆ¿zoÙoR0©ÒRÌYñJØb±°A\)ì°…RK^ÿü+S'ÀU¬›ÒĞøóie±|,Ÿğr%X]©Ü­ØšOÛ¸ÚğŞ¨‚AšZ8”+9T²(Œ»‚%H(ÍHfa¼o.¥å*ëŸßÈœ%l‡gÒtÉñXÊuMÆ¹ªŠrÆ—Â&±p”/ä\.—H=VV®HÜÁz
+Œòh4õæÈVjR÷Ï¯YQvOe!p{S%pÓ[#DÖÁq#àhUÎXÉçŠåé£k1,[§µ!
+H«ÈÁrİI4ÿâ‰MaÑ$ó‹‰L€Ñ¾­xÎa[½5œ€ó÷M‡–Ø`,bY2q¦È+Y£¼äK­)[±K‰GÙšÉBº½¼ºÙƒ¬
+öº/úŸŞh3j7®ïë%+Ùèöwn\á€’šr	Ÿ«œ¥£|]#ı­|Ù«,£]‹°©ÖUOôyh€4ÿì†‹L”HÏ©¸;g°§}8»K–ìÌ:(Â¶—ë¾ßQÁx»&£˜/i¹¾Q¥‚ƒeÛ=cK˜{*FÇÂµT¥&‚MŒwOû³Û‡ºŒ&^ĞEk·fD×™EÅRñ¢çİF©8Ëæò›Tèçv¶¶·š£ú¬”Ô~¨m3^V*o¦×ë-\šã°F¢¬Sã´;¸Ò
+§gÜAní›Ù?NœÂIXáwçª“ÂN(½Š[­ËÎg|fIÿ÷añö ì­›ÀzEÖåèXU ÙÖ\^‹ÔÅ1FÊ4ájÑ+q½\	Û®Ìà8t³Ê×€é„FC¦6,EB¼ùâeşoŸ"~;öC ÃCÊÄ?ÈH´­Ùaäz`Õtğ:äij]i„¨íU¼bà]H™r–ƒâB”ÁÓh‡`¼)ü<ãUaN} –0Äs1›¨+h ôek{2á™TÛAI‘kµÆ§C}&¾9%¾[
+ìŒöj?!ß c?­ËK±¹ØâBà Kàò¦ĞÁÛ@[8©\3°ÁAhW‹…ˆKYS¦Xvõ´V‡ØŸŞ§ı{<¢‹TÆ3T±ñ'-ŠÙğ(Š<2ºœÛDàX,M·WO™rò8Zÿ’/„œDLqÁWláD:šVİhpp†å´Ïh¢\r$BUúÜãÏĞ|£|Úª¼¨D
+µÙ›f¼N%+!@®§séG½­»"¢æ˜õÑX':à1Wğ–ƒæ"oĞvçF»\ˆZzèğG·Q)[:Îô¢Z,0à…aºÊW,yrÁâÇkĞ#Ü‹W ñ9•˜+È®EkĞ ¥ +“/ËÕ>_[ãÍdCËšÔñ|—h¡ òB³Z½7·¨ì«sÇü5NÑªÒÌQ‹|?·¢| »XG³ôvİ?‡¸”÷XÑËP!ÚB^“İáY¼ŞÚ×¯ÿ¾—…û`ÉxuÚXJ©€ê•â=UŸk0şŞ¬gïlZ}—|]®(XBè6(DŒîu>g2M÷`IP’‹
+G ë\QÎıPƒs#4¤^ŞU^eF5#Ü0„èQ(Ï•=³d±Æöİ:L°+PåuZƒ<¹|H‹¹ÄQû³›ZRc)I×¾ƒEYá
+„	ßì1Ìº,Û‹èW–{R«@ø1EÙ?7f¢·P2ë•–¶èr§ PÖ.d•'L9¤O´Xà«}×ÓÉ31OÁ—}G³•„jz_ê­FÖEäz/‰¹¨@â°7àî‚õ\§‚Ü­7ÛŒ½XV(‘°E[Ÿ;ìîL~Ÿ°_¥ÚKú6B„óO!”ÃÿX4Ê>x¦¯œ¥dü8Ãª(eFlbe8öÀÓÏ•HxâÛ«N¾ƒb ŒY_§–á9Æ]éÎcú¬XR±”œE*¿{$æĞ=œËXıš äsÿš¨êÌUÏÜæè‚Š“NüS¯Ç1Â¿ÕßÍ§`¸s\)iÑç˜É†UƒåÜW<Öe˜f²(\>iš"\û‡£|qÃò øRa6@Uy¬Ù½ÁqlAO2cù’‡Ì1n¿àĞ9ß@úø¤X†VU~° ;ö|LœıÄVM†ğ¾3•¼íxJÒÆÒ1kõT]-c£"­	§@3…âÒYE‘Iÿj—„°lŠ­Ü<£/ycëA¬S±ùœ`Q5<é¿K]¾$³U`é–\µ5‘?Á“æO%È¹3û›°F#]Ìª“Y!ø†Ûy!Óf„*ƒ´ÍÚò|¦Üì?-SïECêÆDâ ùlk‚·ËãQ‘œàG0aÅ#O~‰/[æ4nìYÎÀÔIºì8U–gÆ_ãÉ¼å‘ŠˆY½/£‰w·5,f;o¢­ŸB5N]×ôbD°Ö”£ØwMux”}k†òo¿TH+DxSWy¡Ş®,¨c&¬Êî°JY³J×yRüs»Ñ^@xÿn.)„€SÚø1}y)¿ƒ©+Jßù4­U… 4Ş™g×(³˜]cY¨ñÜ;‘}Ã)Z£Bzèw-*„ oÊEË‰“h^¤œÇ¼(  CŒr‹ÙAÃ
+v¬¯`„¤ÒŠàÚ¹õí*Î‡,ÅÚê|·„âq*:at0EÆÊxåİS,q[%ZÛÚ09ÏtcÏ–…¢€ã ÓVgÛ½{¤øĞ`î4“úˆ¬H­I<S$Psİåâ·jÚzf‚ÀVG8­£ña&%y Kgü·J` m†ñ¹ˆö¢œè5R¶h›=ÈT€Í\‰-;7TT­q•®(ÔVtşntëóZàdê@J o(@E $õ_TÚŠ»-fkPd6b‚rIëĞEÁÂQïòÇ¬ :+ V€÷ĞšÙÌ”.›ÉN@×‡Šy6õ,ŞHa¬n¬ÛW0~]}ƒY\di·pPöpÁb^iK…9W|ƒYjœñ”³â 9Ä'Ìíåk©¢ÈäVU‘ãT¨Ù SÛ¨z(¶0F†ê*Øà>ã³n6ÀBt
+Ç…åöjP‘âw]?ˆîÀ,Å%(½BQŠËRË@üa€M†ıs<ßAÌøš	iád ÇÔæŠ#¥Åv:|ÁÒÕªoz½ İ¿]ì!”-"j>w„ö™4£¸D`»v,Ú£ìs…c SNÛ‡vìú.f%Wäjƒi$Dõ?àñ§5Ùf,µ¬SvE£:-VS¡İš6FC:Ê‡`­KdÅ éo$yu‘×9)b5±<Ùƒ¹Doé†••b)¸­@…@" kÆ+Ì‹4qû”a®$9ãLT’%èëŸ@ÿİê”İĞy«¦î4†vÄÀÎƒl‘
+å‰£àQ„Pg`À‘ú)ÛF`_SğõW,ßÅaAËˆxº8<9JCíAyí	ÁPÙ—ëƒÖÌ€g‚¿ˆ¸$,5BÎOÀë+#Òî ¿˜­£¡@â5	œ ›•±Ÿ4¾£ş“:VpÕ‡ÑpÆsø9ñÏÀ·ØNu[ô&UŒıM{™¶D£<®z	®âqg¢û úªİHSHÿ†_`q×“»¯‚ÁÊnÆ‹w•¹¨ÊÃ¸Ú7
+è«nqh„­Ã¹ñW,>V,¾0• ½ùï¼©\ˆrÊÕ
+–Bø,Z‘ïöÁ8Â6İ÷–ªÙl,ÑÂ†ÁiXkGAKy›A/uüC’g‰P?(fTçAc–
+ë™Ø1Ö‹‹r€UÂØ(³ş9V ¡ıÇ2BÛ¹™a!h.uø
+$ˆå$‚cQ–`Fév„oR%ºîÚj´‹r&–+ŒH„íº¶ixB_Â°*ıòí’oDlú"Œé«ÿX–ÿõôñÃ«?ôşøMä‰ü^|øáO¶ä(Ví$eĞ#+û NiÙtËË!¤[bö¡=2³ê“š}ØFnB6’º“7ô©ÒÓe(sãHœ#Î)Ìkf	c_| ŸhTöûIgOLïò¦ÎæÂØÉ©›¬
+¯ÁC°†mJ‘ğsoã. £-²QÈòMæÅ£®~ÓĞÂdÁ¯²$:©®9zÜášaÏ¥1ıµƒp!áN§[3‰¦'¹'ÿè´³>¿s'E;¢í%ë#úä^bœªÛY
+"/-«[a¨«§õuœO’4ŠW<AÊ,uvÈÑ¢L¨¥4Ù6GìuÕôË@Ì•¶G¡n,—OÛFIœÛÜ„çSéº‹İ=Âd0.ğš!áTumÌ›*«µ…‰™úç”¿µ
+ßš-á À¯;ã`(İ÷@åúÈuªcşK¾æ şòX€|u±X{•Ô)*e©É/¶Í]¬m‰|.±íâ6Öw–İÍÆÍ6÷
+41)ëhçÓ™õƒ|®È4ƒéN±a‡±ğ«…¡¯\cKáï[à
+‰‘¬(dMºãÎîvÃ)?\“’ Á	8ç*9F•6¸™¾Pú3´§ìl‰Ò{ëfo2Êã´Â¬³r‚éLµMTĞ%9Všõt«éuÊ–Pìr"Ÿ]Å+G›-Uªtè„Ğ—”©åÒU—ÄZd5Yğ@ØøöÜ.›mpRòÚß+÷"Ç†–Ş?à_¬xŸy>ÊLŸ¸Cp\Î›½¨@®«œ2Œ…¾ûğU¦Øéº~CŒÀMGåuİ"ÿ£ímJu·SƒäĞ¬dl.·9ÏzÂ34ñ‰àû·~üñ½%ºÚIM	Ä1Ã[œ'è/ÊP»ƒYzüÓİ ç^¡¹H±¤uãÒ¦Ó1m_­Íê½=›­½§ğ
+TøqoÁÏn©ıàë©5úêŒ pîQ>ãÈÒAàL=›‹boSœõÜÙ4^”>sñ\Ì«,lÒ)Àâ!ÕÑ[Ø=ÎzÂoüa#ø÷“p‘'«‰Å3ÈŠØ€†ÿUqOa"ŠBGHÿÜ8Wp<µ!©¨ÆÓÑ˜JvaX°Ğ]¥IÉ…H)ˆÚ`è—H«ŸŒ®ºªÈÜtm÷ùìºF¢T}ë{©Ê×e¾®`#ZÉïÆƒ3(ƒõÚe_¾Ã0æã¡!gçÆ€K‚Øœä|Gãë&Ëa7üã^•–›ûÔBß·†jñ#D“5±ú O¨œÅÎkaÿÑ¹+,ÿ¥­EÀqİ'ÚĞİ—™mXY”¦²]ïÖB3Z±FÇ2Áò˜{HÎ ˜ÈÒó˜ @gõEÊÇ“j¸`7‹P)Ê2”n®Á: t§–{§øª|Ï?wºŸAASPÄT‡KdÏz.€é¢q@èÀÄp1DØ<ù \ïši0ÿ; ğúz åƒâÄ¹”)èi`SÆ‹ï=°+ A=–÷¦WRp¿zelkÕtx!–Uı¼¾«ÅUO'–\<Ñ,¤V†¡dsé\10·+/Ø‘KãbìC›ì2*İ¦ØùPİ¯ºéŸóƒ¿ØÇè2âıó¨Uª¶hbPL¸ËÆÍ9omaÌhè<ã‹ªø"@Ç©xµÕ*™¨İüzÂ\¶öÈƒ…õòJ§·~"üâ4xğÌŒg yäOây¿xßÙmšN¼j¬ƒÑİë}˜‚
+¿éø­sÚŸ³ÛYÓ‰ù$ÕUænó­İWÔMæ”¾.ó¢Äşoß”7Ÿùøì»v\|”š={ª“¸^·ÂõÎ……†ìï>ŒÔ¶Ó]+cĞõãô÷®(Ó9Äœåš›F$ı‚Ş&^6†m„ÏHï3:F/'âMeºğE,3uø‚£kl…‚Ã=iVåºó“°jÆxÎŒÚ­v¦ŸUi8auIãˆt«èxõ+£lGO9PñiƒL7«#f§ÖŞ¨Ÿğ Ï$^Ù³8‰åp¯ñ]˜g#ÇÙ0T{~>> TGj$û"}İ>›ÜÙúŸ8¬	‹UGV2ù®©¾0Ü«ìéŸa@?ı¸°f4—<×÷ûƒ±gü7ìï|l­#E¿ô¤¡Z0áåÄC4ÔóÖa©7–4ø€"­ÍÂ±óÓÂÚ9jxî]CTnqµGÏU·`í6Ù=Ç¡!öl`ÂFÉ˜^ÃêŸ¿?³ÖÏ`SÎÉ=æ>¨yh€w=èÚB¢Ì^*(˜Æ×äáÿ3?Vİú;ÈsYÖ/ª»ç96©>ŒëpØ–™÷’¯o×´wŞ8²æNSğÑÁg#Õ?1{qóbŒ©û² eöbrğÚ˜á…O4«—÷â:«6Eõ”ÉÀõÏUùbtÒ*Éø ŞÃıi„$»s"IÈÜœ|fhgh¢a0Š1/ıs=‘z¾‡C§¦6/„‚w`XìŠ¾I³â6ÈCW·#9d…w{àĞú†İwzè_û†İ‡w{y´%
+ÔûQ›Ç x&äÃËXæ·éĞà›:–\¤VÂu<E÷8´9ÎKÀÃ¨…*öÓ9‡H›Çùa‡ïZ;À¡n|°yiaÇÙy`-èÊÂ~#“oÓ'7=P¹Ê&œ>ƒÂÌâ®^ÊŞQgıÎÙaúçZggi—Ï³yƒÿ/J¼ôJĞXÖ~‰I’Öu~Š£Í„øÖ%5ˆêoxã^Íæ¦‚I^–ƒ\»½ú:!5¡ªEèÔŞ'×¼£Û\/_7¹ø$Rİ€ïMJóî¾­€ÁEŠ7ÈN^µ-rxÓJñtkî+œDÓCJkåK»Ñô
+µ€>eıe’ç`ƒ™3êö?µÏä†ÉÃ“;“¾Ds^Á4ö‡êµú6ªòÎåÿ¿E·¦3#ÎÇâ¡vïËEzOõµû2û~ô‚~6 FÕß´-®¹æ«p¤Šs7 ú=l0öæ°07·óŞè¦w]y—!œ>‘
+ñÄğ§ŸzE·rx˜í’G]|öxXè2‹r‹,²»ÔïĞ©	ş»Tu·&°95ÉôºnítcÖ¡Ü»·?8¢9Ó©½eıªî¬÷ã;V­—®«4Õµ~OŞ Ûô•î=-Z/çø\§ã7}ìpl63,mïó ÛW_j¥î¦ ¸ï`ˆËÚƒìv]ÒÁ(õgÑö^Âìv¼<¼îÊ7IGú›+tëÆ›S²Z×.½p½İµÀº‹cWÆë1Ğ}¹ä˜8¢;ˆn™írzv`5İ´Ë%„úø3p¡qôUyïÊQKí#@mØı—“p7~'AÁÑc4¨De^¡î-šşH«pz+adƒI®E.:Ş{î‚6M ì¾+„rà¸qœodÔr5ÂÈÓ|½>×dù,Cû(—º‚i
+órõÌ>+Öf FúY_IğBëà¹‰’®¥š\FõÖ¬y­µşbê¢ÄLm­1jAzt#îãîé”Öª[C”(jˆ‚©Ğ	&—ÿ
+
+Ûo-ĞªÕQƒ?Po¸°¯&p«½mwBøt?ø
+¤ÈOsAu~BGğ4Ì±”ÑÏQtğ®Í ó$ıÙËw/ß¿üáåë×¯ÃÜÍ÷Ñ	õê	è´´B¯íå…âìQWG^Î>ãsÃsÌ™‘=uÀÖ’!˜”,•áÛ{ÃÏ­-´Ş²¼}ÖBË }>4,x1RWm^Ì^8\n@Ò9³‘ĞÎ¢ÜƒŸÁœü<aæZÛ·,»oÎwA¡× âAø°èRvöÎyF×Ş7~Lñğ{Š³(Çtç•xÂŸt4*ïc™e!øa«ÏmÀ@1©…±ïÁµP°3k0…$L¹ï@Xr(aéVïm¨6Ów>}Şò PŒ´7s”†<ğı·rÏ|K·ÍWÕQ¯ÿß\Ìmlv¯îcïµZ‰{Mâ¡{¬g\âÕºàh^Ûøƒw¶én¢˜>©u¾Ÿâ:Ş¶Âš a.×;Ù3C0Ğß X¶èŸ¿±/°ù’d,7GJp)ŠªÓrgz£{Eë'^ûçÉw;éôíBÛH_æ“±ë€à£úªª¯Yzó¥ÌRİMê¥¶ŠöGän×ıÔM]‹Ñ/=nœß’#zï@÷¾dJåV'+á'\õê'`íæ2Aôî·—Î#oÀ¼½¸f:l'6qQÁ€	X|‘Âzî%ıâÍâ|{aÅ­Í·1İ;ŒûØÍÀØ±ñèÓİ,©:RLûğzÏ·ù”9?Î†¬oÒ7!¡}"iï¾±„\e¾u57Ã:Ø
+­ °úóMƒ‡b¯rœñWo-ŸÛƒñ” ÁX^e`tùEÆë/›zX?d¡ã`Ë%n’kÌ$NbíqáÚ	¶]Ëèü–eiFØÍ£³_—érJúV¸¡†™ª!¥~ƒÌMïíËú½¿cÑóÆ-u·[ø§7zLĞªçø_PK    wİP_Ãày   ¡      simulink/configSetInfo.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²qÎÏKËLN-ñÌKË·ãRP@ˆ($•ø%æ¦Ú*égæ–ædæeë'Ãdô€()8&—d–U”•¦*ÙAô–%– mµÑ‡´HÍ& PK    wİPøŠ³ÿè   9     simulink/modelDictionary.xmlMKKÃ@…÷ıÃİOæ‘×¤$é®àBµk™gšIBf¢öß[7>¸çãpêÃ§Ğ»]B?°„²£L?8½±€C»«ôÿd¬“ëŸ¤¾È³m ½4ßñ´ô¡.ÆyOHĞõ2ñ2vÓr	‰<ñ’ïyæ”Uòm»‚r. İ!T¿\C´Åë¼™ï h]{Ó€qœJ•—ØNàLğËœI,
+^¥ª&/ÙM²iÆh'µı1ıñ¯¬´©b†+¬+#q¦òm)f´ĞZÉ47Z¹U"÷Ûd£ıPK    wİPh­jWS   o   $   simulink/plugins/AnimationPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²qÌËÌM,ª	È)MÏÌ³ãRP°	PğKÌMµUB“S²ËÏ³Ñ jÒÇĞ PK    wİP«üY   ~   )   simulink/plugins/DiagnosticSuppressor.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²qÉLLÏË/.ÉL.-((J-.Î/²ãRP°	PğKÌMµUÂ¦@É.?ÏF? ¨]»~ PK    wİP4ÏîX   {   (   simulink/plugins/LogicAnalyzerPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²ñÉOÏLvÌKÌ©¬J-
+È)MÏÌ³ãRP°	PğKÌMµUÂ"¯d—Ÿg£ Ô¬U7 PK    wİPŒkP   c       simulink/plugins/NotesPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²ñË/I-È)MÏÌ³ãRP°	PğKÌMµUBW²ËÏ³Ñ *ÖGQ PK    wİPp³¢O   `      simulink/plugins/SLCCPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²	öqvÈ)MÏÌ³ãRP°	PğKÌMµUB+ÙåçÙè •ê#« PK    wİP*Y+Ó^      /   simulink/plugins/WebScopes_FoundationPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²	OM
+NÎ/H-wË/ÍKI,*È)MÏÌ³ãRP°	PğKÌMµUÂ­LÉ.?ÏF? h”>>³ PK    wİPÒwKÌ   ®  )   simulink/stateflow/_rels/machine.xml.relsµ±N1†_%òÎåÚ¨BM»UbèR•Y9÷]GqhéÛ“ÄÈh[ş¾ßŞî?bPW*â9Xu=(J–GŸ&¯çÃÃ”TL#NdàNj¿Û(`m;â|Õ I¸Zó³ÖbE”3¥6¹p‰X[Y&ÑÎ8‘^÷ı“.ß°dª—Ñ€uXêÛúÔËDõ«Ó5nëŞ3ı²6—»q™¥³µøø|š<RhÚÕf©Õí¸J—À·#Zçş3È0ü2ÿD/Ş¼ûPK    wİP]àè%l       simulink/stateflow/chart_25.xmlåWkoâFıÎ¯¹j”H‰ÁÆ&P+Cœ†Ö<„MÛU´BÆ„Yü@ã!$[õ¿÷ø£Uû¡Ú¶‘‚mæ¾æ3—cíÃkà£Lc…=AÂ¡y$|î	;ötÓ>ôkš»v(CÄë	²*ôki34qÜBøúúQìbò‚ëcİ6õºß….ƒ Z}V°ß“Ğ‹ö³(&|Uè?*²ŒÔfGì(’Ú¤HÍOe§‚÷&	‹Á¡$µ%Şªˆß4áæÌ<v)Æ<6DDÍVeş!Jí†šıµ*óLWŸ…¾¬–—Xù+‡#¶ks}şqiO§æ@ŸŸåGŞy^ÿê0LÇİ@ÀfÙÈÃnlO}šË6æËáƒ>·Ï’¿m!«16«—tî‰'»`…)d;KFbgåãQ°õ‰KØĞ‰ ,ô¥£!|~=öÉ=!X?ØhÃ5ñ=ŠÃƒCÌ`›È²Fw@ !ı2ÇwVØ·MòaØÂÊß,7˜†Ø¿¼:Ä.8d=y”Ú¨¥ˆ*’øÍ	®‚õS2‹|R%¹j=Şm1µx‰BßZòı+Ù­8úI÷Ô*ƒƒûÅd¸´lİ6ªlŞÁôÌşÔí‚7‰á“r.%[ˆzÜîƒk8v1fŸê!€ê’‘ _Õ`¿`Å—RëZºê¢ï¿‹6>ëÎæ†nšÏ¬[K<¹ŸãÇ8³˜èÖ‹Ä Æ ¦"~åØÅÄ½¼p`k]}¶äGı§WµB=tZO‹éÖpèUï{„EÔtŞ¢ĞĞwâZí€¨Bì@Ú×Kª¯=J±qTşqÛHïù¥@ˆzFázBÉÃƒç0çÀNU@aJ±}pNÔØ8ÂÓ…=[ØË;İÖóá·4ÚÆ¹M8”:oÙs>NÂÆ›Œõ’ƒÆùTé`¶<`ëır4y0æ#Û¸[ÚgF!`şÀP>aö&>wÓÅÀ4Î´z1c6=€²>~%ì-ñNÇ3Óø-Ë]ŞMæ8ÜÏõ±±œL‹v»°ÊjÓ¹BÂ5¦„•*Ì;iõBË³3xÚÉY¥1~@, 'F	v>	7§¨Z[ŸA’Là}—
+£É’	…‘c‘ç{å©“ÿÁ¨gâğ™­Á¨õORêóošYróÈ¬d şï¦Ì¿…[ßş¸bÔ	S!q¤ÖW´ÕïeqÕı£J£$>9ı-·EI‰ÕÛ ©¥†,ªŠ‚$Eì´”¿¤¸bêV‰š4pŒİC¶Wíğ/7EõV¹åyZ2—ò¥ó\0Í‹YE`Ş¡ß¬†»”•g¼É§Uäôz–7—+;*Ä›E‘7ëà/C{”V»²?ÃÓËŠ/ĞVY;¼»én“ìj¥óWe¨G½ÅŞ¸D²Æ%-ûÄ«:2 öİ—ÁÔ~ 1:ş\ìuŞ-Sg¯ØİñşM©ÇË‘r4Í¸yøæóQ”¦TmS5§êO tÒëíßëD*È‡ÓÉÄÚ£_ŒåO ÍíÑt’+ôXWú“½¸hõä©_ûPK    wİPÑÊÓ©b  Ş     simulink/stateflow/chart_33.xmlíXÙnã6}÷Wz(À‘¬ÍKGÑ@vÄ­7XrÛAP²Ä‰9‘%ƒ¤“¸Eÿ½¤k-Ó¦E "iŞ÷œK[×øø¶ÀÄEá­ ‹ÀĞ‹|>İ
+Gúù¦/|4[†·s1È¿TU0[ K0w÷ğVÙS0­% 0ô¥™åL­!¸?†eeCZ–¤_QèG¯Ëˆ ¾-˜š¢ ]ˆMr 4Yıµªô‚àëí%L¡d½+ötÀ'*›ÔÄ‰‡!ä¶™E v;LPáQîwôü¯Ûèg±ı"˜ªZİ¢Ql]<‹|vØéd¸²VŸ6Îb1Z«š2ñĞÓîg—B<sñ³`ÊµDøĞ‹ö‡sFÓµíŒW›ÑƒµrjÎOæu<›6oÇØÜ£ Îû-Ä‚©Õœ!ân8Ùä!:r	eø²°2A¸øXƒõ³f"R*cŒv(ğ1SBÙ1mOî}„äÃ‚ÀİÂÀ¦8öÙ¶ÁóæâW×©í’B“G¹ºš¨™OÎp•¤?G!µÑo,TYiÚ'ÇÄ6Q0íõ°˜¿ŠÜ–£Ï³w¿$`p¿6¶c9ã&™¿À´&ÎvI†pI5@£eˆ¤•4WO'µK)¢G²™çÁ ÍÊ9ˆÌ§6È‚iŠöğºÅ
+b¾q<ò®¾s™Äk¹áÅ›,®[éòÛ­3¥æà¡h„§î):RŒ—–­èÈ8)˜3—Eóv¥µåëÖ£Ü;m óG¯“ÌùPÂ^ÊÙ*ÅìK¾Kİ”ˆš ÂØ3?C”Ä‹8š“ùrílî,Ç*š?àè@
+‡p1vOùºh&&ŞM1©¢`pê4êï!İE>#æıf2¯&Îønã|ZK‹µù-ˆ^`¬s·X§ãº‚!•=æcg ßv±şh1[NÇ¿ä¾ËV!¢Q$W
+w#Zñ\T2¤R*ó2a89q9Mß›m — í
+ŸÏV‰K×îf gôü¿\º8lôB¿zw¿v#ìOaøDwL¨ûo°å|!ã˜Lá~eÍÆÿIrõÎäâ7Ş…Yf½³ú³²/Ñ¹.äz/r2rå?A/äºë}È%w2vñßúf]˜õ˜E±&—TÊ/å+­ƒß«½ƒ4½‚Ç:…ö’ÒeE²*ö{lè(¢®i@ÖÄAWû¦†Á^Ó;{H!&ĞK½uxSŠı+ª¨÷´÷ÓUx§ªò[0fø„6æILµõŠWîñ¦èVS’±æ·à+¯ä/#f‘'+ÕWXz´n¿1?Ãs/N‘E™¥UÑÅÏnrÚØ»Ş¨üÕ.‹İW›x[ÀUZ5$@~SåŠ¼gV5Ã…ó°±ÉèÇr®‹jyGâzG¿öy8r¦97ÓO¾d=—„ªjª…¦Õ„A2öş^&’~Óh1ŸGÎä§ñæ‡õœMóB Y\|mHy_Îâ– ÙúPK    wİP.iB  r     simulink/stateflow/machine.xml’MOÃ0†ïû–ï[¶¦“vH;'@¸¢(u×ˆ6Ei:øùôsT»Sì×yüÚŠØ—œÈÖº2nVk2ªJµ9Ø¸l¹Ã}¸‰“²¢ú
+ ¢”*×†@§z>v¹6Ã‹,)À:{xîÖİá`ñXtŸë"µd†°M8iäz”ï#˜ÑœJfè”jeõ§ëá”É¦pè²)´ù€dùØÕ‰pè©«sß–Á†NçXåÒ:x¥,Àşúîm‘İV9ŸTÁæC6n£´©4jX÷.W3–bèù¿+™Änt£,)Ò'bÏÑá)ºƒi¨ë½³¶%Á¦ş×f|ş?35™ôÒÉæ¦Îÿ°"Øìûü PK    wİPå1¶P¹     )   simulink/systems/_rels/system_20.xml.rels­Ğ=Â0€á¿n·WŠˆ±›à*u–ĞmhóA.~ôßpĞRÜsÇ½dW>Í îX;+a™å ÈÖ®Ñ¶•p®‹Ê6jp–$ŒÄ ÊıîDƒŠé†;íY¤ˆe	]Œ~‹ÈuGFqæ<Ù´¹º`TLÏĞ¢Wu¯ZÂU¾0mŠc#Gd.k•
+-ÅÏ$Kİ4=ÍÔduzÎjgµ¹ÚöI\æSß1Àßr1“‹?Ë8ùÈıPK    wİPIœ‡±     )   simulink/systems/_rels/system_35.xml.relseË
+ƒ0E%Ì¾ë¢”btWè¶Øu	:Õ yIş}İ(]Î½Üs˜ªùØY¼(²ñNÁ^ Èu¾7nPpkÏ»#NÚõzö,Ä šººÒ¬SŞğh‹q¬`L)œ¹Éj–>ËÍÃG«S>ã€Aw“Ë¢8`\3`Ë—^/œÈŞËD«ã@iÉLÎñèÏ›mãÛÇ‰eç-²±ÏÙ¸);÷ÅÖ‰?`]áæ¡úPK    wİPéjå  1     simulink/systems/system_20.xml­VmoÚ0ş¾_¹_»‚óF:A*Z@C¢-¦I›¦ÉÓZMlæ8-ì×ï’`š†4…µã;?Ïsw¶Ó¾XG¡ñHeÌï |ÖDåX0~×A‰Z~öĞ…ÿ©=İÄŠFş'ÃhÑ‰€(ˆBşOŒ½óSÃòš§†‰]016í_íÆøEÀ”ªşšIÔa*–Ë²[Ég¶YQä÷è"	hÙõ‡Ñ€JHäc§¹È¢$düašÌ5ş¤]/C<Ù;ê «ÔDÛ¶ƒé°©Ai@aõ±ˆÙV¿	Â]xlx¼¦^$z+Hš-G#72Ğj@8O¸&2ä EBö—ƒ„lNËİ§%Uœ*X§l±eÃ+³Zn-éóıÉ™¤Duã®¾=¨%ßw›Ğ?	³º_	®èZù=•LĞbù1™#WcI}ês2éâåòyvŒ	]vPœÙ¿]Ô8>¯×İÙ¨{YÎ©õZN1ô÷yuÒ- ÓŠÏkÓêîOö¥r¤ªˆ¢ËP<Í$áq£3¥­
+TFL}eTÜ³€„‹0Éyõ×«LİòpóßµÌS7%Ñ*¤3AùpÃn6?¦èÓÁ®NÈ/•å£ZÄ: E&İ,áyEµ"øj?g}b×	ØK;6˜i‚áÖï¯VaZ-7Kıw“DóÔï|éùãï×Ï5ôJï—‹·zç-Á--ãZÅõ1Š%©:Vóm¢Và§ÅÂP4kùôz³<x0NÕAğ¬Wtø½xÊYWn€a 7‹W!Ù¤×Ô'¡Áaæûb_‘©KVq?¼TäiE¸Y/É>ZRZˆ|—Öã´]Ñìe¶ÎşÔˆÌi˜â µêŠÊ ùö‰HÔ—ŠâõâT	>a|7ÛnhnU$wy{ÉªE²²^Âµ@Öñ@^­¢
+½ãT¹·Ë4*şI*1©KˆãVñl7ôğ?PK    wİP ÛëŸ  |     simulink/systems/system_22.xml–Qo›0€ßû+,÷5]±!„D	•º¬Z¥n‰D¤I›¦‰'³
+vvÛüûÒ8ö‚8ø¾;Ÿ}Ş¼f)x&yA9›AôÉ€°„¯)ÛÎ ›« Ş„Óh_’… L—à{œ‘|àI,Ô[0ü…±; ®@€}uqİßÓëåQtDÄ—W’Èò9ÏbªŞã›ÍÇ°1«ıÀpNÖ2!'_¼Ÿ¥Û¿?bAò,ÎŸ`ˆG'14“)eO‘|ÔP}K‡Ş¦<yÕµ¤Íà=Ûñ\ÀÃ¶ûœC X3ˆñd‚`ùRƒ°äÕUp 9h ¼ò4Ö5hDÿ\äk’Ãğ
+iüuEîbA…\“†Æm:®Ğzä>[–èÿ‡g’´)é¶ItÍ[ÍwNÒí/ùLÔ*öMO¯Å;‡bbl-æğœ§×ßs§Ã6OO{úVOÿœç°¿§ ÙQcúmÁaÍñØºæ£s~Ç9Éä«VÕ/Ğ´tN-sQ(E%‡ZÍ$FÕnW·êaÏ±¥NŸ-¤ØÉÖé(ˆ®î$KŞ:áN¤ï4SBã)­â­:ô„:%7)õ‡À™ıTæï·æ‚*ÿ‘ZA·ê¹À–¿súLk”¿`XlşÉÌFŸ¹doZF«÷BÌÉ.åûŒ0ñ«s²1_š†Å)¹•E$wU‡Ü€îv_Te[¼0’WKq4±l«µR‰²Xğü}µê[Gh›'_Í‘r£TÅÆÖb:©(#çâ9ç‰:ğË&ºäRLóB"Æ—”MêÎÕ [ˆwDâ^HÃX«‘nG¤ÛiØT5Òëˆôz!ó¦F;"‡½†ÑQ#ıH¿Ò0	j¤ÓŠÄ¨Ç¶=2nG:&äôZÿ/ıPK    wİPªœJß¢  Ï	     simulink/systems/system_3.xml¥–]oÚ0†ïû+,÷FR©cÕ*u-R&mš¦‹Hl”Ø£ı÷µCM²Ä˜²İDù°ÏyŞã÷eróœ¥àÉ‹„Ñ)DÙ*¡›)|İõáMp5	_
+N²à
+€É<F™ÂG\î‚Á×Å€±ß¾;ŒNzó¿V‡„~&±P;f,‹¹­×Íe5‹—ÁŒ¬DLZïg_’Íïo'yå[àQkM’‰4¡ÛP,uRıJ/½MY¼åUe›Â{ºc9‡ox’d®)Äã±;„jS-Ãœ‰®‚ÓÈAĞW7h¤kP[ıı)_‘È×é{ef3ÉŒdâYƒ€ò	ÔXœ6KÎ	"!yu(],/XQËG,j{|'T2ô!a÷NĞ¸Ì­Õ„úMM5-¢<1.x²=¨â ×¤ï(Ûå#_«kà:VùNû›ÆPO0(Ö¿Šµ f¢OLĞ–‘êX‡Ù¥ì%#”e+Roz{Ğh™’[Q„bWº4`†´á]Lï‹²lO{Jòò$šåîÃmƒ÷QdK%»*pmÁAïnŸUzU¤óAñé 9)7„µk![?¡gùÑXÕ«z¯ KßöÊ}Õ¸Ê®gí\÷=†WíQ"²`‹wå0Cü³C¤ëıJYæ
+·Z®EƒšÆëÛ
+32û¿rRó!¡äD Ï`è<–ŞQã÷š	>6Ì£9K]6ğ:Àù$®gjêYÁËHhtĞq5¼4	Ì`ú&ó ıé!Z’TI‰Ö$I”&ã<{Ó4ÄZS×*Ê»TS£çšª†ÿ­
+[T¡şà(«o“…/8+î[Läœ2‘Nè¢ËÜß¨…ÍµèX
+„<K)$»lÒÓ¿g¯PK    wİPæ2:h"  _     simulink/systems/system_35.xml—]oÚ0…ïû+¢ô¶+±óA¨€ŠªUêVìfÓ4¥Á´V›9…?çÃ+4‰ãôLbû<>9~†×û82vˆ%˜’‘	.-Ó@$¤kLGfÊ7_|óz|6\âñ™açÆ÷ F#ó†£Ìñ/ üÁ…aûÖ…'š @ç÷°7?°D|¶GaššÒ8Àb(İl>vûĞguØ"s<Eë4D•qœF˜¼.Ó'9¡¼$»ŞD4|5òÏl¦‘yO¶”q³œáùÀ¨i,ï§#ÓöÌlÄÑôsšàr…ĞÊÖwa¸âÛ…riG}>²5bæ<)İËUu(Î1O×H’ô[H|» ô•$ıêÍy¦:†Ÿ@CI>¿…ÀÒ*à¨½ò›íî„;$î`~ƒ6È~é"ğÕ6š î[ÉP@:V$¥“ĞV9i[V¤«y›5%cù#„J]Áå	8'kø–ÒEK‡Clä¢ÒH–o“ÕÃäÆ¸KI˜‰‰«XŒ'‚É«8ñ4ó²/6snªï«˜}»zsÆewaVixÀÑ&¢o—+$¿.¹lÕ@ cş#°ğ‡A´@	Òl¶ßFX¤÷‘D‡êØCŸ$Ncş X<VJªİ
+ë–A¼Ğ
+Ç¢l‚S—Œú›¢$¯Æ·”p´ç÷ä1Ì¢ã¢|<ùİÿçd?<–jï|ZÂçí0z›‘à)BëSê‚ÖX ÍÈLòöñX{­Y{sÇËT.I\5/E@µ¿ È"àˆeÁ«KÎ{|N|µĞd†mĞÆ–Ÿ¤y…@	§UÏµà „«Ù`§p Hç€«¶N«–kÑÙ’În¥s¥wĞR{§UÄµèIç´†Î’ŞAGí]]õ~À5€5—…â€èŸÓ”_êíi’·à“«÷ŒK	¥VÍd…–§Ö²ºk¯IËRjAø	­š‚™kÁ†–×M«æİ¢X—­¡åtÓªyÙ*´ †–İM«æÕ³ĞZ°[kNéBËWçğÙ€MÙ°u¹İ´œ&-uEtº¯ËmĞrÔûK,»FkØ“ÿPK    wİPÛÚˆMâ       simulink/systems/system_6.xmlµ”oo›0Æß÷SXTmR·`…®„*ËT)[#ÑW›¦‰šKeìÈ¢ôÛÏĞºÉEÛª½à¾;?¿{0$ÛºBŠ	>Åä½‡p*JÆï¦ØèÕ»_¤GIş 4ÔéBÉ}-j˜â… …¶]8ıNbBNPèÙàGg6şHÆËßrĞŸ¶@MÓ”‰º`¶U¬V‡e57kÀi¥¡pXúMˆz^P-$NIvYm*ÆïssëôÜ’+½¬½Gml„¬ú¸^0;-‰R³ˆv«ùU6Å1nvØ“[
+ÅñƒĞZÑ^6ì¼Øg¿–¥İ+tSSÅm…}/Å^ğnQËÔÜâT‚í&·Ãô÷Y
+ÃK7•{j§™DãSïEö"±gŞÀ8~ı+	q(CÎ¶(„8ÃÄóev³˜]Î)w<W\ƒ\KĞP¢Çäñh;;ŸN[Œ'N¿Ë)µj {˜öOGƒÚœÖÎ¡ÓáÇ=çcÇ›Ò
+
+ùæ¸Xu>[ş”@ao»×F¯ÎX¼ùŞ-ª÷?üy~‘Ák"sˆÃ…c‘^¾Ò ãğéî™Kj¿òx$ŒşĞ“Î”¶é`Äøs6;…!)ÿ%©hXÊï“JÆîÿPK    wİP³š| …  Ë      simulink/systems/system_root.xmlÅ“[kÂ0Çßı!Ï^zYµB[Ù¦cÂ˜EÇ±=Õ`›tiêôÛ/­jİdo{9rşçö;Äí“í@d”3ë]#`)[»8—QÇÆ#¯å,™„Äk!äøè™$àâ'©²°÷¦ë†ŞFÆÀRF×”«Ìğİéùg	³”˜³æûädA^ó„ĞBEMYCórH{có šÒ%çÉ	$Ø34­CÊ…,|ìe4ÉcÊ¶"’Ç²+Ry1àtüH×›W"A$Dl±gõ/4§:‹|UíP=UÒ»˜[TÚbx•“¯\ñ©È­@w€‘jêbCÃEj­¯&ÏrM¡®Ÿ…3z:JßPç0M£ú¶R›¶ùƒ~9!”lã28‡Ï²ò8÷œIØË)Û€ ’° ê7ªå”B&};
+_FV1„µ«+éqg4‡ÈÅYé¨={%£^‰çï¸2`á‰•iıÆÊºÊÖPÚ lKy7ÚUPÃş‚RKƒrzÕ×üPK    wİPë’Ô  ¤     simulink/windowsInfo.xmlİYms¢Hş¾¿ÂòãnD†w®’l5jŒ[q£1f/¹º#!A°€„¸¿ş¦Ñ("$’ÔŞŞeªºŸé—gz†ñğëÓÌ«=Ò0rÿ¨N8¾^£¾Ø®ïÕâiC«=ştøÃõí ‰zş48şT«Oî¨×a0ÿnÎèQİ°3"õÚòy¯Í ëµ–gFÑRläÎ<×¿çŒvV1‹PK0…bÌ¥tAjK¡^Vì>Ò•æQİ×2½ú19lvÄÏËŒYHÖâvğ0ñhıø/B¥ƒš Êø¥k<~©’Äñg‘v|é6õŒ¹CÃ¼Cb±C;*ÏèK¯ÜÈEË^ô+#ß¬ûA¹[ŞY·fX?>£Ó¸Xé‡kÇ·ki×E¡~,óÅÂ§Ôunã}¥O\/¦a^Z/î»¾;sR;gù¹Ÿ}sØòTtæ^ÒĞ0w2!g"¯ñÖDìØah.²¦Ùn„+Æ_.æ[F¤Ï–ÚîŒú«IûYÉÚ³òvã’œyZyFäT.ÍÉ$ı×U®\š0SĞ“\Îİºægô‘zegiÌGÚkç ø2ÎSLı8Ú»š"ád•ya{²nißÁìÄ´X¤w ˜Z™ÖùtÑxwH™HQD^—Qc=‘Xé`ÅB¢ó’Š½¬”3²¨O/0‘>Fò­ø5IÒª%“¼ëyJQH©J¡Ò8•S¨Tåu
+&Ñ"ªL áßgáäªj¨§É*‘„´yM?¨5t…ãÕ4ãiŞ"¿CûÀüVt_%NÉ6½:¥ÔI)±4½¿R•‹RƒÕNày^Te—K8ÛĞ²)<¯¿ƒR{pP+wi’ErérúËX$Vg‘®sÚº<°%˜°¤ëÙ¦¾B{Á³MÓĞq¢¨œ˜mRu2é’LÊo¨HjõU-)òfË"iËmCT¹,Tı;¥}G`{%]äÖ«!öÒLÉ®‘‚&Vçá?$ÁÈÿb#NˆÌé™ôë¸ )¬vdšğrµ~•øa3}9,}UÄ7ùV0›>¹ğqK¤àÅQxñÅ‘b¾P¨{6î m4Œ=?šSL\)}ózÖ¬½ªºçyGF£R3¦-Óó&¦u¿=p³PcÑ°mÆæ>²'^`Æ®ïT˜‰/Á\àÑI™^á)Œ"•S|#i¥
+{¯ìYë„ŠÜÍYšìÑ-¥¥şï°&=ÃDU&Ki^"Ë1…³Ÿ³R©ŒÉëIV†ûû(eqÌşsœûQ.Ó¯Õ¿ÉxÌ;ŠYr˜ÀZ3Á¾­céol-¼6¾’VzÙŒ°ÿ!Lãº\%ÆºC¸IN‡ĞO:(ó”êÁ¦}ALã.Àx„nÌÄøº÷p†İ1Ø üR²İÄ¶Ñl«Øã:	\h÷ §=¸²q™u×	âò`¥øŞ@{Î’·é¥m€–hhø]ú;KgcÚs\¦c.Á¸‚Îú(p`9÷w¸th|Ãq¬ÄHĞo6>]ÉÁc±<8Ğ¹‡‰cü\İ¿Ãû,ş‹\¼Œ0ı­¥7ñsë RwNÓ8~ÏÅñÜ1.—ëA·ƒù¸„®³ŒÏ2~ßÑ>vŸ=O0·xÿz"ºç"€•Ëë»>>7R)g·Ö2±ıM§}½ÊC“0>ŒW=¼ö0.×˜¯	Æ™ÙÃü ÓÃûô‡Ù;cvµ·ó–mµ=ç˜OÄ †Á|f¹ÿ‰\¼vğzc´aÉ…NÒX§¶´­‡\d¶Y`"—’"ÎÂsVşïô¯‡×ü*ïqñ<£ìy~×3Àÿª¢˜Ú0ŸGÏõ¼­­ÿ™lŠk®rŒÜ|1²,‹ªDV–HÕ†$ğjC—%¹¡‹’f©Ô2Uiº6j»N­ÁvğÄÒEb¡!›[ö´1‘x±a«¼®QŞšJ¶½ŞÀ6·şnûPK      wİPºÔvzÜ  ²	                  [Content_Types].xmlPK      wİP'âo b  b                _rels/.relsPK      wİP¹ğî£Y  º              ˜  metadata/coreProperties.xmlPK      wİPWç+Å   G              *  metadata/mwcoreProperties.xmlPK      wİPÎBéV¼     &            *  metadata/mwcorePropertiesExtension.xmlPK      wİPÖš×º   .  (            *  metadata/mwcorePropertiesReleaseInfo.xmlPK      wİPåZ #  £               *  metadata/thumbnail.pngPK      wİP7ªp—  ·  $              simulink/_rels/blockdiagram.xml.relsPK      wİP¹ï‹´     %            Z!  simulink/_rels/configSetInfo.xml.relsPK      wİPI¹/–  ¹              Q"  simulink/bddefaults.xmlPK      wİPÉ^½Ì  u              *  simulink/blockdiagram.xmlPK      wİP5ëÔÉ  +…              /  simulink/configSet0.xmlPK      wİP_Ãày   ¡               J  simulink/configSetInfo.xmlPK      wİPøŠ³ÿè   9              ÎJ  simulink/modelDictionary.xmlPK      wİPh­jWS   o   $            ğK  simulink/plugins/AnimationPlugin.xmlPK      wİP«üY   ~   )            …L  simulink/plugins/DiagnosticSuppressor.xmlPK      wİP4ÏîX   {   (            %M  simulink/plugins/LogicAnalyzerPlugin.xmlPK      wİPŒkP   c                ÃM  simulink/plugins/NotesPlugin.xmlPK      wİPp³¢O   `               QN  simulink/plugins/SLCCPlugin.xmlPK      wİP*Y+Ó^      /            İN  simulink/plugins/WebScopes_FoundationPlugin.xmlPK      wİPÒwKÌ   ®  )            ˆO  simulink/stateflow/_rels/machine.xml.relsPK      wİP]àè%l                ›P  simulink/stateflow/chart_25.xmlPK      wİPÑÊÓ©b  Ş              DU  simulink/stateflow/chart_33.xmlPK      wİP.iB  r              ãY  simulink/stateflow/machine.xmlPK      wİPå1¶P¹     )            5[  simulink/systems/_rels/system_20.xml.relsPK      wİPIœ‡±     )            5\  simulink/systems/_rels/system_35.xml.relsPK      wİPéjå  1              -]  simulink/systems/system_20.xmlPK      wİP ÛëŸ  |              N`  simulink/systems/system_22.xmlPK      wİPªœJß¢  Ï	              )c  simulink/systems/system_3.xmlPK      wİPæ2:h"  _              f  simulink/systems/system_35.xmlPK      wİPÛÚˆMâ                di  simulink/systems/system_6.xmlPK      wİP³š| …  Ë               k  simulink/systems/system_root.xmlPK      wİPë’Ô  ¤              Dm  simulink/windowsInfo.xmlPK    ! ! ô	  Ns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            function [pwm, reset] = AP_receve(time)
+global u
+persistent connected frame_time last_sim_time frame_count last_SITL_frame past_time
+
+if isempty(u) || time == 0
+    pnet('closeall') % close any connections left open from past runs
+    u = pnet('udpsocket',9002);
+    pnet(u,'setwritetimeout',1);
+    pnet(u,'setreadtimeout',0);
+    
+    connected = false;
+    frame_time = tic;
+    last_sim_time = 0;
+    frame_count = 0;
+    last_SITL_frame = -1;
+    past_time = -1;
+end
+if past_time == time
+    error('Receve repeat time');
+end
+past_time = time;
+
+print_frame_count = 1000; % print the fps every x frames
+bytes_read =  4 + 4 + 16*2; % the number of bytes received in each packet
+reset = false;
+
+% Wait for data  
+while true
+    in_bytes = pnet(u,'readpacket',bytes_read);
+    if in_bytes > 0
+        % if there is another frame waiting, read it straight away
+        if in_bytes > bytes_read
+            if in_bytes == u.InputBufferSize
+                % buffer got full, reset
+                % should only happen if we have been paused in Matlab for some time
+                fprintf('Buffer reset\n')
+                continue;
+            end
+            continue;
+        end
+        
+        % read in data from AP
+        magic = pnet(u,'read',1,'UINT16','intel');
+        double(pnet(u,'read',1,'UINT16','intel')); % Cant set frame rate in Simulink
+        SITL_frame = pnet(u,'read',1,'UINT32','intel');
+        pwm = double(pnet(u,'read',16,'UINT16','intel'))';
+        
+        % check the magic value is what expect
+        if magic ~= 18458
+            warning('incorrect magic value')
+            continue;
+        end
+        
+        % Check if the fame is in expected order
+        if SITL_frame < last_SITL_frame
+            % Controller has reset
+            connected = false;
+            reset = true;
+            fprintf('Controller reset\n')
+        elseif SITL_frame == last_SITL_frame
+            % duplicate frame, skip
+            fprintf('Duplicate input frame\n')
+            continue;
+        elseif SITL_frame ~= last_SITL_frame + 1 && connected
+            fprintf('Missed %i input frames\n',SITL_frame - last_SITL_frame - 1)
+        end
+        last_SITL_frame = SITL_frame;
+        break;
+    end
+end
+
+if ~connected
+    % use port -1 to indicate connection to address of last recv pkt
+    connected = true;
+    [ip, port] = pnet(u,'gethost');
+    fprintf('Connected to %i.%i.%i.%i:%i\n',ip,port)
+end
+frame_count = frame_count + 1;
+
+%print a fps and runtime update
+if rem(frame_count,print_frame_count) == 0
+    total_time = toc(frame_time);
+    frame_time = tic;
+    sim_time = time - last_sim_time;
+    last_sim_time = time;
+    time_ratio = sim_time/total_time;
+    fprintf("%0.2f fps, %0.2f%% of realtime\n",print_frame_count/total_time,time_ratio*100)
+end
+
+end
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   function AP_send(gyro, attitude, accel, velocity, position, time)
+global u
+if isempty(u)
+   return 
+end
+persistent past_time
+if isempty(past_time)
+    past_time = -1;
+end
+if past_time == time
+    error('Send repeat time');
+end
+past_time = time;
+
+% build structure representing the JSON string to be sent
+JSON.timestamp = time;
+JSON.imu.gyro = gyro;
+JSON.imu.accel_body = accel;
+JSON.position = position;
+JSON.attitude = attitude;
+JSON.velocity = velocity;
+
+% Report to AP
+pnet(u,'printf',sprintf('\n%s\n',jsonencode(JSON)));
+pnet(u,'writepacket');
+
+end                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              clc
+clear
+close all
+
+% ArduCopter SITL example vehicle
+% This sets up the vehicle properties that are used in the simulation
+% simple 450 size x quad based on Hexsoon
+
+% setup the motors
+
+% locations (xyz) in m
+motor(1).location = [[sind(45),cosd(45)]*450*0.5,0] * 0.001; % front right
+motor(2).location = [[sind(135),cosd(135)]*450*0.5,0] * 0.001; % rear right
+motor(3).location = [[sind(225),cosd(225)]*450*0.5,0] * 0.001; % rear left
+motor(4).location = [[sind(315),cosd(315)]*450*0.5,0] * 0.001; % front left
+
+% PWM output to use
+motor(1).channel = 1;
+motor(2).channel = 4;
+motor(3).channel = 2;
+motor(4).channel = 3;
+
+% rotation direction: 1 = cw, -1 = ccw
+motor(1).direction = -1;
+motor(2).direction = 1;
+motor(3).direction = -1;
+motor(4).direction = 1;
+
+% motor properties
+electrical.kv = 880; % (rpm/volt)
+electrical.no_load_current = [0.7,10]; % (A) @ (V)
+electrical.resistance = 0.115; % (ohms)
+
+% ESC properties
+esc.resistance = 0.01; % (ohms)
+
+% Propeller properties
+prop.diameter = 245 * 0.001; % (m)
+prop.pitch = 114.3 * 0.001; % (m)
+prop.num_blades = 2;
+prop.PConst = 1.13;
+prop.TConst = 1;
+prop.mass = 12.5*0.001; % (kg) (only used for inertia)
+prop.inertia = (1/12)*prop.mass*prop.diameter^2; % rotational inertia (kgm^2) (rod about center)
+
+% assign properties to motors
+for i = 1:4
+    motor(i).electrical = electrical;
+    motor(i).esc = esc;
+    motor(i).prop = prop;
+end
+
+% Setup battery
+battery.voltage = 4*4.2; % (volts)
+battery.resistance = 0.0034; % (ohms)
+battery.capacity = 5.2; % (ah)
+
+% Add all to vehicle
+copter.motors = motor;
+copter.battery = battery;
+copter.mass = 2; % (kg)
+inertia = (2/5) * copter.mass * (0.45*0.2)^2; % (sphere)
+copter.inertia = diag(ones(3,1)*inertia); % rotational inertia matrix (kgm^2) 
+copter.cd = [0.5;0.5;0.5];
+copter.cd_ref_area = [1;1;1] * pi * (0.45*0.5)^2;
+
+save('Hexsoon','copter')
+
+% Plot motor curves
+% http://www.bavaria-direct.co.za/constants/
+% http://www.stefanv.com/rcstuff/qf200204.html
+% Some calculators estimate heat and increase resistance with temp
+% But then we have to estimate the power dissipation
+% Max power for plot only
+max_power = 260;
+battery.voltage = battery.voltage * 0.50;
+
+Kt = 1/(electrical.kv * ((2*pi)/60) ); % Convert Kv to rads/second
+
+% plot the current from 0 to max power
+amps = 0:0.1:max_power/battery.voltage;
+power_in = amps * battery.voltage;
+
+% voltage drop due to copper and esc
+copper_drop = amps * electrical.resistance; 
+esc_drop = amps * esc.resistance;
+
+ideal_voltage = battery.voltage - copper_drop - esc_drop;
+power_out = ideal_voltage .* (amps - electrical.no_load_current(1));
+efficiency = power_out ./ power_in;
+
+torque = Kt * amps;
+rpm = ideal_voltage * electrical.kv;
+
+% Plot motor characteristics
+figure('name',sprintf('motor characteristics at %0.2f volts',battery.voltage))
+subplot(2,2,1)
+hold all
+title('RPM')
+plot(amps,rpm)
+xlabel('Current (A)')
+ylabel('RPM')
+xlim([0,amps(end)])
+
+
+subplot(2,2,2)
+hold all
+title('torque')
+plot(amps,torque)
+xlabel('Current (A)')
+ylabel('torque (NM)')
+xlim([0,amps(end)])
+
+subplot(2,2,3)
+hold all
+title('power')
+plot(amps,power_in)
+plot(amps,power_out)
+xlabel('Current (A)')
+ylabel('power (W)')
+ylim([0,inf])
+xlim([0,amps(end)])
+legend('Power in','Power out','location','northwest')
+
+subplot(2,2,4)
+hold all
+title('efficiency')
+plot(amps,efficiency)
+xlabel('Current (A)')
+ylabel('efficiency (%)')
+ylim([0,inf])
+xlim([0,amps(end)])
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                MATLAB 5.0 MAT-file, Platform: PCWIN64, Created on: Mon Jun  1 17:14:49 2020                                                 IM   ^  xœíW½oÔ0—„Bù8Uâ„`‰¡c7º œÊ KHl=¹ÛFÍÅÁq+Z„Ä€t)+¬ìü 
+(âS,HL0ÀS‡Ö#„r×óİè'Yşüù=?¿÷sR€ûÇ FD}@”ìÓıZ©È5˜¦œ09ïÁa=~A”6å”e
+;‹¸X³’·Û(Ó£ QBPŞÆ!t‡#sbA]ôoín§k5îÁ!İŸ%¦ñˆ&rÛ”$$–«Âˆ¬†I,Z,Â(’áÂ„”ÑÊR×ç*ìÙÅ·dÇ¨(Ç¥ş‹~kæê¦_Ôåı&zìW+íçˆVÍ ç
+äö¶Â×öv¯…Çt_ê[\şËĞ ¦(ğc$áÀHe%˜˜Ï¥®Â5{àœŠŸ¥s¹|×ş=İ”ûLö¡T_;{ğÓ£ô©/ñw¡?q'ëİüabÏÆãó_WoçöL:föLƒŒxÔ&y¦Bq¼ V%Kí`6F!ÉàÒ9šd<½ò§YJ×r¶šŸ§µşü÷xë½oŠßzıãÕ‹)u?ıæ3€İù54~é-òÖDïÃRîûëç“ù3GÂ1Hüµ¡§øË3Äş³üeù,Yşú¾mƒ¿œış²üeùËò×øk ÿG×g¿¿,Yş²üu²Ïü/âç”(Ë4æh>æRhc”"ñèˆ©oßH™0ÎÛ`ÿ»—?/ûIéo4‰«ë]p.üû>È÷äãÿÙËµÕÎ»P•½Î÷zŸ
+İÕ÷IÉ¿Z›îwsú¿3³éWëùƒ«¿                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          clc
+clearvars
+close all
+addpath(genpath('../../MATLAB'))
+
+% Physics of a multi copter
+
+% load in the parameters for a frame, generated by Copter.m
+try
+    state = load('Hexsoon','copter');
+catch
+    run('Copter.m')
+    fprintf('Could not find Hexsoon.mat file, running copter.m\n')
+    return
+end
+
+% Setup environmental conditions
+state.environment.density = 1.225; % (kg/m^3)
+state.gravity_mss = 9.80665; % (m/s^2)
+
+% Setup the time step size for the Physics model
+max_timestep = 1/50;
+
+% define init and time setup functions
+init_function = @init;
+physics_function = @physics_step;
+
+% setup connection
+SITL_connector(state,init_function,physics_function,max_timestep);
+
+% Simulator model must take and return a structure with the felids: 
+% gyro(roll, pitch, yaw) (radians/sec) body frame
+% attitude(roll, pitch yaw) (radians)
+% accel(north, east, down) (m/s^2) body frame
+% velocity(north, east,down) (m/s) earth frame
+% position(north, east, down) (m) earth frame 
+% the structure can have any other felids required for the physics model
+
+% init values
+function state = init(state)
+for i = 1:numel(state.copter.motors)
+    state.copter.motors(i).rpm = 0;
+    state.copter.motors(i).current = 0;
+end
+state.gyro = [0;0;0]; % (rad/sec)
+state.dcm = diag([1,1,1]); % direction cosine matrix
+state.attitude = [0;0;0]; % (radians) (roll, pitch, yaw)
+state.accel = [0;0;0]; % (m/s^2) body frame
+state.velocity = [0;0;0]; % (m/s) earth frame
+state.position = [0;0;0]; % (m) earth frame
+state.bf_velo = [0;0;0]; % (m/s) body frame
+end
+
+% Take a physics time step
+function state = physics_step(pwm_in,state)
+
+% Calculate the dropped battery voltage, assume current draw from last step
+state.copter.battery.current = sum([state.copter.motors.current]);
+state.copter.battery.dropped_voltage = state.copter.battery.voltage - state.copter.battery.resistance * state.copter.battery.current;
+
+% Calculate the torque and thrust, assume RPM is last step value
+for i = 1:numel(state.copter.motors)
+    motor = state.copter.motors(i);
+
+    % Calculate the throttle
+    throttle = (pwm_in(motor.channel) - 1100) / 800;
+    throttle = max(throttle,0);
+    throttle = min(throttle,1);
+
+    % effective voltage
+    voltage = throttle * state.copter.battery.dropped_voltage;
+
+    % Take the RPM from the last step to calculate the new
+    % torque and current
+    Kt = 1/(motor.electrical.kv * ( (2*pi)/60) );
+
+    % rpm equation rearranged for current
+    current = ((motor.electrical.kv * voltage) - motor.rpm) / ((motor.electrical.resistance + motor.esc.resistance) * motor.electrical.kv);
+    torque = current * Kt;
+
+    prop_drag = motor.prop.PConst * state.environment.density * (motor.rpm/60)^2 * motor.prop.diameter^5;
+
+    w = motor.rpm * ((2*pi)/60); % convert to rad/sec
+
+    w1 = w + ((torque-prop_drag) / motor.prop.inertia) * state.delta_t;
+
+    rps = w1 * (1/(2*pi));
+
+    % can never have negative rps
+    rps = max(rps,0);
+
+    % Calculate the thrust (with fudge factor!)
+    thrust = 2.2 * motor.prop.TConst * state.environment.density * rps^2 * motor.prop.diameter^4;
+
+    % calculate resulting moments
+    moment_roll = thrust * motor.location(1);
+    moment_pitch = thrust * motor.location(2);
+    moment_yaw = -torque * motor.direction;
+
+    % Update main structure
+    state.copter.motors(i).torque = torque;
+    state.copter.motors(i).current = current;
+    state.copter.motors(i).rpm = rps * 60;
+    state.copter.motors(i).thrust = thrust;
+    state.copter.motors(i).moment_roll = moment_roll;
+    state.copter.motors(i).moment_pitch = moment_pitch;
+    state.copter.motors(i).moment_yaw = moment_yaw;
+end
+
+drag = sign(state.bf_velo) .* state.copter.cd .* state.copter.cd_ref_area .* 0.5 .* state.environment.density .* state.bf_velo.^2;
+
+% Calculate the forces about the CG (N,E,D) (body frame)
+force = [0;0;-sum([state.copter.motors.thrust])] - drag;
+
+% estimate rotational drag
+rotational_drag = 0.2 * sign(state.gyro) .* state.gyro.^2; % estimated to give a reasonable max rotation rate
+
+% Update attitude, moments to rotational acceleration to rotational velocity to attitude
+moments = [-sum([state.copter.motors.moment_roll]);sum([state.copter.motors.moment_pitch]);sum([state.copter.motors.moment_yaw])] - rotational_drag;
+
+state = update_dynamics(state,force,moments);
+
+end
+
+% integrate the acceleration resulting from the forces and moments to get the
+% new state
+function state = update_dynamics(state,force,moments)
+
+rot_accel = (moments' / state.copter.inertia)';
+
+state.gyro = state.gyro + rot_accel * state.delta_t;
+
+% Constrain to 2000 deg per second, this is what typical sensors max out at
+state.gyro = max(state.gyro,deg2rad(-2000));
+state.gyro = min(state.gyro,deg2rad(2000));
+
+% update the dcm and attitude
+[state.dcm, state.attitude] = rotate_dcm(state.dcm,state.gyro * state.delta_t);
+
+% body frame accelerations
+state.accel = force / state.copter.mass;
+
+% earth frame accelerations (NED)
+accel_ef = state.dcm * state.accel;
+accel_ef(3) = accel_ef(3) + state.gravity_mss;
+
+% if we're on the ground, then our vertical acceleration is limited
+% to zero. This effectively adds the force of the ground on the aircraft
+if state.position(3) >= 0 && accel_ef(3) > 0
+    accel_ef(3) = 0;
+end
+
+% work out acceleration as seen by the accelerometers. It sees the kinematic
+% acceleration (ie. real movement), plus gravity
+state.accel = state.dcm' * (accel_ef + [0; 0; -state.gravity_mss]);
+
+state.velocity = state.velocity + accel_ef * state.delta_t;
+state.position = state.position + state.velocity * state.delta_t;
+
+% make sure we can't go underground (NED so underground is positive)
+if state.position(3) >= 0
+    state.position(3) = 0;
+    state.velocity = [0;0;0];
+    state.gyro = [0;0;0];
+end
+
+% calculate the body frame velocity for drag calculation
+state.bf_velo = state.dcm' * state.velocity;
+
+end
+
+function [dcm, euler] = rotate_dcm(dcm, ang)
+
+% rotate
+delta = [dcm(1,2) * ang(3) - dcm(1,3) * ang(2),         dcm(1,3) * ang(1) - dcm(1,1) * ang(3),      dcm(1,1) * ang(2) - dcm(1,2) * ang(1);
+         dcm(2,2) * ang(3) - dcm(2,3) * ang(2),         dcm(2,3) * ang(1) - dcm(2,1) * ang(3),      dcm(2,1) * ang(2) - dcm(2,2) * ang(1);
+         dcm(3,2) * ang(3) - dcm(3,3) * ang(2),         dcm(3,3) * ang(1) - dcm(3,1) * ang(3),      dcm(3,1) * ang(2) - dcm(3,2) * ang(1)];
+
+dcm = dcm + delta;
+
+% normalise
+a = dcm(1,:);
+b = dcm(2,:);
+error = a * b';
+t0 = a - (b *(0.5 * error));
+t1 = b - (a *(0.5 * error));
+t2 = cross(t0,t1);
+dcm(1,:) = t0 * (1/norm(t0));
+dcm(2,:) = t1 * (1/norm(t1));
+dcm(3,:) = t2 * (1/norm(t2));
+
+% calculate euler angles
+euler = [atan2(dcm(3,2),dcm(3,3)); -asin(dcm(3,1)); atan2(dcm(2,1),dcm(1,1))]; 
+
+end
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                This is a example MATLAB multicopter backend for the JSON SITL interface. Its mostly physics based, Copter.m is used to setup the property's of the vehicle. This does some basic performance plots of motor thrust and power from the given motor and propeller parameters. The vehicle parameters are then saved in a .mat file, Hexsoon.mat in this case as the model is roughly based on the Hexsoon EDU450. This file is then loaded into SIM_multicopter.m and the connection to SITL started. SIM_multicopter is written in such a way that it should be simple to save a set of parameters for another vehicle type, such as a hexacopter and run them with the same model.
+
+There are many simplifications in the model, the most egregious of which is a arbitrary thrust multiplier to get a sensible hover thrust from the correct vehicle parameters.
+
+A update dynamics function is included, this takes the forces and moments acting on the vehicle and calculates the states required by ArduPilot. It should be possible to reuse this function with any vehicle removing the need to duplicate the time integration scheme.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  PK    ªyİP !#Vø  5
+     [Content_Types].xmlÅ–ooÓ0Æ¿Jä·¨qáB¨í4µ›4iâ%º9—ÄªÿÉvÖ•OÏ¥-¡¥ÊKŸŸ»ßsN|òäêE«ä}ÖLÙëtÌ4ÂfÒSöéñvô%!‚É@YƒS¶ÅÀ’«Ùäqë0$”lÂ”•1º÷œQ¢†Z‡†vrë5DZú‚;k(¿ßraMDG±®Áf“æP©˜Ì÷ñºô”I]ë)XróBá½ÁzÍ;2À9%Dòg“ıbct°zT;M(¥¯Hğ€vÃÉª[n¬_‡4H])iÖ©ÎT«f½¦’è˜½Ìğ,×Âz9O»>J<ø^‚ ©
+×!ƒ¼.]úOìıc—'Põær›³<İ@“Ò¯“¨Ş™Üîå(é\7ÍÿEw'—Å
+cÿ]ÂÉ¸?Úon{i±ğàJÒ¨;Êó9ì&·µãu>îæi›¡ZHQ ¿½æTUHC$âPíÖ÷ÊÀ¯MÆºärÀÁBBalˆR¬*ç<†`ı 6îm!ÅµµıŠ~°Ãx°Ã`ôÕı|>ü3>­Í¸ğåÖVô@èñ§\ÑK"«Îiv9Võ†¼Éd´şïĞ½îll„ˆ¹²Š‰Rš?tÙHùAzq«OÊŠu}‹é[ws7ÒdvG:ß½úfß PK    ªyİP'âo b  b     _rels/.rels¥ÔQOƒ0ğ¯Bú>
+¸5c{™&{01:?À­Ü ¶¤íÜöí-°bØ|„ãş÷W˜-¢
+>P®dJâ0"J¦2.ó”¼¯Ÿ&w$0d•’˜’#,æ³W¬ÀºSğÚ.Dš”ÖÖ”V  ª¥«l•`İ¥Îi¬„iE·T·3H73Xe)Y;±‘À+¬AçhS"ĞB¨ı©…µÌ]ıXãÿ ô<šPjS)V.9äÄÉe¸ØU\–ô«œ}—C7|€æ@Å^éÒ„L	úÛDqÔcuæù@LÉ-ÏßĞ®äVyDúU¤iÔè3	•aµä¬¹	úèQõ¸ØõÜô7¸³5öFûxz•Å3%öLi|ÑîÜhËÑŒFNUœœ½«vâ&¡y<X”Íwzë|…Şè!ßÍŸëC0xÑ)k	ïÿ¶Â‡ŒSqô>¯üU4ù“º³^Úù5Î?PK    ªyİP›òùÕe  ¾     metadata/coreProperties.xml}’_Oƒ0Å¿
+é;´e"c‰š=¹ÄèŒÆ·¦Ü±FÚ’¶Šûö¶°á4Æ78çôw—–ëOÕ&`4z…hFPZ˜Zêf…v›ô
+%Îs]óÖhX¡#8”¬«RtL÷Öt`½—vLt+tğ¾c;q Å]:˜{c÷áÕ6¸ãâ7€sB–Xç5÷G`ÚMDtBÖbBvï¶ µÀĞ‚í¦ÅßY%ı±ƒ?OœÍ‹´«ÜŸáÁ™’ŸNN©¾ï³~6äBŠ_¶wÃ§¦RÇU	@ã~¸‡ÆØc¥Lm‰/¥ò4š	A«“0€ÅÏÎóìæv·A-Š"%Ë”Ğ)Ø"g‹Åk‰ÀñÙØjÓÊæà¥Êcn’c§–;¿w/¡¾>V÷(C³_ÆÔO´
+æ$'±`^ìèœÑËÉEÁ3`oáCÆ›VÑlIæÃàIŠşé"V‘Éÿ,ûûqåª/PK    ªyİPWç+Å   G     metadata/mwcoreProperties.xmle1nÃ0E¯"h¯åx*
+YÙ²¥(Òô ¬DÄ‚%RÕ¤¾}=t°Û‘ßûŸöø“ºc•È4êC×k…ä9DºúãzzzÖJP€Ä„£^P´::›+¾U.X[DQ«‡dÔSkåÅñf.C›\gé<gSÀÏpC3ô‡Áìyí¬gjHíºtPJŠÚÚÊÜ)l<óWŠ4w™&k¶ÔVqª)¤å2º÷_HÿA»;»æ$ø¼`Bt—¡z°f¿]ç?Ï»PK    ªyİPÎ\½     &   metadata/mwcorePropertiesExtension.xml]±’ƒ E…¡dE"4Õ¦Şb7=Áu"à Æìß/›TIóŠûî=sÔángtƒ'ïZÌH‰8ãûÉ-şù>F1i×ëÙ;hñ/DŒ²›ñ¾‚_ ¤	"Ê[<¦´ì)f«#±:›×HŒ·tÑæª %ãôuÿyOàş%pfë4ëóé)ÕIÒ’°ŠÉR4Š¾>ÕºN}ÇŒ¨8ßÕHÉ
+.ªºBæ“³ªçR@}QôQÍ€7óîPK    ªyİPÖš×º   .  (   metadata/mwcorePropertiesReleaseInfo.xmluK‚0„ïüŠ•{¡H0)åÆÍñq$V!¼L‹ÆŸ/•G¼xÛ™ofwyòîZx¡ÒõĞÇ¶çP°/†²îï±}:¦$²añ!pSP÷·Aur4ó4ÁAÕeP†ŒQF%dØ¢Ô„LÍæË•Üô…ÀCìÈ¡ç3?¤Œ»«m"j^%æÍÜ]µa%êBÕó‡àî¯úR9¢Hñ
+,SÆ1¨¨°hô³~àQº÷i0ÑÍ´¸ûïçPK    ªyİP‡İ|H)  …+     metadata/thumbnail.pngİzUX”]Ø.¢€Š„´€4H# RÒJwwÃĞ!ÒHÇÇPÒ-Ò!Hw!1tC34ÿò?ÜÇû`_{.f†ƒwf­õ<÷sÇõN¸ª²,>>Ü)5ğŞ÷ï‰‡^Ë?W@ÁÛÇ_\00îÕü{brô©Hb`ĞbÈI½ûäùßÜËçÓFÎİáhÙlB[Xö=F::)û!7“¬ÚµµµÚ)‹Ş:)%õµˆïÿ©Öéyä„´Cö'RlSIÆ‡Œt˜ñq¾æñC¦giK4’8_™I>¼Ûºñ>¤wÙüïõ(ãq¦ËÈñ›-/SÎ”ÁPZ<¬xÄ=¼?L÷èñH½Å~„÷öÃcLbìô´A´ï°¥3~ÀÂ&~ü.öÿ·‹#®WÉ0æë¶"¹Úh99	Ë5#õ+{®G·Wû$Oü!3ğ	„!YY#ÒÓ)ÒÓÓ·wwMçëìLÍÍ'ÆÆŞš˜0TWW·Üİ^…„†æLY{]íÕ‡ÇÆöZòåÎ ­llxyãU$nHCß¿SQ!Â	¿Š‚B©©q½[©£e:³î®-b¨„ß{z
+™™™…„„r?rß}NGGçêî~„(ÌZİßy!Ú70Ğôç·ò
+Rf¬YšßĞztälllü-2Ò¤;âéîbkF¬øå·Ğ‡dÆ¼i©¼fø‰ÉÉO¨©•ååñŸE†îÍ××@Ğöú=şôŒ/D~Ê·èè—É:uªZZ½õG%F{¢)­¬¬ŒÖz¢-ù(îaa[ò%&%¿srâñ¿»ZúÈštrvöÓ©	öõU&ï0äø½ÄüæÍøà0A+†7—§—ƒVv[kñO&­O«êbÃìíQß’¥xÿaïş²sc\¿é_[S^rçFªFİÂµ’%!†ò»B R22õ™p{ÙrM>Šøø®¹ª,"™©Ãæ×77NºP3ğQ äÁ£]N¬=òG8âw×.Óe_‚;Wlah
+Î”‡5³QòùG»[îdÕ¼Ì^î³&aËH=²iÜ±Féş²”¤×%‡àİ„àäh5z_[Ã˜lã‘Ÿ£d ÚuQËËË<¬Iü”§¶Km/ò=¹`SSİéü6_o´ı_g‹XÅ¯‹ì|Å¹2|.ˆYı™=jú.g
+ÑÕ¥ÜÀ&¨é³g„6¾Wgã0˜¤‹Ëk».›B€ÙXj³ÉbÉ
+7!U!ªÎ¹ß°ÜÜÜ oßğå_>xğ ¸²Æ&¨–¦*\vsem5£¶x³Òœ÷sß!Â	ñôÉ“÷VV¯¦¦¦$qºLy‰?^>nC"‘ˆ½½¤GßúMÿÜn+°+1z…S•%J?95õ=5•å‹¹×Oª=Òò}ÑÊ{„˜”_õ54J)œ_´êÈä­ ß‰!§ËhiFF”1‡v¦J1ÑK¦Km¾¤¤¤qééòOggg}n/¶ºz{IÈÈÂdòŞÂÿ<ä:€ïû¥ h>ãĞ–ÒÒ"“Ï__7eöYÊ("BÖ8nÉÈÃó Î¦$xqÛüË„âqéTÄZÃÚæ¦¹ˆ¨èÇÒ©ÏìÏ0&­ù2¢Ñ‹¢€¢"–ÑÑ`¯›Ó™şşş~“e¶Ù=GT§ãÑº@ÂKôÕA'‘ËşÚäsİ£Œ©¤vvNEÌ˜MÕô´æÀÀÀeyŒ	\ZÍU‘8tÉÆô¼ZXC†¶saˆV‘±àˆã.bÜ;l·¼bô”$ \§ş	ÿ£Áğoß–3=éøù“¢)ÕTUô+-`J‰‰‰UÎòQ2:u¶+€.¶ú¾3˜ZXäÁ–66y#0ª±™:uuI;;ïV(d¿•,¡_JVPŸB2{‡%_|b¢”··oší¹ƒab´÷ÛËÌ]wÑÀ-Î\"ìsÎ†‘”Œ,O³±³C
+××÷áN°Ê•ƒ¥%-3sØ¼ÃïL»Ş‚¶ÜÙG4¾Ø‘d°ùùH¸=áT‰»nK*o’;–V3Céç5Á?ªLûŸøÍßèì3gµZn¨nzµûe?ü€ÅÂÔk'
+¼£Ğ$›˜˜øS ˜æ)›fö¸%Æùt}Ûı†RôUÉÑSüP-ï%aaáÉÉIÕOŸ¤ ‚Ö¼¹ÜÎëêê³­Êš$DE –ÄÆÅ=.5¸‰RÄøO™¹µµ Æ`.ã¹tşp³Ë–òæpFXçJ»)¯×œŠ7"&K’2(mhHëŞü¢QWğÎŒ«ÊUeQQvNN`W—”½„wb°p<²”’BHÌ…ÉÉÉ)Ùz6g³>
+6Ã‹F|-}jsÓÂ"#ËfrŠŠë‹GŸ-0b•ö•­™öŞŸç…2•½½½ñ>¤LâÕ³“¹Á[uqÉì3åU‘¤i‡Ã•Ş¿¿§]ş,oüÛ¬--m;Ìs;²¥åÍÑÑÑQõ‹jç%%ßDjñ¨sIá›8ºıW\Üw>LYP93ªÉ€6ºKËZmBê7¤¤°+Û.Y%®fGYØØ^¾¼ßª¯âá!XwŸ/Jty8ÔmÕm|HÅo+@‰‰‰¹}ê­2è»„H1I­•ñ]¹¸R¨È‚<39±ò÷%CDé}uR½İh2 ´YÊ“ÎQ=8©Ô˜S8;;{YBìîşÈÎ¨ªâvß_ä¸ÇKq9bpåW7k‹ƒ³ê(ô†ÌŒ7m™Şn]ë-ÂNØˆK}P¬Dçø­GJeÖ	WJülÜ!;{ °ĞİâOúşDùjÂ(ë”ÔÿŒgG|ÛAkY“ğÙNYƒõ³gß7 ¿b}š™™	êõŞyõÚ$ÿÓÙæ=0 _¦ÉFıulLUDD„ûù£¯_Ú©èèP¦¥¥¹ººò¦ááã¿gJà1úB‡¶û¥ıàÏø·<d_÷o6ÄiåH	ùÍÙsBúğàÓVP³fé¯_‰ssÚ`„aÁV°b**@ü«“Åêâ÷TÆ´65Q€bkkSôÆ¼09Zïwõğ€ÍÍíËW^ X’è°VñŞøQIè«Z¬±K•7º¦8Õ.ÎL@JÎì·-vaø>M`R:²52%–ìfddíyïïïŠ;L ¸ğ•““ãxö 4’ïy]]ø_p?°çFCô˜1dsØM  éèÌWÕá#'[ù‡‘tõBe£úùÃããÎçñÅEå‰{cizÍk>jiÉ(utt`ccÇ½–Ò8ödJô:êg¾è¤¹}H†3%òüÜóıû÷–öö›iĞÿK’Ø7Gx¡¡¡eÚµdú‚K>	Àá|÷¿Cûo/ÂFxè?á„Î0¢„´4aNJL_Ù¸fc>Š°Úh]NfQQH¢üz3‘Äõ˜ÙZ¨€˜˜Ø‚SïÛùºèWê›Cäÿ¼ø ­f…®œ¥åöSÎ›|Q—ÍG¯^½‚ö‚ÎôôÈ0)¦ a/şäï…ııûAM-~‹}ùSLåî(lhlœµÉÒzè$ñmycXp‰˜‹´×jÒ€-ÁWDE=ú¥í‘Uİ¦^ñçÏ{}¯§«««©şâäää×—3¿™€ñªµ™¡%F§átZGØi[ZZZ|†6†li¨$Ü¨¨´4¯¤$"1‘àÅÎÎ °}vAÁ×$Lq))½P1Èeå¶•j€P€ù77'0 äG=”{µ3Îw7h´èşƒ‡®d³Õ&¸`õ¢)k xÈÙ®QO9PËƒ-‰»4éÈgzÎWÓIŒ1´’Û|E‡‡‡ÿî¹ƒuÁpƒşy6õîÎÖ„E«;î†™Îş4Ójú›2dÉg\3{€F£u]Náœğ^ëÚ£)-'°´wò)\^lÌ¤tj 7Ur¦ááñ¿î¶ğó{‰0ÂôÀÍgÔVL®Ôì´&|_š õááá¿n¥¦>Oæ2&;cø3{réOyZãe¡œ,-}¯Ğ¿´ß×\To<0ÈÆ` ´K„€ˆšµ-ÈËÃ’h‡ûièè@¦4„Rÿ?¸Ù]ú%ì²‰²	Øœæs±‘²¾¾î‰Bì7›	N&%))	ºWéş¿ö|æÿôçO^ÜŞ¢Ñb&ŒÚ"ccM¦J6n’ç÷Ü‡Ì1tğLŞq¦DøÍ•6¸áLşHÆ¾	1¿à<èQ­ÍQ4åOyêÆĞp~'î[Óo²®ÍşTrİîgT9‰~)û•u–2ˆp=@ÿşİ]gGsAÍÿS.”,ş¤§ÙÜŠîÿÀA9r¼„İÚ*õ9úøŒ½õól­x™ğÑ#z~7z?¿[Ry*BÑ/ìÖ7ŸÍÎÆt®t­T• rõX ƒ 8‡2šé^d·”¡!·raBCƒ+k=V!,°RÁ²èëÀ o|ïG³N¬n-Sòæ&)ş}Ş´(ŠÓÙùˆ'CéäÄÕ„Û•„˜øş[­Bš¢“EeèQÖ¤ˆ†lGâ7¤¤¤RUY™bìÑÖaJXD¥&¼iëß–·¶b7ÔŠ»Œ«?yâ’d/ÌËÛĞÕ	X^VëğPÎvñÚ_1ï~éÔ{°iëÚË…s5e
+Jâ§O‘üjQƒ–$â¶·Ÿ×9Ü¥RşBœ÷ÎÍ[ÛŞ™à1HúmÈŞr<âŸÓ»%ÿ®¥E¬,% Şgv¦'OÔssCÎÏMµuFŸ¥|PP ! (L}ãE¡§'%ƒe12IBJ”•ECLüİÕ±@Ğ‹ˆ&É+}ş,4<İÕÓ“§Ê"©LN–¡g0‹NØë¶®L$¹Ø¤—uÜ’ŞI^¿KñHì3»¹­ 4ä]Â;„M ãi«~˜öhõK–ç™.“X¼¤¡Ä0ã:Æ‚;˜ÙÙ©òÕŞIK?wú»'ğçÏ`âÏ¯pA‡¿*2un3‰ùò*)Yô·~ıû×³¤”›‚ \,YTÂÊ,.Ş×ÇÎ!’™ÜŞşö	I¦‡!+«|ß0‡ÚÃnåo5ÃRj@ie DúÕ«›~ƒaíØ¨¨3oN6¶Ê¥Kõ‚ÿö™¨i²ÖOu]\@_ ½5£èkÛúùq„HxLÌ©O†€ 4ÙoË„¬w+¨¬w.Fâ720pìÍÉå0=ÏaĞF09ù¨rÉH9Æ¡óÅƒ­Sd™Ğ_ÜëÕ¬rf·EH#ÒàyLä«$ùÜ<±ù~S^5µ	½;dI~~x{»á{Ix½~1òqBqÊÄ„oÑ§›æ:Y™¸ï<¯YHñWWq¨—!|'''U£Ôıßì(’qbK9,–Äú¹>DNÃr¥mp}Úª«c¾á=š‚›šŸa›qƒn·gÒC=W½ÌGõ…Œ7v·-×Òm˜ÒÓçö¬wvbxV?R>‹ôRÄŒÜ?4ÄÈÀ`2ææ¾7·qñåW°®´¶NÆ·ğpŠ¯4ÅÚ™‘ƒ[³W/^È^ÚI'hjë\É.ÙáÆïŞ¦²RÎÖ,İË‘œœ¾—ª8Ğ´c‘h*;®Ö“'p8ƒŸßH Cìµ‘¹b­™Ù•¥İ¢íùÎÅ³VômÆî®Mß E³ÁúTAıÌ=¸ÓèZ[vƒ.çÙ¾÷2qşSrru™Zİ§OŸ}beecC—a­ošÒÜò6{ìSÕÎØÛÛ3²ôÅJ\¯ ¡f²1T9yyÁS¥Zêjj«nùù¡û>[¢X(‹(åêİ7ÇCk)¤qì?k^q.Ê¼};Yd\??[¿¯èCNíK»uXVª âtH]ip·ïïÿ¨²›Vò&/7w{{{yÎfkÙUäbÏÁ€‘ƒcÖsLSf±1ğ=SàÊøşıûŒLLñÈ´}öõÇ£ş~=Dşç,h8úoQë™èş5YZš\Ù—š‰Û­‘L \cîçÿ$xm0ò¨­’ Kó)Vt¶YçƒˆN£­@\Ôú°  æÈÀC»ğ«ñl}ê°2>ş3]ùCÙOŸS¿îÚî÷pdíÍñA%4À.Û®?-Fı\EH3K²††q[‚KŠÖÖ"û­èBb®<ù|c<ÁšÎë}0Fïöö´+ší§¿İF¡zl 3øP{Ø-à¬—EMü(Ö…”‹ây,z1;´&k©®o4ÜìÕsY\×ûjj&OKã·äÂl†+kjâ¼¶8ËÊØp><ìmæ¼SŠŠ‰ÈÍ5Nå}™F C¿#UÜ—:-íİMİàhV´æ<«YD¤#'*ùã,zãs³;xˆ«Œ`›PÅİ\yx‰Ù[Y½ÏW#!'‡;À³³'`¯?/ï¶#uOHN "Ä#$Dy4331Å„“Œ6TWï^ï‡}e_{‹Ü·$/a=9Œ§­MôD¯ùLÇ„{cã¥b–8Ìæ$~Üıe‰W˜"¯ƒ~ÎÌšŠø®‘ñM²Aƒ½Ò°øèO á•©ŠÏró˜y!gñ•ü#÷ØŸÕl^b„`î§>Şâ"¿$ĞıŠ^ºc˜•4Àµª…wu™Æ%o¢U5r`…*…U"¬¬„yS$$êíÿ	#:9l_†6­°ïëİüùö“Æk‰´VJ`£KJÎ'ÖÊüûr8¦û‹*xø;²~Sz‰;ï{÷î:­måa?=öİIñ_îíqômHú›hhjº™’8{=÷X¨‰‰Q–W¨'y–¼låŒm†×Jèo[İË`JåZÛŠâÀ¨©2Ô–üÈí‡b¦ÈÌ	&„·   @të¹ãk¥¥±ÎËí„æÃÚ] ¾E¥¢‹û}îGë< )b±ÇG	)‚™TBUÑ¿~Qãdï¯÷›„„ÉzSsé8ÎäW}*šâTS3~@D$[:•«Ö(j×ÄŒw“Š¬ĞAÀˆ}_ˆºÁŞ~60PÆ_>?èäŠ£%ˆèÂÂ³6”ı–µJ¦¦ë	ß¿¿SR"Ç¾?G•åoõÚkóá&â”ÁnÌÇ´
+ÚïuŒ?m8ìáw()(ˆ™­!‹Ï’H+)QÃˆ"'/ÿ£ºÚj,ûsùVs:ÙÓòÍâB}ª~wÔuùks#An³mMß HĞªÏÿ¸(ø›ë«Wr-ç«ş‹+Á fR†>C6nQ3ÓÑ¥…Q7ÚÌ·eÛÂ/É!h?cã ³ô¢CµuäÉÈÍºÊY˜r
+¶AâñÚ«¤¤J½ƒD¦ñ˜à¼|ùXãøïß;”Ÿf,]ÇÔÕ7âÜ+ªàÜjTm»>º&ï£théØ«_yá±Ğ‘Ì¡Ó×××n+ ƒÁ$õô^ˆdÆ”•±²ppK½mj†°pqÉÂÀTËçÓÿŠœq9.=_º»¡äıBÜ’ŠÄMöÒ™†Æ)Ù¾Q'¡´$m´T¬âèø7,âá3öÂú™>·¥Íºù¶Ş\i/hšÖUĞÄ¤kr+D„\80-Ø^^¿(dz~éê^wÅ÷zêÃ—ªv=Js9•}‘É‰‰üe™ÁXzúH\||O‹×ÌñvÚÓºÚï(¡0Mí­œ)²]kgcÃöòeaŒ¼)?8y%”ì¶/Š¼æb~iÑpâÇ«?tß„‰{†i½®ĞCNÅ·™†_‘No8W›ºkV´$Œ¬D_JPÉç= 1~ÅşfÉB%o¼
+œjÈüµÄİÅh«õÄå-Ó2<“<®¥…|ÁQ’#’ŒëÌ»¢Áîäôê“¦&AS+ÜŞâpõ)#s3s‰•KVbÆf…ñàĞĞ{‚q­v¢€`}kôŒ²v~³ïÛa¸|°’òµ'{\jlnîQ{®´4È†PÁÅsxÜ•Áï[Ñ­‘°0İÓx„«¶¶vË’­-;NpG©æFW8°mÂŸ•İ£}óæIí\ìâ¢~¥İÃ‡'ŞssòNNÂttN¤¤²0Ùõš7H_¼€U¾şQyÉù+/w¤øˆ³½yY»½b?¤M­Şú##câùùxó—D{W¸ÜPªS›æÈ„ŸË5+ÃMÃèÉãÎÎ@½§õ—¤MLÈ^[pÒJøûİŒ[‹
+¹ngo1D6k÷öôP"çşÂ
+G´´<’¸À6ÿ}0¸Xo²Rÿ¦PÂ'²ÛÇş±è.?[;?dJOÇA¹¼¢.Œ›˜(é{369>®Şßw ÕPØÑmmm&’XQU}$ñ$¯:„ä¸„×6ŠsÀ­øŞ™vv¦	\•Ü‡Lt+Óı÷VvJ7÷vvâÿ“»ø³ü‡‘)27w9:Z¨&Íã²9FÀALü‘]·!êçO=É
+d)Jí¾û7R—ZQÑ¸Ÿ(P{¯·Îî©%Ÿ¤ƒëÓƒßÆ]^Õëëã=*ÒÄö(rÔ»9ytµó†ˆÛg¨›Gµ"¶“Á¼^G|ëÎÂ@ı(>~äé\¼=A$P‰iÿùeU#'—&„ÿr·ÒÁÚÙ ìG@ÀH
+}3· `ç§ıß‚Q¥8:N9?‘Mé7ed.Ô?Bê˜¥›w›òz%[ñQh–7½ãe	ˆÁò³2RéÏZ¬„´Ûé»Ÿ5•äšÃƒ¹E–tzzb‰‰¶œœyª2MÑ=WcŞ´&,||ü£7[ÇÄ¦¦ıí¦Ë.ê
+q-deÙ88¢3Ó·`YB<$}TÎ­•¯ƒ;Şjh4Îğ–×%Ğ\Š-İİß\ŸŞßÈôĞg~eÅÚÑbİhFiw¦ó§ÌÌí97²p-õêªhj>ÓĞĞøªı²
+¶ÕoñÍ’35W^ı[MrÄ«fÇç[9ãí$D-~qùU«vÖV‹•Enob<‚v+)/_G5;l.wô[e_2¸FËa?ó³¨è3Ô÷Ì¬òÕˆˆÈÙ²›Ûé'M¨áæP(#ãOsªÛ~hAÕÌ¢Ï1Ñ~§yó¹ãl¶w†pt¿áûâoµµ±cÅ/Y<–|srrX’ş!Z¤33\Æ¥ÁµØ¥^@I’ÚsJ £ ‡´©é^¿"‹HMõ¤ö\v§ P>\p©ÑöëµX¦°z¬¢ùz{àq+ŸßõKïnÿ[Ÿ¹ùy1±×××× GÑñğT/…^=Çéê–$[i<&’q@í)Ã»VUu¯/²Í"ÂåvÑ-OHñ¥s% »2]Ş‡‘=ÁeIúR32c}ªq¸ä>/¬YtÕ.g[o»ºµkßÚs§„lğz9?ÓŞsò†@.6¸üt›¡Q±¾Ş\	Lf<N«KVK¯²aˆõİÙgoõ+-îná>œ¾R×ÙÃ£~ÿ¾‹»ª(.ÎmK„BÑ ‹†ıÌ!ÎÏ×bû;¹Ç&'»V»#Å0É¾Áí{7ş°Q‘y¯Eßõ‚3ñ“%Ì×Ù‘ˆJL,îêe&jÅD9t‡“äõÒ44¯ÅzèômÈ§§§Ç¥/¹V>b¢§wn—ÓÔªhI“¥¹9Í×øä#­¿Èïs‘Ÿ¬¥ïu?`nN„/»òìñ+àµ ÉvÑ2Á0„)Å5†Äôâö¥OÅ¦YÆ Xğó'Ö›³¿5â{l
+È °Õ‹‹#±oV…[ãûM-qÒæıïÅÇÅu8øÏeöv¿<˜Ö©tšÑCÇö!¥eekœÍè44d…ç«‚xãØf¿¾¿Cû73fÅ~û–Ÿß½©Î½€”=œÒ"Hù”üÚb§o°ù«°‹½)˜‡Ïì­]=L¯½~îÃ<êë İKK4…°ş­¬ıSl“Ä[x0\b3*);`¤ddÎ2Ô|äNôRNÈtìâÕ^±³Sœ\t†ş­Zúe>e¾gj¡b²7G©Z
+[¢Æò>d¬°²Jx“I%;¿3…zè“¦(£<ÂOJª«âüÓ•¿|Ø|#/vñT—C§.¹ªÊ±Î‹‰¿6 ØAïŠ<£½¹Zàz¼”;¸®gf’p¿æN¹{.…&Êç[¼­W@”yV3C=©uWÔK›}¯Üz(¹œ¶2Ñ¡º¸Ô»»VŸ4^Á
+îŒP”-œ'ö­§2šeŸÁÌT´•ÍÜTÏ–m»jWšab†„„7:Šd*¦'¶çA¸ÓLúIÌyŞn‹kÂQ¾{ÚŒäq?î¥©ı“”îbuÙşÑ,®Ù/NB#P»eÀšŒ/•Ö}C¾~=¼Ù¿K]_¿õ¸?=5L*ÃÅÅñèpˆë­e÷©7 1Ãçµ‹-²a„¾ÒÖÖ©3ÒÇãyfŠĞ7c£¡ÚåU˜š¥IzÍ#¸ù•Î¦ŒÍp¢çhEo[[ª„ÉÔ¡)Œ‡lÿ~ÀdvĞMfğ˜ŠJÑÔ”QNuXlgd÷úæˆÑÊŸ%ˆ®ºº*Y‘|ß‡®Äˆ¢Ìş„œZÿUPr#ÂWÕn¬±½8zz}œ5ÏÈ¥Mãw.ä	¯5™È@#ßç¨V§«3$ôPP0™øñHÀnîO‹×`«8YeÛ¥fY¹#Ú¼n~oÁ±3×ïyÙ¼¯:Œ|n.³´eTüŠİfº¬ÃºÖ›‰r…S„BÙÏÍÍõQùqhÊÊâº¹¹ıëò=Y†b^@¼n/
+¹Š«23÷¶”C2ŸİÆşv>öĞhÃá]˜£Z™ø‘Ÿ_í†Ô|„ƒåÜøßÉ‰ë=,ÿ;;ı©¾ááèÔasà—"7è™™Ãfü3“Ø´xÙÅ¯l¹~_³ãúğ,#S‡[ÿÚj¶İØ-İ&cE[«éèD‚a]ùêsĞhÔØØø şwW^­XÈm‡ôğpë
+÷’4ß¦¥9º¹PáïĞŸPÁŸ~uŞ3è3æqYï3¢"ô`ş£^¨ì<ÈáA ‘V'(À]`èJI¦¿<!³vş;NÂûä±f©}û–­ ùıû3X()i—]=|ÓkaÒõY­H¼–ÁMéŒ7.áîKfæ¬éiy>
+‹Qh·!÷Áao]Â}Ëœ7‡È[¸ û7\f×;Z\WŸ*K¼Ğ(ø`W8‰•¥åòf†ª>‚§ó‚€`‹Í…kbÊÌ9í{“L-stLfàœ•%A@pÊÈØ0/ú}WÈ Ğ>”6CÉx,¦K×€ãË“³³*À5„aÁå:õô)ƒ_Z<yX“"’“5Ñ 9tçåÏ6Ö<]½îí³vóò¤Ë¬ ‰ì¾yiÂıüoë•‚éÏ·æCåzïßóîí•§h,Œ(?yò§çûàà˜çåíĞõ€Tp|59İÑòtœ)Ú»Ë(ûõ‹´\bŸxmbjaABF¦ ó5ğ…¨8=ß'€q\\x[kkhEE`¬™¼²òqcÊÑO3›êÏC ‘ú'ŞaÌÏeò0K§Vİ®ö-H”Ÿ“Mc¢“èn¬#Â|8½»ìË¬¿ƒ]¯u­Ú—Ù»²å÷„a…Èw…°ğáé;w¼Ğ÷ˆâ¤'\ô®üÔA_6ª®Î\['vÕù"!‰?rlì–cĞ½U››
+º[¯ülÑİAõ¦&c¸§ìËŒÓÑúG0	i¢ãIœÓ3òffüøÒŒÒÒ.,¬MVÛ>ªšg/ß½«óóÍSÎ²7E-$_\@´Œˆo·F2¥yîî6ø¨W¾O–8=]Ã0Çé<uÿG¶!tËç|²XŞï¬2ÛŒîzÊ95Å, Ì&ÿ²…99Ã|Šb*·Ã¢¢¼‚Bk:ææÓQ¬¿Ï@í'úWÑ’’˜ï.Î”RU«”öÇ<¿lppq1‹‹S‡uj–Jç¨ş—¡0‚¸ˆH“Açy^_·.'™Å¨€gm¾¤‚¼üËW¯Ü†Ğ«æº#Ci0ÏÃnƒ‰qóöGş7È»ƒÖ}±>˜ŠD~e¯)/1Íşƒÿ;ôİØß¿r€$\E8˜™¡çßUÌDÜË(¢™¾ÙÍ‹²CĞpÙ*#¬ĞĞĞİ…F’h™5òşõ¡´×,Iò¤ø÷¿ßª«°|û‰Õ?™ıÕÎL·.SÂáNé]?‘ßA¥‰ qL·±ù(”(<bGb€!`0ŸQâîˆ)äº‰¢ˆ<û×¯tJ¿·ûËè•ÂB£•÷-2y‡'Eb®Eñ——æ›#zïs~4ëŒVèe9îL>@5!é²N:pı88b^*ŒŒBâÓÒú›ÜB>çÜÈ™Jf–>•¾Ğ[-\úÆ\ÌşáÌÎA®ÑÆxéƒªù= M;=›­ñT„¸ÌÊ“gÍ8Åâ2ö¨ :È“¦I£!KZgXiQ¥?ÆlÍ¨Š:9ùp8‰¬•ÍñErpQÑs0,©|ˆëË©©)@p NcbbB‘q‘6¿zàüÿÛôÒŒÍ9‚±góÅ¨³K%À°óø7)Sƒ}uÊA0Ân%ÉÖòò%©Üt‘_jpÚf_ÒÒüœ·|ÙoºÚ÷arf†¨I_qè¢ƒ™ëhÖ‚ò¥_üª£*«dª¸ïA?.P>ª,ß³ï3?²ƒ>±ÖÎpL¦ĞÓÓSHHül2°îás­uÒ(R‡‘“sàµãB¾¥É(4¶ É22—¤˜)r®X‰J
+”µ£!PysÈÌ©×LDè£2ò€DÊañã
+
+uİ­øÑÂÏ…*Y……½.Ááı¦Æ=Qäÿ	9ıSXxxx i!í¾EM›O_É‚n¬o6U
+²²^Ş~Õs§ÉŒ—Üe3
+nÊ¿ßÖİĞ ÕÔlƒë#Nkxb¿JÜ#˜…¥öñã;…‡$ÌÊ?êê’w]eh„±kçÄàûİy‰è/U†Ô™™™>ç+ìûÒ$4Y}‹­ó­Ó¯886Çr‚}:(«9ÎGC–
+*£]–'¾jOW2:·N†q«\jÀâçõ‘<~U[{*%Ëì|}~ˆ)Ê¤ÍÎôŒK_¨9gJäÕKãï7)#NŒmp~h>˜|@ËÍ=V˜yâ-&êîÓ±Ş}«—p.yÙQ¨¨T4¦2\‘©sI" ;[œ,CAÑXµVï¾×ÑTAÙ.†İpçœùşât¾¥w¢ÈOlÉ#s¤g¡q0lwB×À?¨Æ‚ˆ¨kÃ™Ç÷rˆ§•ğcñ$»î6dï«#‚²+®Yy;]Ub§®ş:•ßf—Òú%ÖÄ<’â—Ã¨* 39¹ğül'™R^ŞÇóªæBÄd1ŒázÈÅÃÚ¼ï·\ò\I—¶Æ‚+ÑÛ{²Ï”÷ö¼7¥á
+E£wfø8ÈQ¸ÇT·LaÅUä^ËD÷ã¶•³§@V;pi(gj²ğ—­qÒâHr‘“§ÑSİÃÈh™,nË2Ï‡¿ÿ8^/»{Ú«÷vs¸9Ğë¸‹[lÉÕbd2!>^Æ|Óô'¶áZO4VŒŒs‡{´¥pŞÛÊß¯¯ÏêUˆŸ?çÛÁ%òW+^ÿ.{›t~î©ÈDìOÎÖ¿ÛOÙÎWˆüûTÄûQğæWllX2îMÂÄ†ZÏæ–Æù²Já11&·×İŸÙËùÑŸZêB’Øà&ºªTïBJ¼/Ç`Û¡!!ÆÛ(ÔÑPòÆCs>jBğ-º;—Mmâ©%¬Kü(¯"V|Xúñ5hÿ?å°Q¬¸)æe›¢äQOÚGU¢7Ö¡ó–ø)ƒüÛ“zÏ"C£)—è„<¯=
+ÏEX¹¸Œ+|Ü|b˜g|w‹õŸ°‹,ãAŠ
+gJµ+ÂøO'îí½ã¤7|Ÿ×ûVc½ùû—–ÿw/ºöÈÄ³ÉÃ 9ie©Š÷†AÿPK    ªyİPvRÇ¹µ  ®     simulink/ScheduleCore.xmlÅUMsÛ ½çWxtÇ:¶2Ó¦‡NMrÎ ´ØšX#p›ô×Y‘m9nÓvÚ©/»Ëòö½eY\>T›Ùè\ÙÔËˆÌq4ƒÚ4EY¯–ÑíÍ;$£Ëìbá6¾½[uº]“hÖjs¯WpÛ•n­½o_Å±3k¨ô¼Ò~ıµéîİÜ4U\Yï²TUü™bŠõÅD‘„Â²‹ÙlwÌ¼ªÂ†æošÚÃƒŸùÇ–Ñ9W4ÛnËb¥LH‹•FF`Š¶å”p”(Œ$Œ³ÂîG´]Ùt¥¼*;0>’}(WëOÛ*‡î£v~?vBQú¦»öÚÃ9LoîWÁ†â
+Ä…âˆifP®F$åF«\§#®¿t×µYwM]~ƒ"óİñ‰q@Ay2uMão´»?‡¬·¤J-cÚ¢"p…˜P€rŒ1"9Ñ©JÎ9@2W‚xŸÚMiJŸY½q¡Ìız¨uÙX½İIv«Ñ5ê“¡@®`2I™<¨¶sÛ|hØ3àß÷:É1 '€˜zix‘VÛ¤°©%¹ØSû@§{‰g‘ É­ÄÈªÜ†¤<G’Zƒ •@¤Ä…‘éQÒ6×úOÂï—Ç1ÿJ_ÒdhÒ"#¡+‹‰q'O`ªÔT-†Ÿ‹4´nèâ³|~>ºJ€¹&	ÕHcøÔ‰F’	‘P[pN™5>Cb]×M¸"ıÀ¦‘¦Ù4]F9_ÄÃçÔ½Öîõ¦1÷îI›Ãz×Wrİ‚ùQ1½ïdÏVŠ¬§gøš&Ç¬'vçË~Oÿwqî~Ÿ`i“\‰0T @¢\…®ÑB)JSL¤?!øŠ¼H/bIJ±HRò?YcL9üÈ0O^f~ï&Å~ ÅãD§ø8³wO_|î6‡—7><½ÙwPK    ªyİP	e4DÉ  ‚	     simulink/ScheduleEditor.xml­VKs›@¾çW0ôš…}ñêØd¦uÚ[yœ3bWØLxx ·I}l0qÇií^´Ò'­ôíÎ®ŠÜú‰u“UåÜfµ-,U¥³r9·ïï¾‘Ğ¾Š/fMŞ®PgmUO­™m­A=Âïë¬™Û«¶]vİF­° §€võ«ªGU…[¤Ô]d°¬¡¸î¹7œ²Ì7dŒÖ{»oˆÛç²…§n+§ıÖˆ	Æ˜”Ô/,k¦·œ-V§¨4æÎ.¬Õ>¯qn3±­Í&ÓÆUêqÄ×Ú'eJBÑÈ%õ˜
+‘ë> 	‰e›µ6ÇÜ_w6Ïƒw¨ç{	%ÓÌxg”„Ô÷÷|Í„H¤ï{;ïÆÿºjŒÿªŒé%¹£4¨›ì7vªË^İK£ª/Öu…Á¸ƒ×¤SÎVçü0ğXE• $Š@ÉHSM’D'(xÀªlwôn2Ê1şZ•íÌİ®G‰'Ğ QtËÏ&ùøQJ•¦>I°CEuBB†H¤‡DÂ^ÊÇb½[®Óªò½†õjìB1"ÀR6Œ4‰4M•B BøL ß—åXa†Ò,;÷Û r÷%Úu—;´×Nş(úDP¤$Õ`ĞG‚“DŒ` •t@¿C¾À6ùKğG€ÏÜcÇØ[ ìJƒOo ß)üÀ_@d]qM¤–f’øê$Â@É(&±®ª¶w®ºŒç¢VY®k,Ï4DÓv­³ª6ÜË®[a¯¯¡©å ìQ- …‰»j•Wuü‰ö¿™»§+h¾ä•zlâ¶Ş˜İËS«.nlö÷ÿSÅ±îî­›3 GÿèJ¹÷f
+vBïÎòß4·¿…^Né¹.†)ÕºXØğ'ÑØ©'ı¡ÿ…Ğ§IºC–{šæñà2z¹şêIÏ€<İ‘~¶¬ø:¯™Ç”;yMÅ PK    ªyİPœ®²lÑ  l	  $   simulink/_rels/blockdiagram.xml.rels½Ö_oÚ0 ğ¯ù}JµjZU´•Ú©öˆŒsI,_äsÆØ§Ÿ¡’à ±<æîr÷“m9¹¹û]èèXRhb6YFb¢L³oO>³ˆœ0‰Ğh fk İİŞ|-œ‡rURä›ŠYî\ù•s’9‚X‚ñ™m!œ´/…\ŠøÕpø‘ÛzÖìM“˜İUl#¯ºÊ”aÑ›°¸˜•Ûgâ­‚Ÿæ‹Ö%Y|Y¾B»¤Ä‚“**­ÌòĞ3ºnbøû€WaEÎ¯ãŞƒ™ArJÎª²´@„öØªêúŒ™’÷Fèõ°]k(ê™ùP¯–ì™5{LºT‡\ß(ß;©4LĞÂUş3hc·,1§‰rõÓßŒ_Ô²Òü„ÅLúk‡æOXù;ëÔİÑ]ÛóV.4Êåæ–ğUŠJ;:pI²‹µˆŸZ¢à°Ê”¹’BO—§BÖÙqîrK˜âùo’ƒTãj^™+SÓíS|—ºnßúe74H[“ƒb~5ÕLÛ˜o°Ïµ›Ã¶gÛî”bÜi÷$°ˆ®±IşoÇJ™W45)µàùÇãKQŸä%¼ñ“tûPK    ªyİP¹ï‹´     %   simulink/_rels/configSetInfo.xml.relseÁjÃ0†_Åè¾(£Œ§·Á®kû ÆQ“X6–×­o_JÃú…¾OÿpøK«¹R•˜ÙÂ®ëÁû<EÎ§Ï—w0ÒOnÍLn$`ãğM«kz#s,bÂban­| ŠŸ)9ér!ÖÍ%×äš5`q~qğµï÷XŸ°eš¯É‚Ï|‰áHM¿:¹¨=g²5¿úgVßü›ë"Ï	%¦Ÿ5ò¢ÖİÛÖŠà8à¦ÕxPK    ªyİPğĞ‰ÌR  Ï3     simulink/bddefaults.xmlí[ëo7ÿŞ¿b±
+÷a[Ê5‡»ÔV![Vbœm	–‚‚ÚI¬)rKîÊrşú›!w×z²œKÒ\Ñ q¼»Cr8ß<Èı²˜‰hÚp%ãæA#@&*årrùxÿ_ñ/­oN„Jî:œM4›u`Ì
+‘›Ö7Qt4x09¬¼Â—ıèŠÍà8î³tOs9Ëq¸%˜LM‚¯û>â¾2œ(/U
+q‹¹
+2$(Œ€< º‘<7q‹Ëd
+f“fÈ¤–ğ’é	—Hú®qğ²A~Œ¶ıö>8Ù	ÈZs“d0U÷Dq¢
+™2.¨ÆãMBÚ½8ÑêŞ€~ËqÁó‡ˆoyšOqí—¾Õ O•P:nİOyîÑÁ¯JÍº,É‰¤ÙhxÄªtnmÁÜ8U³‰¯T¥]/½V>nÚLi_~+ê*M2+™	–Üm.t‚oWè›ìh•¦,U÷éç…JÊMT«Ù&UWÉœ~‹[o@Ì!ç	óø²4éë-ğÉ4[Ré~š¶œI…HÈ®'Jn~}ÃSh£#Íp?I˜ÌjàºV¥‡[KqÉµ&Ù.ësCyGm)Ë™:}£4ÿ€;c¢-øDÎ!âV‚?}¾ü4Iw™tÆÓTxtûÅmåë±Ä°»"s¸8#LØ$AŸíp“	ö0„EŞ6§‚'w§LˆŠ#°ÁGUº©ñ	~cõK«|é›r?~™E	U^‚s²ƒLş\µ4¿]]p	Ağx–~şıiÕst¸ÎÚÑ%3µ¯DcÄo>æl$pÜk\N]**:O”ìj»
+ú¥}ìeì‚í¿qt]ÈsŒthûôõRÍîc&™xÀ=Ù!Ö±qˆTßŠWoRÇ‹#³‡"\ÆKnˆë>#6P'ÑÙœ‰Â&–†…,¹Ç‡+ÀdbÀæåf"«Jä¤|¼–ö¤x(ÏìÈÔµ‘®šg¨”òÌ>Ö"aBMNQÖZ	÷ß–Ï½ŒÌÂ¬Î²2ÿµB©H¸£GôäheÉÔô5´¼Bşã8WY-¥/Çñ´G6ÎÇÌ42ŒE‚1R0.í32°È0ã)wK8İåâÖsù@)Ô«ZÅ·J§·š¹½GôgÆÍS‰ãpCG‡ËÖõXëEÖœÄ~ŒìOÇúIaN50ÿ+ùÖPèÒÉ™ì\>âår¸/òËÍ‡Â[çr
+šç¯¢•dn9Ú*ù–ë¼`W_ZBÜâÎMÎ(¬Ïùís%[‰&”ßX‘˜fg%.ÇT6ËPµ—ˆÚ'ˆFÌ@Øô%G¡¼{úÊ[¾úVşQùÑ·,SæçjÇ9 ¸w¾9Ñ†ïÊ<tYëûƒ!'däÒKbQ§,¨4HÓ×€iç*Æ†ÏÓ`fÅbS}(’¬ Ìı'ßšk†8bÚG…Æ„èŠº®«‰gğÕMä&WèË¨Ãå^ñ®ùş»§¤ºßÜy5Tğær¯U®†l·Ú¾•­KAÄ-$óÑàëåê\]ÛyzÍ¸Gî­×­.W8ºL•6Ÿ	 TmÿØûÏÁ÷…W`Ö·¸ûvû}»ûÌ9‹x…"]ˆj}>Ş‰ƒ§]öZ¦—@9SW(åµùËq¹')ìN°öÆ`<ëÉëÿl°dš_›ÁË³šM®úö­×dWX"ºH³xEë ©[H(”3eúYl)=Ÿ6BÇ|Ûà”E’))û#¤·Kz½eÔA[‘Ô-2+³|5%Ó>©ù†é-S`æÃ„+;Bû_ÓA)1LòN:€ªFb”‡ÁªØÍ‡„fUPfİH©JrcLp+]”@/\­³·[ï…šğÄ3Ğ.k_uüË¹@ù"dßX¼’ø4B&'…ğË¶¤[ƒÒ„Î0”ÓrØ¶g "LÆ|B8„FÕ©§yQÄñöÃ'ŸJaá»)<+›	Rcoÿ§W/½.7¤!nEõ½æÍÆwûƒ—~_Sw7™ÃàG=ãföÏ9&ìåÓÃÒVÄÆÜèŸSÂ™óV¿¾¸vÀ #YÑ;ÏÅªÕ¾Šì»­£HUè‡9cp…ĞÖAr»^€ùCç{¯Ö#nœ-¸É/Nú¡ÍÖÔ× Î\g¬qĞØ¾ëöÈ”¤MØÿç®V~É$–Hƒ{ ´ië§…Ö˜m '~ñnÎ´±]Oš\ú2ø
+—vIàC•$*€b×èwØ³–(ê_?m•IÁó3g§_Wºp&M¡¡Tü¹)'ì7ŒzcjÂ!9ñ•-ˆ049²Û)¥Ø6UÜš‚ğöVfÃeaòk0JÌa¨œ0pGn$†m‰´ÄÅÔIE]n³áÕìR§¥mšL£z<'Kêk•Z‹|V´µ2=øŞN•,3epÂô(JkCŞFæ‚b±Î¯¾`åğ—­B¯q!fmîÄØg¸ºv§Şàİ¡¼tÆ%ù$DTººGÊ×ÆVÅOp÷¸ŒnqkAÂÇ;(Í4Ô¶Ü –¨À¥¦ˆuE®5¾ä??mÃNğ+huª•1ŸÖ&|LƒÉw—¢qÕ”ëPÇ\û¢¹ß‰˜Ö,¤şå!T¡`íñ~WV*Ûäå&C=^ sJEuÌ}M¬uì±Æå¶qM?¿°?6şÏJ£§“(Ÿ…”/+vïJ‘Ÿ˜‘ÜiHTv;ééx²óÊ¶Ûíóì+›{öÆËÖˆQ),\ÈëIØwX 4*qùØGAÕ ¹û!›û°çe¸êµ`¨oNÏ”m{óOBwSn˜Noõò!ÿ:eş†#êdJ8e©Â>†oã€NÊÚ¦«O\20%´ï¶˜\(•õ’ÄVjÉúİŸåm&SH1>·M}ğ„˜èåÛIjÄŞ:ÒS—Ïò^$ë&Ö.†Ív:.àiÂªê¶İ’1K€bÜš+şF?¶¹åùt #˜#'K—út¯5Ë¬âê¥Â=¼½D¡AB+Qx¢ökìpÇm«(BƒÏÂÏKÛ©NÌÌG®Õ?jğc¼İu8‚Ô[÷X8u`Î·È¶ª›&úNWTfSb¨9Y$Öútî.Ê†7Ç^ÕÎ0©3TÖCäp#	xG£b ©RQÌF&¶Q²ËÂî¾Åû3wtÉŠâÁ*4äØİç0÷è]ÊanÏ´“”ßËSÖt2	è|#^ƒ¤Ìú2­yŒÒu:»­—RU÷áW×Àú,c\êq€[%<¤Ñ×Z¤TV“ 6|Óx·XŠw8G3-o}„{ôæFV[HÎåï6œÛÉa¢=B§îÆ)I!<×$½lõ™„µvÃ“QÓ/—ûÿtÕ-ÊQ®?üğõ”Ám’ê~ér:ØZ¦¤	ı0n/"[FÃ)ÂÍTù{UõÇ€_ìVDşÅ÷¹Š)Ù{”y×ìÚ†ˆmiÔ­Òw&³9–7<\nH—e\qó›²å®?z.lN¢¸ÍFÃk5Hø¬ÄÏ@µaó¤A 
+UİDô¢Sûş£*Ğ£=DÊ„ĞÿFL(9‰ò)×é#Üy{]¾È0xuyĞJ0+©öÉ©±³’¨é5í½¥dó ×Çy×ôzH¤ª”Œ4Ñ‹ÈO×Ù†JàŒ2ÙÒ0§øËe¡
+3 [¥í<×|„CqÛî’ZøªÖe¢ì÷¬ÿ‡§¤À'
+w¹~ØÖÍ2ÜëK˜=jµ(mŠ<™n¹]¢ª
+ú<W»“>Cİëx;ElEéòWÏíÍêÎıúÈù/PK    ªyİP«×û­ø  S     simulink/blockdiagram.xml¥Y[sâ8~ï_áríNuoUäÖ½;„)0M-*v’yK	û šÈ’K’é_¿G²!|¡{ßŒı›tî´ÿØDÌy©¨à·në¼é:ÀR¾¼u½8ûæşÑùÔˆØˆ/„ŒˆF¨ó”'é|rœbğyæÜ“n]¼Ax·"’ä cìvÖ”‡b­ÎZ×íÆì€jÀÉœA7@)_ôˆ‚g!_ULp;‚xã¿îDKÄ£Nş{Œ¸{£*+À"†X xåÓ‘Íóæåu³Ù<ÆNñ`$á˜¦H‹>UVoÆ,^!j±(€MŒŠ[ænçQÁX„y 5ª§éÆ1£€‡ãvPÜ}¤ĞN(Ÿ¡\0±‹åÒ^A½Ğ}Â®VôÌ-»ór-©†cªáÌH¸yv;øà´
+“Í¤?RcÊa|©Wn§uQpc¢´u"+^C 	Ön®ÑßÍÑ$ZÌ+µSw‚/èrB8Y‚Ü~ËqyŒC¢á;UZÈw<¨üÏ{@Ëwó6¡g/(„½÷¡·óÏß˜şİhóÛRÿ^E‚—'=øÏ[:ã‰&Qìv®[×—WW­¯ßJä Ëâu+§u¾“4â„¸şÏMójOl»Qq`íAHñDJOÑCÅïò 
+]Î…¶é¥=¦sIä;:Î+Æ[ÌŞŠ°ÏèÆÃö½ /z…€>
+ç*“[Šœ	©·Xa"1&gRÄd‰7ztÉ	“9°rª<ïÌ®íUu%Ê?gïeÍe˜#H™u©[ä3‘Ü\Ü)ØnøF•w+^«-7v<rª«Q}Px(„/kr,D¬¦ÜZU¦èhÉ…„©Äô€—ˆ‡]z9c]}úUôAé™ \‚÷Hïù”`‰Q£–à‰Âd5Â©A–jùD$%\c¨âm¡ÜêÅ“AüeûñV¡§J£?`Ä}ü^~Bäk—!zL¯æÑº;KÕµÀ¶`ï >àålÑ¯Icc‘§%z÷I2°È‚õH©?bJÖ‰J%R%ö>˜Oí}ìÒY¹n5äèâUÉ4cqóúÈÑk&DU0$LS%„wÂ£Ñ~µleø6Âf¦<õï i·À÷[±<r4Æ•1s;$­ß–ã½w¥!²ö™ğt;ZÄ‘)r${*ù"¶E±^µ}:K„}`%|2?ıîğ;g¬èA¯ÄB¯‰„3ÊÏô
+Î&Bç³¢ìKaõ ‰²¯úº€âätáiˆÓ*Tœ“X­„î%‹:'Æ;›UÈÇÀ|#¬·•j›¸Œ¥bÓFëeUÒ~~@ï(±a/½MÔ²¼7Àú¼À´B&İØá‰DšácÒõÇİŞîu¡[Xê¡>‘KĞC+†˜×çš¥4>`„¦MÈ+,>h^BXŒÓ*jiN@á¡Û‰ğÇ‹ÔëÂÜ%M_aNÑ¼?<²:ÿSŒcÚ—Ñ#v‹“¢F}ÿ\ÇÑ\äc.;ÿğCn'ãb¦Hw+/§šà—Œİ­¬LıÇ<”Bèœ†HÑ•’¼çTdbÙU^AÖ[i
+Y™®	#s]‡:ÿ«•SÀÌˆ(‘k>åD7¬ìŸÖÅóFıÿK¡F©íFzå7ˆe[ËÄtøÛfTåoğ¢ø¿OFçE”¶ÏÌŒÏ1T2S±'®6ƒ*…åßâû!ng²ÇQÿÀ5¾5¿_É·‹³‹ùõ×³+˜ßœı»ÂY8¿"Íù"¸¼ —í†eRÁ8ë2ôêĞónœştè<ùÓ±ã|î¦½ñ¿4núbè|$¤ÓåKêK«^Şş!û+³o¨¥Kæª5*(¦‰mºğ–ÇÍe(’¹É)—ç'ÈÅHÅjÄ*Ø4Oa“ºŒyş	ĞfÌ?ivã-]L«Ú:EÕ	ÙØ._Ğ7/®Na‘fû´zb¸hìª"Lw¿xv#54¯Y~…¿È¢}µÛ°š“<Œã”ĞVÀ¤uB$[f»h>”r˜:ôMçŒ:}Û‚|Q™Û²µ=Ø`ƒ>j²ôqK²Ñæ}è`•ve%½BL[˜!$íd‹ÇƒìKºL•X´“âÖ0ÍäãX»Ú«†EX¶%ıQ5`véƒ]/Ü*ä ıD’t²lå×¤Õàs0}ÑwÁÂébQÖæ¸ƒİøÔÂ¶» ·#©B-jğcx3Ó@Û½ıgµ#d[µ)ñt‘¨îó
+xWFµ¬ÃĞÃC7¾xª˜03ô³YÑv³­x.w6FFlÎ¬C{¯4î‹5Ç‹‚‹ªTæÓÅk:Nß™2}°PoGo{;¡a
+Æ.¤|B5kŠ=hº	H—¤•”²Ñ´”Â®n ´D]¹´½ÔÁRºQ¥³YY‰Ä/z° )œ»{v_®g¾Õ»,nõşdbNØQAŞOç±{’è5 ÷ŞyàÛ5Ã~‡3à*‘à„f{ƒ…C8:à|ÈåGø#úË~ƒ_'²«jd¢)VsXb ¼;bqz‚ <uı+6á«mBß•$Ù ôJ„5²ï&ÙÃ¾ÿ#‚bFª±~kkÓÑDm÷úÕ^ÕN'XİòÖUöùÅDi-Î|¶ó){Èı1Øùô?PK    ªyİPiÒÍö  9…     simulink/configSet0.xmlÍ=ksÛ8’ßçW¨Tùp·•‡í<&©ÊhK–äDw’­åäj¶¶\	I“„$k~ıu EJÄC½½ù2ãØİx4úİğóßŸ’¸³£"c<ı¥{ùú¢Û¡iÈ#–®éùêÕÇîß{?}ğtÅÖÍ{?u:Ÿï–¿Ñ0ï|+Ñ®.^_¼¾ìv1É²[’Ğ_ºKŠ˜¥¯+Ì.¢ò¬£ †,#Ë˜F3Á·™Æı¥ñ~ÙíıãŸŸßÌ1h
+¶ÍaÎîı·¾dßÁ1Ì€'[Ò4‡!û-üæ+I#±3d	Mõ6ÿöI¯æ°õ¿ñvÓõÛYÀc Ü`PõœÍ¹6Øø{}sC9ù¶Şí]˜ øV,²vˆş2[ğ¸Û»¤¯Ş Šœ!‰i	ÊW«vÈöD£ §[XÏë‹‹«÷í`ã”åŒÄ
+Àèí`Sòt'"*º=Ã8¿†‹ Ù†Ç‘m`ÒŒ†EÎvô×A†³Îi¬ö|ñ·Ë«£[m`MdD¹0zô”²å1ÁÖ×z[$K*néœ§ãœ
+‰‚ƒ—QÕÂRrÖ6S!¬Hdd‹QŠB0-âœ-Hö:ÅÂ0sXÜ°™R	^·WñRß¸#Š?Ÿş_$äKFÒ)Í7<‚uå÷i¦[°![:>£bG+x­úqlàM*ø@ğ,«0î3:á F -s –å*¼~¼æ‚å›¤Û»å)‰ÈÍ ¡ñš.aá„ómIÀ…(²|N×ÀZ6zŒÓ_ğõ:¦ MòÆ ?Î¶ıí6f4§Áxæ<Æ9P-W”†#"YŞ<ãÃİÍÃ=ïµôÇuŒ•E>'9]’^Ç¶ÅdSÔƒ( ¦,‹u¦Pÿ‹F&M%'Y\OyLö}CS
+Ûêlá€¿k:´0Àş#ò%c²´àE6NsºV*Â²Eg–ø×pœl	˜:/¤»áè¶Yìµ.óŸß(ói6ªo=êäd|÷7ªp@IE9ƒrUOEJâqº-€‘ş‘¿ì†ÑnXŠ–ØTé©'ù‡]h€Ôÿl‡°„åHÏg¸;g§:œÙ€M8‰vfa›Ëµß¨à ¼ÛJk˜®år]£rÕíI7Ñ ÆÖ0óôŒYÇA’€n²¬¤Èí$@ ç–êÓ›5ë0˜:a@mAÜªmGşe‰Ù$¯Ú‡É
+ä‚’dÁ¿sñ˜ê°nGÂ~#‚¡¨*†Îäïxa!¥r@£Îi^ˆ´š_-Øê" Õq`-RÆÉqâ\n„SS ÷æíÔTÇpFøÃÉ*à(3“J­âN)³Şœ®À.©ßá>şBÀ¬ÒÚ)¬Vd\Z€Qêm-ø‹m§«M®”¾×K3íJCW«|˜Vh´dbGb$Ä+–®^và?uŠ¸Ù;OC†‡”°?¤•hš³ãõÈ¬©¨u@ãØ³Êa¢4Xá†€3„a©§4ábßÏeüWl?¿Ap|I¡gâßÂA?mó!Û]ïq,ØPT“Ş¥º¦EG*ÖBã1€Ÿ½¯9)I³~vÍò£q”yáÍàç9-2Íñ}±†!‹YÅš^€·€¾f°Ú|30Â^h£ÕŠ…Ã¤B†W3"H2zÚŠcìÏo$§ı{\¢ë˜‡s¡Ã¡Ô…2œn#†£‘8Ş0*¥Òé° Cº"nJšPàäkº!;ˆ ÖQÔjGƒ£ ®e(i nAÅà•#ŠÜå!à@Î7N7 ¯òë‚Åà\;63ŞÄœä—ÓÙ4¤ÚÖ}
+AOVòÌ„êpŒq™eq
+ºˆ¼Cûjl³³¥ÌÊãß9dMÍçs]¬VóØ˜Fé†¤!®IøxÒäÈp_b¾$¨6¨ €l[´õZ
+º3é:ßøpv?ÚÉeMÊˆ¾M¸PTi¦X­Ü›‰Z§JÍ&Y'Ç€U(æ(ÀK~XQ~0Ğ`ì#I|·íö 4¥’uTÃ¦¨Wgvhn÷æõ«¿×2pÙ®V-KÉP½´#ÊsõÆ¯ÍzyeŠÑÊ“Òm¾‘ñR·wuùîçwß~x÷³É• BI~?¸¡†ıÏy×ÖaÈQJ_N\ Ûñ¢¸»¡ú!fIäjy£´H´X*~¸%Ñ‘A=æ“Á“0ïÖâ>Øb–ßÄyÖO£á2ÎG1ƒ›]M*‹)5î¬q@2[ÜV!L	øh·ˆa_Ö„­@ËXø“–-(´ ´e·§mEg%xÒ­MqæAK¡À]ó"ˆ°ˆøŸh¶À+uÔÊ1!Á¥]òŒ¢íŠ|Õ½+W#ã"Rµ‹¼\ öğzÁ„ncˆDî·‘
+ MŸ­¤jÈ‘°YS©[Œïœÿ˜’ß¸¨åP]‘„œĞ!¢ÃÿÔJ¼LW‚ƒJbiÜ8ƒ"Ëy"ÙÄÈodIã/‹häÚ«Ê¾ƒ" ŒÉ_«¡)†_ñÁmú"HTXz«˜ÿpÌ±Oz<—;¾zï›(¤ËBÆtÿšàêÒ\ÏÜ¥è‡²“OüS°§áÉ¿Õí/f`øtTnĞæ˜Ñ†UƒùÜ64Tu˜f2(\¾Ô4™¸rÇéê–¤^ğ¹À¤€(ÒP±{…cÙ‚šdNÒ5õ™cÜ~MW s¾ƒôÑi¶ö-®Høş
+¬Øó1qö3¥‰g;›œ¡¨‘øë)ÌbN²}=WÊÃd(óG«*PK5\óBå)N +WD¢˜TZ3¶ÑxZ#ieäAş·±1¹œ`K¼Ô|Cq]º–+Ã Ò¹hi"c‚MŸr0éÅÔ÷`ŒEÚ˜)&³|ğ5›ÓŒÇÕ²2¸{ùÛ–ñ@¾ÛNMî¶4=ß˜.8»O[W|Ñ’º1¡Ø~c…ÖÚÁ'er	oø)Éiôk8ddrP¹¡c9c ga¨úãL$òÔĞÙ8DèÚoYóSº—Ğ˜ò@ö	ö.ùªPÊò¦“¢LÓSó²Ì†!aÉNîİ€İç)…è¾sçcšb”fîª£îÙÔá0*O¸Ã"&Õ*m§)ƒŸ»rjÜ³ ÂÛ«—ÒÎQiÌ!ÿ–.Ë]çS!4VåƒP9g]W ÒB™ìšğÌÃTxÒ»c1Ğ×QÆj²î»ÄFƒ
+>§›2cÉåÇ‰4'RJCše!F¾Ç¡f3Ö7°D\(EpåÛºv¦c‰u®[Dµ%ñ°×ªø„áÁ”e	ÉÃsW!ÇåhtKå^3h^ğà68Ilr²íšÉ¾3X9Å.ê
+©Ï8&'¨–¹îSö{qi3A@«"›Æ‰8ÎpÎ¹t6@‰ÎéïÃÀYãÀ„à™ŠüÌv"p(ø`Ÿ,yÌÀxÚá2h®"§ Øâ2má§.æ¨ìİøÎeÖàÒÈä9ßÊÈTZP*ş¬PÖÛîK4ÕÑe%(Ñ˜²ö]ìÁõ>}LAÿ£Ó°bµ{d2]·¬f²»tu¤ø—ç`ËVÅ[Ò‹e€Ì.€eó
+F­Ò5uÌÕìáIÃ	iy¤ÕeèÓ%²ipNcJ²£î—4W<tˆo¸T±˜RşCŠS¡^ƒ8Lìƒb™íaŒõ•·:Å}"Æ5Ü!l€…¨ÜËîÏ0 ¢ÜUıÜÃR€A
+sĞ,t„4’¹-C- ñ‡>6v{xÄı4šÓ-aÒÂÉ ® -EJõ³kì´x5¤jU:Ìqì-şİª†œÉ4‘¤æsGhI5ŠM
+jØ¥KÑ¥Î–t1­m!ÙÍ}
+Ì*8’ÑóGˆê:À£O[i™±Ğâ.Ó*^¨X!Œ™räÄ!ÚÒq: ƒ#3zrË¥wPyu‘SF¬$—s8ØLô•nI^ƒÓ
+”ğ$°g¸Á¼H»ÏæJ¼#°Ğ’Š‚“=ı3Îà°ú¾Lp¨¤UUùöCùa`ìA¾¤&§S£àa¨¬ÎÓ‚&`Ä‘ş1Ù`ccğô7$=Da^Ëh¼:óì*j÷ó£„Ä¶1ıTV}©:eÅıSê¸/,â—‘îÀïË©ŞASK7B„sâ9¶+cGix/›^Ê0ÁV[ƒ9MáçÈ=ß-±=]–mİ!¶?,«ş2eŠÆi`uqõxK°Ä­)î£À«ô#~‘ÌõWÌ‹»™ŞcVv·Ò~¼­À%ë;ˆ«œ.àˆ¾©‡JÒ²6Š¸«<«_‰ˆ`|úol†D×,ŸQ1E.°`#İÿË.À1¶ê¾5TÌ`FÖNÁ[
+*X™´ñt¨©ãR:—XütŠÉÔ…à,XËtÀN°Vœå}¬†Zu{xZ8š·×–ƒaÇûk@× "ÙéiÈ¹#Æäˆ¤RïÓ*o†ÿÎE¤Já¶İ¶Êçl½ÁAÊ±Y!Êj¶Pw1ŒA¿~ÒuSÄÛ«WK–w¤«ÆBS:ËôâQtHÔ*"u@»CÚÅ¤í”:¨KTê°NaiĞË..q£ Ï™,§Ğ(œsØUÏâÇ°
+ø<©T8çÈ¥ÂpK¦‚ƒx¶‚4ìJ
+˜›{›÷M!|–¯3.v=1ú][Ê‘%KE*ÿ(n(úŒÔâa£¥6÷¥SpÍá./J7fşÌÎrI~ötIšù¿¸c¢ÜÏæ’Õ}Ç+é	±çM”=ƒ$	O×yUı‹0Ôèi{¦Ó(Â2k•2›ª8µ,¥Ê³YÂ­QÕaVÜEv_Ù<Ùv4™»¹KuL>ãòşµ‰ù[G˜ö“ş5^ş@+Ä¬š®‰y[$e~6Ó‘R·'Ó¶FáÛ’5øße'¥úà–²Hßa©ê=µÌ?¤[
+Ú/ÈW‹5W)ÛC9ÏU÷øõ¾úƒ¥uµI –öã5vZÜ…ê’²½Ã¸Úf­“I&•ãÚ: TFı(•ËÅaª5lĞb,Üzá£ï³7ØCø×V¸BIŠ€2RÚÃÍ
+î+¶¿	7\•† Á
+¸ "a)“&¸¹ºÉ´)ffÏÙ¡öÖÎßdœ†qÙfaSj“¬h ¡t&Œ %ë©ŞÒ›˜¬ Ø%dD>…K[-•‹x`…P·“e¥ª¬…™%¨	Š2£`óØ}ñıÔwh©æ•Ã—­X
+Š4$~Xâ_ŒxœŒİZşœ—õN/j›"•iÅL]yøÆ2]æ´X7uÂ˜ö›SĞu²¢®:ãß›µPÆTµ9UHİ*ÍÍpŸp­§4AÃ	^¿Tğşı[Cxu8’’R'¯o¡ÀdbÚ>˜ÌÜá ¨\÷r$Y¬­ê`X÷Ğí˜¶/¶z•ş/¾ƒö®)şOŠ_!ÖÖıì^Ú®fZ­·¾Âç§sŠœíuN×S°­(¤ø6ÅùXÏMáñ³1WÏÅ%~“Î ©Œâüî2–~§Ë£?ÎÂA~R¬&fÏ +bvú'²Š{öS–e*TúsãŒàxJqôBÈ¢f0ÌÆY²óÃ‚…ªL‚¯X,“Î¨†z
+A*÷ó‘Ñg…´:mÛ}~»*‘(gUİú^‹üuRjØuşC{r¥¿İÚÌ,À—Q´Æb2Ğälİp	R5³õ!G,›$$…İ$ğ‘®LTìP+u?Ş³…V–’Õûi$[ÁIh½¦Qñ­»ÂÒ_ÜX×C‘²§×yb“g¹.k—[5L.WI¢­©hñ]ß>²»(ŞhHÇK !½«¯œ?UõÀÍØùC–¡ì ¾£ú¬JõiÙ÷q–Ãªàk^ºÚ+tòŠ›Ê IZs„šË {h,*<± \Oú6M.çm3õgıÁ{ ŞÜ,< \£W´¸à<-ÍÀ¬
+Áxé½VD¨CÒÃ,KÎW'/M:L^^±uQ¾î„ÏjQÑQù%OT)U¡¯™:Ûû@ŒíÆ	vâĞØûØ"ÛLJ»!¶¾Gp‚@Ë‡nº=zôóm&¼Û
+Ğ¥bäú›P¸Í'ÕU9g…aBh`=ãë"ûÊ@É‰p³—:YR»úõ”Ø,í‰ÿîëä•V_ıLøÕyğà—{ h¿ÚòÄ›öÄ9ñ}=ğ,³İÖœyÃX…¢‡Çû0åÁñ{3óTŸ³İUSùù(V½TúJóÙST=æ2‹gú5‰úëWGEÎg¾9{ÕŒŠO´—ºt ·ÛF°Şº0ß€ıêãÑHíA»¼a¥ºzQ@ş½-Æ4!K”Ê#	o¼à»Š€Tçai‚=W¹@F`†y·<Bdœ3şÏ@”·l§Şl3NT¦7¢>IÙµä'Ï9ø`A³|+<óôg<ŞøÆFô|•¼	Ó³N²|’bÁd˜óßé…t•<{ ÀçâŞàÓ.ÏF[R~¨*ü||@í‹–ü†öuü8¾{6¹“íŸ8¬)	EKjÑù>g-ù:?ÜQòôgĞÏ?., -ø#MÕí|oì9ıÛ¾[_i3 Hí¯eß´Ï“”ü¥#	Õ€ñ/*£áºŒÃÊÆX©©Ádq©ÂNŸÖÁQ«ÀSç‚|«=y¬ºk¶Éö9u¸cSò4&ò%¬nïí¥°|[fœìcÖAõ´í=×’ÌëÅLÓø˜7ü7qc•}¿ı4åyù’º}S×Á…qãÛ0dNÒãµí’öÒkGVßh*>ZøÌ`İº½ó·/¦Ş˜ª;Pæ/¦G/ÙĞ¤E“xşSÍÊå½¸ñÆ*m˜B=g20]İÈ_ŒÏZ¥´Zˆ·|8Ò`Ii§Î>34Pr¢7Š¶KİM¤z~€Cğ§¦²KÛïÈ"™}JÍŠ3˜ ]ú–äŞ6î‘ãî¶nõ8p[‡·{‚9´Áe÷ÔuSï0HÇ^öğ–ş­e:4øV€Š¥ı&T:¸L‚{mKõ94ÎI¿ãàCV0Ì‡s%vÓã6ß#´fØíM~3$ÎÌ8ÏÍ±UX¨w3¹6}vçÓ•‹dJå×Oˆ¾QÜÖQÙ9i‹¿³¶Fè&ºFwÄå¥gÖåË|Qáÿ‹ò.Gr,c³Ä4ŠË2=ÇÁ/OÙ6s"¶"âû˜²¿T}ùÃw4_è*
+&‡I
+KğG.W¬. ÂPSYí8cÙ\½‚ ¾­LşY˜BĞx¯o	œ×èyAKkqÄg)ü7]-÷Üò´­¿”OFÑ³ö:§	ßQùl|ğ?\çxÎ£ÅÈ£jw:#„>QU6jàûŸ\¿Ä‚^HòáÅ¾3‰ %ö,2”Le~d½VİDÕBŞº³ÿ·àV·e„é„-»=¼©û¯â‡<ùqòp~ Å
+ß4-«ºåëp¤‡uÀêl°òúÉ°-·w‹Îø¶sŒœK‚Ø¨O¢B 1øøéÍàÓEç?ú·Áø?mñu£àQ–ş:Ì,ß#‡.ô»ÂsÙ	ÿƒ‹²aäU6ÈtÚnî´c–ÜÕÅ;K,§»#•¯¬AUíõWï?˜±Ji¼)âXUúYìÕªı4k<›ãòœNô±ğÄ©ò÷Ì¯4µŠ+°nŞ)‡à¼ƒ,]f÷BB°»m.Ÿ×ğF)?†V{MĞ³İ[p.ğø¦7Ú.5–
+<ÔWäİg6Lğb[zºòUëı¡ÖWœz$Nÿ[R½!Å¼‘¼ˆhÚ6ßÅcaGVØNñ	_C¤?jG_ä¶4ì§3}¨	[6	wãvò¤’Õ5&§(ôÛÓUÕi”cçÉl0ÉKYË+ÏmĞÚCò„­;^(Gş›çÄypFFË<eI ¿Ödø"Cód*uÓdú½ê[œ|T¬É D*hu-Á	­‚ç*Jºáb:Êw«IõRkùÔUı—ÊfcÕ€thh/oÏÅİ³™\«jYôÑ¢¨!2"|'˜ÿÇ¶_	š}Ç›;N¯Ú·°«Æs§•½möA¸ø
+RŸçªô„úˆày˜Î! _ ¨Ø]Ùš>8úúË—W/ß¾|÷òõë×–aîut‰:z:…ä,.Ğk@9{y-(yTµ‘—‹“Ç¸ÇÜÑ3fR‰;`ãZÉ ,J’¾Jğİ=Ëá§™RJmŞ=k €aP>Ú¼©j6/æ/,~7 ©”Ù™HhæQÀÏ V~}3Èî[æí·çÛ Ği`aßXt)[;ç£+ï¿¤xü1ÅÖYDcªïÊ<¥Oªš>å!Oü$ŠÑçÖ` —ÄJŒ–·à(Ø—ÕŸıì‘–™oOXéOzÂÊ«½w1B?èÏ®\ê¼á@¡)gfä•…<Šïİ7s/]_C·ô§ÔQ¯ÿß\Î­Lv§lcï4‰;UŞ¡}¬g\äUºàd^Óø;•‚·6éî‚P~Lk®Ÿ *Ş6Âêø`Á·åÅlã„‚qö~ Á¢E·÷Æ¼Àê+’!ß(Á:$RU§áŞôNuŠ–ï»v{‘á²	€‚ÊÈM=ê|÷u1Ø®¿ ş0./«º:¥w_ó$V­¤Ö/\áÂ°¥¢ùù¸»ÕÊŠRbÔ;ËÅMíhí+¦²Ôê@Ô¦û#fÒñ<äÃo‡Öã®Àœ]¸z}*d—,b[•c°ö,†õ<pù‹7/$×#Ø#niºµÙ>`<„væÅ^u@—fèbqÑ’^ªÃ«=ß¥3bı$²½Nİøhƒ
+öIJzûe%ä)ı¹«Ñtâ¥dÀËªàÌ+-?ØÔ_f|—ã’¾º0|¬=§±„S`x€Ñßg	-?iêX.~ÁBÅÀ†KÜˆo]0Ó0
+•»…_h°=—×0ƒG
+¿aVªó¨Ô×0^Ï¤²=¼„š½Avì|Ã—NX¾oA•#ÏD‚È\½E	æ§óñİû—Ë÷Ÿà?¯à¿?|êüó]>{ÜP„‡M}~£uÛûéPK    ªyİP_Ãày   ¡      simulink/configSetInfo.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²qÎÏKËLN-ñÌKË·ãRP@ˆ($•ø%æ¦Ú*égæ–ædæeë'Ãdô€()8&—d–U”•¦*ÙAô–%– mµÑ‡´HÍ& PK    ªyİPÉe…  Õ	     simulink/graphicalInterface.xmlÍVkOÛ0ıÎ¯°¬i‰--‚´6(¥-DµehŸI.Ášcg¶Ó~ıœDé¢6¡¨BlŸ]Ÿû8ç<ºg‹˜¡9HEïáö×FÀRõpª¿œâ3{§{!IòDÂ\®A>’ ì„º>º!1ôğMO„Ğ.O„Ô
+Û­®å×¼T7!|"ÍÕwd”ÆÀuVØZ-s-B`xiæ„†^3PÚÔÌNiÄ	3¸v‰[;Ì¢•ü"˜İİ+G£”±>ÁOŸè'lz¥aeuĞÀ¡ï3oŒĞ®3œxıñÕÕˆÚ¦$rxÄ@í•3Ty=\ÂÛ‡ë§cãü¿rzM9Ãî¸Õj­Ğ˜h³[l”ü­ZªòùRÌiá(åA–Ü´Qø•Rù˜=œ¯İû%Q.§šF_ GUVUÍ@Æ”]bÖ$á\ÄÉpAšM31¡|öœ ¶o¹a5ÁUÃEæÆrüÜY5…]åÈà‰jt*áÔíÌ›:“·€3WıŞ Şpa0fG#Ê jûN‰­¬ø`Ç6)}J0Ó¾Î¥5&}7»Oİ¶ê¼Zljìö'ÎäÇ}ì_-ÛÈqKöDY.ŒËM|MÍb4ÙßùLâär¨T	@¸.™9-—¬j›¡MÍrµÚÇ5/†Të7åáu)$}\Zw&€roo§O–ß®/Ød™öIçßŠ°|`î.¦§GÈ|çT?C£ídˆŠo¬˜ËpØ9¨QèCtpüûsÁÍ{MHËñ‘„ è61™3:>jŸüŒğÏ{#¬ärú^\ÊlO†&æ®¨|*
+t­º³?PK    ªyİP8[7é   9     simulink/modelDictionary.xmlMKO„0…÷ó+šîKt*5Àì&qabÔY›Û
+„uş½8¨qs“/¹çËÉ)Ÿ¡Gï~İ8T˜g#?ØÑuÃ¹Â§×#)ğ¡Ş•Göÿ‹cä|KŸÀ^àì+ûÎa4mxš»Xá6¥éÒh[ Úq¾ÄÌ††Ñï}Œkx[oÁ„(p½C¨|¹ÆäJ×i5o€Ñ²t®Â°— çd_E¤¡=ÚæŠÂ°;{“¬š‡!ù¹ëLü+óÚƒ‘R£¥!’N´rŠ0ã”È}Îc1½U¢[uºQPK    ªyİPh­jWS   o   $   simulink/plugins/AnimationPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²qÌËÌM,ª	È)MÏÌ³ãRP°	PğKÌMµUB“S²ËÏ³Ñ jÒÇĞ PK    ªyİP«üY   ~   )   simulink/plugins/DiagnosticSuppressor.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²qÉLLÏË/.ÉL.-((J-.Î/²ãRP°	PğKÌMµUÂ¦@É.?ÏF? ¨]»~ PK    ªyİP4ÏîX   {   (   simulink/plugins/LogicAnalyzerPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²ñÉOÏLvÌKÌ©¬J-
+È)MÏÌ³ãRP°	PğKÌMµUÂ"¯d—Ÿg£ Ô¬U7 PK    ªyİPŒkP   c       simulink/plugins/NotesPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²ñË/I-È)MÏÌ³ãRP°	PğKÌMµUBW²ËÏ³Ñ *ÖGQ PK    ªyİPp³¢O   `      simulink/plugins/SLCCPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²	öqvÈ)MÏÌ³ãRP°	PğKÌMµUB+ÙåçÙè •ê#« PK    ªyİP*Y+Ó^      /   simulink/plugins/WebScopes_FoundationPlugin.xml³±¯ÈÍQ(K-*ÎÌÏ³U2Ô3PRHÍKÎOÉÌK·U*-IÓµP²·ã²	OM
+NÎ/H-wË/ÍKI,*È)MÏÌ³ãRP°	PğKÌMµUÂ­LÉ.?ÏF? h”>>³ PK    ªyİPL>úœ³        simulink/stateflow/machine.xmlM±Â0Dw¾Âò)°0¤í bDHEìQêBDâ¢6>Ÿ´¨Ş|¶ßùdùq^Ôõ¦å×«X·µá[Á7Ë–ÅBV^yjlû. Ò)}7L`êx‚ƒÅ3œ”£ûæ:á°ØeCm7RœÓÒşnlİOm¼ênäGÒ!0ş6fäšzİ™§ÙjT°*ã‚5ü€jy¬‡!\Fèêob2JoˆùR¤<1§˜ıPK    ªyİP5Øñ`³     *   simulink/systems/_rels/system_168.xml.relseË
+ƒ0E%Ì¾u!µİº-v]‚N5hdÒ‡ß@7•.ï\ænİ¾Í"X;+aŸå ÈönĞv”píN»Êjq–$¬Ä Ú¦¾Ğ¢búáI{	bYÂ£?"r?‘Qœ9O65wŒŠ)†½êg5y^bøeÀ–)Îƒ^9’¹UU‚èT)nY¢§bõôçNÆéåÂÌYï²6EÛ9y÷ùÖ‹_`SãfTóPK    ªyİPN˜•RÛ   Œ  (   simulink/systems/_rels/system_3.xml.rels½Ó=OÃ0à¿bİNÎi+¡ºİXQ™‘•‰•øC>·K£TL(£Ïòûøîpúr£¸Rb¼†º’ È7¡µ¾Óğv~~xÁÙøÖŒÁ“†‰Äéxx¥Ñäò†{Y”Ïúœã"7=9ÃUˆäËÍGHÎärLFÓ¦#ÜH©0İfÀ<S¼´xâLî½Ş–OœMê(ßÎª’]æS¤…\¼ş3¤«&8dë.£õCQk9Wñ7ğ}·_ê»ıZººÓ]­ÖıNõµšo•\ê?Ã•|µÀÕ?Ë8[¢ã7PK    ªyİPnê#ö  ù'     simulink/systems/system_138.xmlÍZ[OÛH~ï¯°\©j·dñx|-ªÀR¡-R(•vUEC2$'õÂª?~çLìØ	ã±h»D=óoÎ=ì¿_ÌBíÆIÀ¢ınèFlD“=Kozş¾ÿbğ¤tÖ¡iûÚ_dFôOlDRş–Şÿ§çîhğ‡LÏÛÑÏûº¿{±¶x@Ó?t”ÁÇlFş»¹Ù\¶±æòaNõş1g#º¹ôŒix³û„Æ_‚q:Õû¦al®ú›±Ù	¥,ÖûŞ£§ƒ`–…At;È®PÅ­béaÈF·šø4úi4gqªç;œFH×§Çœ:ìëğFeû–9C–±£™'Ç…Ó,ªB=Ç”Ãì¡Bö®Û†YÀ°Œ&Îa¸®
+†ùøÙˆì›ÛàÃ+|H…ÏŞÑ0šàÂVÒ„ëğá6ø³ä(¦#™ßyõrñaou[àµõoœ&¬É^°¢oÃa;|!ˆ·:ò=˜²{¸ªúJå1ç8$’7ƒd’‡óùÉ5‰e¯Oi¤'1›;±èY¸+|¦YÇÓÈ29iñuØCşaÏùÉìÁop]x®}[á>ø.;BğMCÁ‡mx	9
+YBOF\XJ&ã€„l¢‰{—~d)»$½?ãñ0ˆRƒ†WòUWA\a>èıIÈ®I¸MÎŠ&+hr[pÃÓ,Yj–¬ŸÂ‹†“˜eÑøùùéªÄ¯WyÈ’¸\éS®IœKäWEOÏíÌ@Õÿ0<[<ü;Ìîî‡óoß9ËÂ4˜‡AQ@œ‘4¯ÿü-{£½Îx9	ûÍ6,˜eäQY‰ AeA²•4tw¥_MC™mU,@zÂˆg[ÓWq•éÖß’„Ãœ„áˆEéäàˆEIJ¢UÍñ‰ï˜fcZ1	I*_‘a‚EØœ.<u…ft&ãŠ„f<E\f
+GeÜ†0l8Xd8ÂÆUÚØ¿H«èª’ÕAp>ôËØ¥ÔÅè^<‡.vicª6†ssÔ†¶Õ#??E§TEed Š“«â«UÙúH¸*wOQÅ-UqTñÇohÍ$MGk]îÛèr–-ôUh\ Òã%,iÜ\H#ğ!ìCÃ"ŠjËñ”¡»ñ%°„ŸÚbºeìIÚÇ¶<¸¶%.o/Qü`e(é~ÖÏÎÂ [ÕÀü²,ñ$A¦mOj£‚[„#%	=Ô½@>å‰~0%0¹‰yö&Ñ$åÔ’¬ïoßv§¢’Ô½í¹°È(˜Xàü¦m+Û÷˜½·ß[éx¤£éJÍü[aùªºŞ-2”qW¾ºí‘8øofyCKô~fj¯&év9i2e¡¤kzøåñeæ’f1IéytÊ›Ã	Ïïh|²ûµ¹_W2*ñPrì•€¦mÂé"QêcCu²¶!)nÿw|\²/,¾MædDR.™¶ºWx/ö$5ÿÒ#ÜAôÎ9<³Ã aÕ¼Jâ‡dt»ìsX×ILiÔÙi®§ı:¤Ë%Ğ=HÚ²8&)¹`AšÍÈb˜;*9~*ó^°W»Ñêy–Vg—ükx•u·)
+T×+¸TFX’&®D¿sAb2K>$èø„Å\ş—)>G<®Fü1×™Ì§ ¢5Âd=ñû–ı’eé;Éó‚[îM;Z5œÆ$M—_$¢œr VÍIÊ±—Aô®¢ønu·¦­MC¶õ
+(|=äT nÊß ùH*· PÅ¤,	,™DuL
+Ù¼¯Šn'Ì®f!«A˜Ù]˜lÌÂ`Š«”Ã–îâd…\\­rÕ£î`’Hj7vA•½¥IVjå:“Ä
+‹,Ä[ÛŠ7›Ä·‘î<Á¤-Q~n“Ù¬Eƒ–òdi.Ïi%Ïì&¯Î¡×o%¯›[ Éïy€iôBoõd3Ş\=Üè†xÃ¥€ºéoÖX±] ŸãÙÓ Å­…)¯;ª:+‡°®Äv÷CÁu±YF#¶âH otFcÉæƒöŸM·“pê~j®e„Å
+é9µÀŠ:¥£+uDÁØ¢šéÈ¤¿ì­ëHY]ƒÑk;\ís­[ÆçšŒd+2’`ê	¢‹•Ò¡·Y—¾¾ŸŒ<¿²¼F#Óş*_´¦ÓZªŞİP¤‡ÕBª±Eb—s³Q§"hÏ·È|ÒIñR _úó(ël!Oúy.¯¶”(mÉïXƒºMÑ[·£Gœºõ½KùÒ¾¬ŞŒåâ·uLdØ{›Ò½Ûf]Î„ÿ«h<L¯Ò‚)­™uÇ´ ı}-GV[!—È*	ËßãVù]6ÏYCºYZïïÿÈ÷PK    ªyİP}ıîš0  9      simulink/systems/system_147.xmlÍZmoÛ6şŞ_!¨@±­I#R/–ÛÄE7@€f5ê,V-3‰4()M†ıø‘”%K6õlØ‡Ø²Dò{x¼{NÈñÇ§(41	£'&xg™¦[º:1ÓäîĞ7?N^ÏŸãG“W†q<3~G>1?³ %b–9ùæÁñK|@[\à[ßf•ñsœ|zÂA*çLY„ˆ˜Éîîv‡íŒ¹~^cs2ÅË4À»C¯Ø‡gœıŒ1¿%ËäŞœ@ËÚõ'cÑ
+ÆÍ	€î,¥!¡ót‘£ÊoåCÏB<êSÂ91/éšñÄÜ¬pIiÌ/§‚>Ç7åŒÒò3“KPğãû†+¾s‚ÊP¿ğ%0AnúHYí†(Æ(€+¬G^ŒaÀıg3ir»à›â(}Êám~d ]k Ob‰îÀ°5ˆÊø=‰Ûõ¥2à@£öş³3<¬8Kéòœ…2(¡¸³?n~Ï~Ê«r”–I“u*1ÛÃ¸(bÆÃÉxğÀIN ßÄ„ó?abÆ™8ËEØNÉ#Yâ‚XÇ…p4sU@l
+ŒQîş3q”G¿uñã+¾Ã\¤J¼=€ğDÜ80æâ"ÉúàÍë§ÓoP´ş`œ¯1^®Ú/8¾Üw™sÌ%PÇLá©×aãGt…{ïüg²àˆ?ßdåC¤×wĞšUXÊ¬¸3's’Š…Å#g¯ª|Õ-—†í[Îåô¶Ù›(<C1>UÄœœ~Ú½¤q‚ÄšS” ìViş×ëÛ+Íqp‘Òà’’äóH¹Çœ$Æg‘ÉÂT¬W79«t¸÷\	ëœ)Œ2^Ì¾¤	æ…ƒ&Ï7Åm°	¦ÉŒãG‚~¢hŠsP©£]ÒßÕ6™^•S©Sw¦œÖôaÛ"}¨?©c€c5©Qï£2%ñ:DÏ_Ö™¹â]’LÕÏ¢À»nŸv«Ÿb²Èç©Üá4ùé÷ö3O¢šÂ;Œ‚yå¨ËŞğB¤‚2" ¸ğ½&Æı	ß#™œ8DH¯Ò°ğTCÔßoßv¡AfB‘T±›®·a?jÒ{ck£— ¥
+d³ğ´º9Ü«S`mRÈÀÏÅ©Ğñ­êèJMo¬œ¬e"¡ñçíö	T	—éZbÜR®‘ØEõn*²z«n%TSĞˆğ6A¶Æ\±?A1¡X`·Œ?Äk´•3(\+×8Qß+EH]İd

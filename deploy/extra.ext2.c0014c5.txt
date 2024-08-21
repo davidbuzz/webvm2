@@ -1,0 +1,1691 @@
+n USB connection,3:Discard log on reboot if never armed
+    // @User: Standard
+    AP_GROUPINFO("_DISARMED",  2, AP_Logger, _params.log_disarmed,       0),
+
+    // @Param: _REPLAY
+    // @DisplayName: Enable logging of information needed for Replay
+    // @Description: If LOG_REPLAY is set to 1 then the EKF2 and EKF3 state estimators will log detailed information needed for diagnosing problems with the Kalman filter. LOG_DISARMED must be set to 1 or 2 or else the log will not contain the pre-flight data required for replay testing of the EKF's. It is suggested that you also raise LOG_FILE_BUFSIZE to give more buffer space for logging and use a high quality microSD card to ensure no sensor data is lost.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Standard
+    AP_GROUPINFO("_REPLAY",  3, AP_Logger, _params.log_replay,       0),
+
+    // @Param: _FILE_DSRMROT
+    // @DisplayName: Stop logging to current file on disarm
+    // @Description: When set, the current log file is closed when the vehicle is disarmed.  If LOG_DISARMED is set then a fresh log will be opened. Applies to the File and Block logging backends.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Standard
+    AP_GROUPINFO("_FILE_DSRMROT",  4, AP_Logger, _params.file_disarm_rot,       0),
+
+#if HAL_LOGGING_MAVLINK_ENABLED
+    // @Param: _MAV_BUFSIZE
+    // @DisplayName: Maximum AP_Logger MAVLink Backend buffer size
+    // @Description: Maximum amount of memory to allocate to AP_Logger-over-mavlink
+    // @User: Advanced
+    // @Units: kB
+    AP_GROUPINFO("_MAV_BUFSIZE",  5, AP_Logger, _params.mav_bufsize,       HAL_LOGGING_MAV_BUFSIZE),
+#endif
+
+    // @Param: _FILE_TIMEOUT
+    // @DisplayName: Timeout before giving up on file writes
+    // @Description: This controls the amount of time before failing writes to a log file cause the file to be closed and logging stopped.
+    // @User: Standard
+    // @Units: s
+    AP_GROUPINFO("_FILE_TIMEOUT",  6, AP_Logger, _params.file_timeout,     HAL_LOGGING_FILE_TIMEOUT),
+
+    // @Param: _FILE_MB_FREE
+    // @DisplayName: Old logs on the SD card will be deleted to maintain this amount of free space
+    // @Description: Set this such that the free space is larger than your largest typical flight log
+    // @Units: MB
+    // @Range: 10 1000
+    // @User: Standard
+    AP_GROUPINFO("_FILE_MB_FREE",  7, AP_Logger, _params.min_MB_free, 500),
+
+    // @Param: _FILE_RATEMAX
+    // @DisplayName: Maximum logging rate for file backend
+    // @Description: This sets the maximum rate that streaming log messages will be logged to the file backend. A value of zero means that rate limiting is disabled.
+    // @Units: Hz
+    // @Range: 0 1000
+    // @Increment: 0.1
+    // @User: Standard
+    AP_GROUPINFO("_FILE_RATEMAX",  8, AP_Logger, _params.file_ratemax, 0),
+
+#if HAL_LOGGING_MAVLINK_ENABLED
+    // @Param: _MAV_RATEMAX
+    // @DisplayName: Maximum logging rate for mavlink backend
+    // @Description: This sets the maximum rate that streaming log messages will be logged to the mavlink backend. A value of zero means that rate limiting is disabled.
+    // @Units: Hz
+    // @Range: 0 1000
+    // @Increment: 0.1
+    // @User: Standard
+    AP_GROUPINFO("_MAV_RATEMAX",  9, AP_Logger, _params.mav_ratemax, 0),
+#endif
+
+#if HAL_LOGGING_BLOCK_ENABLED
+    // @Param: _BLK_RATEMAX
+    // @DisplayName: Maximum logging rate for block backend
+    // @Description: This sets the maximum rate that streaming log messages will be logged to the block backend. A value of zero means that rate limiting is disabled.
+    // @Units: Hz
+    // @Range: 0 1000
+    // @Increment: 0.1
+    // @User: Standard
+    AP_GROUPINFO("_BLK_RATEMAX", 10, AP_Logger, _params.blk_ratemax, 0),
+#endif
+
+    // @Param: _DARM_RATEMAX
+    // @DisplayName: Maximum logging rate when disarmed
+    // @Description: This sets the maximum rate that streaming log messages will be logged to any backend when disarmed. A value of zero means that the normal backend rate limit is applied.
+    // @Units: Hz
+    // @Range: 0 1000
+    // @Increment: 0.1
+    // @User: Standard
+    AP_GROUPINFO("_DARM_RATEMAX",  11, AP_Logger, _params.disarm_ratemax, 0),
+
+    // @Param: _MAX_FILES
+    // @DisplayName: Maximum number of log files
+    // @Description: This sets the maximum number of log file that will be written on dataflash or sd card before starting to rotate log number. Limit is capped at 500 logs.
+    // @Range: 2 500
+    // @Increment: 1
+    // @User: Advanced
+    // @RebootRequired: True
+    AP_GROUPINFO("_MAX_FILES", 12, AP_Logger, _params.max_log_files, MAX_LOG_FILES),
+
+    AP_GROUPEND
+};
+
+#define streq(x, y) (!strcmp(x, y))
+
+AP_Logger::AP_Logger()
+{
+    AP_Param::setup_object_defaults(this, var_info);
+    if (_singleton != nullptr) {
+        AP_HAL::panic("AP_Logger must be singleton");
+    }
+
+    _singleton = this;
+}
+
+void AP_Logger::init(const AP_Int32 &log_bitmask, const struct LogStructure *structures, uint8_t num_types)
+{
+    _log_bitmask = &log_bitmask;
+
+    // convert from 8 bit to 16 bit LOG_FILE_BUFSIZE
+    _params.file_bufsize.convert_parameter_width(AP_PARAM_INT8);
+
+    if (hal.util->was_watchdog_armed()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Forcing logging for watchdog reset");
+        _params.log_disarmed.set(LogDisarmed::LOG_WHILE_DISARMED);
+    }
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    validate_structures(structures, num_types);
+    dump_structures(structures, num_types);
+#endif
+    _num_types = num_types;
+    _structures = structures;
+
+    // the "main" logging type needs to come before mavlink so that
+    // index 0 is correct
+    static const struct {
+        Backend_Type type;
+        AP_Logger_Backend* (*probe_fn)(AP_Logger&, LoggerMessageWriter_DFLogStart*);
+    } backend_configs[] {
+#if HAL_LOGGING_FILESYSTEM_ENABLED
+        { Backend_Type::FILESYSTEM, AP_Logger_File::probe },
+#endif
+#if HAL_LOGGING_DATAFLASH_ENABLED
+        { Backend_Type::BLOCK, HAL_LOGGING_DATAFLASH_DRIVER::probe },
+#endif
+#if HAL_LOGGING_MAVLINK_ENABLED
+        { Backend_Type::MAVLINK, AP_Logger_MAVLink::probe },
+#endif
+};
+
+    for (const auto &backend_config : backend_configs) {
+        if ((_params.backend_types & uint8_t(backend_config.type)) == 0) {
+            continue;
+        }
+        if (_next_backend == LOGGER_MAX_BACKENDS) {
+            AP_BoardConfig::config_error("Too many backends");
+            return;
+        }
+        LoggerMessageWriter_DFLogStart *message_writer =
+            NEW_NOTHROW LoggerMessageWriter_DFLogStart();
+        if (message_writer == nullptr)  {
+            AP_BoardConfig::allocation_error("message writer");
+        }
+        backends[_next_backend] = backend_config.probe_fn(*this, message_writer);
+        if (backends[_next_backend] == nullptr) {
+            AP_BoardConfig::allocation_error("logger backend");
+        }
+        _next_backend++;
+    }
+
+    for (uint8_t i=0; i<_next_backend; i++) {
+        backends[i]->Init();
+    }
+
+    start_io_thread();
+
+    EnableWrites(true);
+}
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include <stdio.h>
+
+#define DEBUG_LOG_STRUCTURES 0
+
+extern const AP_HAL::HAL& hal;
+#define Debug(fmt, args ...)  do {::fprintf(stderr, "%s:%d: " fmt "\n", __FUNCTION__, __LINE__, ## args); } while(0)
+
+/// return the number of commas present in string
+static uint8_t count_commas(const char *string)
+{
+    uint8_t ret = 0;
+    for (uint8_t i=0; i<strlen(string); i++) {
+        if (string[i] == ',') {
+            ret++;
+        }
+    }
+    return ret;
+}
+
+/// return a unit name given its ID
+const char* AP_Logger::unit_name(const uint8_t unit_id)
+{
+    for (uint8_t i=0; i<_num_units; i++) {
+        if (_units[i].ID == unit_id) {
+            return _units[i].unit;
+        }
+    }
+    return nullptr;
+}
+
+/// return a multiplier value given its ID
+double AP_Logger::multiplier_name(const uint8_t multiplier_id)
+{
+    for (uint8_t i=0; i<_num_multipliers; i++) {
+        if (_multipliers[i].ID == multiplier_id) {
+            return _multipliers[i].multiplier;
+        }
+    }
+    // Should we abort here?
+    return 1.0f;
+}
+
+/// pretty-print field information from a log structure
+void AP_Logger::dump_structure_field(const struct LogStructure *logstructure, const char *label, const uint8_t fieldnum)
+{
+    ::fprintf(stderr, "  %s (%s)*(%f)\n", label, unit_name(logstructure->units[fieldnum]), multiplier_name(logstructure->multipliers[fieldnum]));
+}
+
+/// pretty-print log structures
+/// @note structures MUST be well-formed
+void AP_Logger::dump_structures(const struct LogStructure *logstructures, const uint8_t num_types)
+{
+#if DEBUG_LOG_STRUCTURES
+    for (uint16_t i=0; i<num_types; i++) {
+        const struct LogStructure *logstructure = &logstructures[i];
+        ::fprintf(stderr, "%s\n", logstructure->name);
+        char label[32] = { };
+        uint8_t labeloffset = 0;
+        int8_t fieldnum = 0;
+        for (uint8_t j=0; j<strlen(logstructure->labels); j++) {
+            char labelchar = logstructure->labels[j];
+            if (labelchar == '\0') {
+                break;
+            }
+            if (labelchar == ',') {
+                dump_structure_field(logstructure, label, fieldnum);
+                fieldnum++;
+                labeloffset = 0;
+                memset(label, '\0', 32);
+            } else {
+                label[labeloffset++] = labelchar;
+            }
+        }
+        dump_structure_field(logstructure, label, fieldnum);
+        ::fprintf(stderr, "\n"); // just add a CR to the output
+    }
+#endif
+}
+
+bool AP_Logger::labels_string_is_good(const char *labels) const
+{
+    bool passed = true;
+    if (strlen(labels) >= LS_LABELS_SIZE) {
+        Debug("Labels string too long (%u > %u)", unsigned(strlen(labels)), unsigned(LS_LABELS_SIZE));
+        passed = false;
+    }
+    // This goes through and slices labels up into substrings by
+    // changing commas to nulls - keeping references to each string in
+    // label_offsets.
+    char *label_offsets[LS_LABELS_SIZE];
+    uint8_t label_offsets_offset = 0;
+    char labels_copy[LS_LABELS_SIZE+1] {};
+    strncpy(labels_copy, labels, LS_LABELS_SIZE);
+    if (labels_copy[0] == ',') {
+        Debug("Leading comma in (%s)", labels);
+        passed = false;
+    }
+    label_offsets[label_offsets_offset++] = labels_copy;
+    const uint8_t len = strnlen(labels_copy, LS_LABELS_SIZE);
+    for (uint8_t i=0; i<len; i++) {
+        if (labels_copy[i] == ',') {
+            if (labels_copy[i+1] == '\0') {
+                Debug("Trailing comma in (%s)", labels);
+                passed = false;
+                continue;
+            }
+            labels_copy[i] = '\0';
+            label_offsets[label_offsets_offset++] = &labels_copy[i+1];
+        }
+    }
+    for (uint8_t i=0; i<label_offsets_offset-1; i++) {
+        for (uint8_t j=i+1; j<label_offsets_offset; j++) {
+            if (!strcmp(label_offsets[i], label_offsets[j])) {
+                Debug("Duplicate label (%s) in (%s)", label_offsets[i], labels);
+                passed = false;
+            }
+        }
+    }
+    return passed;
+}
+
+bool AP_Logger::validate_structure(const struct LogStructure *logstructure, const int16_t offset)
+{
+    bool passed = true;
+
+#if DEBUG_LOG_STRUCTURES
+    Debug("offset=%d ID=%d NAME=%s", offset, logstructure->msg_type, logstructure->name);
+#endif
+
+    // fields must be null-terminated
+#define CHECK_ENTRY(fieldname,fieldname_s,fieldlen)                     \
+    do {                                                                \
+        if (strnlen(logstructure->fieldname, fieldlen) > fieldlen-1) {  \
+            Debug("  Message %s." fieldname_s " not NULL-terminated or too long", logstructure->name); \
+            passed = false;                                             \
+        }                                                               \
+    } while (false)
+    CHECK_ENTRY(name, "name", LS_NAME_SIZE);
+    CHECK_ENTRY(format, "format", LS_FORMAT_SIZE);
+    CHECK_ENTRY(labels, "labels", LS_LABELS_SIZE);
+    CHECK_ENTRY(units, "units", LS_UNITS_SIZE);
+    CHECK_ENTRY(multipliers, "multipliers", LS_MULTIPLIERS_SIZE);
+#undef CHECK_ENTRY
+
+    // ensure each message ID is only used once
+    if (seen_ids[logstructure->msg_type]) {
+        Debug("  ID %d used twice (LogStructure offset=%d)", logstructure->msg_type, offset);
+        passed = false;
+    }
+    seen_ids[l/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include "AP_MotorsSingle.h"
+#include <GCS_MAVLink/GCS.h>
+#include <SRV_Channel/SRV_Channel.h>
+
+extern const AP_HAL::HAL& hal;
+
+// init
+void AP_MotorsSingle::init(motor_frame_class frame_class, motor_frame_type frame_type)
+{
+    // make sure 6 output channels are mapped
+    for (uint8_t i = 0; i < 6; i++) {
+        add_motor_num(CH_1 + i);
+    }
+
+    // set the motor_enabled flag so that the main ESC can be calibrated like other frame types
+    motor_enabled[AP_MOTORS_MOT_5] = true;
+    motor_enabled[AP_MOTORS_MOT_6] = true;
+
+    // setup actuator scaling
+    for (uint8_t i = 0; i < NUM_ACTUATORS; i++) {
+        SRV_Channels::set_angle(SRV_Channels::get_motor_function(i), AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+    }
+
+    _mav_type = MAV_TYPE_COAXIAL;
+
+    // record successful initialisation if what we setup was the desired frame_class
+    set_initialised_ok(frame_class == MOTOR_FRAME_SINGLE);
+}
+
+// set frame class (i.e. quad, hexa, heli) and type (i.e. x, plus)
+void AP_MotorsSingle::set_frame_class_and_type(motor_frame_class frame_class, motor_frame_type frame_type)
+{
+    // nothing to do
+}
+
+// set update rate to motors - a value in hertz
+void AP_MotorsSingle::set_update_rate(uint16_t speed_hz)
+{
+    // record requested speed
+    _speed_hz = speed_hz;
+
+    uint32_t mask =
+        1U << AP_MOTORS_MOT_5 |
+        1U << AP_MOTORS_MOT_6 ;
+    rc_set_freq(mask, _speed_hz);
+}
+
+void AP_MotorsSingle::output_to_motors()
+{
+    if (!initialised_ok()) {
+        return;
+    }
+    switch (_spool_state) {
+        case SpoolState::SHUT_DOWN:
+            // sends minimum values out to the motors
+            rc_write_angle(AP_MOTORS_MOT_1, _roll_radio_passthrough * AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+            rc_write_angle(AP_MOTORS_MOT_2, _pitch_radio_passthrough * AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+            rc_write_angle(AP_MOTORS_MOT_3, -_roll_radio_passthrough * AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+            rc_write_angle(AP_MOTORS_MOT_4, -_pitch_radio_passthrough * AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+            rc_write(AP_MOTORS_MOT_5, output_to_pwm(0));
+            rc_write(AP_MOTORS_MOT_6, output_to_pwm(0));
+            break;
+        case SpoolState::GROUND_IDLE:
+            // sends output to motors when armed but not flying
+            for (uint8_t i = 0; i < NUM_ACTUATORS; i++) {
+                rc_write_angle(AP_MOTORS_MOT_1 + i, _spin_up_ratio * _actuator_out[i] * AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+            }
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_5], actuator_spin_up_to_ground_idle());
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_6], actuator_spin_up_to_ground_idle());
+            rc_write(AP_MOTORS_MOT_5, output_to_pwm(_actuator[AP_MOTORS_MOT_5]));
+            rc_write(AP_MOTORS_MOT_6, output_to_pwm(_actuator[AP_MOTORS_MOT_6]));
+            break;
+        case SpoolState::SPOOLING_UP:
+        case SpoolState::THROTTLE_UNLIMITED:
+        case SpoolState::SPOOLING_DOWN:
+            // set motor output based on thrust requests
+            for (uint8_t i = 0; i < NUM_ACTUATORS; i++) {
+                rc_write_angle(AP_MOTORS_MOT_1 + i, _actuator_out[i] * AP_MOTORS_SINGLE_SERVO_INPUT_RANGE);
+            }
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_5], thr_lin.thrust_to_actuator(_thrust_out));
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_6], thr_lin.thrust_to_actuator(_thrust_out));
+            rc_write(AP_MOTORS_MOT_5, output_to_pwm(_actuator[AP_MOTORS_MOT_5]));
+            rc_write(AP_MOTORS_MOT_6, output_to_pwm(_actuator[AP_MOTORS_MOT_6]));
+            break;
+    }
+}
+
+// get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+//  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+uint32_t AP_MotorsSingle::get_motor_mask()
+{
+    uint32_t motor_mask =
+        1U << AP_MOTORS_MOT_5 |
+        1U << AP_MOTORS_MOT_6;
+
+    uint32_t mask = motor_mask_to_srv_channel_mask(motor_mask);
+
+    // add parent's mask
+    mask |= AP_MotorsMulticopter::get_motor_mask();
+
+    return mask;
+}
+
+// sends commands to the motors
+void AP_MotorsSingle::output_armed_stabilizing()
+{
+    float   roll_thrust;                // roll thrust input value, +/- 1.0
+    float   pitch_thrust;               // pitch thrust input value, +/- 1.0
+    float   yaw_thrust;                 // yaw thrust input value, +/- 1.0
+    float   throttle_thrust;            // throttle thrust input value, 0.0 - 1.0
+    float   throttle_avg_max;           // throttle thrust average maximum value, 0.0 - 1.0
+    float   thrust_min_rpy;             // the minimum throttle setting that will not limit the roll and pitch output
+    float   thr_adj;                    // the difference between the pilot's desired throttle and throttle_thrust_best_rpy
+    float   rp_scale = 1.0f;            // this is used to scale the roll, pitch and yaw to fit within the motor limits
+    float   actuator_allowed = 0.0f;    // amount of yaw we can fit in
+    float   actuator[NUM_ACTUATORS];    // combined roll, pitch and yaw thrusts for each actuator
+    float   actuator_max = 0.0f;        // maximum actuator value
+
+    // apply voltage and air pressure compensation
+    const float compensation_gain = thr_lin.get_compensation_gain();
+    roll_thrust = (_roll_in + _roll_in_ff) * compensation_gain;
+    pitch_thrust = (_pitch_in + _pitch_in_ff) * compensation_gain;
+    yaw_thrust = (_yaw_in + _yaw_in_ff) * compensation_gain;
+    throttle_thrust = get_throttle() * compensation_gain;
+    throttle_avg_max = _throttle_avg_max * compensation_gain;
+
+    // sanity check throttle is above zero and below current limited throttle
+    if (throttle_thrust <= 0.0f) {
+        throttle_thrust = 0.0f;
+        limit.throttle_lower = true;
+    }
+    if (throttle_thrust >= _throttle_thrust_max) {
+        throttle_thrust = _throttle_thrust_max;
+        limit.throttle_upper = true;
+    }
+
+    throttle_avg_max = constrain_float(throttle_avg_max, throttle_thrust, _throttle_thrust_max);
+
+    float rp_thrust_max = MAX(fabsf(roll_thrust), fabsf(pitch_thrust));
+
+    // calculate how much roll and pitch must be scaled to leave enough range for the minimum yaw
+    if (is_zero(rp_thrust_max)) {
+        rp_scale = 1.0f;
+    } else {
+        rp_scale = constrain_float((1.0f - MIN(fabsf(yaw_thrust), (float) _yaw_headroom * 0.001f)) / rp_thrust_max, 0.0f, 1.0f);
+        if (rp_scale < 1.0f) {
+            limit.roll = true;
+            limit.pitch = true;
+        }
+    }
+
+    actuator_allowed = 1.0f - rp_scale * rp_thrust_max;
+    if (fabsf(yaw_thrust) > actuator_allowed) {
+        yaw_thrust = constrain_float(yaw_thrust, -actuator_allowed, actuator_allowed);
+        limit.yaw = true;
+    }
+
+    // combine roll, pitch and yaw on each actuator
+    // front servo
+    actuator[0] = rp_scale * roll_thrust - yaw_thrust;
+    // right servo
+    actuator[1] = rp_scale * pitch_thrust - yaw_thrust;
+    // rear servo
+    actuator[2] = -rp_scale * roll_thrust - yaw_thrust;
+    // left servo
+    actuator[3] = -rp_scale * pitch_thrust - yaw_thrust;
+
+    // calculate the minimum thrust that doesn't limit the roll, pitch and yaw forces
+    thrust_min_rpy = MAX(MAX(fabsf(actuator[0]), fabsf(actuator[1])), MAX(fabsf(actuator[2]), fabsf(actuator[3])));
+
+    thr_adj = throttle_thrust - throttle_avg_max;
+    if (thr_adj < (thrust_min_rpy - throttle_avg_max)) {
+        // Throttle can't be reduced to the desired level because this would mean roll or pitch control
+        // would not be able to reach the desired level because of lack of thrust.
+        thr_adj = MIN(thrust_min_rpy, throttle_avg_max) - throttle_avg_max;
+    }
+
+    // calculate the throttle setting for the lift fan
+    _thrust_out = throttle_avg_max + thr_adj;
+    // compensation_gain can never be zero
+    _throttle_out = _thrust_out / compensation_gain;
+
+    if (is_zero(_thrust_out)) {
+        limit.roll = true;
+        limit.pitch = true;
+        limit.yaw = true;
+    }
+
+    // limit thrust out for calculation of actuator gains
+    float thrust_out_actuator = constrain_float(MAX(_throttle_hover * 0.5f, _thrust_out), 0.5f, 1.0f);
+
+    // calculate the maximum allowed actuator output and maximum requested actuator output
+    for (uint8_t i = 0; i < NUM_ACTUATORS; i++) {
+        if (actuator_max > fabsf(actuator[i])) {
+            actuator_max = fabsf(actuator[i]);
+        }
+    }
+    if (actuator_max > thrust_out_actuator && !is_zero(actuator_max)) {
+        // roll, pitch and yaw request can not be achieved at full servo defection
+        // reduce roll, pitch and yaw to reduce the requested defection to maximum
+        limit.roll = true;
+        limit.pitch = true;
+        limit.yaw = true;
+        rp_scale = thrust_out_actuator / actuator_max;
+    } else {
+        rp_scale = 1.0f;
+    }
+
+    // force of a lifting surface is approximately equal to the angle of attack times the airflow velocity squared
+    // static thrust is proportional to the airflow velocity squared
+    // therefore the torque of the roll and pitch actuators should be approximately proportional to
+    // the angle of attack multiplied by the static thrust.
+    for (uint8_t i = 0; i < NUM_ACTUATORS; i++) {
+        _actuator_out[i] = constrain_float(rp_scale * actuator[i] / thrust_out_actuator, -1.0f, 1.0f);
+    }
+}
+
+// output_test_seq - spin a motor at the pwm value specified
+//  motor_seq is the motor's sequence number from 1 to the number of motors on the frame
+//  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
+void AP_MotorsSingle::_output_test_seq(uint8_t motor_seq, int16_t pwm)
+{
+    // output to motors and servos
+    switch (motor_seq) {
+        case 1:
+            // flap servo 1
+            rc_write(AP_MOTORS_MOT_1, pwm);
+            break;
+        case 2:
+            // flap servo 2
+            rc_write(AP_MOTORS_MOT_2, pwm);
+            break;
+        case 3:
+            // flap servo 3
+            rc_write(AP_MOTORS_MOT_3, pwm);
+            break;
+        case 4:
+            // flap servo 4
+            rc_write(AP_MOTORS_MOT_4, pwm);
+            break;
+        case 5:
+            // spin motor 1
+            rc_write(AP_MOTORS_MOT_5, pwm);
+            break;
+        case 6:
+            // spin motor 2
+            rc_write(AP_MOTORS_MOT_6, pwm);
+            break;
+        default:
+            // do nothing
+            break;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /// @file	AP_MotorsSingle.h
+/// @brief	Motor and Servo control class for Singlecopters
+#pragma once
+
+#include <AP_Common/AP_Common.h>
+#include <AP_Math/AP_Math.h>        // ArduPilot Mega Vector/Matrix math Library
+#include "AP_MotorsMulticopter.h"
+
+// feedback direction
+#define AP_MOTORS_SING_POSITIVE      1
+#define AP_MOTORS_SING_NEGATIVE     -1
+
+#define NUM_ACTUATORS 4
+
+#define AP_MOTORS_SINGLE_SPEED_DIGITAL_SERVOS 250 // update rate for digital servos
+#define AP_MOTORS_SINGLE_SPEED_ANALOG_SERVOS 125  // update rate for analog servos
+
+#define AP_MOTORS_SINGLE_SERVO_INPUT_RANGE      4500    // roll or pitch input of -4500 will cause servos to their minimum (i.e. radio_min), +4500 will move them to their maximum (i.e. radio_max)
+
+/// @class      AP_MotorsSingle
+class AP_MotorsSingle : public AP_MotorsMulticopter {
+public:
+
+    /// Constructor
+    AP_MotorsSingle(uint16_t speed_hz = AP_MOTORS_SPEED_DEFAULT) :
+        AP_MotorsMulticopter(speed_hz)
+    {
+    };
+
+    // init
+    void                init(motor_frame_class frame_class, motor_frame_type frame_type) override;
+
+    // set frame class (i.e. quad, hexa, heli) and type (i.e. x, plus)
+    void set_frame_class_and_type(motor_frame_class frame_class, motor_frame_type frame_type) override;
+
+    // set update rate to motors - a value in hertz
+    void                set_update_rate( uint16_t speed_hz ) override;
+
+    // output_to_motors - sends minimum values out to the motors
+    virtual void        output_to_motors() override;
+
+    // get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+    //  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+    uint32_t            get_motor_mask() override;
+
+    // Run arming checks
+    bool arming_checks(size_t buflen, char *buffer) const override { return AP_Motors::arming_checks(buflen, buffer); }
+
+protected:
+    // output - sends commands to the motors
+    void                output_armed_stabilizing() override;
+
+    const char* _get_frame_string() const override { return "SINGLE"; }
+
+    // output_test_seq - spin a motor at the pwm value specified
+    //  motor_seq is the motor's sequence number from 1 to the number of motors on the frame
+    //  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
+    virtual void        _output_test_seq(uint8_t motor_seq, int16_t pwm) override;
+
+    int16_t             _throttle_radio_output;   // total throttle pwm value, summed onto throttle channel minimum, typically ~1100-1900
+    float               _actuator_out[NUM_ACTUATORS]; // combined roll, pitch, yaw and throttle outputs to motors in 0~1 range
+    float               _thrust_out;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ *       AP_MotorsTailsitter.cpp - ArduCopter motors library for tailsitters and bicopters
+ *
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include "AP_MotorsTailsitter.h"
+#include <GCS_MAVLink/GCS.h>
+#include <SRV_Channel/SRV_Channel.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define SERVO_OUTPUT_RANGE  4500
+
+// init
+void AP_MotorsTailsitter::init(motor_frame_class frame_class, motor_frame_type frame_type)
+{
+    // setup default motor and servo mappings
+    _has_diff_thrust = SRV_Channels::function_assigned(SRV_Channel::k_throttleRight) || SRV_Channels::function_assigned(SRV_Channel::k_throttleLeft);
+
+    // right throttle defaults to servo output 1
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_throttleRight, CH_1);
+
+    // left throttle defaults to servo output 2
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_throttleLeft, CH_2);
+
+    // right servo defaults to servo output 3
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_tiltMotorRight, CH_3);
+    SRV_Channels::set_angle(SRV_Channel::k_tiltMotorRight, SERVO_OUTPUT_RANGE);
+
+    // left servo defaults to servo output 4
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_tiltMotorLeft, CH_4);
+    SRV_Channels::set_angle(SRV_Channel::k_tiltMotorLeft, SERVO_OUTPUT_RANGE);
+
+    _mav_type = MAV_TYPE_VTOL_DUOROTOR;
+
+    // record successful initialisation if what we setup was the desired frame_class
+    set_initialised_ok(frame_class == MOTOR_FRAME_TAILSITTER);
+}
+
+
+/// Constructor
+AP_MotorsTailsitter::AP_MotorsTailsitter(uint16_t speed_hz) :
+    AP_MotorsMulticopter(speed_hz)
+{
+    set_update_rate(speed_hz);
+}
+
+
+// set update rate to motors - a value in hertz
+void AP_MotorsTailsitter::set_update_rate(uint16_t speed_hz)
+{
+    // record requested speed
+    _speed_hz = speed_hz;
+
+    SRV_Channels::set_rc_frequency(SRV_Channel::k_throttleLeft, speed_hz);
+    SRV_Channels::set_rc_frequency(SRV_Channel::k_throttleRight, speed_hz);
+}
+
+void AP_MotorsTailsitter::output_to_motors()
+{
+    if (!initialised_ok()) {
+        return;
+    }
+
+    switch (_spool_state) {
+        case SpoolState::SHUT_DOWN:
+            _actuator[0] = 0.0f;
+            _actuator[1] = 0.0f;
+            _actuator[2] = 0.0f;
+            _external_min_throttle = 0.0;
+            break;
+        case SpoolState::GROUND_IDLE:
+            set_actuator_with_slew(_actuator[0], actuator_spin_up_to_ground_idle());
+            set_actuator_with_slew(_actuator[1], actuator_spin_up_to_ground_idle());
+            set_actuator_with_slew(_actuator[2], actuator_spin_up_to_ground_idle());
+            _external_min_throttle = 0.0;
+            break;
+        case SpoolState::SPOOLING_UP:
+        case SpoolState::THROTTLE_UNLIMITED:
+        case SpoolState::SPOOLING_DOWN:
+            set_actuator_with_slew(_actuator[0], thr_lin.thrust_to_actuator(_thrust_left));
+            set_actuator_with_slew(_actuator[1], thr_lin.thrust_to_actuator(_thrust_right));
+            set_actuator_with_slew(_actuator[2], thr_lin.thrust_to_actuator(_throttle));
+            break;
+    }
+
+    SRV_Channels::set_output_pwm(SRV_Channel::k_throttleLeft, output_to_pwm(_actuator[0]));
+    SRV_Channels::set_output_pwm(SRV_Channel::k_throttleRight, output_to_pwm(_actuator[1]));
+
+    // use set scaled to allow a different PWM range on plane forward throttle, throttle range is 0 to 100
+    SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, _actuator[2]*100);
+
+    SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft, _tilt_left*SERVO_OUTPUT_RANGE);
+    SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight, _tilt_right*SERVO_OUTPUT_RANGE);
+
+}
+
+// get_motor_mask - returns a bitmask of which outputs are being used for motors (1 means being used)
+//  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+uint32_t AP_MotorsTailsitter::get_motor_mask()
+{
+    uint32_t motor_mask = 0;
+    uint8_t chan;
+    if (SRV_Channels::find_channel(SRV_Channel::k_throttleLeft, chan)) {
+        motor_mask |= 1U << chan;
+    }
+    if (SRV_Channels::find_channel(SRV_Channel::k_throttleRight, chan)) {
+        motor_mask |= 1U << chan;
+    }
+
+    // add parent's mask
+    motor_mask |= AP_MotorsMulticopter::get_motor_mask();
+
+    return motor_mask;
+}
+
+// calculate outputs to the motors
+void AP_MotorsTailsitter::output_armed_stabilizing()
+{
+    float   roll_thrust;                // roll thrust input value, +/- 1.0
+    float   pitch_thrust;               // pitch thrust input value, +/- 1.0
+    float   yaw_thrust;                 // yaw thrust input value, +/- 1.0
+    float   throttle_thrust;            // throttle thrust input value, 0.0 - 1.0
+    float   thrust_max;                 // highest motor value
+    float   thrust_min;                 // lowest motor value
+    float   thr_adj = 0.0f;             // the difference between the pilot's desired throttle and throttle_thrust_best_rpy
+
+    // apply voltage and air pressure compensation
+    const float compensation_gain = thr_lin.get_compensation_gain();
+    roll_thrust = (_roll_in + _roll_in_ff) * compensation_gain;
+    pitch_thrust = _pitch_in + _pitch_in_ff;
+    yaw_thrust = _yaw_in + _yaw_in_ff;
+    throttle_thrust = get_throttle() * compensation_gain;
+    const float max_boost_throttle = _throttle_avg_max * compensation_gain;
+
+    // never boost above max, derived from throttle mix params
+    const float min_throttle_out = MIN(_external_min_throttle, max_boost_throttle);
+    const float max_throttle_out = _throttle_thrust_max * compensation_gain;
+
+    // sanity check throttle is above min and below current limited throttle
+    if (throttle_thrust <= min_throttle_out) {
+        throttle_thrust = min_throttle_out;
+        limit.throttle_lower = true;
+    }
+    if (throttle_thrust >= max_throttle_out) {
+        throttle_thrust = max_throttle_out;
+        limit.throttle_upper = true;
+    }
+
+    if (roll_thrust >= 1.0) {
+        // cannot split motor outputs by more than 1
+        roll_thrust = 1;
+        limit.roll = true;
+    }
+
+    // calculate left and right throttle outputs
+    _thrust_left  = throttle_thrust + roll_thrust * 0.5f;
+    _thrust_right = throttle_thrust - roll_thrust * 0.5f;
+
+    thrust_max = MAX(_thrust_right,_thrust_left);
+    thrust_min = MIN(_thrust_right,_thrust_left);
+    if (thrust_max > 1.0f) {
+        // if max thrust is more than one reduce average throttle
+        thr_adj = 1.0f - thrust_max;
+        limit.throttle_upper = true;
+    } else if (thrust_min < 0.0) {
+        // if min thrust is less than 0 increase average throttle
+        // but never above max boost
+        thr_adj = -thrust_min;
+        if ((throttle_thrust + thr_adj) > max_boost_throttle) {
+            thr_adj = MAX(max_boost_throttle - throttle_thrust, 0.0);
+            // in this case we throw away some roll output, it will be uneven
+            // constraining the lower motor more than the upper
+            // this unbalances torque, but motor torque should have significantly less control power than tilts / control surfaces
+            // so its worth keeping the higher roll control power at a minor cost to yaw
+            limit.roll = true;
+        }
+        limit.throttle_lower = true;
+    }
+
+    // Add adjustment to reduce average throttle
+    _thrust_left  = constrain_float(_thrust_left  + thr_adj, 0.0f, 1.0f);
+    _thrust_right = constrain_float(_thrust_right + thr_adj, 0.0f, 1.0f);
+
+    _throttle = throttle_thrust;
+
+    // compensation_gain can never be zero
+    // ensure accurate representation of average throttle output, this value is used for notch tracking and control surface scaling
+    if (_has_diff_thrust) {
+        _throttle_out = (throttle_thrust + thr_adj) / compensation_gain;
+    } else {
+        _throttle_out = throttle_thrust / compensation_gain;
+    }
+
+    // thrust vectoring
+    _tilt_left  = pitch_thrust - yaw_thrust;
+    _tilt_right = pitch_thrust + yaw_thrust;
+}
+
+// output_test_seq - spin a motor at the pwm value specified
+//  motor_seq is the motor's sequence number from 1 to the number of motors on the frame
+//  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
+void AP_MotorsTailsitter::_output_test_seq(uint8_t motor_seq, int16_t pwm)
+{
+    // output to motors and servos
+    switch (motor_seq) {
+        case 1:
+            // right throttle
+            SRV_Channels::set_output_pwm(SRV_Channel::k_throttleRight, pwm);
+            break;
+        case 2:
+            // right tilt servo
+            SRV_Channels::set_output_pwm(SRV_Channel::k_tiltMotorRight, pwm);
+            break;
+        case 3:
+            // left throttle
+            SRV_Channels::set_output_pwm(SRV_Channel::k_throttleLeft, pwm);
+            break;
+        case 4:
+            // left tilt servo
+            SRV_Channels::set_output_pwm(SRV_Channel::k_tiltMotorLeft, pwm);
+            break;
+        default:
+            // do nothing
+            break;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /// @file	AP_MotorsTailsitter.h
+/// @brief	Motor control class for tailsitters and bicopters
+#pragma once
+
+#include <AP_Common/AP_Common.h>
+#include <AP_Math/AP_Math.h>
+#include "AP_MotorsMulticopter.h"
+
+/// @class      AP_MotorsTailsitter
+class AP_MotorsTailsitter : public AP_MotorsMulticopter {
+public:
+
+    /// Constructor
+    AP_MotorsTailsitter(uint16_t speed_hz = AP_MOTORS_SPEED_DEFAULT);
+
+    // init
+    void init(motor_frame_class frame_class, motor_frame_type frame_type) override;
+
+    // set frame class (i.e. quad, hexa, heli) and type (i.e. x, plus)
+    void set_frame_class_and_type(motor_frame_class frame_class, motor_frame_type frame_type) override {}
+
+    // set update rate to motors - a value in hertz
+    void set_update_rate( uint16_t speed_hz ) override;
+
+    // output_to_motors - sends output to named servos
+    void output_to_motors() override;
+
+    // get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+    //  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+    uint32_t get_motor_mask() override;
+
+    // Set by tailsitters using diskloading minumum outflow velocity limit
+    void set_min_throttle(float val) {_external_min_throttle = val;}
+
+protected:
+    // calculate motor outputs
+    void output_armed_stabilizing() override;
+
+    const char* _get_frame_string() const override { return "TAILSITTER"; }
+
+    // spin a motor at the pwm value specified
+    void _output_test_seq(uint8_t motor_seq, int16_t pwm) override;
+
+    // calculated outputs
+    float _throttle; // 0..1
+    float _tilt_left;  // -1..1
+    float _tilt_right;  // -1..1
+    float _thrust_left;  // 0..1
+    float _thrust_right;  // 0..1
+
+    // Set by tailsitters using diskloading minumum outflow velocity limit
+    float _external_min_throttle;
+
+    // true if differential thrust is available
+    bool _has_diff_thrust;
+
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+#include <AP_Math/AP_Math.h>
+#include <GCS_MAVLink/GCS.h>
+#include <SRV_Channel/SRV_Channel.h>
+
+#include "AP_MotorsTri.h"
+
+extern const AP_HAL::HAL& hal;
+
+// init
+void AP_MotorsTri::init(motor_frame_class frame_class, motor_frame_type frame_type)
+{
+    add_motor_num(AP_MOTORS_MOT_1);
+    add_motor_num(AP_MOTORS_MOT_2);
+    add_motor_num(AP_MOTORS_MOT_4);
+
+    // set update rate for the 3 motors (but not the servo on channel 7)
+    set_update_rate(_speed_hz);
+
+    // set the motor_enabled flag so that the ESCs can be calibrated like other frame types
+    motor_enabled[AP_MOTORS_MOT_1] = true;
+    motor_enabled[AP_MOTORS_MOT_2] = true;
+    motor_enabled[AP_MOTORS_MOT_4] = true;
+
+    // allow mapping of motor7
+    add_motor_num(AP_MOTORS_CH_TRI_YAW);
+
+    // Check for tail servo
+    _have_tail_servo = SRV_Channels::function_assigned(SRV_Channel::k_motor7);
+
+    SRV_Channels::set_angle(SRV_Channels::get_motor_function(AP_MOTORS_CH_TRI_YAW), _yaw_servo_angle_max_deg*100);
+
+    // check for reverse tricopter
+    _pitch_reversed = frame_type == MOTOR_FRAME_TYPE_PLUSREV;
+
+    _mav_type = MAV_TYPE_TRICOPTER;
+
+    // record successful initialisation if what we setup was the desired frame_class
+    set_initialised_ok(frame_class == MOTOR_FRAME_TRI);
+}
+
+// set frame class (i.e. quad, hexa, heli) and type (i.e. x, plus)
+void AP_MotorsTri::set_frame_class_and_type(motor_frame_class frame_class, motor_frame_type frame_type)
+{
+    // check for reverse tricopter
+    _pitch_reversed = frame_type == MOTOR_FRAME_TYPE_PLUSREV;
+
+    set_initialised_ok((frame_class == MOTOR_FRAME_TRI) && SRV_Channels::function_assigned(SRV_Channel::k_motor7));
+}
+
+// set update rate to motors - a value in hertz
+void AP_MotorsTri::set_update_rate(uint16_t speed_hz)
+{
+    // record requested speed
+    _speed_hz = speed_hz;
+
+    // set update rate for the 3 motors (but not the servo on channel 7)
+    uint32_t mask = 
+	    1U << AP_MOTORS_MOT_1 |
+	    1U << AP_MOTORS_MOT_2 |
+	    1U << AP_MOTORS_MOT_4;
+    rc_set_freq(mask, _speed_hz);
+}
+
+void AP_MotorsTri::output_to_motors()
+{
+    switch (_spool_state) {
+        case SpoolState::SHUT_DOWN:
+            // sends minimum values out to the motors
+            for (uint8_t i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
+                if (motor_enabled_mask(i)) {
+                    _actuator[AP_MOTORS_MOT_1+i] = 0;
+                }
+            }
+            rc_write_angle(AP_MOTORS_CH_TRI_YAW, 0);
+            break;
+        case SpoolState::GROUND_IDLE:
+            // sends output to motors when armed but not flying
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_1], actuator_spin_up_to_ground_idle());
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_2], actuator_spin_up_to_ground_idle());
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_4], actuator_spin_up_to_ground_idle());
+            rc_write_angle(AP_MOTORS_CH_TRI_YAW, 0);
+            break;
+        case SpoolState::SPOOLING_UP:
+        case SpoolState::THROTTLE_UNLIMITED:
+        case SpoolState::SPOOLING_DOWN:
+            // set motor output based on thrust requests
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_1], thr_lin.thrust_to_actuator(_thrust_right));
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_2], thr_lin.thrust_to_actuator(_thrust_left));
+            set_actuator_with_slew(_actuator[AP_MOTORS_MOT_4], thr_lin.thrust_to_actuator(_thrust_rear));
+            rc_write_angle(AP_MOTORS_CH_TRI_YAW, degrees(_pivot_angle)*100);
+            break;
+    }
+
+    rc_write(AP_MOTORS_MOT_1, output_to_pwm(_actuator[AP_MOTORS_MOT_1]));
+    rc_write(AP_MOTORS_MOT_2, output_to_pwm(_actuator[AP_MOTORS_MOT_2]));
+    rc_write(AP_MOTORS_MOT_4, output_to_pwm(_actuator[AP_MOTORS_MOT_4]));
+}
+
+// get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+//  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+uint32_t AP_MotorsTri::get_motor_mask()
+{
+    // tri copter uses channels 1,2,4 and 7
+    uint32_t motor_mask = (1U << AP_MOTORS_MOT_1) |
+                          (1U << AP_MOTORS_MOT_2) |
+                          (1U << AP_MOTORS_MOT_4);
+    uint32_t mask = motor_mask_to_srv_channel_mask(motor_mask);
+
+    // add parent's mask
+    mask |= AP_MotorsMulticopter::get_motor_mask();
+
+    return mask;
+}
+
+// output_armed - sends commands to the motors
+// includes new scaling stability patch
+void AP_MotorsTri::output_armed_stabilizing()
+{
+    float   roll_thrust;                // roll thrust input value, +/- 1.0
+    float   pitch_thrust;               // pitch thrust input value, +/- 1.0
+    float   yaw_thrust;                 // yaw thrust input value, +/- 1.0
+    float   throttle_thrust;            // throttle thrust input value, 0.0 - 1.0
+    float   throttle_avg_max;           // throttle thrust average maximum value, 0.0 - 1.0
+    float   throttle_thrust_best_rpy;   // throttle providing maximum roll, pitch and yaw range without climbing
+    float   rpy_scale = 1.0f;           // this is used to scale the roll, pitch and yaw to fit within the motor limits
+    float   rpy_low = 0.0f;             // lowest motor value
+    float   rpy_high = 0.0f;            // highest motor value
+    float   thr_adj;                    // the difference between the pilot's desired throttle and throttle_thrust_best_rpy
+
+    SRV_Channels::set_angle(SRV_Channels::get_motor_function(AP_MOTORS_CH_TRI_YAW), _yaw_servo_angle_max_deg*100);
+
+    // sanity check YAW_SV_ANGLE parameter value to avoid divide by zero
+    _yaw_servo_angle_max_deg.set(constrain_float(_yaw_servo_angle_max_deg, AP_MOTORS_TRI_SERVO_RANGE_DEG_MIN, AP_MOTORS_TRI_SERVO_RANGE_DEG_MAX));
+
+    // apply voltage and air pressure compensation
+    const float compensation_gain = thr_lin.get_compensation_gain();
+    roll_thrust = (_roll_in + _roll_in_ff) * compensation_gain;
+    pitch_thrust = (_pitch_in + _pitch_in_ff) * compensation_gain;
+    yaw_thrust = (_yaw_in + _yaw_in_ff) * compensation_gain * sinf(radians(_yaw_servo_angle_max_deg)); // we scale this so a thrust request of 1.0f will ask for full servo deflection at full rear throttle
+    throttle_thrust = get_throttle() * compensation_gain;
+    throttle_avg_max = _throttle_avg_max * compensation_gain;
+
+    // check for reversed pitch
+    if (_pitch_reversed) {
+        pitch_thrust *= -1.0f;
+    }
+
+    // VTOL plane may not have tail servo
+    if (!_have_tail_servo) {
+        _pivot_angle = 0.0;
+    } else {
+        // calculate angle of yaw pivot
+        _pivot_angle = safe_asin(yaw_thrust);
+        if (fabsf(_pivot_angle) > radians(_yaw_servo_angle_max_deg)) {
+            limit.yaw = true;
+            _pivot_angle = constrain_float(_pivot_angle, -radians(_yaw_servo_angle_max_deg), radians(_yaw_servo_angle_max_deg));
+        }
+    }
+
+    float pivot_thrust_max = cosf(_pivot_angle);
+    float thrust_max = 1.0f;
+
+    // sanity check throttle is above zero and below current limited throttle
+    if (throttle_thrust <= 0.0f) {
+        throttle_thrust = 0.0f;
+        limit.throttle_lower = true;
+    }
+    if (throttle_thrust >= _throttle_thrust_max) {
+        throttle_thrust = _throttle_thrust_max;
+        limit.throttle_upper = true;
+    }
+
+    throttle_avg_max = constrain_float(throttle_avg_max, throttle_thrust, _throttle_thrust_max);
+
+    // The following mix may be offer less coupling between axis but needs testing
+    //_thrust_right = roll_thrust * -0.5f + pitch_thrust * 1.0f;
+    //_thrust_left = roll_thrust * 0.5f + pitch_thrust * 1.0f;
+    //_thrust_rear = 0;
+
+    _thrust_right = roll_thrust * -0.5f + pitch_thrust * 0.5f;
+    _thrust_left = roll_thrust * 0.5f + pitch_thrust * 0.5f;
+    _thrust_rear = pitch_thrust * -0.5f;
+
+    // calculate roll and pitch for each motor
+    // set rpy_low and rpy_high to the lowest and highest values of the motors
+
+    // record lowest roll pitch command
+    rpy_low = MIN(_thrust_right, _thrust_left);
+    rpy_high = MAX(_thrust_right, _thrust_left);
+    if (rpy_low > _thrust_rear) {
+        rpy_low = _thrust_rear;
+    }
+    // check to see if the rear motor will reach maximum thrust before the front two motors
+    if ((1.0f - rpy_high) > (pivot_thrust_max - _thrust_rear)) {
+        thrust_max = pivot_thrust_max;
+        rpy_high = _thrust_rear;
+    }
+
+    // calculate throttle that gives most possible room for yaw (range 1000 ~ 2000) which is the lower of:
+    //      1. 0.5f - (rpy_low+rpy_high)/2.0 - this would give the maximum possible room margin above the highest motor and below the lowest
+    //      2. the higher of:
+    //            a) the pilot's throttle input
+    //            b) the point _throttle_rpy_mix between the pilot's input throttle and hover-throttle
+    //      Situation #2 ensure we never increase the throttle above hover throttle unless the pilot has commanded this.
+    //      Situation #2b allows us to raise the throttle above what the pilot commanded but not so far that it would actually cause the copter to rise.
+    //      We will choose #1 (the best throttle for yaw control) if that means reducing throttle to the motors (i.e. we favor reducing throttle *because* it provides better yaw control)
+    //      We will choose #2 (a mix of pilot and hover throttle) only when the throttle is quite low.  We favor reducing throttle instead of better yaw control because the pilot has commanded it
+
+    // check everything fits
+    throttle_thrust_best_rpy = MIN(0.5f * thrust_max - (rpy_low + rpy_high) / 2.0, throttle_avg_max);
+    if (is_zero(rpy_low)) {
+        rpy_scale = 1.0f;
+    } else {
+        rpy_scale = constrain_float(-throttle_thrust_best_rpy / rpy_low, 0.0f, 1.0f);
+    }
+
+    // calculate how close the motors can come to the desired throttle
+    thr_adj = throttle_thrust - throttle_thrust_best_rpy;
+    if (rpy_scale < 1.0f) {
+        // Full range is being used by roll, pitch, and yaw.
+        limit.roll = true;
+        limit.pitch = true;
+        if (thr_adj > 0.0f) {
+            limit.throttle_upper = true;
+        }
+        thr_adj = 0.0f;
+    } else {
+        if (thr_adj < -(throttle_thrust_best_rpy + rpy_low)) {
+            // Throttle can't be reduced to desired value
+            thr_adj = -(throttle_thrust_best_rpy + rpy_low);
+        } else if (thr_adj > thrust_max - (throttle_thrust_best_rpy + rpy_high)) {
+            // Throttle can't be increased to desired value
+            thr_adj = thrust_max - (throttle_thrust_best_rpy + rpy_high);
+            limit.throttle_upper = true;
+        }
+    }
+
+    // determine throttle thrust for harmonic notch
+    const float throttle_thrust_best_plus_adj = throttle_thrust_best_rpy + thr_adj;
+    // compensation_gain can never be zero
+    _throttle_out = throttle_thrust_best_plus_adj / compensation_gain;
+
+    // add scaled roll, pitch, constrained yaw and throttle for each motor
+    _thrust_right = throttle_thrust_best_plus_adj + rpy_scale * _thrust_right;
+    _thrust_left = throttle_thrust_best_plus_adj + rpy_scale * _thrust_left;
+    _thrust_rear = throttle_thrust_best_plus_adj + rpy_scale * _thrust_rear;
+
+    // scale pivot thrust to account for pivot angle
+    // we should not need to check for divide by zero as _pivot_angle is constrained to the 5deg ~ 80 deg range
+    _thrust_rear = _thrust_rear / cosf(_pivot_angle);
+
+    // constrain all outputs to 0.0f to 1.0f
+    // test code should be run with these lines commented out as they should not do anything
+    _thrust_right = constrain_float(_thrust_right, 0.0f, 1.0f);
+    _thrust_left = constrain_float(_thrust_left, 0.0f, 1.0f);
+    _thrust_rear = constrain_float(_thrust_rear, 0.0f, 1.0f);
+}
+
+// output_test_seq - spin a motor at the pwm value specified
+//  motor_seq is the motor's sequence number from 1 to the number of motors on the frame
+//  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
+void AP_MotorsTri::_output_test_seq(uint8_t motor_seq, int16_t pwm)
+{
+    // output to motors and servos
+    if (!_pitch_reversed) {
+        switch (motor_seq) {
+        case 1:
+            // front right motor
+            rc_write(AP_MOTORS_MOT_1, pwm);
+            break;
+        case 2:
+            // back motor
+            rc_write(AP_MOTORS_MOT_4, pwm);
+            break;
+        case 3:
+            // back servo
+            rc_write(AP_MOTORS_CH_TRI_YAW, pwm);
+            break;
+        case 4:
+            // front left motor
+            rc_write(AP_MOTORS_MOT_2, pwm);
+            break;
+        default:
+            // do nothing
+            break;
+        }
+    } else {
+        switch (motor_seq) {
+        case 1:
+            // front motor
+            rc_write(AP_MOTORS_MOT_4, pwm);
+            break;
+        case 2:
+            // front servo
+            rc_write(AP_MOTORS_CH_TRI_YAW, pwm);
+            break;
+        case 3:
+            // back right motor
+            rc_write(AP_MOTORS_MOT_1, pwm);
+            break;
+        case 4:
+            // back left motor
+            rc_write(AP_MOTORS_MOT_2, pwm);
+            break;
+        default:
+            // do nothing
+            break;
+        }
+    }
+}
+
+/*
+  call vehicle supplied thrust compensation if set. This allows for
+  vehicle specific thrust compensation for motor arrangements such as
+  the forward motors tilting
+*/
+void AP_MotorsTri::thrust_compensation(void)
+{
+    if (_thrust_compensation_callback) {
+        // convert 3 thrust values into an array indexed by motor number
+        float thrust[4] { _thrust_right, _thrust_left, 0, _thrust_rear };
+
+        // apply vehicle supplied compensation function
+        _thrust_compensation_callback(thrust, 4);
+
+        // extract compensated thrust values
+        _thrust_right = thrust[0];
+        _thrust_left = thrust[1];
+        _thrust_rear = thrust[3];
+    }
+}
+
+/*
+  override tricopter tail servo output in output_motor_mask
+ */
+void AP_MotorsTri::output_motor_mask(float thrust, uint16_t mask, float rudder_dt)
+{
+    // normal multicopter output
+    AP_MotorsMulticopter::output_motor_mask(thrust, mask, rudder_dt);
+
+    // and override yaw servo
+    rc_write_angle(AP_MOTORS_CH_TRI_YAW, 0);
+}
+
+float AP_MotorsTri::get_roll_factor(uint8_t i)
+{
+    float ret = 0.0f;
+
+    switch (i) {
+        // right motor
+        case AP_MOTORS_MOT_1:
+            ret = -1.0f;
+            break;
+            // left motor
+        case AP_MOTORS_MOT_2:
+            ret = 1.0f;
+            break;
+    }
+
+    return ret;
+}
+
+// This function is currently only used by AP_Motors_test
+#if APM_BUILD_TYPE(APM_BUILD_UNKNOWN)
+float AP_MotorsTri::get_pitch_factor_json(uint8_t i)
+{
+    float ret = 0.0f;
+
+    switch (i) {
+    case AP_MOTORS_MOT_1: // front motors
+    case AP_MOTORS_MOT_2:
+        ret = 0.5f;
+        break;
+    case AP_MOTORS_MOT_4: // rear motor
+        ret = -1.0f;
+        break;
+    }
+
+    if (_pitch_reversed) {
+        ret *= -1.0f;
+    }
+
+    return ret;
+}
+#endif // APM_BUILD_TYPE(APM_BUILD_UNKNOWN)
+
+// Run arming checks
+bool AP_MotorsTri::arming_checks(size_t buflen, char *buffer) const
+{
+#if !APM_BUILD_TYPE(APM_BUILD_ArduPlane) // Tilt Rotors do not need a yaw servo
+    // Check for yaw servo
+    if (!_have_tail_servo) {
+        hal.util->snprintf(buffer, buflen, "no SERVOx_FUNCTION set to Motor7 for tail servo");
+        return false;
+    }
+#endif
+
+    // run base class checks
+    return AP_MotorsMulticopter::arming_checks(buflen, buffer);
+}
+
+// This function is currently only used by AP_Motors_test
+#if APM_BUILD_TYPE(APM_BUILD_UNKNOWN)
+// Get the testing order for the motors
+uint8_t AP_MotorsTri::get_motor_test_order(uint8_t i)
+{
+    if (!_pitch_reversed) {
+        switch (i) {
+        case AP_MOTORS_MOT_1: // front right motor
+            return 1;
+        case AP_MOTORS_MOT_4: // back motor
+            return 2;
+        case AP_MOTORS_CH_TRI_YAW: // back servo
+            return 3;
+        case AP_MOTORS_MOT_2: // front left motor
+            return 4;
+        default:
+            return 0;
+        }
+    } else {
+        switch (i) {
+        case AP_MOTORS_MOT_4: // front motor
+            return 1;
+        case AP_MOTORS_CH_TRI_YAW: // front servo
+            return 2;
+        case AP_MOTORS_MOT_1: // back right motor
+            return 3;
+        case AP_MOTORS_MOT_2: // back left motor
+            return 4;
+        default:
+            return 0;
+        }
+    }
+}
+#endif // APM_BUILD_TYPE(APM_BUILD_UNKNOWN)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 ‰PNG
+
+   IHDR  @  `   ÄA×´   	pHYs     šœ  
+OiCCPPhotoshop ICC profile  xÚSgTSé=÷ŞôBKˆ€”KoR RB‹€‘&*!	Jˆ!¡ÙQÁEEÈ ˆ€ŒQ,Š
+Øä!¢ƒ£ˆŠÊûá{£kÖ¼÷æÍşµ×>ç¬ó³ÏÀ–H3Q5€©BàƒÇÄÆáä.@
+$p ³d!sı# ø~<<+"À¾ xÓ ÀM›À0‡ÿêB™\€„Àt‘8K€ @zB¦ @F€˜&S   `Ëcbã P- `'æÓ €ø™{ [”! ‘  eˆD h; ¬ÏVŠE X0 fKÄ9 Ø- 0IWfH °· ÀÎ²  0Qˆ…) { `È##x „™ FòW<ñ+®ç*  x™²<¹$9E[-qWW.(ÎI+6aaš@.Ây™24àóÌ   ‘àƒóıxÎ®ÎÎ6¶_-ê¿ÿ"bbãşåÏ«p@  át~Ñş,/³€;€mş¢%îh^ u÷‹f²@µ  éÚWópø~<<E¡¹ÙÙåääØJÄB[aÊW}şgÂ_ÀWılù~<ü÷õà¾â$2]GøàÂÌôL¥Ï’	„bÜæGü·ÿüÓ"ÄIb¹X*ãQqDšŒó2¥"‰B’)Å%Òÿdâß,û>ß5 °j>{‘-¨]cöK'XtÀâ÷  ò»oÁÔ(€hƒáÏwÿï?ıG % €fI’q  ^D$.TÊ³?Ç  D *°AôÁ,ÀÁÜÁü`6„B$ÄÂBB
+d€r`)¬‚B(†Í°*`/Ô@4ÀQh†“p.ÂU¸=púaÁ(¼	AÈa!ÚˆbŠX#™…ø!ÁH‹$ ÉˆQ"K‘5H1RŠT UHò=r9‡\Fº‘;È 2‚ü†¼G1”²Q=ÔµC¹¨7„F¢Ğdt1š ›Ğr´=Œ6¡çĞ«hÚ>CÇ0Àè3Äl0.ÆÃB±8,	“cË±"¬«Æ°V¬»‰õcÏ±wEÀ	6wB aAHXLXNØH¨ $4Ú	7	„QÂ'"“¨K´&ºùÄb21‡XH,#Ö/{ˆCÄ7$‰C2'¹I±¤TÒÒFÒnR#é,©›4H#“ÉÚdk²9”, +È…ääÃä3ää!ò[
+b@q¤øSâ(RÊjJåå4åe˜2AU£šRİ¨¡T5ZB­¡¶R¯Q‡¨4uš9ÍƒIK¥­¢•Óhh÷i¯ètºİ•N—ĞWÒËéGè—èôw†ƒÇˆg(›gw¯˜L¦Ó‹ÇT071ë˜ç™™oUX*¶*|‘Ê
+•J•&•*/T©ª¦ªŞªUóUËT©^S}®FU3Sã©	Ô–«UªPëSSg©;¨‡ªg¨oT?¤~Yı‰YÃLÃOC¤Q ±_ã¼Æ c³x,!k«†u5Ä&±ÍÙ|v*»˜ı»‹=ª©¡9C3J3W³Ró”f?ã˜qøœtN	ç(§—ó~ŠŞï)â)¦4L¹1e\kª–—–X«H«Q«Gë½6®í§¦½E»YûAÇJ'\'GgÎçSÙSİ§
+§M=:õ®.ªk¥¡»Dw¿n§î˜¾^€Lo§Şy½çú}/ıTımú§õGX³$ÛÎ<Å5qo</ÇÛñQC]Ã@C¥a•a—á„‘¹Ñ<£ÕFFŒiÆ\ã$ãmÆmÆ£&&!&KMêMîšRM¹¦)¦;L;LÇÍÌÍ¢ÍÖ™5›=1×2ç›ç›×›ß·`ZxZ,¶¨¶¸eI²äZ¦Yî¶¼n…Z9Y¥XUZ]³F­­%Ö»­»§§¹N“N«ÖgÃ°ñ¶É¶©·°åØÛ®¶m¶}agbg·Å®Ãî“½“}º}ı=‡Ù«Z~s´r:V:ŞšÎœî?}Åô–é/gXÏÏØ3ã¶Ë)ÄiS›ÓGgg¹sƒóˆ‹‰K‚Ë.—>.›ÆİÈ½äJtõq]ázÒõ›³›Âí¨Û¯î6îiî‡ÜŸÌ4Ÿ)Y3sĞÃÈCàQåÑ?Ÿ•0kß¬~OCOgµç#/c/‘W­×°·¥wª÷aï>ö>rŸã>ã<7Ş2ŞY_Ì7À·È·ËOÃo_…ßC#ÿdÿzÿÑ §€%g‰A[ûøz|!¿?:Ûeö²ÙíAŒ ¹AA‚­‚åÁ­!hÈì­!÷ç˜Î‘Îi…P~èÖĞaæa‹Ã~'…‡…W†?pˆXÑ1—5wÑÜCsßDúD–DŞ›g1O9¯-J5*>ª.j<Ú7º4º?Æ.fYÌÕXXIlK9.*®6nl¾ßüíó‡ââã{˜/È]py¡ÎÂô…§©.,:–@LˆN8”ğA*¨Œ%òw%
+yÂÂg"/Ñ6ÑˆØC\*NòH*Mz’ì‘¼5y$Å3¥,å¹„'©¼LLİ›:šv m2=:½1ƒ’‘qBª!M“¶gêgæfvË¬e…²şÅn‹·/•Ék³¬Y-
+¶B¦èTZ(×*²geWf¿Í‰Ê9–«+ÍíÌ³ÊÛ7œïŸÿíÂá’¶¥†KW-Xæ½¬j9²<qyÛ
+ã+†V¬<¸Š¶*mÕO«íW—®~½&zMk^ÁÊ‚ÁµkëU
+å…}ëÜ×í]OX/Yßµaú†>‰Š®Û—Ø(Üxå‡oÊ¿™Ü”´©«Ä¹dÏfÒféæŞ-[–ª—æ—nÙÚ´ßV´íõöEÛ/—Í(Û»ƒ¶C¹£¿<¸¼e§ÉÎÍ;?T¤TôTúT6îÒİµa×ønÑî{¼ö4ìÕÛ[¼÷ı>É¾ÛUUMÕfÕeûIû³÷?®‰ªéø–ûm]­NmqíÇÒı#¶×¹ÔÕÒ=TRÖ+ëGÇ¾şïw-6UœÆâ#pDyäé÷	ß÷:ÚvŒ{¬áÓvg/jBšòšF›Sšû[b[ºOÌ>ÑÖêŞzüGÛœ4<YyJóTÉiÚé‚Ó“gòÏŒ•}~.ùÜ`Û¢¶{çcÎßjoïºtáÒEÿ‹ç;¼;Î\ò¸tò²ÛåW¸Wš¯:_mêtê<ş“ÓOÇ»œ»š®¹\k¹îz½µ{f÷é7Îİô½yñÿÖÕ9=İ½ózo÷Å÷õßİ~r'ıÎË»Ùw'î­¼O¼_ô@íAÙCİ‡Õ?[şÜØïÜjÀw óÑÜG÷…ƒÏş‘õC™Ë††ë8>99â?rıéü§CÏdÏ&ş¢şË®/~øÕë×ÎÑ˜Ñ¡—ò—“¿m|¥ıêÀë¯ÛÆÂÆ¾Éx31^ôVûíÁwÜwï£ßOä| (ÿhù±õSĞ§û“““ÿ˜óüc3-Û   gAMA  ±|ûQ“    cHRM  z%  €ƒ  ùÿ  €é  u0  ê`  :˜  o’_ÅF ¥IDATxÚìyXTåû‡oVt\peÜ@%RÌµŸæRV".å‚šf¢hæi¦»©~Ë4ÈÊ2À4wqEAÆTf\ÅrA~0ç4Ã¢ì‚ûººªaæÌÌ;çœ÷ó>ïó|£Ã‡gR†°µµ-K‡˜˜¤ñ‘ÆGŸ²5>5jÔÀÁÁÁà±{÷î)O<¶lÙBdD*•J|ÌÎÎ·Q£P(Òõ%?/c$$$$$$Jˆ-[¶°å·ßÄ€J¥bÖÌ™¨Õji$^
+¦ÒHHH”7îİ»Ç‘#G¤(¨¢¢ ğõõÅ±CñqüıüˆŠŠ*RHBB@e;{{"##qwwÏõïöööÒ IHHBBBBâÕâ£>(‘ 		I IHHHH”i$!	‰²‚”-!!!!!!!	 								I IHHHHHHHHHBBBBBBB¢|S®“ SSS‰‰‰áâ…\¹r…¤¤$îİ»Gff&*T N:XYYñÆoĞÊÁúõëK¿¸„„„„„„Dù@7nÜ`Ïîİlß¾=Ïç<|øÛ·o£R©@¡PĞ·_?ºuë&ıòÅÌÕ«WYïë+–:×­[{{{&¸»S¡Bi€$$$$TX’’’Ø³{7Û¶mstt¤mÛ¶4kÖŒbii‰±±1©©©Ü¼y“k×®qñÂ‚‚‚P«Õ¨ÕjvïŞM¿¾}éÖ½»t”2éééh4®]»†&1‘Ûwî––†©‰	Õ«W§~ıú4lÔˆFQ¹rå\qîìYâ°±¶Æ¦iSªU«&ìKæÎ;,ööæÆâc·nİâÖ­[$&&²båÊ×r\T*G¥Fô~çjÔ¬Ybïõ(%…ÈÈH>|HËV­¤ˆ·„Ä«"€öìÙÃz__ñÿ'O™Â;ï¼C½zõr}¾L&£nİº´nİš÷ßŸé3fpñâEØ¿oÑj5—bbxï½÷ËåÒ™PÂœ?ó‘‘DDDäùœk×®qşüyñÿ
+¶o¼AçÎ16ÎJW ,,€°ĞP*UªÄÄI“ò<$J‡õ¾¾Ü¸qÇğÕ]§†Ù³f¡V«Ù°aãÆ{­ÆäòåË|·n×¯_àï;˜9s&­[—È{mşùg’““ˆŠŠÂmÔ(j– à’P	“‘‘ÁÆäï¿ÿ`¤›£G¦jÕª:¹¹9mÚ´¡M›68;;3sÆvíÜÉ®;ùbÚ4i[¬„8sæÊğp._¾€™™Íš5ÃÎÎ
+4@&“ñøñcnŞ¼Ill,ª¨(ÔÑÑbÄîdX<xğ€ğğpŒùbÚ4"#"8pà >k×òùçŸS»NiÀ_×¯_çôéÓ ,Y²D|\.—ã9w.#†çÌéÓ¸¹¹annşÚŒKdd$W¯^å£?æßşáøñã¬\¹’/¿üÛ7Ş(¶÷ILLä×_~áÉ“'tîÜ™ZµjÄùÈH)Ê-!Q^Ğƒøí·ßØ³{7 Ë–/§GE>n=;y’ïÖ­ã—_~aÕÊ•<ÔjéÿşûåâG{øğa`ió(%…€€ 1¢Ó A\¤wïŞÔ®]›{÷îqıúu’’’¸víÌÍ©U»6.0aÂRSS9qânİJdd$û÷ïÏ:aMMY´h½Şy‡¡C‡bbjÊŞ={X½z5Ó¦O—®è|=WÇÎÎ G›‚Ş}ú°oïŞ;´nmàê{üøq222pqqA&“¼—B¡À±C”ááœ8q‚î¯Ñ„|ùòeîÜ¹Ã[o½…³³3_ÎË¾½{Yºl³fÍÂÖÖ¶Èï¡ILÄßÏ­V‹s¯^|óÍ7=z”ü‘DF:Ù%$Ê£ Òjµ¢øquueğ!ØØØä~ĞhˆV«¹zõ*©©©<|øš––T¯^[[[Z´hAÅŠ^cffÆçS§R­zu¾[·6ğìÙ3>0 ÌŒÁ­[·ˆŒŒ$!>kºwëÆòåË	9vŒ®o¿ÍäÉ“ËdriRRşşşüûÏ?T¯^qŸ~ÊÀIJJ"(0£GråÊÒÓÓs}}ıúõéĞ±#ï÷ïÏÆM›eÕªU\½z•Å‹Ó¥kWÆ~ò	:vdÁ‚ ìİ³‡]»vÑ±cGéª~iii9ruôşcÏ{üÌéÓxy{S¡BÎè¢?ÎÎÎ×¤°µìììŒ2<œ}{÷¾VÈÔÄ$kÌŸ<`öœ9¤¦¦räÈ–/[ÆOÏ<ïiùá†FÃÏ?ÿÌİ»wyûí·™3g¦¦¦<yü cÉåDB¢\
+ _ıU?ŸŸc/;##ƒƒ²{×.BBB^x<·Q£pqqÉ‘ï3zôh*˜›³jÕ*6mÚD•ªUnä/‹ã!!ìØ±ƒŒŒ bcc¹{ç§OŸF&“rì—ãâ2th™šT’’’ğY»–'OĞ¦M¾ñò¢B…
+x{y±{÷nQôaee…¥¥%•+WæIZ÷ïİãæÍ›Ü¼y“¿¶mã¯mÛhÓ¦S>ÿœïøÄë×y£EÆÇÅˆˆˆ C‡xxx°wÏâã¥+ú¨Tª¹:Ş^^´P(pqqŸÄ:ÜÜÜp5J|\jµšµk×Ò®];bbbÄH°xñòòïââ‚¿Ÿ*•
+µZıÚ6¿¬R¥
+_/\Èüùó9zäK—,aöœ9X[[øX7oŞdóæÍüûï¿¼ıöÛ|õõ×R1€„Ä« €ñóá‡2vÜ¸âgÿşıxÎ™cğXçÎ‘ËåT¬Xîß¿V«%!!•J…¿Ÿş~~Œ3†Q£GT}<l©©©¬_¿µkÖ`gg‡••ÕKùî< 00UT \\pvvf¢»;ñº	şçÍ›ñöòB©TòíªUDFD”‰Rã¤¤$Ö¬YÃÓ´4úôíË¢E‹8zô(‹/æÎíÛ ´rpàƒ> C‡Ô®]€ÌÌLŒŒŒ H~øÈóçÙù÷ß„„„pöìYÆË_Û·ófË–Løì3.^¸ @'''Z¶lÉ¼yó °.Âjúu!..À@„xÎ›ãy...‚HÀ±C–4hÀˆáÃ	9vLŒ6Ğ{®R©Dn vœ{õÂßÏÀ€ ¾Ôı^¯«š3giOÊÊ+˜1s&7.ĞuöË/¿pëÖ-:têÄOOªKâGBâÕ@BÎÏ@WWjÕª%>––ÆÚ5køı÷ßèÒ¥İ{ô qãÆ\¸pë×¯sçÎîÜ¹FFÔ®]'''j×®Í‰'ğ÷÷gÓ¦MlÚ´	ïÅ‹yçwÄc2v,fææ¬]³†ıûö1jôè—õ9pà )))Èd2æxzfm(• Ü½{ÈJ.ıÎ×—mAAx{{sèĞ!ùdìØ—¶ºNIIág¦¥ÑïİwY¸p!?şø#ÿ[¿€æ¶¶|ñÅ´oßµZMPPüsë©cfjJÍš5iÑ¢]ß~›ÅK– Ñhønİ:º¾ı6+VäÓqãÄ*²êÕ«ãååEğìİ³‡
+*ğî»ïJWt!Ñh4å%
+
+B¡Pˆç–\.ÇÑÑ‘àà`”J%2™Ì j|à@Ö¿ƒƒÅ×¸¹¹áïçÇéÓ§¹~ı:6|mÇºvíÚÌ›?Ÿy_~‰R©dÅòåLŸ1#_"())‰_6oF“˜ˆ££#_ÍŸOİºu¥¸qêÔ)Ä-æfÍš¡°³Ãuà@›„ë×¯@TT·nİòóŠùW©T>tˆ„„ +GÓÚÚšî=zäÈã{¨Õjñ»§¤¤äúİïÜ¹Ãz__ñ9vvvLpw/Ğb¢L
+ ¾ıúñÇï¿ ®îïŞ½ËßO@@  S¿ø¹•»÷ìaÑÂ…/<æ„	Ø «&Û±};sæ””ÄÈ‘#³nò¬]³€Ş}ú”ê÷}š–Æ[·qî\ÖjÙÙ™9/<¸¸àØ¡sfÏF­V3kæLú¿ÿşK)7àŸş¡mÛ¶,\¸M7ŠâgèG1mÚ4Îé¢9çtß3·›»J¥"((¹\Î¨Ñ£YºlO<á³ñã¹pá+VäñãÇÌñôÌÊgY¼8ëœéÛW*ù-B¹:€‡‡‡ø¸ş~~(
+6ÿò‹ø¸ş¹9@/ùY«ÕŠÆ£ÁˆÇ’Éd¸¸¸ÄŞ½{_»’øìÔ­[—¹_~É×pöìY¾]µŠiÓ§?WŞºu‹-¿ıFbb"mÚ´Ásî\Éş¡œ!äpêG\\GÁËÛ›ÆsõêU¦L,¦@d/‚x*Œúå—_Ä¹F 11‘ÄÄDÎ=Ëw÷—z^>|˜oW­ÊS¸	ß}×ÎÄÄÄüm±·7k}|ò]mZ&Ğ°aÃ¸ÿ>Ûÿú>ıôSQüôí×÷ßŸİ»vRÿşı±¶¶¦b¥JYdf’tëª¨(NŸ>Ízİd<yòdFÃO›6‰‚ç­·ŞÂÛÛ€ñŸ}VªbgÎœáÀşıÜ¾}Û ê“_är9?oŞÌ:üııù{Ç.EGã1yr”pQHNNæüùóYQooBOœó?FŒÉ”)S¢AeKĞ¼ysš6mJš5IIIáÚÕ«\ºt‰ Ñh022"%%…/¦NåÂ…XYYqãÆz÷îMÏ=qŸ0­VK«V­èÒµ«tw-$Z­V?Â¿”áá¹>®şV™L&ãô™3y
+ö   ×²$>77nŒ§§',àÂ…|»jS¿ø"WtëÖ-~ß²…«W¯Ò²eKæxzÒ¤Iéä-GlØ°cÇÉd¹ujµ??‚ƒƒ™ëéÉâ%KDñãââ‚Û¨QQÙ   ¼½¼8qüxĞö¿ş"âÜ¹ç~†õ¾¾L›>ı¥D‚ôÅÛ¨Q¸¹¹|á»oüñG´Z-
+…‚ï|}‘Éd¸»»£'00Ğ JµÜ	 aE¿oï^~ûõWÒ<Å££#>ûL|Ş—óæÑ³gÏç–…ÇÄÄåY»–ÈU?üÀÚ5kx÷½÷€¬-·ÒÚFyš–F`` èŸâèèˆçÜ¹9¶üııYçã€µµ5			ôìÑ#‡PšäáAOgg{{£V«™2y2C†Í÷‰PvîÜ	€½½=éééÌŸ? WWW¦L™Â7‹ñ×_P±bE†Ê Aƒ¨]§Z­–‡R¡BjÖ¬É£GØ±cVVVtíÚ•	Ÿ}FDDuêÔáÆÔ¯_Ÿ_ÍÖ­[Q*•ÔªU‹®®Òİµ<|øğ¹âèy8vèo#Ñ×¹$>/š5oÎ—óæ±ğë¯‰ŠŠbíš5|>uªÁ˜şûÏ?lıãâãã±··gîÜ¹4oŞ\:qË÷îŞåè‘# |çëkª P(X²t)³gÍ"88˜½{÷Šâ'·ü<gggÖùø T*d‰¢Õj9{öl¾>ÃáC‡øàÃK}œöíİdå%æ–ƒèââ‚2<\Œ2;;;‹i”›Êğp1¶\ &yx°ÎÇG?oÚÛóµ®ìyğàÁŒùäƒ¡¼°µµÅÓÓ“7ß|“…_Í_Û¶Ñ·_?FÉÏ?ÿÌ®;éÛ¯nnn¥òİ®$$°cÇ®]»–õc{z$‘
+Š\3 ïôîM«V­Ø½k*•Š9³gsĞÙ™IâÍR¡Pd%H{{³-(ˆ-¿ı&&H—T4èê•+œ>uŠŠ+r)&†¡C†œœŒ¼AfÏ™Ã6ˆâG¡PğõÂ…Ô­[—ßÿıû÷£IL$--jÖ¬I·nİ˜1s&?æ³ñã‰ŒŒ¤^½z$%%ğÕ‚Ü¼yó¿íÊŞ½±°°(–ïráÂTQQ\ºt	Û7ŞÀŞÎ–­ZIwïç “òˆ²£¿Š+lIüö¿ş"!!ÄÄÄç>OÈex7ïÂÒ¢EfÎšÅ¢…ÅHĞçS§Ò A1òsùòeš7oÎŒ™3iñšVÑ•g¢Tª,¯&gg
+÷	Ğh4¸…‡‡n£FŒZ·Å#TUBV>İìY³òƒKˆ'%%%_ŸAÈ*í…˜J¥·ËóB£çoUU/:$oĞ @œ+Êµ xçwhÑ¢‡¢m›6ÌÕ©á1cÆà>qb÷şûïÓ¸qcşÜº•=»wóî{ï±lùr.^¼H¿¾}Kå;mÿë/±l_¡P°xÉ’+hAÀ 4jÔç^½D³º%K—ò÷ßóÇï¿Lpppå©‹y{y¡R©˜2y2ŸŒKÿşı‹ıûŠËÀüßÿıã?ı4kµñàóæÍ½™™+W­âÎ;4È ©²lnİº…ÂÎ””<&MâüùóÔ¯_Ÿ
+:§AƒÓ®];†}ü1?¦]ûö¼Õ¦M±|u>>¢Ù" Fæzõê…ÇäÉÅòIII@¥J•°¶±aàÀy–/_IH`×®]$$$`mmMs[[ƒÄı—\.7ˆBáïç—ëó„š‹‹ë||Ä’xWÎóØğÃ\ºt)_ŸIÈe¸zõ*“§L)7dëÖ­ùjÁ-ZDTT!!!|ôÑGDFDO‹-˜;oåToÙ²…Èˆˆ¦šn£F½¶Â¤,LÒAAAâDîïç‡‡‡‡8¹Uj
+[Ñ b“á‚pG(¢ÉÇgĞ_h\IHÈò£Ë¶ îIENÄÌY¢NÈCÌÔĞÏÿÑçÖ­[Ì5+_ÿ2ß
+£Q£FŒ9’?ø €aÃ‡ç*~îŞ½Ktt4ç##I}ü˜zõêÑ¶MšÛÚŠ%Ö dff²wï^víÜ‰S§N¸–ÂJö¨››“ô’M•¿ÎÇFƒ±±1;wÎu%Û¿ºtîŒ¿¿?‡ÊLÛ¶1ÇÓS<ùkûvQLmøá1diiYlßKğ09°¿x‘¶~ë-"Î«ù «	êìY³ˆ‹‹ãÑ£G´hÑ§Î¹xñ"J]{///ş¯[7&{xˆâ§Q£F„‡‡Ó¬Y3fÍšÅßÏ¥K—hÔ¨,–ïàûİwìß¿Ì[o½EDDnİÊ011)”àÎ~^ïë+V4¤¦¦¢ŠŠâYz:ãt¢1ûù²nİ:¡)ˆÍ²"‚œ{õ2<uÕ_#õ"©?ûûl°¢ óŠŠŠ¢Õ&ô;wîpéÒ%är9K–.}ád©V«ñöòB­V“˜˜HİÍ¾<ĞªU+>ùäVû-±º›ûÕ«W©oeÅ˜±cËµøÙòÛo9W©TÌš9“¥Ë–•¨:"NàÖÖÖ888KB|<©©©‘Ãî=zpòäIbcb¢ ÖÖÖ¼ûî»4)„g &ktÂÙÙ™àÄè‹pîæ‡””š6kVàû¸¥®H$?Ÿ¡Aƒ9Ò4r[ü&$$|à@sU~¸~ız	ß¹‹••UâGÿÜòY»ö…M˜ËE3ÔÌÌLñ¿«T©’cğøU¯B%;^^^•]úÉƒiOŸ–Šø&3…Ba T„Éq±··¸¯immÍ@W×çfâ×¨Y“Ï§NÅ¡ukvíÜ‰Z­fäˆ9„•§§',ööF©TO±u¥nÜ¤	öööDEEñï¿ÿÒ¤I†NŸ>}ˆÇÆÆ†£G*¶ÅhÛ¶-:°}ûvnh4˜™™áåíMçÎùlüxÎŸ?Oí:uèõÎ;üìïŸÕşâ›oP©TlÜ¸€>}ûbffVäÏ¿vÍ‚ƒƒ122bÆÌ™¢îÙ³'7fé’%ìİ»—ôgÏ˜\„HĞÉ“'Åğó’¥KÑjµŒ>œK—.qæÌÚ¶mkğü]»ve	e]hZ»»;gÏœ¡G˜šß¥«Ÿçó0[Î~~V«5¨öÒ?+ÃÃÑh4ØÙÙ‰c˜––Æ¾½{Å¿	‘Ná=ªf»–sC˜ ÊBiniĞ¢EjÔ¨!F5¬ê×§E1ö+m„œ___ƒmaeUbèxHˆ¸Ÿ}!‘[äğìÙ³e×ú¯[·nïôî]¨ˆ½2™,k‹Kçµ}Çƒçøûù!“ÉØüË/9v<çÎÅsî\ñ>P<QÄÙØ`aañÂÏ ÌAë×¯ÿoÁ>j”¸u¦ÍDHH““>|xÁ#½V:¹å<	5ÂwÏnäªi
+0FZ­æğáÃÏİj/ÈÄÄ„¹_~‰×7ßğıÿşG“&MèÕ«;vì`á×_‹ÏkÓ¶-Š-¨P±"ÿşû/ë~Ü¹sç¡‹~Èd2~øş{ úõë—câ)	ÄÉ,—¨Ï¶  Ö­[‡V«ÅÂÂ‚^½z¨¢©{÷îtïŞ6ğ÷øëVÜsçâèè(*}A³wß¾bM=f< %9+İ…[«V-1?kàÀ¸¸¸€••FwÚÙÛóÙgŸáääÄ˜1cÄÈÏÍ›7ùÙß€qãÆaccƒË€<{öŒ;K¥5«WsğàAÌÌÌ˜úÅ9"®®®<KOgõêÕ8@FFŸşy¡ŞKp©"!2™·Q£ğöòâdX˜ÁyxEw“–Édb¹c‡bq|||¡¿¿½½½ÁN?rckk+FPªÊd¨Õj´Z-vvv¨T*fÏ-Ş ±=D¯ßéÜÜÜ{{{1$-L~AAAcgo/
+œ¼hĞ 5B­V3¢ 7×F•«è@ô¥KÜ»Ÿ¦M›Ğ°Anß¾Mttt¹­ú²³·'22÷<¶l„s²$ˆŒŒ²RœÅ\šìFúUPÎÎÎ¸è,F²‹µıûö*
+[£fMş¯[7şŞ±ƒÃ‡‹ù6ÙßûEÂ¢#7‘ö"d2mÚ´!$$ä¹ŸÁÂÂ‚‡ÉÉ\»vMLÎís	÷¤..Ltw'âÜ9š4n\àŠ\AÌ½¨úY(¸Ğh4/|î Ô^^¨¢¢Ê¿ èĞ¡#İÜøÙßŸ9³gg¹¯^õeÀE—K‘À#İJ{ìØ±œcñâÅüùçŸdffR«vm¶nİ
+À!CJå³+}ñ£ÑhD7gá&ñ¼|1nÜ8ºté"¶˜èînà'$“ÉàâBppp¡V/¢ZµjÏıìF:cÊğ“'E Ñ£Gã>q"÷ïßçÉ“'2„‹.póæMŒŒŒxã7èİ»7#FdÉâÅh4š6mÊ AƒŠüyW,_Î±cÇ077Çsî\ŞÓUfgÈĞ¡XXX°xñb<È³ôôB5]µ¶±!66–p¥R¼±
+ù0			ÜºuKÜGnÚúy]Z­–h½ğtaQ(YÍ8gÎ4AmÚ´aô˜1L™<Ù ‘ÙÊÊŠ	îîYÄğpƒ\„ìBÊÖÖ6‡°àîNbb"jµÚ ”½xÉ6løÂP6Àä)S^é$hq²>M?şÈÍ7è¥»Á7Ò™¼nÜ¸++«n–E„sâeä 	÷^aÂtvvfó/¿äxOa¢Pv<<<èàèˆ»»;±11…Š	ŞWïØ>ºê^}¢Ñhø@×”{û¢ğğöò2¸.ºœĞ‚"\!!!¹~FÍºuëÉdâ'88o//±üÜsî\Ñ Õsî\fÏšELll ƒ‚‚Dgv„H²ğYòJ”Öjµb­İÄµiyº\]]¹sç»vîÅÏ˜O>áÃ?äĞ¡CìÙ½Û YòÃ?¤o¿~üäçÇÖ­[EE€9Å¶TP4˜ÓT«V-z½óN±D¢„‹xË–-ìÚ¹Suşµ}ûKıİÎœ9Cdd¤ğ²³³câ¤I,]²„;wÒ¬ysÖ¯_Ïøñãyüä	ï½÷5âÚµk¬]³FüíŠcbÌÈ*W®ÌÜ¹s_h|ù^ÿş˜š™áíåÅÑ£GÉÈÌdÆŒzOÛæÍÙ¿oŸ9 pC
+
+"22R¼©f¿i¼V«ÅÎŞŞ KQDP”î÷°··'ŸuëPEEñ09™fÍšñû–-xLš$şfíÚ·7Xµçv}*T¨ÀŠ•+Q«Õ/|n~nÜ¯*çÎã›E‹ˆÅŞŞ^œDZ·nM´ZÍ¥èh¾^°€yóçÓZ/ÊVDPiXrä¹\.zÆÈår|×¯ÏÑ¸×ËËFc%"			Ü¹s§P¹”ãÆ£uëÖy:Aûûûçp~ÖGxnQŒD?øğCšÛÚæé}øĞ!q&Œ‹F£1¨BS«ÕLtw·ë„İ†ÂôcìÓ»·8_µkÛ¹\n°5'üVú‹2ex8íÚ¶5(—×Â‚ìE•¦¦åñBÚ¥ó9r$|ğ¸ı£¿š={ö,ıõıõ³fÍbàÀbRî¨Q£èÔ©ÓK½ ÿÚ¾]Œ mùí7"##‹Òc
+–zY<xğ€Í?ÿÌ•+W€¬ü­¶mÛÒ·_?şïÿşÿı—?ÿü€çÏsìèQÆ|ò	7nÜ øÀ:„Z­“ãÜ'N,r6o//N<‰……_/\H·nİòw‘öéC…
+XğÕW„;Fzz:s²õ£{M¬­E'ex¸¸Ò°ª¼¢‹rè· ÄƒƒC±ü6Ù/Ğ°aCÑˆoú´i9œVU*óæÏ_›_!“×ûI@´ZÍòeËˆ‹‹£eË–>@uêÔá£>â÷ß'..eK—2ÿ«¯hÑ¢…4p…d[P8¡j4ÂÃÃ¢	‚ø¬íZıfÀòĞh4…@ íÛ·§½n!‘Ï§NeÜØ±y¾¶wïŞÅÒ©ÀÎÎN¬,~QÔL€víÚ1ô£D7iak[ˆî¦cš5ñòöf½¯¯A„0·ÏìĞº5NNNÏ}nAªäŒËÛÉ+“Éøkûv6ıô]]ùàı÷Eñ³êÛoQ:Å6°gï^†ér–.]Š©©)Ûwì`ÓO?áRLÕCùE¨”Z§núyyê¶¨TQQ¬Z¹’ãùèlŸ6l`ÖÌ™¨T*ñØ‹—,1HZÍoX°¸àÊ•+4kÖŒé3f°}ÇV®ZEÚµùóÏ?±´´¤ƒNÔªUÇøõ×_èâ‚QQQdddĞ®}{Ü'NÄ¦ÍNŸ¥§³háBN<I5X¾bE¾Å@÷îİY¶|9ÕªW',4”o¾ùÆ AÿE4×åíè‡²õW•W8yò¤ø¸~èW­VÓ¨Q£RÉYÄ´Ğåıô™3œ>sFŒ\8~\šE‹‰ØØX¼tv
+;;&O™’#ß¢v:2kkk¢¢¢øfÑ"âbc¥Á+Â¹ĞOgz«ï+£ÑhĞh4b[ı¿½.ÛÌúaÌÚèî?CsóüıüP†‡g™ÒrnmÜ¸ñó+‡ê¢ˆ7~nË˜*Uªğå¼yù¨Æåñ266¦V­Zes‹¾ù†·ß~cã¬¯T»vm¦N*º<GDD`dd”/ãÄâFp—ö÷÷gäˆ¹\\Øö×_8;;“’’Â_ıÅwëÖåÛÌéğáÃLŸ6Mnnnüµ}»’„¬í“~Hpp02™Œ>½{—øw>pà *•ŠÚµkóÃ†899á÷ÓOtqaÌ˜1¬Z¹’;w²lùrÖ¯_O@` ·oßfã?’Î[mÚà6jË–/gèĞ¡E?|óÍ7œ:uŠZµj±déRƒñ):t`ñâÅXZZ¢ÏW:;ŠUú7V¡œ<22’ølÉÒÂï”ª°]¥/Ä„ÏU9d¯#W®\a±·7.\ÀÖÖ–©S§æyc¯[·.}ü1Mš4áâÅ‹x{{sõêUi6ÎçEİf~¹}û¶X½Xn´Dyp>›0€y_~ÉåË—ş¾~ızq»¬ëKìÕÄÚšI“&‰ŠyäˆÑ ™LÆâ%KDSÄ„„V­\Év½òÍìÜ»{—Õß~Ë·«V‰+õŸ7oÎQeæííÍœÙ³Ñjµ8::²fíÚÏ}Ò$&ŠˆóçÏçşıû6ŒÍ›7sõêU5jÀ²¥KINN¦•ƒßÿï|:n>¤õ[o1lØ05jT Kn<JIaŞ¼yœ9s†Úµk³zÍš"GQY¹jµjÕâôéÓÌŸ7'Oä+z)¬ªô£@B¨9!!»wï´—ĞjµbÕTqm•[·nñ~ÿş¼ß¿?_LÊ†HKK“f€””„·—gÏ¥iÓ¦yö ËM5hĞ€³gÏâõÍ7yæŠHÁ¢¡’ĞSò5$·è—pß\ªÅ*±C‡‹åë'ÃÂ$Tšôë×u	’êª» vïÚÅÆàë…‹Å3¦¨"hò”)¢¢A‘ ggşÚ¾..dddÂÚ5krìuşı÷ßxxxpH—¬æééÉÏ›7z4(•|øÁlÓMã>ı4ßaÁ¢"øn2„NNNÌŸ7Geùÿ8:ríÚ5ŒùÆË‹ªU«2şÓOÙ²eZ­–Ö­[óöÛo³á‡X´p!³fÎ×§ii¢ ú÷ŸP†‡¿Ğ²}şW_qáüyär9«¾ı¶Ør'Ş|óMV¬\Iıúõ‰ˆˆ`ş¼yùÁ¥çÂÍE¡Pˆ¡çzÑ)@…¢Èn«%A\\ïØÁd)"Q ùõÂ…œ>}¦Ï˜‘ïV5õêÕcøˆÈ4àôéÓ,Z¸ÿıWT‰bCˆ¶ëß£„EZHHÓ§MÍ—,]*¶®ĞO—P)2zÌzõêE@@ «¿ı–³gÏŠ9GÍ[o½Uf>ë~hDŠ>ú‚æÚµklÚ¸‘ıû÷“””ÄìY³ØğÃb_A0eúLtwéÖ¬]["m0rChõĞ¸qcfÌ˜ŸŸ/^D.—cbjŠR©ÄÌÌŒ%K—Ò¡C&MœÈÅ‹±’Ëñğğ VíÚ¬]³†K—.aii‰©©)áááü²y3sæÌaÆôé²bÅ
+¶nİÊwëÖ±rÅŠ\?Ë¡ƒ‰¹t	Öúø{î›o¾É·«W‹¿åéS§ò%„­­­Ñh4^:ú	‡ú¿§pêQF‡º%æ>s†Í¿ü‚c‡Ü¸qCôv’È›û°ØÛ›ğ°04lX ñ£/‚†Fí:uÓÙ|$''Kƒ+Q,´ÒEšƒ‚‚Ä-A¡ÂXÈ)•ËåøúúŠ‘j¡DİÚÚºTÙ/Z`¼ß¿?³gÍâÔîÉ¯„ 222¢o¿~ üòË/|ª+üpÀ€ç6U{™Ñ 	&Ğ®]»‚E?* ¿¥µß>±t2û–™€°½&D}>úøc–,]ZbP³MXXÆÆÆ,Z´µZÍ÷ÿû Vr9ÊğpÌÌÌX¼d	o½õãÆı¯ß—¹9>>>â„?ô£Øö×_4Ôm—EDDP¡BŒŒŒåÙ³g¼÷Ş{´rpàæÍ›¹F‚„\•şï¿O5¸{÷n±ÿS§N±|ıyú8èİ`D¤Ë¯Ñïn,ä
+Y[[Ú‚¿8‘ëDª>
+…B¼ªTªŞp^g<xÀ×_}EHHVVVÌœ9³Ğæ†VVVŒ9KKK9ÂWóçK"èAè…¥ïĞ.ü·E>ÜÓ‹Šo¼ñFVé».}B¸7:|˜ÓgÎ°}Ç1?P£ÑàååüWèñ²ÆM>T©T,Z¸ğ¹÷$ÓWå¤iÖ¬³çÌaÏîİ$$$Ğ·_?†Vf?¯™¹9C?úˆæ¶¶Y}´”JFÁ]#SqÅíæ†B¡`¢»»8ÉÔm}é³ÎÇGÜ.±µµÅcòäR> OŸ>eï= |úé§(ììp0€§OŸŠÆæææ,]¶Œ®]»òë/¿ˆ	¿7oŞÌ:MMiÓ¦£FÆÑÑ‘u>>\×Y±7oŞœÕkÖ0í‹/ˆW*œŒäöíÛbµ€½½=`ÍêÕ¢oTIß8òCÇN8vì˜A‹¹\c‡ıµ1XVrüıü7h`pºèUîåUâûº‘şì *V$==Å‹Bºu™5{v‘ûA:|Ä6ÿü3ÇeÉâÅ|ãå…y…
+ <Ë£·ÒëNöv/e…qqql
+B1w.jµZ4Ìµ/¤bA<dë}}Q†‡óá0ÀÅÅÀ9[ˆú„+•¢êo¼Qj}
+ë
+½Õô‚2™ÌÀ?ÈßÏï…÷$ÓWéÄvrrÂÉÉ©\}æ¶mÛÒªeKşØº•ˆsç˜3{6õœ_„F£aÎìÙbeYÿ÷ß/’IVa	$11;;;ÆÇªU«¸~ı:ÖÖÖ(ÃÃ155eÉ’%´k×ƒÁÁtuå½şı¹rå
+wîÜ¡j•*4jÔˆºõêqáÂÆÏİ>sÍš5Y¹jîßód¬­­YìíMff&fff9Ä@=C•¯ÎãäÒÓ±··§OŸ>¢Ià‹055ÅÆÆ†»wï$FU\\\Äê4a‹ÌÂÂBI—fÏš%nİé;ê
+¦oå³zñu iÓ¦ÔªU‹Ğ'Ø±};J¥’š5k2gÎ±ÕEQiÔ¨#FdÓÆ:tˆ™3fP»NjÔ¨Aƒ´Ux¼·|||Äz‚¥„î|à€˜Ãâ§[DZÛØãµB¹wQÅëóèÓ§»vî$((È JÜõí·KÍ¼·ZµjLpw'00UTş~~9:²ëÓ®]»bkN—`Õï*±f7–5ˆ	mC5•nSe#4|øpš4nÌF©Tæˆeg[PŞŞŞbÔç“±c_ŠÙÜÙ³g9}êæææxy{sêÔ)±ûsBBæææ,úævvŒ3†Ø˜är9íÚµCagGÍ5HJJ"44”S§N‰aU±déRRSS™4iÉÉÉôìÙïÅ‹<x0W¯\áó©Só´7èÑ³§(„Ê;väôéÓlÓ@¹)Š2ÓT«ÕŠ¢,%%El¨ Ó…í¥m˜ÿèÜ¹3Çe»Î‰½ZµjLŸ1ƒfÍšëû4jÔˆaº*K¡0B.—Ó¼yó×ş7x÷İwY·n]	¼…BAkkŞxã.]ºdà \«V-zôèmóæ¹¾¶MÛ¶ÅÚŒ8;6dÍÚµ¢Ù_q¸?V3†+		:|˜„øxƒŞ}ÖÖÖ4·µÅ¶yóbÙ¢¯W¿¾Øw0((Q°ÚÚÚ\7
+…â¿…ºŞnús_PPXiı<ß;I •!ºtíJËV­DÕ=göl”..âÄX³fMîŞ½›£X=˜àîN]è»4y”’"n}Mıâ,--7v¬X­effÆò+èÜ¹3aaaÜ¿wOŒph4qrÈ¡Ş«VÅuĞ Üİİ9}êÜ»w;;;–,]J`@€¸=V»vír÷[ë;C»¾Ğã…ª±²€Ğ¾J•*…jÆøºQ·n]>Ÿ:•°ĞPª×¨A—.]Äüâ¦¹­-ÓgÌ üäI>|È[mÚˆQ¹×Á‚d×®]$$$ˆ“¶°U3jÔ(‰çîİ»X[[3ĞÕSSÓ¾¶$iÜ¸1K–.-3c8¦”r{÷éƒJ¥ÂÛËo]^@[]¾¬>Üİ™ëéIpppæÌúQ³W¢êë‚ º‡„°cÇ¶‰“¡°m2rÄ´Z-VVV:ô…ıNJ’€€ îŞ½KÇ4hó¾ü’Û·og\¦¦,\¸Ö­[óİºupqaç®]ìØ±ƒÃ‡‹öÁÒÓÓ166ÆÂÂ‚&MšàÔ¹3...Èd2¾ÿßÿØ¸i™4mÖÎœ9ÃÊ•+ÉÈÈ S§N¢ùey£c§N$$$°ÎÇ‡º ­V+6´³·/ÉÏE˜<š4)µ.î2™Œ^¥”ƒQŞDĞD]?»ì¹˜…y­Dñ#ÌeûöîE¥R‰í/rë#×¸qc|||D­R˜0ÚÙÙÑ»OŸW¯ØëjnkKdd$	ññXÛØĞ½[7*U®LÈ±ct}ûm&OüR¢>‡æüùóT¯^¯, 88˜=ºh™™Ë–/§k×®Œ=šóçÏóÇÖ­ôéÓ‡Ğ¿233Ñ>xÀ£ÔTÌÍÍ©^½:æææÜ¸qƒ€€ şŞ±ƒ7n Ğ«W/|ı5gÏœaæÌ™brõ@W×rû·mÛµZMÄ¹s¸gë[caaQb{êeYåwQ_£fÍ"mJ¨S·nİáÖ3fğÙgŸ•X(½ İİ?›0KKK¼¾ùF?K—.¥mÛ¶Ü¹s‡I“&ñı÷ßsæÌ‚	
+¤n½zØØØ ·²¢jÕª¤>~Ì­[·¸’À•+WÄ-´F1îÓOéÛ·/[~û5kÖNÛ¶m<xp¹ÿ‡N:uˆ‰!!!J•*amcSäÆ¸’ zå(â²’ËöíÛÇ‘Ã‡éß¿?Ÿş9«W¯æ//Úµk‡ÛÈ‘¤<zÄüyóøş‡8uê¿ÿş;§”Jn%%åY1dbb‚ı›o2pà@úõëÇÍ›7™4q¢Ø(´C‡zÄÀ;ï¼Sjå£EAğ©Zµ*·nİ2('ÖêåIHHHHHâ•¦S§Nø×¬ÉÉ“'™3{vV²s—.T©R÷	Ä=Ù	&àääÄ°áÃY¶lÉÉÉÄÆÆséIII<~üS33jÕªEÓ¦MiñÆÔ®S‡øøx¼½¼Ø·o=¢F¼ûî»´.CÎŞ¯*B™©~õ‹2<øÏ§Äßß_>‚gÑó*.$$$$$$ñJP±bE>?ßï¾ãØ±c|>e
+Üİ™öÅDEEQ¯^=ìíí9}ú4¡¡¡„††beeEÛvíhíà@+zöì)Åİ½{—+W®ğÛo¿¡T*‰ßë­·Şb «++V”¾P(,]¶ŒY3gˆ [[[ÆÇıû÷	9vÌ°<¸M›Rk¹"!!!QTŒ>œY–>íK´ÒÎ˜˜¤ñyşøÜºu‹?şÈİ»wÅÇår9#İÜ°´´$55•£G’ÏåË—ó}ì:uê`mcCçÎ±²²’ÎŸ—pş¨Õj±¥ˆ½½½×Æóş&]_Òù#4>e}|¤D‘©[·.Ó¦OgÏîİÄ'$`cmÍ‡ˆ¯T©}úô²Õ%$$ORR>$ıÙ3ŒŒ°°° víÚ4jÜ›2ÒÿêuGèT_Ğ¿•45jÔÈÑ"äŞ½{DFFJ?ZdË–-DFDôË³³³Ëa`'!!	 ‰rG…
+DÏóÄRİºuË”ÁŸ„„DÉŠÁ^•JÅ¬™3Yºl™$‚$$$!!!‘îİ»Ç‘#G¤(v¾¾¾bq üıüˆŠŠ’„$€$$$$$^-ììí‰ŒŒÌaö)`/UJHHBBBBâUChc å IHHBBBBâµA=§ç–„ÄK@y•¥-X°€³gÎ0ÉÃƒQ£FË›ùùù±ÎÇ‡6mÛ²`Á‚\Ÿ#•í=Ÿ‚ŒÏ\OO<yÂ±*W®üÜç>zôˆ·»v¥B…
+xy{¿ã#?ÒøHã#4>/&éæM¢T*ş¹u;{{Z¶lY¨&Ôem|òŒ ½÷î»œ=s†u>>¬óñ)Ö7}ïİw%éY
+X[[ÍÖ­[_(b·nİ*¾FB¢,¡V«ñ÷ó·Oò»u²aÃ±K´»t)£FÁÚáÌéÓ$$$äz¶m×kkkêÖ­ûJı6IIIˆßÛÚÚš®®Ô«W/ÇsŸ¦¥H||<wïŞ}aß»‚[¢äøî»ïØ·woÇûôéƒûÄ‰åú»i4š<OŸ:E@@€Á¾mQ°³³ÃÕÕ•víÛK+ŒRXa¨Õj6şøcÿÉØ±Ú“—V`Òø”äø¨ÕjfÍœ™ëßW>½à«¯8{ölÇÇ}úésEPAÆG˜ĞÏ=KFFÆŸollLçÎùàÃ‹õü¹zõ*ë}}}Ÿ¶³³c «+íŸs_Îm|<xÀª•+IIIÉñ=§MŸn ö¦¥±~ız®]»–ã˜µjÕb‚»»zš–ÆÊ•+¹}ûvc1mš(‚¤ë«dï?‚ø166¦_¿~XYYÂ¥K—ÈÈÈ wïŞLœ4éÕ‹ ´kßş¹bE¢l£P(ødìX<˜ëÊ4û*µGÏRB¢D™áúõëÌ™= 777&yx °ÎÇ¼¾ùjÔ¬iğºS§NqöìYär9‹—,A¡PÌœÙ³ùã÷ßéÒ¹s×&òá÷ÓOâ=ÀÅ¹\››[çúûû£ÑhØDHHW¯^ÅmÔ¨\£åêÕ«ÌõôÕ•J…jáBæÍŸŸ/$HJJ
+ÎÎÎ,^² ooo¶±k×.ÆŒcğÜk×®¡P(X¼d	r¹­VËœÙ³Q*•æxşíÛ·qttä;__ƒchÒ•(¾zâ§o¿~|1m2™Œşï¿ÏêÕ«9rø0ûöíãYF“'O.—ßQJ‚~D$j$Ê#ª¨(222àâ"Š€Ih4‚ƒƒùqãFfÌ˜ağ:¡=Ç ñÜwvvæ ³3ÁÁÁD©TtéÒ¥ĞŸëiZš(~ñœ;¹\çóQ4`À {{‹[z“§L)ò­÷õE«Õˆ‚âïïÏ:
+$€âã˜ãéùßo3iÛ‚‚Ä¿hµZÔj5€(~ d2‹—,aÀ‡¢ŠŠB«Õ"“É ˆ×½Şsî\ñ8&!!G½0¯Q¢hâg¯NütïÑƒ)S¦ˆ¿Mıúõñôô¤J•*ìÙ½›àÈxöŒÏ§N-wßÓXú©%$$Ê"7“’ r“<<Éd„;ÆáÃ‡ş–’œœ5ÁV­jğxUİ\ø{aÉxøÉ¾Y÷İw(
+®]»Æşıû‹ô9>|ˆJ¥…DaZq¤:Èd2
+©©©\ÑEâãÅHQö±’Éd8::p^×Æ$11‘»wï¢P(ò=¶ÅÇz__QütêÔ‰/¾ø‚šÙ"¦ÕªUcÆŒ<˜J•*qèĞ!V,_.E€J’èèhqPX[[ÓÓÙ™-ZHg})qöÌ¶nİúÂ›­ƒ¦MÛ¶Ò ½¦ä%dQ4iÒ$¼½½Ùøã´vp(ò¶V~ĞfèG' ”J%ş~~(•J¡¦¿-&“É˜äáÁDww¢ÕjŞyç"OÕ\Æ§  áš+–––$&&¢ÑhÄè €££#jµšø„šX[såÊ Zä‰î©‹ÌÅÄÆÒ¥kWîè¶³‹µZV«¥AƒRô§„ÈÌÌdÏ=Ñ®}{¦Ï˜‘gâ~ÅŠñ˜<Yµjlşùg;ÆÓôtæÌ™#	 ’??nØP¬ÇLHHàÇ;nœ$‚JIüäe•JÅ‚X°`$‚$re€‹J¥2Ï­°’ ¯h†Z­fb.NÇë||x¨Õlá9::¢P(P«Õ$&&Ò Aƒbÿœİİ„X~èêZàdbb"J¥Ò`›]:‚ğ¬B¤';ÂãÂ¶Y^‚Iø>R¥jÉ‘¬'ª??†>÷ù&&&Œ3†ªU«²á‡åëø*Ÿ÷yI å“ã!! ¸»»3æ“OŠå˜›6nÄ××—ã!!’ *vüıw¾Cá·Ùñ÷ß’ ’È“I(•JB£E‹%Ræ®Ï»wsN k×®¼ûŞ{˜šš¢R©Ø´q#şşşb’tY¤ U`ú4iÒ„¢u±ÜV«%11QÜËáojµš+		y
+&á}š4i"ø%Ä³gÏ²„©)iOŸæûuƒ¢Zµj¬óñáÌ™3xÎ™ƒ÷âÅ/|¯k×®‘tó&&¦¦X7iBí:u$”W´`h1º‰ıè#|}}‹mKMâQ]rj~~Cá·^#!‘r¹œ9b…—““ÓKù:àïïOHH!!!X[[£°³£]»vœ>}o//±š)88µZM£FJ$ú£ÏÂE‹hİºu‰ÛÚÆÆ 2£/hd2Z­–ØØØ\ÅŒR©4xLÛ,/Á$F€tï+QüT¯^'''BCCùşÿ£òÔ©Øå³WÛ;ï¼C•*UXıí·\¼x‘)“'³déR*Uª”ã¹nİJxxxÇ›7oÎH7·\_óZ ‚˜úåÉü¯”WšööbP~í¤F‰¥JÔÅ‹9r$×EAõ5°±¶Æeà@*V¬øÒ>cpp0ÎÎÎâÿëWx­÷õ¥F%öŞ–º<#F“#êñ¯/ë||P«Õ$èE2jÖ¬‰R©¤}»v¯iÓ¦M‰Õüyó^ıqhİºPm*d24 11µZm X	&R—Øœ] ùûù<–}Ûìyù?úùFEEßCÉÎÎ	îî4nÜø¥Ûúæ/ËøqÖìÙLöğàÜ¹s,Yº”Ï?ÿ<ßçª““U«VåÛo¿å|d$“&áåímGôÇpJ©ÄÔÔ{{{š6kFúÓ§DDFËÊ+˜8iR‰^ÇåN uîÒ…èèèq¦î\„’X‰üSwñ×Õ5<))‰ƒ¢ŠŠâiz:ööötíÚ›\ışìïÏùóçóüûı{÷8{ïñ		Lœ8±TnP¹­V£Ñh’‹çxz¢T*Q*•ôîİ»äb66XXXÌ$Æ`¢vttäçÍ›ÄóÛßßŸ»ºm3ıÅœƒƒ]ºv}éç™J¥
+#‚—,æõôÔ¬jµZÌİ„lö< Ü"FÅ½XÍn ©R©XïëûÒDPvçë„„J]±ÖÇ‡iÓ¦¡ŠŠb±·7'M¢[·nùz}Ë–-™;w.kÖ¬!ôÄ	Æ+&üù'§”JÌÍÍ=fıúõC.—“™™É¹sçØüóÏ„„„°rÅ
+Ü'NÄÊÊªD¿k¹)ƒLıŠó°¶¶.°ó±Dái×¾=óçÏÏWµ‰óçÏíŒ8ïİ»‡·—ŸÇ¿ÿÎ…ˆV«	àó)SøzÁnŞ¼Yìï»yófÎŸ?O5˜äáÁé3grü³}Çœ:wæş½{¬\±‚{÷î½´qZçãc…‘Éd¢MXXX‰½¯şÖŒ·—WÏ›äáÁ$N>Í_Û·ãææ&F.¸sçN‰Ïw¾¾œ:}ú…ÿÛrgNŸ.Ôûù8yå¥¦¦¢P(¢6‚˜Ñ~ù¼~DH_ôê¿_q /~NŸ9c ‚^úâGø<‚*mŒŒŒXµj-[¶$!!åË–ñ·.‡3?4mÚ”Ù³gÓïİw111aß¾}ø~÷'OÄØØ˜ÑcÆğÉ'Ÿˆ###Ú´iÃŒ™3éÛ·/?fÕÊ•%şİËU¼dê÷jˆ É]<w’““ùzÁâãã©X±"ÿ×­ıû÷ÇÌÌŒ}{÷rèĞ!Îœ9ƒÇ¤I¬^³¦ØòG‰Œˆ Zµj¸»»3ÀÅ…´´4HNNÆÄÄ„:uê —ËY°`Ë—-ãÀìÜ¹“#F¼´ñÒÏ«Ã­°’dàÀ\¹r¥RÉÈ#˜ãéùÜû’\.Ñ¶  ¼½½	Ñu¤-FI _‘G³fÍ
+Ó5úß9»Ê.f²¿FÈîõ¹F€Š1š]üœ>s†vmÛ[ë§‚’]üŸçeæ¨zy{³háBN:…ÏÚµ$''3tèPŒŒŒ^øZ+++¦L™Â“'O8|è{uıÄFŒÉˆ#rm¦jeeÅ”Ï?§jÕªFú³g2äõ IH¼ê,üúkâãã±··gÇßãååEÇiÛ¶-sç²}ÇúõëGZZ$&&ù=333	ÅÈÈˆV­Z1ÀÅ…ÇÈèQ£ÿé§Œ;–/¿ü’Ë—/S³fM>ûì3d2‘9raJ¥R)zØÌñô,Ö‘Ü037gÔèÑ4jÔµZ%‚fÏf[PĞ_;ÀÅEÜ&		Í_æªÕjlmm,~„ÈMƒü‘²GÊò*gòz„çÉd²%‘ÿ#‘?æÍŸO'''îŞ½Ë÷ÿû?şø#iiiùz­¥¥%íÚµÅÎÇÃ†1fÌ˜çæ
+½áÆ‹¹¹9§”J~Ñ]3¯uHB¢¸É¯¹fI›fnøá¢££iŞ¼9ËW¬Wÿı÷_222¨[·.Ìœ5SSSvìØA`@ S>ÿ¼Hï+4²¬V­Î½zY­$V¬X!~ï„„ÎGFòÕüùüòë¯Ô´´¤wïŞüùçŸ$ÄÇ‹“ÕãÇIHHàêÕ«â
+±R¥JX[[¿ĞO¤°üìïoàÉ#l…	=ÄJ!WChì)äãíí-FU;tÈÕûF¡Pàææ†¿¿?‡fL	aÔ¨m¶íEòÈ":úcŒV«Ï«ƒÁÁpq#x‹õœ¡sD¤b•—Æœ9sX¹bGåg´0ş³Ï¨R¥Ês_wûöm9Bzz:.2vìX,,,^ø~U«Ve¤›UªVåÇˆˆˆÀÔÌŒ¡C‡J¨¬_Wãü"¹—¾øÉ¯¹fI›f
+ı«æ~ù%uêÔáéÓ§|:nQQQdff"—ËY³f›4aØğáìÛ·ƒâ2p 6äŸş!äØ1¢T*RSS±·³ÃÎÎî…ç’°’«\¹2ddddyÚ|ğá‡Ü¾}›%‹“œœÌƒ¨X±¢ØÈ3åÑ# şøıwN:•çû4mÚ”!C‡æ°Ô/
+]ß~›cÇXçãcĞ
+BØ
++	ÒÓÓš 
+"²V­ZT­Z•„„1[ˆNewƒ©@ú=³^E©ÈËH.—çÈÿ£°³ÇJ@‚h*ü‰‚3mútLLL8tè<Ğj™<y2µjÕÊõù÷ïßgÕÊ•œ<y’¾}ûŠ‘ãüR±bE\]]IOOç‡ï¿çô©S¸¸¸`nn.	 ² ~³Û¥ä~\ºÄ\³$M3£££Å­/KKK fÏÍÅ‹ÉÌÌ²ú#Í=›-¿ÿNİºuéİ»7;vì@E`@ ‡2T/ŠÜ°áÃiÙ²e®ïm¬‹Ô<{öŒäädŒÅŠ“+W®””$Şp222HII¡bÅŠ¢aš±±1›ş™ÈÈH*T¨À[o½Å›o¾‰±‰	™™™Ü¿ex8—/_fåŠL›>½ØDµµ5‘ãd0‘Îñô…\q²kçÎ]Ê…hKºuY²t)ñññ\¹r…Ø˜ruƒ¶y4wîÜ÷â¦$}€Äß!< 
+Ù¶H…çØè¢9¹½Fòÿ)»|>u*&&&8p€½{öœœÌÔ©SsDxµZ-k×¬aÿşıôèÙÉ“uİ›››Ó§woÂO$<<œ+W®`kk+	 —MA\ó‹ä~\ºÄ\³$M3…Š Úµk£ÕjIMMåÂùódffÒ·o_>6ŒÃ‡óÏ?ÿ ŠŠÂÎŞ–­Z±cÇvìØÁõë×©X±"]ºvÍÈÎ=Ë={P©TÌõôÄ¹W/&Oœã½+éz*iµZ<H‹-°³³ã7ŞàÒ¥K¬X¾ûl^Lú	I7oIõêÕùtüxzöìi0™§§§£V«Ùºu+{vïfõêÕLŸ>½Ør9>;–oW­bİºu8vè`°–Wë…â8gôÅÌâ%KèÙ£Ñj5wîÜÁÖÖ[[[ŞyçÑº m)Êyù)
+>|(>O£Ñ V«©Y³&M¬­s}£££”ÿSÆñ˜<cöíİËñR’“™úÅâÂğÑ£G¬÷õeÇtéÒ…©S§R§Ï5jÖ¤~ıú ÜËf)QT¤$èÂFk
+àjœ_„cIîÇ¥ƒS ˜.>’4ÍÆÑ£G>lCæîİ»têÔ‰	îîbaff&Ÿ<ÉŠÆè"0×¯_§uëÖüúÛo,Y²„=zàèèÈøÏ>Ë¯ÍÌÌ>p€«W¯æxï
+*Ğ¶m[RSS			!55•úõë³àë¯éÿşûÔªUKÜËÌÌä‰îı3u¯ŒŒ¤ZµjLœ8‘ÁƒS£F.]ºÄÏşşìŞµ‹'OĞ²eK¦L™B·nİx”’Â¾}ûŠmìºwïN×·ßF«Õ»?XAÀ 2228pà ·nİEelLL¯ÄAi¹Ş–Æµ”[e—€P'xY	¯9¨Wµ—WÉ¼”ÿS¶˜8q"}úô!##ƒ³gÏ²páB<HBB«W¯&00öíÛ3mútQ¼–ˆ‹Ä¢6ş•"@ÅDA\ó‹ä~\ºÆ\³(¦™QQQœ8qUT”yEĞ›oŠÛVÂÿk>dÎœ9âvSMKKÚ´iCJJ
+u¢ä­·ŞbåªUâ¤ÏÍ›7yóÍ7©V­“'£ÕjÙ¶mü‘á¹”­<˜3gÎpåÊ–-[ÆW_}EóæÍ™={6şù'«¿ı6Ktedöä‰Aùª‘‘bõØîİ»ùõ—_¸ví„„„0zÌlmmÿÙg„„„~ò$ï¼ó˜GTTÆ~ò‰¸Ö3›KtILô¹%üº¹¹q08˜ˆsçˆ8w.Çëô#FÙ#%ÙÙüENĞ Íš5CagÇ¸qã
+ı>yåé­ÄİÁÁçFÇ¤üŸ²‹ûÄ‰±gÏb.]bÑ¢E˜™™ñàÁZµjÅô3Š¥øáØ±cbÛŒâŞ•P!)Œ«qA-QòæšÂÊåE_=íCõíªU>|8ÿbIOÔ¯_Ÿ%ºDß[·n±oï^ÌÌÌø¿nİÉdÜ¾}›ÅŞŞ=zÈÚ;_ºl]»veÚôélÛ¶-Ïdıë×®áèèˆR©dÿ¾}h< wïŞ¼Ó»wü‘ôgÏÄ¼$€*UªĞ¡cG nÜ¸ÁŠåËÅÄêääd‚ƒƒyôèkÖ®ÅÒÒ’nİºe9\«TtêÔ©X~Ç5k2dèP6üğ‹uUX%µ]ÒÜÖ–¶1`À ñ}är9?oŞŒ¿¿¿A9¼³³3#İÜrœ7?ë¤ËBd#..¸¸8îß¿ÏŒ3
+'óÈÒ'{.Okk*Uª$ŠÁÜ~3)ÿ§l3ÁİÏ&L`åŠ;vÈr‚5{6M›6-Ò±3339xğ ë}}IKK£½£c±GK%THWã€€€b­suu•ŒKY•´¹fjj*‡¦R¥J4ˆŞ}ú’œœï×›˜ˆB$55•íıEZZvööbYèï¿ÿÎÑ£G©V­M›6åìÙ³,ööFşİwâ–Cvï˜˜BOœà¢Øzòä	GåìÙ³lİº•ÇÿwCÒİ”ŒŒŒÄ< 
+*ˆ“ø¿ÿşKZZÍš5ãÓñãÙ¶ma¡¡\»v‡R³fMºvíÊÁƒIˆ/6Ğ¿"#"P*•,öö6¨
++Nôó£²¿\.ÇÓÓO#u^øûûŒ……İ{ô(‘Ïù]ÜŒÕj5“&N$äØ1†Z¨U»L&KÛ³7:Ãòw}¡cmcƒ**Ê >·(™”ÿSv122bøğá;v¹\ûÄ‰4oŞ¼HÇÌÈÈàØ±c¬X¾œ{÷îÑªU«1C,° Êoé÷ëPÒ-¹KäAx˜››Ó¬ysŞxãBçñãÇ|ÿı÷üúë¯YÇ33#==°°0è¢KÓgÌÀÁÁ™3g­Vsÿşı\õë¯¿rîìY Ë¬¬o¿~4kÖ­VË)¥’"""²&öĞ$&’›÷«±±±èëñï¿ÿ`Q¥
+ÆÆÆ•b+VäéÓ§<ĞßågÛ§®®-»Ù¢ğÿÙû#Mpw':::Ï­0a;¥i!ÿô<d«V®ÌšÔİİY¼dI¾'hooo1B4dèĞ"Mì:ıDãÂ.z:;³-(UTT¡·-šÛÚ’U•—‡—ƒƒƒÁã¨¢¢ÎE 	¹ARşOÙGğÄjÚ¬m‹8çgddÆÊ+¸}û6o¾ù&#³ÙH¼TÒo©¤»ôÉ¯©_~)ió¿×333 >}Ê•+W¸rå
+ÉyD€ŒŒŒÈÈÈ·™RSSy¨ÕÃ={Ä>`r¹œˆˆºêr’233±óÍLnü¦?UªTá£>ÊÚÊ©VŠ+’‘‘Á{ï½G||<[~ûƒŠ=¿„Ï¤211¡ŠN 	‚ÇÔÄ„Ÿ6m"**
+333033ãÖ­[Ö•ëçgKCHß¶m=Qèl#“É°ÏÖSÎÒÒRÜ
+›3{6==ÅIÕßß¿HÇúT«V	îîøıôJ¥’=zàææFU™,‡ßÀ¶  4èdllÌ¨Ñ£óÕïyT­Z;;;T*sfÏ.tÔK­V‹b£(ù‡8À¶  är¹8Â¶ ±±1Í³•0;88p`ÿ~”J%ë||Ä\©àà`q¼òsNK¼äEŞÓ§â¢,?m2ò"33“Ó§N±bùrnŞ¼‰B¡`ÔèÑ%ö¹$€
+Rú-•t—¾øÉ¯©_~)ió¿×={ö ŠŠ¢sçÎœ8q‚M7²iãÆB¯uëÖXXX™™I:u8§K¸uhİšôôtæÌMrJ
+W¯\¡nİº9:¶?~ü˜³gÏbaaÁGÌøñãÅÇÏ;GÅŠQ(´nİš:µk“	:xĞ@ üÛØ³lÆdÚ‡‰‰¡V­Z>\]'%%Aİºuóô%Ê™ÌGfKŞ2t(5rñéß¿?å¬ííí··w×õêÕc‚»;¨¢¢ÄÉúEù€ÖÖÖÅÚİ{‚»;s==³„aÜœ!ËX²(I«uëÖeÔèÑlÚ¸1×ÜÈQ£GS·n]Ã	ÈÔ”¡C‡²nİ:üııs´6ùğÃi"E€Ê<B×ök×®Wè-°sçÎ±lÙ2®_¿¹¹9jµßï¾Ã}âÄ—/€
+Rú-ø¦H%İ¥CALıòKIšÿ½.wgia[*;‘Ù¯T©_Î›‡µµµXºnjjÊ¥K—€¬ÊŸñãÇ“™™Ihh(‹.äñãÇcÿæ›,Z´+¹œ1cÆpìØ1Òu+¼\–l9DQlLr¹œ7n¤fÍš˜˜˜˜˜ˆçœ9@–Ù±±1çÏŸ¡©ÙŒ3¨^½:j•Š¸¸8ìììèÜ¥‹(tr£ÿşT©R…}{÷Š[õvvvtu¥}1nYW«V1cÆp%!ø„Ô*U®ÑWkkkvvØX[ûdŞ¸qc¼¼½:›”â¨°³³cÌ'ŸpøĞ!q,¬­­éŞ£G¯&ÖÖLš4‰]»v¼ÆÁÁ.]»J7‘r€-
+¢Õj~Ú´‰iÓ§ØÜ3**Š%K–pãÆŞ{ï=êÕ«Ç¡Ã‡‰¿|™oW­Â}âD*T¨ğòPAJ¿¥’îÒ¥ ¦~ù¥$Íÿ^'¾^¸33³,ï‚„‡33ÿ{~f&FBù¹P…ed„±‘&&&˜W¨@¥J•ÈÌÌ¤J•*4nÜX¬˜Xµr%µ¥tñÂ ºuëd¹=Ïš9Ó ÙùdXóæÍÃÇÇ‡:uêĞ³GÑ»'###G$H(‹7Ê¶²¯]»6éééìÙ½›U«VqïŞ=
+…(^âóÙ¢0s÷îİéŞ½{©ü¾MtÂ¦G	%4çG-Yº´Ìœïvº6,Ã‰“&I7‹rHFFÏ=cÖ¬YLöğ`ÿşı<ËÈ`âÄ‰4jÔ(_Ç¸|ù2K—.åJBãÇgÔèÑ˜˜˜àØ¡>k×ráÂV®XÁ$bMˆ/ *Lé·TÒ]:X[[]"¾DRbÑx÷%^ë||Ø±cåš<ïË/èÑ³'•PüøñcšÛÚ2räHvïŞU¹uõ*ÿÜºEš5Å*2}ácœ‹ËÔûï¤¤$†}ü1ÿşû/<àÙ³g´jÕÊ@ Û±´ùêÕ«bäÃÎÎ	îî4nÜø¥µĞ$5!!¡Ø·º¤ñ‘(i<xÀãÇIII!##KKKªW¯‘‘)))¨U*&'“‘‘ÖÖÖø~÷{÷îÍq¬ƒÁÁh<`ÊçŸ¿p÷àÊ•+,Y¼UTcÆŒaô˜1â¢ªM›6ÌıòKÖ®]Kè‰,üúk:uêÄ@W×Ò@)ı–JºK—Â˜úäØ…çğ¡C˜W¨ º7£K"ÎÌÌ4ğÔ!3“gÏ‘©[UeffŠÿÎÌÈ C÷ÜÌŒQlè¿ŞH'BLML¸ÿà;¶o'.. ç^½hÒ¤	&&&@V‹
+à?—éŒŒŒŒèŞ½;a¡¡d’åùcjjJ•ÜÜWŸÉj×¾=§O·Û :tìÈ Aƒ×ªU«b™Ü!«èb½¯ïK›äõ'wÈŠÈ¼´I^‰‚°tÉNœ8‘ëßşïÿşOôÓG¡P V«166ÆÄÄSSSLLLxôèœ:u
+o//>Ÿ:•6mÚäzìË–-ãÜ¹s|<lcÇ30Z…¬-ÚÙ³fáããÃÁƒ	###ƒAƒ—® nn’¨){ÄÔ¯ Q¥¢˜ÿIdQXs¹â E‹1B666Ü½{—½{ö0ş³ÏhØ°!uëÖ%../çÎÍq£222¢RÅŠz-Kp™çİEÇğ^¼˜¤¤$ªW¯………(¼ŠıÉıô™3´kÛVœä_Ævşä.|a’[;Òø”?¥vmÛŠc$<^ÒbùÄ‰Ô¨QƒJ•*QEgcñÏ?ÿpïŞ==J•*Uppp Zµj˜˜˜Zg+!—ËùàÃ©Y³&¦¦¦>tH4}U©T,]²„Ï&L [·nb7oŞdÅŠ(ÃÃ0` ãÇÏ³Ó»•\ÎÓ¦QU&cÇöí„‡‡ó,#CôA+5$Q¶E$VÊ£ÇŒ!**Šô§O9«óİ)	ììì²ñìÙ³¬2q{{ºd‹Şµ~ë-NŸ>Í±cÇDô¿ï¿çË¹sIHHÈı3êİ´ÄØr™ÌÍÍó½ÿ_ô'÷ì“üË@rÏ>É¿¤ñ)tueÅòå¹>^¢çŠ®P©GÏ´nİšÆcbb"60NKK£^½zLıâ±ÚkãÆÄÆÆP±bEú÷ï/&=·Ğùœ)•JRRR¸|ù2+–/çêÕ«8uêD…Š¹zå
+„8“<<D?±¼¨]»6“&M¢šLÆ–-[8}êééé>\@e‘Ğ§O†L¥J•:t(½ûôÉÓHƒí-?™™<IK#ùáC’SRˆçÄñã¨T*T*‹¾ùæ¹¾)‚N||<s==Yğõ×4lØŸüü8|è³fÍÊñ²ûzçSKHH¼¶Kz‹P0Kµ¬Y“7ß|S´BhÔ°¡xß½{3331B£o—pıúuöîÙÃ0±iÚ”/¦McÑÂ…(•JÚ·oÏ©S§øßúõØ¿Ÿ
++róÆÑ8Uß4õEÈd2ÆGÕªUñóó#âÜ9¦¥1zÌ˜×S å×üO2õ+}òë^(Gyt×w‚¶¶±)²_v¦M›†ş~~ÌûòK/^Œı›oæ~Á›šâØ¡Êğp<È£ÔT¦M›†¹¹y7¡ÜŒÍŠbv&!!‘÷<%lƒ	ÿ_Ò4Ğ‰™+W®pëÖ-QÜT•É055J¥¢~ıú£P(¨[·.·nİâñãÇĞ°Q#Ş~ûm «wa­Zµ èÒµ+5jÔ`ÿşıyBèk×®±úÛoñ˜<™Úµk¿ğóV¨P‡£Zµj|ÿı÷DEEñÃ÷ßó©ÎÓìµ@1ÿ“LıJ_üä×5<¿”WwqaÕ”–––åOJJJ¡gdd„™™–––XZZbdd„‡‡F€ŸŸ?üğkÖ®ÍóõƒÆ'äØ1”áá´lÙ2ï<ıDm&RHB¢Øèêš£R®¤i¤<ñññÜĞh@g¨Ù´iSdÕª‰ÑêĞ'è©«mÔ¨®ƒñİºuÔ¬Y“ë×¯³úÛo¹~íN;cQ¹2uşcæææLòğà³	9vŒ§OŸR£fMªU«ÆüÁ)¥’½{÷òøñc<&OÎ—§©©)ïğ²jÕX»f111ø¬]‹ÇäÉ¯ *ˆùŸdêWºÄ5<¿”WwñJ•*Ñ½{w>Ì¦M›Ø´iS¡DON]’‰••3fÎ¤k×®ôÿ}N>MÔÅ‹\¼x‘7óˆ<˜~ï¾Ëö¿şâìÙ³œ>}Èj'qçÎü| é$—(fêÕ«WêIá–ºHÍ­[·ˆ¦×;ïP©R%š7oN³¦M³DÂµk×hÒ¤	fffôïßŸ‹/rôÈªW¯Îµk×øşûïÙ·?uj×&&&øoÛİÔÔyƒï=dÈLMLãĞ¡C¤¤¤0eÊlóÑ/Q¨Z­R¥
+«¿ı–K—.±rÅ
+&NšDE½ÂçQ®—q1ÿ#%İ•qÏ/Â±Ê£»øÔ/¾à//z÷éCÃ†±}ãı#”ÌëÿS­Z5nÜ¸¿ŸIII4nÜ˜¶º*®ül;ZXXğñ°a,^¼˜OÇgì¸qŒÿì3éä•xÄBjj*.\ ))	ÈjXÜ±S'±qñıû÷ÚøÔªU‹)“'Ó£G1èÑ£G¨¢¢8rä7nÜ mÛ¶9ÚŸäõZğõ×ÔªU‹ğğp/^\ ‚‘öíÛ3ÇÓ“Ö­[sóæMV®Xa`ìúÊF€
+bş'™ú•.qÏ/åİ]¼U«Vö¾™>m111‹Â§GLùüs>}ŠëÀ¨T*=Ê!CD«ø<[Wä‚™¹¹Ø’âîİ»ÒÉ+!ñajjÊ;ï¼Ãşıû‰%::Zœ'{÷îÍÁà`Îèª÷8À›-[2XçÁÓ¨qc¦Ï˜ÂÎ=»wçpwOÏgrs•*U˜6}:ë||¸páK–,aÒÄ‰¼ıÿ—¯×¿ùæ›|ñÅ|ÿı÷œ8q‚øË—ó5O”kTó?ÉÔ¯t(ŒkxAı:GLLÍmmùßúõ\»~	Ÿ}Æ¡C‡èÿşû4Ğ…“t-1J)	ZBâÕa’‡ û÷ïçØÑ£tèĞšº<®®$$$p÷î]>}Ê¦‘ÉdôéÓ€:uê0lØ0ºuëFtt4—ãâ¸{÷.DFDŸ/×w333¦~ñ¾ß}GüåË¬X¹’G©©âû¼ˆ
+mÛ¶Í@		ù@åzL0ÿËOTÇÚÚšOÆ•|rJ	Á5¼ =‡óçÏmŒ8…7îß§Zõê4oŞœ÷ß€%‹óÅÔ©â¸üŸ®·×]Å™©™YÉ
+ é—(ç÷&¡âJøwqŞ³ÊÀñãÇ9yò¤øx=xï½÷Ä"‰Û·oóíªUlÙ²Eìhnnµµ5½{÷æÓñã™>c;u@]À*`÷‰iÑ¢74V,_Î–-[óó 66–cÇ`“Ïr_/™ÿ•m$¹†êÕ«Y{ï‘‘‘888ğÉØ±\ºt‰ÈÈH Ë…uô˜1Ô©S‡«W¯rVª.ìM\¸¡™‹Æd•s1(nGÆzÏ³Ğå
+İç%$Ê2ÜİñÈ%áx‚»ûk95kÖ¤G:tˆ­ü½½=7ÆÔÔ”±ãÆqûömöîİKFFwîÜá»uë8wîÃ†£E‹T¨PcccÌÍÍ177§J•* ¤<zTàÏ2vÜ86ÿü3‘‘‘ø~÷îßgÔèÑy&7ÇÇÇãååE´ÎºE>5d„(!QF177ÇÙÙ™àà`¼½¼øcëV,--ÙğãÜ¸qƒÔÔTš6m*š•íÚ¹“‹/bmmıÜ
+°ç!Ü`>|ÈöíÛ©]»6§”ÊœOÔ­È’““Ù¾};5jÔŸg]Ä&§¥A^=Ñ^fÃØ—Í”Ï?çĞ¡CDEEñë/¿0qÒ$ªU«FåÊ•ùbÚ4LMMÙ»w/iii<~ü˜#‡~ò$íÚ·§sçÎ4kÚ”š––T¨PTğ©”ÏŠ¬ìŒ9³-[8}ú4?ıô““7nœ¸0¸víß|ój•ŠÌÌL:uê”o£VI I¼6ä×43¿”†¹æä)S¸qã*•Š1£Gã³nbşÀ³gÏX³f¿ıú«¸z*,BÅ‡V«eã?bjjjÑÉŠ¾ÿà?|ÿ=¦¦¦båE‹|”°JH”ìììP©T¯ıö—€‘‘}ûöeÏ=lß¾zõê1ô£¨\¹2Õ«WgÖìÙ4hĞ€mÛ¶qëÖ-222HIIáè‘#;z333êÕ«G¥J•D§gEÆtèGabjJøÉ“üñûï<¸ŸIÔ­[###’’’ğöòâ¼."ŞÉÉ‰æûø’ *fòë~\^]Ë³øÉ¯if~)-sÍ	îî¬X±‚óçÏÓ¯o_Ş~ûmz÷éCõêÕ9tèûöîåÖ­[ xy{Ó²eËB¿—±±1:u",,,W³FcccŒŒŒ0Òë"¯ÿ¼öíÛS»Né„“(LpwÇÚÙÙ½¶Û_ÙÇ$##ƒ}ûö±iÓ&Ì+TÀÅÅ…Ê•+S¡BÆ|ò	o¶lIÀŸröìY’““IOO'33“´´4®]»fp¼û÷Éı~Ğ A899±Ş×—½{÷òàÁÆ|ò	uëÖeõêÕbÉü’¥KEçjI ½$ñ“_÷ãòêj\^)ˆif~)-sÍÆ3oŞ<ÖûúræÌöìÙÃ={Ó²eK>6ûb°èêÊ <yÂ³gÏxöì‹.$33S¼Ñ=Õ•ÙwëŞ={òìÙ3*˜›c–G7g	‰²HãÆY²t©4Ù˜8iOÓÓ9tğ ¾ß}Çı{÷øxØ0jÖ¬	€££#œ9}š“'OrîÜ9nŞ¼ÉÓ§OÉÈÈ ##C¼wìÙ³‡Ï&L(Rå¨\.gúôé¬_¿°°0¨laÁÕ+WÈÈÈ S§N?’ *f
+â~\^]Ë+1ÍÌ/C?ú__ßR1×¬S§_-XÀÍ›79vô(QQQ$''£°³£S§N…Îùy^$¨R¥JâÿÛÛÛÅ'ÙšÚX[<OBBâÕàóÏ?ÇØÈˆàà`üüü¸vı:£G¦iÓ¦˜››S¡Bœ:wÆ©sgnÜ¸AÒÍ›Ü¸y“»wï’ÎùÈHÂÃÃyúô)ééé˜±2µzL›>Í?ÿŒZ—ìĞ¡cÇB·‘P1R÷caò,®Æå‘‚˜fæ——a®Y¿~}†Zêã7zÌvîÜIBBW¯\ÁÚÆ†îİº•[SJ		‰3yÊœ{õb±·7‡$::šàììL:uDãU+++¬¬¬h£÷Ú À@N:üW]ZTÌÍÍùdìXîß»Çã'O¨]»vŞ=%TºÄı¸¼»—7
+cšYc¿¼÷Ş{Ò‰$!ñºÍkvvø¬[—•osæß­[Ç={èÑ½;N;S·n]d2YHpÅJ•Dqò,ŸĞù¥zÅrI çQ÷ã×ÅÕøe#˜f:x°X«Àzôì)ùP½¤›²P½súÌ™—^ÅcmmMBBBÏó²ZïHã#Q¬‚£zu,XÀéÓ§	$êâEâ/_æ_PÓfÍhÔ°!õê×§J•*˜™™¡ÑhÄrôü¾$TŒîÇùªsuu•ŒKYIbåÕ ¬™ØtueÅòå¹>.OÙ‰BÎqíÚÑ®];.œ?ÏÜ¹sINNæÌ™3œ?*U«R§vmªU«F¥J•HJJ"MçLoVÂÎô%"€ò[Ò]UÉ«^ú-¹KH”<eÍÄ®^½zz\Ÿ—;>E£e«V¢_ĞÓ§Oyúô)=â‡>Î½za^F«CMŸ'~ò[Ò_¤ÒïÒ'¿æ¥aê'!Qœ”5;ımáÿ¥ñ)»ã#Q4&¸»óÙ„	¤§§‹èÎ;<ÔjÅekkë2+~+€
+RÒ_¤ÒïÒ?ù5ÿ+-S?	‰â¼—%»®®€µµõKßŞ‘ÆG¢¤122ÂÌÌ333*W®L­ZµÊÕçÏS ¤¤;¿H¥ß¥KAÌÿJËÔOB¢¸(k&võêÕcb.y7Òø”Íñ‘0:|øp™JÏ¶µµ-Sƒ4>ÒøHã#4>ÒøHãój1¯’ ’„„„„„„„Ä«d„ø’‰‹‹#!>ŒŒ°±±¡iÓ¦Ò HHHHHHHèÕå÷ßç´®YœÀ¨Q£x³eKip$$$$$$$ôê‘––ÆéS§021ÂÌ¦"df’÷???IIHH™Ç³{×.BCC°´´¤““İºu“GB)è¥!tÉÍÌÈä½îï²åÿ÷AÖiëÖ­Ü¹sG$		‰B£/~ îÜ¹ÃÎ¿ÿ–î-:¤P1q÷î]±°°ÀÚÚZì‚N||<ÿÜº…i.Má<yŒ‰±	ãÇNàÄ©PİxÄ†~`ügŸQ£Fip%$
+I\\a¡¡DFFŠ988ĞÉÉ‰fÍšåû8`ÏîİÄÅÅ‰õí×R§N2÷½SSS	E&“ñëo¿Q¿~}üıüğññáäÉ“¼ûî»ÒÉ!QnÉëztss£råÊ’ *-BC¥V›ÍpªS§N¢õ{XXØsQ§Fm l­š1b‚›×øqûöm6şø#£ÇŒÁÒÒRh	‰¢gëÖ­9ÄPAPö›­ğ˜V«¥_ß¾´lÕªL}÷GPµjUê×¯€B¡  11Q:9$Ê-ÉÉÉø¬]›ë5
+0aÂ„×S ÍŸ?ŸçÏóìÙ3ñ1¹\÷âÅÅI¹sç[¶láŠ®É¨••o´hÁı{÷ˆŒŒ$,,Œ..YâÇLjšb\Å2ş3Ş616¡š¬µëÕ›Ğ÷S*™Uäûeÿ#))	FYîz¬HH¼Lîİ»'nÿŒ3÷‰Ø¼y3kV¯¦R¥J:E•* ,[¾œ=z’’‚ÏÚµ ”9”‰ –5kJ'ˆD¹eßŞ½ ¸…‡‡ 7oŞ¤ÿ{ï±g÷î×O =yò„	&pûßsüM£Ñà>aë¾û®Ø")·oßfÕÊ•¤¥¥Ñ¼ysÆG×®]177g÷îİœ?à?!fA¿Qß²>iéiabl‚Æ‘™ùŸ(2Âˆ1½FaS×†Y_Ìà†FÃŸ[·¾ôF†å‰Ã‡‘˜˜ˆ«««(~ şü ''§¯_ß¾DFD@=°°°`öœ9dddÄf++FŒñR¾klLŒAT§“““¸ğğáCññ‡Z- •tËíu+V”N‰2Í‰' pvv¢œå•@sæpûß‘ËåxL,ŒF£ÁËËex8K—,aÙòåE~¯G±Ş×—´´4Ş}÷=fÌœAİêàiZÚbÆÈHüï:5ê`llLEó¬Lff¦øwıç¥¦¥bjlJ·Vo³å—ßùlÌ§\¾|™[·nQ·n]éì—x.\ 44…BÇäÉâãÁÁÁh4°’ËtÌNNN8´n2<ex8: àêêJPPnİJçÎ±±±)Õïhè°k×.œœœ¨T©Z­­V‹L&C«C•+Ubõ·ßæØ
+»sçNNN	‰Ò"99™¸¸8d2™¸¥+ÌõÕp÷µ@jµšØØXd2¾ë×#×»xår9K–,áÃ> ::š{wïR£ˆáß-¿ıÆƒxûÿş¹_ÎÅÜÜÜàï&¦¹éã´'˜™šñôÙSLM122âYÆ32230ÂŒ0ÂÔ$ëo™dr÷ß;4·nNø­pîİ»'	 	‰| WWW,,,şAA tìØ±PÇíÓ»7‘‰Èö73f›6mbÏ=LÔ‹6•4wîÜ!44¹\s¯^ ¤$'` Š42™NğìÚµ ÇÄIDx€ë AÅú9×¯_/ægd§^½zôí×H'®Ä‰ŒˆÈ:wsè €¦ÈëƒW >**
+€..âG@&“‰ƒ¥Ré½nİº…Z­¦~ıúŒ7.‡øIKKãîİ»[ZâMèŸD233yöìOÒÓHyœÂã´Ç¤=M#5-t/131ÃÔØ”™+fñÙ˜ñ„Ÿ§fÍšX[[Kg¿„Ä8rä±11¸¸¸ğÁ‡Ü •áá4hĞ€æ…ìHİ¹KêÕ«'F’Ü'ND.—³oï^âããKí»ŞÕ•³Ë4ÀÃÃfÏ™ÃÑcÇ3f2™L\êgggş÷ı÷øúúŠ¯ëÑ£G–¨º{·Ø?g^â ))é¹—Ğ'îòe ƒè¾ jVÀN
+¯E˜¼Añb+
+*ØêÔ©Sàï;ğ÷÷çúõëdddĞ±cGLMMy³eK.^¸Àp×a`”í€™€±ıİúóÕÄ¯²DÖƒ˜³|öŸ‡h×®\\¨P¡‚töKH¼€0½è>Û„èO§NE:~ïŞ½ñ÷÷'((HLÀÄÅšÕ«K5
+TS—Ó¨IL$(( ,,,pŸ8÷‰Åí/Èº—:|XüıÑ¡C‡€’M>}æL÷ıàı÷¥“V¢à ]V@€CëÖ’ *)„Õ]—®]
+äÛo¿%55€;Š«­pñÂ1Êc@F&O¤‘‘‘ÁãôÇŒÿj<šĞDÈÈÄÑÑ‘ÁC†H_DÔj5ş~~¨ô"€vvv8´nMŸŞ½Ÿ»-zõêUÖûú¢R©°³³£wŸ>tïŞ]Ô2ÈÉ“'¹sç...Ø¾ñ†ø¸V«·¿Šô»tÁßßŸàĞˆ#øóOöíİKß¾}K%ÈÒÒ'''BCCñöòÂÛËªÊdtptÄ±C‡bG&“qóæMq»k[PZ]rtÇœ.!QZä•ÿ£ÕjQ«ÕT©R¥@Ö’ * W¯^ •^Éë¿ÿşËÎ;IMM¥]»v<Xty†,Q£FñìÙ³[c³gÍÊZÉU·ÄØØ˜‡wpãd–øi/‰ŸbaÃ†ü½cGÇU**•Š];w2÷Ë/sDô «ºp±·77nÜ0x ‰ ²¸:ÔùûèW‡@Vò³0Á´ü=;õêÕÃ¡uk"#"’¡_VÈeà@Z¶lIdd$'O…¿Ÿ¾¾¾9VÊ øûù©;JU`å#ú“-ÿG©T*úR+Œ!˜‹U¯^]|,66VÌè÷î»âGLMMÅDŒŒx”–Â³gÏøı[ÈLÏä­6m"‰Ÿb?nnnœ:}Züç;__œÑjµÌš9SÜCÖg½¯/7nÜÀÑÑ‘S§Oãéé™%„t[¡e‡ÄÄDbcbP(y†Ç›û“Öº(R¸îÆ«’ÉdìÛ»—äääRûîÍmmq4ˆ+Wâ:hÅÉşù kÛI?={ödÑ7ß0ÇÓ“î=zHâG¢LSÜù?¯„ ªª+A<.rCø[U½rõââÙ³g¢ß~û‹¡Ú·}ï¹¾GâµD¬ml:t¨t¶‘ë×¯³kçN ~Ş¼™IzÛÂ*bñ’%¸¹¹¨ÛĞ¿¨„¼Ï¹sÅÉ nK-%^^ôG…h[LHXi
+ÂJŸº<Á¬­4yüø174BCCquu5ÈƒÎ]¹\Î”Ï?ààÁƒ„çò$$Êä5^Ìù?¯„ &£D½ªŒ«Ãbš¸„ğùƒÄÇ
+5²šæV–fff´wtÌÊú'•¯ıCıúõ8p`Q$‰ü£ŠŠ"##ƒ..âŠa[PíÛµãÃ>'„‘nnÈd2”J%÷ô*`6şø#9’Ëåh4¶mÛ€½½½4ÀeŒ“ºv3‚ Ñ²Z­–yûK Y³f4kÖµZ#rØAĞë=VZÍO]]]q5Šúõë“’’‚¿Ÿ¼ÿ>›7o²"UóæÍ`çßsäÈé’(Ó”Dş¼&9@B¨J#@r¹œ¸¸8.EG‹*´V­ZôêÕ‹KÑÑ(•J”Je\)…çš™™Ñ¸Işı÷ß›9•%Ôj5aaa$ÄÇ—ˆ{öì666´lÙ’víÛçù<¡o“¢Eñ±uëÖ‰«áàà`ÜtâÇÑÑ‘àà`¢T*ºtéÂ†ˆÑm§‘#o//´Z-]ß~;×|!‰—Gbb"©©©(ŠI¿Å½ı¥¿ğŠ‹‹C£ÑœBâqdDÉÉÉE¾çä{uIhh(ÎÎÎ¢ø¬\ M›6Y.ØÎÎÎÔ¯_Ÿ>üíÃ‡¬Y½š°ĞPºuë&He?úSŒù?¯„ ª§3Ô<§ÁŸ¸uQD#Aâââ8|äˆAîã?ÆÜÜœŸıı¹yó&7oŞ,Ôñ¯]»FÈ±c4mÚ”={ò†^%Ky?Bä¤$‰ŠŠıŸòA‚å` ¬²Ÿ Uu“fJr2jµZÌš£ËùÙ„R©ÄÊÊŠÉzÎÂe¡qn	¿B„¦ŞyP,Q ¦M9qü8jµ:Ç¶› ¨##"èÜ¥K© ~¶ÿõ—(~„j1??fÏ™#F‚ÂÂÂP†‡Sh‘ø<£Ãü””Äûıûçù÷¾ıú¨¿“Ä«GIäÿ¼HhR¨ßó&;ÂÄWµjÕ"½×›-[²ÿ~?Î€r
+\]]éÓ§ÿÜºEú³gí-^„‘‘©©©œ?mÛ¶qùòe._¾LÛ¶mùèãËÍo‘ ³	;v,Fzzz±¿‡©©)Û·ogÍêÕÄ'$ä)€RRR~s}|ëÖ­</$ˆº¹¹¡P(ĞjµbähÈĞ¡’S åvsÔ_!ÚsÈ¡ukğ÷ÏŠ0eË/S(wùr©	 ¡Ïa´ZOÖw×E¿ŞëßŸ;’‘‘A@@ ¢èbÃ†…^™çGüd÷e‚¬ˆº«««X’Ÿ{vïfÀ€å:2.QD$Dô³]ãEÉÿy%0ÁióH‚&¾âèoeeE‹-ˆfãÆxyyTtU©R¥H!ï–-[2`€¿ıö+?ûûsFgV^Dµ:ÄşıûqîÕ«P{²/âêÕ«b„Ææ9îØBAn¸¹‰a‹ôî½{¨T*är¹¸õµØÛ­V‹£££Tú^ÎĞ«R¥JÅ–ÿ# LÆš\r‹Ëxµ trrâŞ½{b¼€“““¸½%T‡åöœ¢c‡øúúøu³çÌ#R¹ñÁûïç:Æ¯—u¨E1æÿ¼²Ì½´Z-&G;ak¬¸*w†ÊÊ+8LÕ*U˜>cF±–V®\‰±cÇbeeÅ’Å‹9sæfffÅŞŸ§$P(4±¶æJBS?ÿœÅK–ğæ›oÛñÕj5³gÍB£ÑĞ¨Q£çæ 5mÖŒÈÈHÔjµ¸o,œ'ú‚H8.dõyƒÿª¾‚ƒƒ	F&“1Áİ]º•Qî-!²_ûº‰Sˆ'ÂbG¿Ù¨şu Ó.*V¬ˆËÀXÉå¤êì:šÛÚlıYÉå¸Dƒ†ó|„DYŒş$''çÈñ+jşÏ+#€ôoDÙo‚BXc]¥VqDœÜ'NdåŠüõ×_ÄÆÆ2ÉÃƒ¶mÛ¨şEôë×ØØX~ıåN<‰ËÀÅzü’bü§ŸòÓO?ÃôiÓX±re±ˆ èèh¾˜:•ÿı—fÍš1jôèç>ßŞŞ À@”ááb©û¤I“ğööÎj©ËÛP*•h4ìììP©T¸¹¹áèè˜µõ¥ÛJ2t(›ş™¨¨(ìííiĞ°!öööR2t?%-€„(­c>KiF€òÓèµ°Í`%Š°g÷nqkçE4kÖŒ¾ıúÑK×ôöu"¯ò÷¢æÿ¼2Èâ9^@ÂcÅXQ§N¦MŸÎo¿şJTT“&NÄÚÆ†¦66Ô¨Q3gÏ¯ç™™‰‰±	­èÒµ«AÉèQ£9|è‰‰‰\»z•&å !ª™¹9ŸÏÆD­V3í‹/XôÍ79²÷Â™3g˜ëéÉíÛ·iÑ¢c>ùä…bĞÁÁ+++”J%ë||˜äáÁ ƒ2iFƒ·—€¸õ5R'–Ö­['Nl~øA|şš££#ÜİKl‚-OÓÒ$>>Ê•+cmmmĞTàÉ“'¬÷õ%**ŠªU«¢°³cÜ¸qåîÚÚÏd¯ş‚ÿ¶Å‹{û+?÷×!÷(7\]]s­ÕoËñº°yófşÜºµÀQŸµkIJJbÄˆ¯W(è¢æÿ¼2H&äå’-<VÜå¨uêÔáó©SùóÏ?	?y’¸ØXâbc}¼ß~û•nİ»ãééIM]o*Y5={öÄßßŸØØØr!€Æ|ò	~?ıDTTsæÌÁÛÛ›¹Té¼¥RÉ\OOîİ»‡n£Få+fnnÎ”Ï?gÖÌ™øûû£V«Q(ôtv&Z­ÎrÄõ÷²,322˜äá!z	Í3µZ-ÎÎÎÈår¸¸ =”J%÷ïßgÅÊ•efÜÿØº•ˆsç ¸{÷®˜“]­]»–cÇDQ'¬DË›¶rªæ"€J:$ÜSr»ïŞQIII¯tò®Z ÏÕR %99G®V«¥ÿ{ïh¬Ë;ÉÉÉ¢øY¶|9=zôÈ×ë¶ÿõ‹-bÏîİ¯ Ê­¾8ò^T­Z5ƒ_n ª%t44ááá„Ÿ<I‡ó]roddDFFGæÈáÃX7iÂÄI“Ä¿·wtÄßßŸø„„rõ›1zÌüıü¸pá3gÌ`Á×_(‘øÈ‘#|5>)))¼ùæ›/ÜöÊB¡`é²e¬Y½ZôhD~G©T2ÀÅEÜ¢B Q#á¿Gº¹1iâDÔj56l(ÂáÑ£GDœ;‡L&có/¿ Õj1|8	ÙÎ‡rìXç©õšÅJ@ ½Æ zõêñÃ†œ8~<ÏçøûûC 	
+õêÕ£wïŞy¾¾wŸ>¯Œ òÂ;tÈ·ø0›6mz-DuöÈWIåÿ¼2H(áÌ­Z ±Úh4Ö®Ydõü
+?y’N:10—ÒÏ¼hÔ°!ß}÷§N"ñz"6¸sûv¹ümÜFâ—_~!âÜ9¾š?Ÿ'sçÒ§OŸ¾nßŞ½xyyñèÑ#Z¿õÃ‡/Ôû+
+Öúø R©8uêj•Š¦M›R·^=*T¨À†~@&“1I':×ùøˆç‘£££(x¶‰ùCßùú"—Ë™ãéÉÈ#$á ñZS¯^½çŞë²/:r£ ÷ÊòLQ¶M–ĞnF¹ˆş”@şÏ+#€„ÖÙ=9´Z­èsÑ´ˆ•<sD†Î;wØ·oaaapqÉwâ²1ºví·ïÜ¹.'èéÓ§åö÷>|8FFFœ;{–E’şô)ï=ÇølçÎx{y‘––Æ[o½Å°BŠsssZ·nMk½ÕÂ½»wñĞ+s<=‘Éd¨Õjƒ›µşE—›‹´B¡@¡P V«‰‹‹+‘²ÿ‚P¹reZ¿õçÎñÁûï‹[gÛ:­Zµ*]ß~›cÇ§°³{¥nÂÖø#]Pq#$97È%ûuœ¬$^L³fÍèÜ¥'gö¬YF­Ï]d'&¢Õj_©hX¾"@%˜ÿóÊ …B¥¥¥Ø›G¿÷“V«ÅŞŞ¾È&ˆ¹‘ššÊÚ5kHMMåŞ½™àîÎ·«V‰ıÀ
+b†xG×‡ÊÊÊÊÀ³(---ë‡2-ß?Õ°aÃ011áô©Sxyy‘’’Â\š¾nİº•oW­âéÓ§´oß>×ç?nÜ(æ÷[_‹½½³.*"##ÅóH¨0´°° %%Å Ò(—ËQ«Õ$%%½t0dğ`LML^˜=yòdÌLMË}tM]~OnNğB^'Tšh‹©ıÄ«G¿¾},›‚Ğ»Oúê^ûÚE€J ÿç•@Âj}ÏîİŒ>5Q%ºXìï÷äÉÖ®YÃƒèúöÛLŸ>
+*öô)™™™trrâ”nŸòEddfŠ	©mÚ¶¥qãÆÿ­2um5ªƒ‘ãËfèĞ¡¡T*Y±b&¦¦±,_¶ŒÌÌLÚ;:2dÈù‡s`ÃC!QÚÖÖö¿6º•½şj^p˜Î>É¦$'—‰1637gèG½ğy*Tàó©SËı9U¹reƒßH!2sG¯Émqr+—v+ğßV¼ä\,‘-[µ¢e«VœèÜ9ßV	õêÕ+5Wñ2ı)áüŸWJ 	½böîÙ#:V¯^É“iÿÃ¼ÂÎ:şı÷_Ú;:2gÎ±rëÉ“' „…†VÀã¶mÛ–¡Ù"á:gS*ÀÇà!C011!,,ŒË—sõêUZ·nÍ¹sçøsëÖ,ñXÀü©‚
+×?~ÿÈòªuô=¶üö·nİ}¥„èar9ÿ!¸<çfH(“»:¯ â&»P–¢?åcR%22R|¬¹­-NNN´lÙ²T?KY4.\ 44Tì1Y‘ñNNN¥é.éüŸWJ 	‚G¡P Ò%¥ZYY»YFFë}}¹yó&ÌŸ?Ÿ:uêˆïØ¡ÌÍó½ı•™™‰±±1o´hÁ;ï¼#V´AVU&µ-gQŸÇ@WWed gËo¿‰Ì :t(Ñ„Èµk×rãÆƒg¡ê«G´oßCtú–ÉdyºH‹9fe`ûëuÅÒÒ’ÄÄÄ<	ï”€ ÊKüèß ¥sÂçù•Gaçßçx<6&†Ø˜Şëß_lò:“×8EFFYjãTÒù?¯Œ ºsç^ß|“ÃUS¥R¡R©8zäs<=‹ÅdÃ?põêUŞxã¾úê«æ^ıßŸşz‰¥EÁßÏOôqiÒ¤É+u‘<˜6mÚÏµk×hÔ¸1666%–¬pêÔ)qëKhwáïï/vzÚ]ØÙÛsâÄ	”J¥˜”›‹´F£A­VS·nİ2‘ÿóºÒÜÖ–ÄÄD”áá9n–B’zbbb±¶|¸œGsFá¼ ¨—O+ŒW¾ıú±g÷n±ÑpvW_\¤¦¦Š“ú”Ï?7ğÒÙ¼y3kV¯fçßÓ¡C‡3Î,”¥q*éüŸWF ­şö[âââP(xxxˆ!³àà`üıüP«Õø¬]Ë‚¯¿.ÒûüûÏ?ÄÆÆÒ¨Q#¾ñò¢‘^®NI¨ğ­[·òìÙ3:tìˆ‰‰É+w±5kÖ¬T…C Îqv¤››¸õõ³®êë“±cEîÖ­[cllÌ¶  qvvÎá"ˆÛfB¢ÄËA6BäEÇP«ÕÄÆÄ« ÊkuZÜ+ÔW777êÔ®ı\TÒœËJHp5*‡‘àˆ#¸ÿ>ş~~œ£{üy^5bt[^ÎÎÎ¹SÔÅ‹ƒƒƒCÉEJ!ÿç•@jµšÈÈHÑŸE°œqttdÄğáœ={Ö B¬0TÒ%\jµZ®$$ä(/.222øóÏ?YïëKrr2o½õƒÊA#Ô²ÎÃ‡Q©TÈd2±7Ø:´Z-]ß~Û O¬aÃ†|2v,~ø9³gíæÆH77ñÜR*•øûù¡T*'ñr°µµ5¸9f Áã‹‹¤< ‹{…ú*P¹rå2ïóSRçIyŒ Aî­eôO-!k	¼"¬Å™ÿóJ ¨¨¨,±Ó«W®?šL&Ã¹W/üıüˆŠŠ*’ ªR¥ŠX"½dÉ*VªD§NrÜ §¦BJàIMMåÜÙ³Šßé­6m6l˜t-ªV­*6<]çãƒöáC±ÓûØO>Éñüş:Ÿ¢?ü€¿¿®fnVVVÌñô¤†.^âåP©R%šÛÚƒ2<Ü iRŸÇè%s¹…ç±…Jï|˜}J”JÚ3ª¼ğ¼hªşãÅMÍ¡à${‹›â®šJ§~Á1r$Ïüü¸xá^ß|Ã×Ò¶m[ñï¾¾¾ìŞµ«ÀÇMOO=4h@·îİŒû$ŠÛ¨Qbo0Axzy{ç)`ú÷ïO³fÍ **J,·³³Ã¡ukˆ¹¹¹4°e bcb6@2™¬Øó€N?Nrr2ÎÎÎ9]áº(TëÜ(8;ub×®]øûùÑ¨aÃŞX%]1XPÇ9yò$îîîÁg¯cÇ%.€„è©Z­6HW«ÕÔ«W¯Ø¢«å^ 	ùÁˆÎ¾Ù	>pÀà¹EeÔ¨Qb·óùóæáåí-Š•Ç©©<*¤ñZûöí±¶±)Rçt‰¼zƒEEEQµJììíi¨k5ò¼×|9o4xå@ üù'AAAŒ3Æ 8¡¸ó€òÊÿQ«Õ(ÃÃiÖ¬™”ÿSÆ¨T©={öäàÁƒ,Z´ˆ€€ \]]E!$iÖ,¡Æ¹å	''' N<™£ÁmÇÅ¿—èõÜºµ˜<Ÿı3gÎX¹@
+…‚˜˜ÈˆáÃ’ •ááøèz;5nÜ¸HÛ_ÙùdìX6mÜˆJ¥bá×_³lùrš5k&¶¾èääÄ{ùìtY=ÄÊ»Ûsy9_Šó<({\@@€ÁbÈÙÙ??"##‹%ÁußŞ½ 9’âÅí¯R¨j’(8}ûõ£AÃ†„††¢V«	Pimí”¬är\ÂÁÁÁ 'ªAƒ4×åÛ•&LÀ©S'ƒêîânòJÌ¸³fÏæ«ùóQ«Õ¸ëJ™õ©]»6ÓgÌ(ö÷óÉ'|ÿ¿ÿË‚¯¾bõš5T®\###ÂBCqqq)P;		‰ÂÓ­{w<È¶  \]]Å(~Ï¶¢nƒåµıséAAAYÍ¥üŸ2‹eÍšTÖ•oë»ĞK('ÍmmKUğä†CëÖ%M5~~¨Æãçïë A¦„uêÔÁuĞ 6nÚdĞ^¢8ÿÙg4jÔˆèèhfÍœItt´(z„`%O¥J•prrB«Õ ³<¢5B9ta9~âUt¡ğ~¥QÒ-Q89‚¿¿?‘‘‘Û_§OŸ&88KKË-í–({¼R{.#GdäÈ‘¥ş¾cÇeıúõöê:uÊw'x		‰â¡o¿~„††âïçgrvvÆÛË‹“'Oòî{ïÊÄ-))‰Ç˜a
+¨ı0`€ô#”AîÜ¹#ü¹ºº2{ÎœÿÄëŸfİ³K!·EB@¯•-,˜6}:			dffÒ¤IIüHH¼ôsüıüÄ‰N&“á6jT‘ÌîèŠ)rDt¨ı)»ÄÆÆàââ")))ø¬]Kpp0;v”Ú`HH¢(X¿"K%$Ê3İ{ôàÒ¥K oĞ@t´uqqÉ@'OX %''óçÖ­bA`óæÍÓ¹K)úSÆ…1dù´	eÕÊğp±¬ÛIŠşHHBBB¢¼S±bEœœœØºu+ş‰\.§GÈår\\\
+
+âäÉ“tìØ1ßÇ*¿ÜF·Õ¶ÿõkV¯ _ß¾ÒÀ—a¸ìä$6—prr¢{Ô¨QC$I IHHH”;t 11‘ĞĞPÖ¬^-º«Î²±11@'tÉÏğ_Ws¡ì}ĞàÁ´lÕJô2ËÀXÉå¤ê|ÚšÛÚJU_’ ’x5'<@LŠÖ§ å½;w&...Çqúöë—£i¤DÙ¥ ¢WB@åZı_·nœ×«Ğ¬T¹r'ÂÜœ‹Û”MBBB@Å†¥¥e‘ ËCGs		‰‚!ÕjKHHHHHH¼v˜Ú¾d«ëìÄÄÄ”©Ï#4>ÒøHã#4>Òø¼zã#E€$$$$$$$^;$$!!!!!!!	 								I IHHHHHHHHHBBBBBBBB@’ ’„„„„„„„„$€$$$$$$$$$$!!!!!!!QjHÍP%Ê`ÏîİÄÅÅY]¸'L˜ Œ„„„„ÄË@qqqDFDpâÄ	q’èÜ¥Íš6¥wŸ>T©Rå¥}©.JlL•*UÂÉÉ‰¾ıú•Úû?oŒôÇÉ¡ukš5kVâŸ'11‘Ø˜bbc‰Í¥‹““M›5ÃÁÁá¥ŒÛ¶mã§M›Û³{7@‰ˆ =»wJjjj¡^ïääD¿wß¥bÅŠÅşÙ’’’8qü8‘‘DFDü­Y³ftîÜ¹DÎŸ¸¸8ÂBC‰ŒŒ,–ãuìØ'''¬äòbûŒ''>!=»w“œœlğ·*UªĞ·_?êÔ®Mï>}JüœMMMådX‰‰‰9ÆL¸÷XÉå/ıÚ’È‰‘F£ÉÌ—¨8İ{öpâøñ|¸o¿~¸¹¹Q¹rå} ¢6K»wï[·nÍ1Ñ÷ìÙ³P"¨ Íä²G/òƒCëÖôëÛ—NNNÅ>>ÊğpBCCILLÌ×ó---éääD·nİJd|^4v>k×0eÊ†ALLl
+bâÄ‰ùšĞò;>A„††ùs;99á2p`±OA¯³Î]ºĞ¯o_Z¶jUäóç†FÃªU«JäF3xğ`;t(ÒølÛ¶=»w“”””¯çbhÄˆÅ~ÿ¹¡ÑÊÉ“'KìÚ*Îë«¸x›}&''³oï^’SRèÛ·/uêÔ‘Æ§œŸ?ùŠ mŞ¼™?·n@¡PàèèHOgg
+…Áó‚ƒƒ‰V«ÅUlL}ûõ£W¯^¥ö…:DlL®®®Ìš=›Ã‡1sæLBCCK,
+ôèÑ#üııÅhÅóÆHœ”J%‘DFDëVÏãÇÙ½k—8ÁŸÇ±C{óæMĞh4³óï¿¹{çN‰E6rãŸşÇN?ÂÅëèèÈ¶  ""#‹mEChh(Œ3†víÚø7oŞä§Ÿ~b[PVr9;v,òçZ¿~½8r¹ggç\3µZÍÁà`”J%'çÄñã<¸@}nç‹şoPT~Ù¼™5kÖdw.(¿çG`` 86ÎÎÎÈårººR¿~ı\ÏgíÃ‡l
+âÏ­[¹qãFDâ‹8rä;ÿş ™LÆ€h¡Pàììœ¯k«{Ô¨QCZ~—âââØ·oûöî5xÜÍÍ­\~a¡Ş¹sgúöëWà Å«Ä¾øyÑÑÙÙgggººò³¿?âª¾4D°¥áììÌ$ º÷èB¡@­V“˜˜HƒJLü8::âêêJ÷=ûaœ„	"  €=»wS¥J•"Obúâ'?Ÿ§~ıúâX<}šÀ€ ‚ƒƒJM‡««kóK&“‰«¯âBXµpq)”øÆMÑ¢Û€Äë×¡ˆH?r¹<×qĞG¡PˆÂZÂ5Z”óçÎİ»YÂó7Šm¬‡ÁO?ıDbb"©©©TªT©À×— ~„{Ëó~3ıóÙÕÕUŒ 
+UíÙ½›ƒ0zÌÜİİumI"¨ì³oï^Ÿ8!nAb×ßß¿XïG¥°K‡¿¿?}ûõcÀ€Ô«WO@ú„…†Š7Ö/çÍãƒ>0ˆ´ T*Å›ò@WW>øàê×¯Ï¬Ù³©*“ñÓ¦MìÙ½‡\C†ÅÅ‘#GÄÓ@WW,,,Ä¿U­Z€ÔGŠı}ñãêêÊH77ƒipp0Û‚‚Ä1’ËåpqÁUïó1¹\ÎÌ™3ùsëVš5mšïí°ÜÄOöÏ£ÖEæô'ƒìJ»víËåT¯^€€ *UªTâ¹S›7o'7a²(i„0löÈJA#@êèh 4lX,c›`U*•l
+'ÎìÏ>bUe2¾Y´ˆ?·n¥sçÎØØØêsØ6oNlL‡¢aÃ†9¢+…áôéÓhµZ,--,~²__“<<®kañ ÑhÄ{Ğ€àâ"F===116&   ÈHÿSû¡pm)
+ñÚ»u*ñrĞÜ‚ÈÑ?¯ôïŸå9¢¥¿@Ø³{wVD¨KºtîLç.]$°{Ï1ò£±/]²D¼ˆÔj5ß,ZD´ZÍ¬Ù³pwwç¡VK@@ %VÍ£¿*ûrŞ¼B¯êJXh¨8qé‹›7oŠ0}4ë||P†‡Lbİ{ô`Ê”)¬Y³†İ{öZ éoíè__ßÉÅ‚@6XÉÖ¯_Ÿ‘nnpğàAºuï^¨‰+?8p@ØÙEkI‘ššJjj*2™LŒ.	c€V«-ĞñœœœŠ´ıuáüyq²‹ŸÜ®3¥R‰R©·x>øàjµ¬Y³†={ö0qâÄB}–NNNÜ»w€€€ïû"òŠ\êS˜s:>>^ŒŠtsÏıÜ°ì÷ µZMLLŒÁù?köl®]»Æ‰ãÇ‰ìİ‡Ö­YÓmf?Ï»FEEáêêŠ­­-LòğàşıûSÓÒ²À9A%CRR’˜º!0ÀÅ%kº¥²Ì¬Ù³éæ&F&…íô*ß}Gß~ı8pà+¿=fú¼ğ_dD\\njÂJ§Y³f4H¼±	É›Èårñ5“<<cÏîİôîİ»Ğ«ÓÜÈˆ˜ıÆTÒÑ5[.‚ ~:wéB½nö‹¬…B!¾nøˆ„……‰yA…¹IëoíÇ=|è(~\2˜¬…\†Ÿ6mÂÑÑQõë×W;‘‘‘Å’ß’ìy?¥%Z¯_Ïû-rLÔ…?ıŞ}·XÎ¡)S¦ä*~Z·¦OïŞâª,,44×ëLØjÚ·w/nnn…ªÂ¬X±¢ø}
+š ®ÑhX³fÿÏŞ—‡5u¦oß".¦
+UÁ D4Z…¶4ĞÅXëBˆÎt¦u¦_«ÛùuZEëlVm§3•ªÓYJ§‹„àF€Ğ¶–j.DÁ…H\‚V­Â÷yOONÎ	IHí¹¯‹«’““÷¼ËıÜÏ¶pÑ"ŠX¾÷î»P©T
+
+²ë ÏåX_„üDEG#&&†ÚSH¬!#„ ’5Q^^¼ü|»ÖÖ‘ÂBèõzÈhª!Îr¹¾¾¾‹ÅTœÉ¦#$mıúõ  wwwÄËdP©T(Q«J€È\!.æxõ%è™¹€s²íAqQòòóM2-ÙÔüŞÂQILØ\O@Ü´¯&%A¥R¡Àhgîİ‹Ì½{cÆéOŠ €Y`Ù\bbcM¬:"-A.—S³»»;d2Y¯­S¦5v¤°Ja¶6öÆÑ2beED"‘ÉçªT*Šü$%%™0hoooJËU*‘%—›¸}BÃÂP^^ŠÊJ»&›k‡</¶,²h<ˆ,¹Ü„„“^¯wÊø±Åıœ9sÆ©Éˆ£§kµZÊM“l<¨újA$±AÁÁX¾|¹ÉEÖ\eE…É:#¤®¼¼çjkíŞ°†
+i|¼Õî™7n =-xíµ×(òCÜS¾¾¾v+š$n!p—`Pp°Ù^€±cÇâ\m-är9.ZD=g2§˜%¬9¼^¤¾Ê¸˜+‘`úôé&÷ ·ÌLd+?nõ¬BBB(£´´Ô)=v“nÔæçå!99¹Wnv›‰,M¡§k¥¥¥H\¶ÌdÜúmmmÈU*‘ŸŸOe²…'0ÑØØH¹[mQæ½^ï0"MbS×Ğ<dÎÒ[Ğ4k%è––TVT@ ˜FcæR@@ kPóô3Ae=,?/¯WÁcPdeáíPPP€öövÈd2ìÜµs"#¡ÑhL>×™ )ó°&_tTçD!ªÙÙÙ&¿ïí&íååÕ}€9BBååå˜9s&gÙ|4ÉïNŒ›b‹û9RXˆ¹‘‘X½jGá¬ƒNğèßİÑò=!??¿[ˆ‹c52b9¬õYb1¢¢£¡ÕjñŞ»ï¢±±G
+©q›Øµ¥èd­¡¡Á„È;vÛ·o§T2{k‘½‚îª,/+ sÔÕ6lÂÃÃ ´½€¸<[ZZlŞƒH ·ˆ¦ØÒ×ïœÈHÎC\l$Lyæ¥%%&---&±›ß;†oÃò+LTÇ¾@{{»Ixó^œEØ Óé°{÷nüò¿@zz:t:$	vîÚ…}û÷#‘æf¥£¼¼[¶lÁÂŞ­¦EEÙüù¡¡¡Ô÷wÄÏ¾ıû{5[¶laİkIï·Çaıúõ¥¦ù‹_`÷îİV—¢x  ®Ã–%ë2`âDáŒFC©G ‰*•
+•vY=z%j5u€1eJ?ü»ïš)W}­V‹òòrx{{[#â`º\z›ñ$‹±wï^¼³iŞÙ´ÉlæÚ ˜‡ š› nfûlq?&„¶¡p’
+D )4èÌ}"@Dá˜K›«t#Ã’•C¬ô±[²tiŸ!=zô¨YÖekk+÷3wî\»SßÙÈOoAÖ›­ãSÃ4oÍ¼+Â××Ğh4”"%‰ ìÎ³Æ8“H$&îºU«V!K.GeEZZZúdUšë^jª«şıÙÆ#/?ß¤¶!ìB)am²O“².}hd81±±ÈU*‘­P [¡ ²Ûâ¤R³ñˆ“J'•B£ÑàÀşı&AÓL÷üCC€è² ó€ ï1c8/¤§›1Ë)"T*jÏ³kÀùaŸÖÖV|˜’BÉíh¶1–ÃP$ÆHˆâb¯uà„†…¡­½+â¶äg?yâ„İ›»­àŠûùØ8_¢¢£Íjm8‹ 1]` àéå…#……¨¬¬4)I*úNŸ1ÃaãQ[[‹––ê ´ÅÈ  ,_¾...ÈU*Ğ§5·.kµT-z {zz:T*U¯«¯{xxÀÃÃƒÔzCzz:**+/“±¾·ÂX‘™N¾ˆÊgÏÁÕf4†3È™7DyåÙ—ÎĞYs*•
+ÕÕÕ}R)ºµµµß<}q/ÌÂ´¤¶[ı(JÕ3fíÒ=	AÁÁˆï“Êâ}•+WbåÊ•&işéééHOO‡H$Â\‰ÄÌHJoĞƒ¦I;4w_;@8 ]¹ÂN€Œ‡‚¥zäoL_)¹–=ÒYMu5ôz=BCCMé©§AAApss³ºêqoŠÊJŠEÓKO?—ÂFÆlL/ê1Ì=Û*p{{;U7‰bû÷ï‡J¥‚———C7f¶¸DÚVù¡Ì9V(((@PPfõÂ­cí FF~^jÏ3#†QÑÑğ3‰‰‰÷¥W™7ôB’ô€{GÄãÅÄÆ"sï^“X¹ĞĞP*~fçÎ&A½uuuÈ5ıÆI¥&c{Àè. î1[@ÜÀÄ-ÌT”ìU/ˆQØĞĞàĞuo#–‘¨ÌTƒÁ€˜ØØ>;¨H%b®{‹ÅNSù!s†Ë+ Õj©˜5:wô¡^^^§û(ÙÃÚ3,*:šªpŸŸOeR~˜’B­!ú¸Ñƒ¦é%:HĞô¶íÛïK½s †µkÍÍåŞ!èŠˆÔY9sæ;‘H„ôôtj³‹Å˜iâóïÄİDZ%m-z
+Ë#±Æz%Ôé!¾Á^030è õJˆEtÌX°€C%Ùâ~öïßO=ÃØ˜|ıÍ7N}^lñ? ¨ }b!2+x9¼¼¼•••¨¬¬´»µ
+¥ ;G‚lF†ËÀø¿ßı³­
+!DYYY6·{pÄ|*--…H$2)Hç,pH‘¿¸¸8dîİ‹ôôtŒ1‚"Í2#YÏV(XCÌJ@H6QÉlQx˜FH$‚V«ECCƒE¨CA"ó°É	‰1±±Ø“šŠíÛ·SñXä÷ñ}XÈÍÍÏ-X€CšİÙ·²vvîÚÅª@Éår¨T&ñQÑÑ
+r¨A6)0b±Ø©Y`½‡‡âe2ÄËd¨­­¥”3bÜoåp‘…††"44kŒûczzºÃî+ºÂák6º{zbÄŞŞŞĞétĞjµÔ5z£ „Z­ÆÊW^1ù[o¢Ş`úŒİÙok×ÚDŠ‹ŠLªA“IdWG.¾ò²2ìedƒ ?V5¥“ŸêêjdÉåĞh4÷"µ’	®¸B´–¯Xé3f8 ±Åÿ İ)ä“'sfŸÑ+ú’ÊË$°ÓŞ¹w¥73© '•B4eŠYÎV(¨z8™{÷¢¥¥Å®Ş{½Qèª!	¸·7åkc^¾bukµZ¼˜˜H8?nœI!Df-"f=.{3X<95¦££ƒ³ğ¦33-ãââ0q¢I_9{û3ö³gÏ†¯¯¯I“]g6¶r¹¦¤PçUTT”S3œlÉ¬¼Ÿ Ù‹ÄEVQY‰â¢"ÊEÆVÔÇÇ‡3–ê$@\°7ˆ¸€ı¾Òøx¸¹¹Q©ïÄzxÊÉggg›:ÒÓÓ¡ÕjëĞ’äjâm\›‰ßpÔbµ÷£Ñh(™¹/ĞÄ¡ À¸qãÌ
+Ú	ÄËd&Ù!ôÊİp6Ì®Ÿ+ÈW(B«ÕšUfS9€î ê,c`" §pGEMu5â¤R“{“;A5$¹‡‡r•J*à» ° /$$Xl’e|}oã£ˆ‡×'•"==9997~<«[T™“Ce«2Ÿ5ù7Qˆúƒæìƒ5ıô= ¥¥mííèìì˜¨aQÑÑ¨§T!¹\oŸ¶šUˆlÎÃ>ïû˜ØØû¦öôÌjôš;tW£åi²¹²5ee‚îZèììtH¡2¶¸B4¢¢£ût!qÅ 1[*Ğ	ÿÔT”–”˜‘9‘‘x{ãF¼³iJÔjÌœ9ÓfK–+Ñ@&“¡¼¼Ë—/Ç‘¦¤˜d¢ÄI¥ˆ‹‹£¾³}	 §Æ‘jÈtS¶B­V‹™3g:<;¦­­ê[ gdXF
+y¿½íxÜÜÜ0)05ÕÕØ¿?5„B!¥P‘²$^¯×ã+c–©ÌÎ£ÿ@"‘ ï¾kVøï§Ø‚kİå*•(..6qÃËd2“µÿP G¦ şTÁìdÍÖCˆî
+rt¿´Yb1<ˆ_ÿêW¬ªİhB‚ˆÂ`¯ÊÆ÷CÈF@@ b¬ˆ—r$<½¼ ×ëq¤°Ğ$“¦,ãÆªàæ;›6A$QjÀ¢E‹pF£\.G‰Zí°X†9‘‘((,Ä‘#G°ö­·Ìê3¿<½i_â¬ŠëtõG¯×#N*¥Æ åºut&[£aBüH!_„Ğ‹Ù	…Bìşç?M²øøx»Ö˜X,FÑEJ¹éí~ØbìÈ};²ª0ëU§ÚÚZ¬^µŠ5š^ø¤¼3ÛA8*º¿V‚f¢¸¨EÅÅ&%D"BCC9³ç´Z-åæ}(ÇYË¤=[µêıû÷S17ÎrÍ=Mz=ëâ3TÚ2Qh˜$]\\ìr‡±ÅıĞäÅÄÆöy¶ 9Ä˜Á˜Ì6#G¤\¯ËåTK Û&—ËQZZêĞ`Îêêjª	p&›0ÉÖËå.˜ôpstÅukÔR·È××“h¤Èàj4Ìl<Jßˆ?LIAJE)vlMHíQÈ¦OŸNÅ!~œn’ºvİ:„††šÜŒi4$¯[×c'{©wCúç}È‘ßS;ˆŞ¦Á÷÷JĞl}ĞÈ:§WSg‚Ùì›´Zyà	[3Ûıc.NÖt2àL·W =~ûöí£,ûW“’pñâE¨ÕjLŸ>İ¦ÃíêÕ«T/q÷Ñä-Yº´ÏêÕ0±¥K—B­VSî0k‚1cbc¡6öuzõÕW)eT(B$A£Ñ ¡¡Áa5‚èãÄÌîŠŠ†@ ÀÖ­[±'5/¼ğu?-ÂöíÛ{ÕÌÒ&NJQĞÕŸ'©?ÌF¨ôFÃ„h£ÄÌÑ7rºbGš^¼x¹J%Ä³fÙÕ*$vş|tvvB.—ãæÍ›&„fNd$+	¦¯s &ˆ^Š‡ã1oŞ<Ì›7Ï¤"=˜—­"›*Dêİì¤©BöÄi†††²f¤Ù­V‹Åvö¾ärq‘,X®’l"û"ˆ¼_(@ ƒ¡Ïªˆ>ä‡Şi€lËvÈõÜÜÜ8wwwªdii©M(++‹úî$î‡X ,+[PYQ…ÀÛÛ»WjYhX˜]Õ‰QYY‰òòr“ÍaŠˆËÈ í\8çi…‘Ÿ—‡•Š
+ˆvDÅu.Ğí2ç: Ìœ5Ë¡s“«jü0ÒkÏÃÃ™{÷rÎg{¢:”ªª®2ª2™O…„˜etÊår”—•™¨TÌÒ äßÃœX™Gwy’ à`è)‚Lê%‰YÍ(¦*D
+#f+Tä­Ş»wï6Q{¬)If³ï¬hÇæ<|øp«[€'UàÍNıÌ`gz–
+=æÄ•{ËËÊÌÔkÜW\
+ÙlñïVVTP1ô g™L£åd2™É!K\‡ä}:{RS¡Óéú´  ¯¯/*++MZ¼ ö÷L£×Ë¢¯k+ALœˆ| š3g@§‚½)7Á…öövTVVR‹NÖ|}}^Ì­*pY2¨:&lóÙŞ^{@wkÙ’%pww‡Z­¦Òd×O
+DPPä™™œuÕx¨o@rbb"Õ•YKÍPI½›åË—?°õnLŒ#ùéÉÅÅV+É"û²TÌP«ÕâŠNÇId¸¨QåøA"?lÁÎDºˆ@lLLwŠªƒpY«5«÷£V«áææfUæœ—— Õj©g'¨gNZkô"§ŠD"“Äİİk×­3‰°ô÷‘ø˜\¥Òæ<Ì‚÷³ÉooÔÖÖR)ï¤‹GGjúfüX8Ñ™ ;™ª!kı!KIS&á
+èqó
+FqQ‘‰bGŸÏ:{˜5ˆ‰ÅœÈH”Rß†@,S®ã#……&d™¹'zñ¨O1lØ0ªğ_qQòòóQYQSRğaJŠYÌ]êMHH«Íµ³UÆ~ØÚX$@lMceèòrèt:pyüÏÀ)S¦˜ªm4dĞeE&ùÙ¿¿IP«3jµ ;¢:UWWã×¿ú
+
+
+0{Îœ-tÒô´™ÖÛÌ°õHs$)·Ó¹ÚZ«	PGG‡Y5l2f½©ydoÓX®5Fª·ô£¾MäpŸËˆpVY®2dnº[ay’yØl‡gñ3ª¬ííí˜E«dlÉ‰ÍU€ó~5áåñ#Â#"a?FT=’9ÚËÆÌı½4= œNôôæ¯6 ûy{…õ¤ °Y;–©>èä‡­x=Ò™ñ>555 ~ìÁHõL*++ë1K€¸p¸k	[xDvîÜ‰l…ãÇ³X¨ÎTWWSÇDe‰‘üôñÆÆF¼³iÔj5&Rõ[úêãjl­‹«]ÁÊjíÖB¯×£¡¡
+øfS€¬ Qä…A¢ÉÜlµ¢˜*E¢J´-$Š	f*ó¡ƒÑ¤×÷¨"²U‚ÖjµĞh4ğòòr¢g¡’ÃÌŞ2 ½I¶hoowxê¶#@w‘²%¤ä„H$¢ZAØ‹şZ	š5«T*“0•5¨Ù!ˆÄ¨T*$”-‘HğaJ
+Š‹Š8Øqõ8²6¶áA©uÃ–æN'?ËW¬pjÅc___èõzh4ê•ÉdÈV(z,ÖwÙØÏˆyÈÙãÁl_@Ï€±ôú6Ì
+Íd3·Å*!íÈaMÒÆËËË©L7NrhŒabƒnnn6bÄ£ÑhL»¯_\T„–Õ«9‰LËıĞ	ÙDYl'ŒŸÃÌ
+10psssxü½¼¶ÿˆD"ÔÖÖâêÕ«œy[[[ÏÍfmTôÆRB¡ooÜ@@Õ!²äf./+C{{;$‰‰;“Îœ9Ó)û=ƒNBƒÃİï¶G½^O‘ÇşF
+††„„$$$˜tK×h4øğÃû¬j}_`Ë–-fAÍ?µ".\ñõ‘.ÊÄ:…N§ÃáÃ‡ÍŞwòÄ	QQåôƒT£ÑPåĞ”¨ÕTÌ[rø'­Yãô…3‰¥\?)l¨×ë¡ÌÉa}q‘ï@‡½)ÎqqqØ¶}»]şbr¨Ğ‰3³Kó’¥Km€fkh9'2‰5ÕÕP3×¸¬W »Íı#kÃŞprhf1Úoã"##ƒõ}‡f]gÕÕÕĞh4ğöövØ:ãT¾Îœé&ŞÆFÅ1”˜
+i!“eáy¥§§£¥¥Å¬ı„-1D\
+khXBBBˆåË—w¯“‚\f¨åÄ°`ë›Fïû7ÃÁåˆúEÈÏk¯½†oÃÑ¯¾‚Ìó¢4fØõˆËP"‘`÷?ÿ‰oÃîş‰jµšj İM›6áƒüQÑÑTİ4G*¬÷do ûlLl,şõïcíÚµ?¹
+Øœiğ111ÈÏË£|¡$ •XÍ¤ÎÉb"r+ÛAJ27¢¢¢ªÁ#ß÷µ×^3«B?ÔRvì ÆËz“âM2M²
+<ûì³T½‘qúôij#‰¥,öšêj”––¢²²Ò¤U‘FÉb·'ÅÙßß«W¯¶)SbçÎ¬İ½É¸ÉGef!''*•ŠªJM&ƒÁ µZÎÎNÌœ5‹RsÈVZZJUB¥½‚´= w;§§ ÆËdĞjµñ¢×aÖ—b’G:±r$bº¿4N_‰ŠBqQ²
+’—˜˜ˆ›7oRíZ¢¢¢¨ÇÁÖ~¢7ûùgh•¹}||LZaÌ‹©{¡gdÊIß?±Xì” h¢~I$jM“$„/¿ü²GuÑ‘ @2ä¿*•ª»Uˆe)úš0 11ùyyhim}à
+ş1/R1şajvò÷÷§êÃ”Ê-1'2’Zôl;ó ı$#Ù
+‚‚ƒªÁ®­­EeED"kœK¼LFUy¶½IñvssÃsàĞÁƒÈ’Ë!
+áããê^Ôj5k Éz ãc#ù™;w®Ã]÷^^^˜9s&JKK±k×.ª6SHH([ZZJÕ»¡ƒ­ÁÇ´CÌŞ~iDÍÊÜ»×¤º0yfD}bVhLk,Ñ×Y@@€CÕF=GÙf'×°!µ[ÊËËñIF†ÉANo×ÂF˜Ù}|ìÙ‡|}}áååFcÒŒŞ
+ƒ™	FÖİ¥KïûçÈêáı¤!3£*$$ hoo ö³&Ö"HH=BŒÇåË—)Ë’,äU«VA4eŠIé÷€c`ÆÌ†ââân‚ÀQ1sÑ¢E=v_gâØ±cØ“šjwµZÒöB¥RaÄˆT*ç¢E‹jVÁ344Ô¬G½VÑÌ™3ªMZ,£´´”:€	"U|³
+dggS¤U(šúÖÖV|˜’BOìüù½º'®5FZ8L‰Lú]‘‚etEYUÜÙäp^
+<±11¨¬¨ÀöíÛ1\  Öi×"š2Åìy±Õr¡»£{3>¤¯^–\ÁğáÔÚX»n¦ˆD&Ûs¢gƒ>·`İ=ö¬!Da™I#k»ví‚Á`@PppŸ¹pHl"é¿G©+×ÖÖöPY<24zôhŠ¸ÈårÜëì„L&C`` géwzàêò+–ª×“•˜g¯9;^ÁQ		AiI	ÊËË»»WÛY®Ÿ<¯Ó§OS¤”^Ù”ôŞd3gÎ„X,îÓ9ÎN¡+béÒ¥Ø»w/ö¤¦¢Ù`0©÷'•ZÌô ×rrÔø6Œs¹»»#11‘3á€NÆ Ç·áZOvÛJ8ˆBöÎ¦M8£Ñ˜´”ééy9z|è}õöìÙCs3E.z2xvíÚEï¹sç:5Š®,¾³iEºèÄ²¯0K,Fee%¶oß­VkV5›û‰o¼ñÆŸ,½`Ü¸qp:Í--8zäYY¸ÑÔ„kW¯²¦Åf+HNNÆ÷ßooo,YºÔ&IXöàî?àøñã2dÆŒƒ±cÇâ“Œ|ıõ×˜hWÆ—ŞÃÃùùùhnnÆˆ#àçç×ë‡ÑØØEV´Z-d2k¦JOããêê
+?tttàûï¿Ç×_ÊŠ
+Ô×ÕAèëkV ’<³-[¶ çĞ!\¿~b±óŸ{#==í{0 À‘#G  O>ù$†O22PUU…è¨(L:µ×óGèëŸ±cÑÖÖ†¢o¾ÁgŸ}†MM¨øş{Œ?Ş¬€F£ÁŸôôt¤¥¥Qn¯È¹s­J'¶f|ÆŒƒGÜ¾s_æçC‘•…ë×¯£²¢‚õ²
+Ø¿o½õªªª¨uö‹_üÂáëË`0 ¡¡wïŞÅÓO?M)„UUUøùÏI“&9„dqªAAêæ]c#ÊËË‘––fñy566"=-GqÊøˆ¦NEKK‹ÙÚb»•JeN’““Qft­Î;×&ÊŞõ„	& ¹¥WŒ%¢¢£‘””„½È ³uşxzzbğ!Ğëõ8~ü8
+T*øûûÃßßÿş÷¿qûömDEEaĞ AN™?}Şœ_Îøñá8s´Zm—µ/fö±ÒÖÖ~)¶´]`3å’ qÙ²k½°ÁR[ÆÃXjjËø0+÷R°Ë–qrt¶1ˆ@RR’U5)¬Ÿ(srl*NÆÕ5Ş‘ãCÊ*´XQë†Ì[j»Øº¾.kµøàƒÌ~ï¨*ÚÖÏÕ«W©ú,¶®%gŒ­k‹(†¶Æ‹:ÑÅhìİŸ;::PPP€#……x5)©;H=!¾¾¾xıw¿súüéïãã,ğãã@üØEVwåŠY bPp0‚ƒ‚m·ÙD'AöZ¶L Ã‡#W©4é¨Û[òc©R´=ãSS]††”––š1ğIœ4	3‚‚ì²½ÀÚÚÚº{í:[Û†Ø:>(Q«qãÆV2äëë‹   øúúÚïbïøäçå¡®¾õÀŠ†÷˜1v*³gşÔÖÖ¢D­¦‚|ÙBÄÖñ!ûO[{;'QŒ‰ÅèQ£úd|jª«Q[[Kùcª0¾¾¾˜9k–İ1.ËvôèQ:x PPXˆ]ÙçÏŸß«8Cş€çÇ§O	?øñáÇ‡~|øñ±Ç }íµ×0E$ÂÊW^ lzç^@óó‡ŸŞÀ<xğàÁƒ‡PZZ
+µZMe	‡††b‡1#ïa)±ÁãÁO€xğàÁƒ‡S@Ü¦¯&%ÁÅÅ;¶o‡J¥‚X,vhÉ<xÄƒ<ú‚‚‚PS]ÕÆš[À1d<xğˆ<x<”˜9s&ÕR¦?vçÁ <xğàÁÃ)ÆÇ÷»®ï<x İàyğàÁƒ<xÄƒ<xğàÁ <xğàÁƒ®|á&ËàÇ‡~|øñáÇ‡~|¾ñá <xğàÁƒÇO<âÁƒ<xğˆ<xğàÁƒ'@<xğàÁƒ<âÁƒ<xğà	<xğàÁƒO€xğàÁƒ<xÄƒ<xğàÁ <xğàÁƒ ñàÁƒ<xô\myñ•+WP__+:êëëÑĞĞ`ö???ˆ¦N…¿Ÿ&øùñ#Ìƒ<xğx0	PUU¢¾¾¾Ç×Ö××S¯óõõ…ŸŸæ?÷\]]ö%ÚÚÚ\¥’ú]xDbcb0}Æş)ÈÏËCKKòóó¡ÓéÌş‹Ñ£F!<"ŞŞŞü€ñ  èt:¡­½¹J%ZZZÌ^ãáá˜ØXssëşï°a½úÌ£G¢D­†^¯ ˆÅbHããí¾ŞÉ“'¡V«Qcì‹$‹;>†ê°q*Q«¡ÌÍEeEµâãã1zôè~ù\s•J¨Õj´··ÃÍÍb±1±±v_/;;¹J%µ·ÄÄÆbåÊ•÷õZôïèåå…Yb1fÏı“^Ï7nÜÀ‘ÂB¨Õj èõ¸ÔÖÖ¢D­Fee%µ¶æDFbäÈ‘½¾×––äçåáêµk&g;§æ‰­{Ï€#Gtqıñ|}=rrrLˆT*Åp ‰"‘Èì=
+…Z­ªÃ‡¡Õj >ú("""ñÌ3=Ş­ÍÒ˜K–.EBB‚İ­™\yYÔj5«f-Äb1F‰Yb±M±-ãsõêUdeeqN.#6&³Äb»Æ‡yàØ‚Iœ4	 l›Æ§§¹b¼½½‹¸¸8«ÇÇ‘óˆÀÚÌšùÓÖÖ†\¥’“,÷„ğˆDGE!(8Øæù“«T¢  €u½ØC‚=ŠC²^ÙÓ¬ñğáÃHÙ±ƒÕ¨è-	rF3KEVu Ú:Ælã“‘‘Ì½{Y¿¿­Äe÷îİ¬û×µ¸Æ§7ß±7 ãÓÓ²e¥3—Âu=úø0ÉJoÇå²V‹>øÀêµeíú*.*B^~¾]ûtTt4¢¢¢Ğ;èË/¿Ä—ùù  ¡P©TŠÄeËz¼ T* $%%A£Ñ %%åeeØ·oÚÚÛñì³Ï:tÂ‘M&“!qÙ2øøøP“eû¶mÈÜ»'Ú4ÑìÙ<l¹FNNS,RæFBˆ«T*…P(4ymkk+ä™™047Cuø0*+*PYQa—ŠÆu€Y‹šêjŠ8‘±q„EÁµI;B!Ù“šŠ––›ˆ¶£æ^¯Ç¡ƒÑ¤×÷jƒgZßB¡’yó  2™ŒZ_t466B.—£µ¥r¹ÅEE(.*²yş´··Ssç¯ï¿ÈÈHTŸ=¹\…B±B!fÎœi³ ¯½ş:ĞØØˆô´4Èår¸+G¨)ôÏhmmEÊËå6lû ×ë¡V«!
+±ñ@HH;†ÔÔT¨ÕjLŸ>“l ---Ôº¢?³ÔÔTä*•˜1}:Â#"lÚ³BÃÂ “ÉÌ¿¿Ÿ¢¢£{¼NCCÔj5D"^{ıuê;núË_ V«ñóÙ³áååå´1fóH0AöØå+VpOÖCæõ,‘NB~d2’Ö¬»»;
+!—Ë¡V«áéåe“Dö¯+V`ÕêÕ&ó~äÈ‘˜Ù+1C  ÎÈ'¸öF•JEí=ùyyÈÏËCTt4bbbàïïo;úä“OPñı÷ €ÄeË””d×D‰DØµkT*Ö­]K*G‘ ììlTVT@*•b]r²ÉßÈa´}Û6(ssB€è›Çk¯¿H0“pƒC­VãÚõë‹Å˜>}z¯îñä‰Pææ¢¸¨€"†îîîœïqww§ÈmRRµ(ÈAfí"¥`7nÄ¢Å‹m¾ÿò²2”•—SZ­VãìÙ³½’iu:Ù&í(â­7ßDæŞ½ˆ‹‹ƒ‡‡‡U$O­V#4,+V¬@HHH¯ïãØ±cxëÍ7¡V«777›ŞÏTe2^|ÑŒ,³ÁÇÇ‡Ú#Ö%'C¥RA¡P ¸¨Wt:ÄÄÆb‘DYBiI	µçg8y2BÃÂ P(PS]mjhh€^¯‡H$¢ö$.[FÍ­Ş ÚÚZÔÖÖš|†»»;V­^MmÈı‰ •––R™w!!!8}êÊËÊP]ScÊÏËc}f’yó R©PT\lb#?Ìç_QYi"
+‡D"1ùR©)))(--Åüùó6Æ¹J%r•J‹khÿ¾}Ø´ir•Ê÷ÖÊŠ
+jl^í5NÌºmß¶º3Œ¡¦º•••39+É8——•áĞÁƒ
+
+²ÚØ$ãümŞ/Z¼r¹•••6 º*‘H •JfÇ ¨uÉÉP(ÈV(Ÿ—‡sµµ=î=.\äG `×®]fä‡¨:«V­BÈSO™ı¤¤¤ =-Íä=‰»víêV–òóQôÍ7›hd³fCBBBÃÂ(vÜ[œ kŞ¼^¢„p¬KNÆÁC‡ “É¨C±¶¶Öîë–¨ÕØ›™‰â¢"H¥RüóŸÿÄªÕ«-’6DFFb×®]X±b `Oj*²³³­^R©Ô.ò ¡aaHJJÂºäd|õõ×Éd”º¡ÈÊ²ëšÅEEf›´£I-@kİEÕ55 €°ĞP‡²ÁO1ŞGÃ¥K6Ï›””ä*•H$øçGa]r²Uä‡d½Ëd2ÔÖÖ"eÇ>|ØîïFÆ×VW!y=ÓUO,Éööö^{«Ñ1\ 0ù½Àøo6wÅıD{[ëıÚ;Æ==³sVìgÄµ#‰LÈÖxOÖÆ&r}Gòoòwg¡¸¸ °hñbÎ5´hñbH$*ÆÎŠŒ×“H$¬ä‡ìCD©e»×Z ï%{ı‘ÂBëç’qıhãLşß–µE'?+V¬À»ï½gùaƒT*EÆ'Ÿ˜ì=–Î.¨è›o(ò³s×.“ÁR©THOKƒF£±x„ü¤¤¤`ı†”K,4,ï¾÷Ö­]‹Ã‡cFPÉÀÙs¨ét:‹“‚HyYòòó­ŠIèI"nGÁÇÇ‡bär¹ÃÜÜ¬ö_2-xº;©ˆ€V«¥²Á`09°BÃÂ¨gE°jõj°}Û6ìIM…‡‡‡E6Íµñô†(®KN†H$¢,vG¹-© ‘5ÑÛº·
+Ğã}øg÷¼!Ò8›bIäf&a…lÉ³÷­KN†@  Ü!ááá½îo ¤×—eO
+…ĞjµĞét|b‡ù),,DJJ
+  **Êº}º©‰õ™“¿;„ôöt¾‰D"¨T*Ô;gQ%#„F"‘8í—-Ã©Ó§ír…õÙÙÙÔóçò}‡yn…†…Q¤™é[—œ¡¯ogE€®\¹‚  ÖoØ`B~Ö­]k¶ñYƒ-›7C¥RQêD"D"J¥‚2'¿|şy»bÅ=Hë‰ ÅEEhY½Ú*…=xwëVÈåòÙép£[Ší]¼t	åee˜Y]m“ YYYœä‡÷À•JEM0™Lf2	é®Ä\¥Ò*W†=ã#‘H ôõe®_´x1†xëÍ7QPP ·aÃlZ º+W8‰«5ÏÍ,YºÔê¹ÅµA;â~Äb±Mî/Kó víÜ	¹\n²ñĞQ^V†ò²2(
+È–,1‹ƒZµz5är9²²²z•ÀãáBO‡q‘õõ°‘ÈĞ°0 %¥Û;Áá&­­­EKKD"Q¯kŒM™Lf—+Ì^ÔÕÕaOj*çó§ÇYÚ{ÒÓÒX÷/æÙÅf€Q(''J¥&LsÕªU(/+3±j$óæ™¸Æˆ:¤ÕjQxäˆ‰â°háB¬[»ï¾÷  iÍ¨T*ÔÕÕáîİ»v¥ÇÙP(š±b…Ba¦dÄI¥HOKC~^â9Üe½AyY™U‡y„h¬Z½šU­*--µ‰ ‘ÀU‰D‚¤5k8'‘··7¢¢¢mrX¡¢²ùyyØ´iÍÍ&UBB.]¼…Ñ·j©<õ4>„`§§¥A"‘@¶d‰‰{(227nÄ¦M›P¢VcæÌ™½·æ¾zBOY`Î˜Gl°'ÕÒ¼a’æ˜ØXÖ€ÖÊŠ
+¨KJ«Tbû¶mh6Ìæ5‰¹ÉU*yÄƒš{–?&ùyXæF£¡<¿¢ÑhP[[Ëªü“Ğ¦KÈ`08œWXjj*:5[ rsst»½Ø¿\.‡F£¡Rİ™ç}ï!û=Šœ]Ú†NÌ•¨?U§OC àU±!\ôŒ- š(;[6o6ù}™ñ½*•
+åeeƒP(DhXXwÀ]u5¦NjóÀQ’ CØµs'RSS¡kl4Ù„¥„ åç;… L
+ÄË/¿Ìù÷ÒÒR\Öj¡V«‘ššjæ¾í&-6¦¾R±P7Dkk+E~bbc‘˜˜Èê‚ˆ@xDÆ‹=©©Ø¾mD"‘	‰“J»	P~¾Íˆ~H'¯_Ïú·ÊÊJ4éõ¨¬¬„J¥‚¡¹ƒÁD_´x14är9:Ìæííıûßıf“ìi9lâ˜7„ˆÊåò3¹‚‚ƒŒà  lİº©©©.˜l4>>>=nô<~šäçµ×_7;üHïÃH~^xŸ|B‘ Ğ°0h4TVT°®‹Úsç(²D'?‘sæ ğÈ‡“ ÄeËpñâE¨T*§ºÂêêêŸ—¡Phf0£]£ÑXÌj#{OTTrss)ÄT‚ˆÆ–¨âü˜}AÜEäaÑƒ™­É[¿aƒ™…M–Nı˜ñ ¯¯«³kğòÙdL¥‡@jjªI¬QŠ¬	8s&fÎœ	i|<[°Àä~	„B!ÚÛÛ©x£Ç"/:Î$«ƒ~ˆò³råÊã/âââ°déÒî{ËÌ4ù‘`‰$ëhaNd$^ÿİï ‹)5¤±±Ñl2@AAC‚Xª°4oˆÛ+<"IIIV¥±Ï‹)iû¶m¨>{–df8|ø°	ùa’›];wRägùŠ•bHÄº¨@ˆ!:œ
+ñÌ€òòr“ÿ:îîî-Y 8tğ .ÓÎpg¨?ä³˜çxOä‡,_¾áËåØµs§ÉßIæ'Ù÷èp@:Œ£
+:ù!™9t¤¤¤P™_ëÖ®µøÀİÜÜP^VFÅ}}ÀêC©şàgzL‡J¥‚Á` $zfÌQ‹HìĞı„pìX @Ëäjnn «ƒE	ŒcAƒÁ€TãFoƒ”™€ à`¨T*ddd˜ümøğá œŸÙ"7!AÌÉLˆ/[A/pØ¼‰‰±)hyŞ¼yŞ¶};RRR’’‚w·n…F£AxD¯şüÄÉ)ÉE~ÈÜ³¶ôÆƒ¦ ÑÿK'6lYÊÅEEhii1&¸®Ó0ÏÊ*+Ì‘µÊH…g X´h‘gP(
+¶©ˆæ°aÃC	 Ì˜Erf}"@ƒ5P©TT0å†²³eóf‚¤R©¨H}6ˆ"ÿ&Ä¥Éh|®àgB¶‚ƒ‚ºï‰‘vK!PıƒƒnnnV²¶´´ ¶¶ÖäÙdãâe2›+Ñ’‰$ÏÌÄ±cÇ tûdµZ-¼½½û$‘¸·ÒÓÒÌ&3ñ‡×8¡JîOÖÎ{ÚÈ$$$ &6–
+NdºÒxğäg‹²ó®Ñ}
+tÇ‰>lä‡K¹!k¬I:ØÜ_tÏL3Gb‚­ägİÚµHII1QÛW­^‰D‚ÒÒR=zÔ¡ã@È“ØÑÉX„±½…-˜>cÁ$uB¡"‘:Îdœ]ˆŠMbkoogUZ
+\\\ğê«¯âÕW_5“õÈƒ2ğõõ¥sòÀÈ—n³±Wğ³Á` ŒÃ#"­VkvO„4õ¦&‰#pòäI³‰ û÷ïĞí²e"ÑŸs"…Û1‘fûiµZ¼òòËyê)* ±¯RĞİÜÜ¨q`J½öÆJñpî¼!X¹r%6mÚ„ÄÄDêÇZW‡%j5oFª3É\.GPp0’““íÎ4íï †œÁ`0UŒSb€fiR¥ˆ±B‡³\alÄÎlÿ±²z8„8±e­³³+IÉ%n)¦´ÆTZÑX¸p!&øùQn,¦•N”ŸŸåb#uOÈkm­	ÂüL¾,‰GeET*•Éä‘ÉdHOK»oÙ(Tÿ'R¿€ úìY*îFleÕjK‰<C{]D~$ixÙ—–™¯¯/*++¡ÑhL/‰•ÒjµĞëõ½.k¯Óé°Ğ—eìéçcjª«ñû7Ş°êµödqÍ²1{xxôÚUE	½^oõ¸ğè?Pææ¢¶¶–5óU¥RQäÇk©ßªAeeÔú“H$HOKCqq1•¤Ã¥Ò:ÊíÅ¶×ÊårˆD"*(¸ÂH›¶x»Qaî?D4	°»\ÙsØˆ¢€„p´¶ÒKq?6%Ù ËËÊàææ†™³fQ*]Õ¡^kŒe.˜¹Øˆ+ÌÓÓÓ¦/ÇüÌt…GD`çÎP(x5)‰º7?bo:·£.fñ¦cÇA™	­V±XŒ±VZ¤ú5ÑÈ«#ÈÙÛÑÙQ‹’kÑ}}¡ÕjÑÔ$
+!“ÉìN='Æ“““²q“6 ¶Ü©’ÀjÄ5oH!Å‰ı,N§7ÏI*•rVŠçÑ7°TgŠó³Ÿıì'3&ô=™`âááÁªÒ’Ğ‡Ça¡Á˜..™7Ê
+]µz5•öè¨QÉ
+»ÒÃ¹ÕÛı'   µµµ&%è„‹îc-ÂCJbCUšõõ¥ê÷\á(2GHÉUãßé¼ÆŠµ\ÁÏôIAd3DEG#?/*•Ê„0I$(
+;Œ Y{p‰D"êµ„üĞÍÙÚ‘—ª8jd¶ÄÕèî¤¢}O;ÆRßW(D9º‹
+NêÅg¬KNfİ˜­I×uT¯9{î‡ô"+Q«­Şœ¸æ	Ê·&Æ‹Ù4µ'ô¶3zoûNÇI~ÈóÚë¯[,V÷P*@,n}•JE5¡®0&x˜¸¿Œï	
+vJ6³X,†Z­FÊ&ÏK¶d	T*<ˆÀI“¬6Ğ{4À×!Âˆ÷˜1½º>9÷˜1RÄÕJ#.–.4œ±A²²{–E¤t777*ˆ–ŞIZúûùYı¥¸‚ŸÉµ˜d†¨AL)Œ”Ï®¬¨èUß-¶úØñã2>ùIIIùÑh4TÄ:éï&mËAÆÃ~†sœG¶"22B¡z½Şê¬J®ycñÛ“šjS2A®R‰ßşæ7Twv7„B!ö8Ğİş¨âš@õnJ§•KyX`ÄL‡gkA)û':å¾æDFÂËËr¹…´`ÎÎ
+s4È¹ÇÌ²fëÏçÂÌĞ¢¿°'?~œ* HPäZ·oßĞİaœ°=…±Ÿ‡ŸŸ&XI€,U~æ
+Úˆ€‡‡•OGGJ\_C$™L¬îŞíğ 7Î	Z¿Ÿ.£ÂÂBhµZ¸¹¹õ:ÊZõˆ´/øëûï÷Hú?¯¾şššçJcı?Dß¯©fÙ­´8b ‹D"ä*•V5^~Á§BĞåjA^ï¬vN#G¤”l¹\nòŒèYa$.´¿ÂÚ^l àJäFº\$
+¡Ñh ÕjMJn“nÓ555Øùá‡Tp3=Î†ş Hk¢ş*ÒœÄY®àg­VFoooÖx—¨èhdÉåÈV(L(Rµ:?/‰‰‰™PÖöp’J¥İ1Æê»«V¯¦ZuÈårìİ»mííV¹3Æx{C§ÓAÛĞ`"'ö×NÔıèæÈôn{ïGlƒ®7ó†¨]¡aaf+¹@æ¹\.GeEçĞãBb€,5Læá|0[«´¶¶šDûøø@&“aÓ¦MØ“šŠ   øûû?œ
+QÁa*@B¡µµµ¬Ù_ôgböìÙhÒë¡V«‘–fòŒˆ+¬  Àæ^•÷… 1<X$”bÍ3âÂhÊìOß IADB~’’’Ì‚’	ÖoØ`RzËæÍĞjµ˜<y2zê)«¿Wğ3ÉHãêÎ‘'¨k9Â—jK'…B””¼òòËØ¿oµø×%'ãµ×_Ğvh{,pN}?,ÌÈÈÀ¯,Àÿ{é¥>·Ì¸ì…Şö#i»Šÿ±§˜——[°À¦ò\ó†¡+\[Dí:£Ñ˜ÈäÖ€P¶º{óœ
+…CšİöGœ<y}ô~ÿÆøıo@‘•…~wŸÕgÏbOj*är95OSSSÍæÏ¢Å‹)¥0÷!V
+)ˆD|¶,Mzü³1ÇhØ¤¦¦R!,€©+¬7®lâ¢Ò2\Tdÿ!Í«í‰ñÎ‘˜E'‘®¾¾¾ğôô¤Òì”6LOK3!‰Ë–A2o
+gkŒÄeËLB~T*Üİİ11  •ğó÷ïñpã
+~~,v˜nÑw¬ÑhÌ"ÂÑÛŠ	kz8ÑûmÚ´	B__ª½{m‰Zİc5‘AÂö4tĞ;5İnÈ=©©hiié³lŠÄ¿ëec&!×8ş”zqÍj²@€H9„\¥o½ù&çë,¾ÚK½ä¸Ö³¥ËÃ‚£GRÙ$>ÃÙM,mÉpU©TT?BoooŠ………™ô¡#YGùyy0zÊ=, e&˜™Jä¿l`Îÿ¡cäÈ‘xnÁ:xòÌL“V9ô¬0{11  :Ædo9àÜ²Tä•ìwôØX ”ÔHºïV«ÕbÕªUf%³¼%ëmÕªUÔµ[[[¡ÌÉAFFşş·¿™Åç0ÁüL$9¡é2™Ìl0HF]rì˜õclĞ			
+…¨¬¬ì1¨•MJ%Š‰@ @KK‹İ*ñó’8¿¾ÿ>  sïŞ>s­5Ä¬K&³gÄ½<l°4o¸ªÒÒ±råJ$­Yc‘ “&¼<œb¿öúë8vü8:„Ğ°0¨Õê~S!½°°©©©ù!ıãââLª…³íëd¯yXƒæYã€Œ„§¥¥¡aa¬a%}¡ İ®°™3gB¥R™õÖ¢×²Gç2ÀÑoÒR‘WJ¢nr(İUD–JZ³†úråeeX´p¡ÙdMOKÃ¢…±níZ³ÍN¥RaËæÍX´p!õğBÃÂ(uH"‘ µµÕbCTKÁÏ„,ì?p Ç L.K”\ó~ô#1>lä‘½=ôºâ’R‰Â˜7³ôF™$Î#22’òI÷UÖSuM€›çRÙ`èÓÀß‡vóe™7dM÷°&æÍ›‡şñ8xĞìÇÑõµx˜‚dü	…BJ!ñññ¡Ö	Y7÷r¹åee¬M-IB6WXHH ÌÍµ¹cÀƒj„ÊĞ¤×®rdR[@â
+-¹Âì©±Åe€Ñ÷{»5°•°D"] `‚Ÿ‚Ÿxƒê×"
+ñî»ïš(9ô¨!O=…””Š0mÙ¼Ùäo„¹¸¸˜\/))	III?ö	{ôQÎ/Ãüì(H¥Räçåİ—€a¶<àÇ¶º“ÁL©´å ³¨º1Hg_Öº¬Õ¢¦ºB¡Ğl2“ƒ;°âõgxxx (8˜*lÊFœ³ärœ<q‚¬ÖôÈ#•ÿ}Ê¹#]ÊdO+/+ƒ··7k1ÕÑ£Gc¹ñefãV&“¡²¢â¡Lç2B"##±k×.“ƒ¾Œÿ¡c¬PÈé©Xµz5Ş}ï=³ÊŞÖÀR†6!T¹J¥ÍÄ÷ä‰ÈÏËƒP(4‹&a0&$’ª´páB¸»»›46Ã®]»(%ˆ???¬øÍoğü¯~?FJ;ùwgg'D"víŞM]'%%ãÇ§ªı²*ÁÏDo”’Ş ½½z½jë`/H x6C‰DH$¨­­5ëên	¨¬¨€D"áÌBè+„Ä3°•_'‡ö$ Ù	ô”õ‡Ñú~ĞAeî2‚Ø‰¡¡¡J `¢áÒ% ?Æ	2·>,BØ“+ìaN·d¼2¾¾ŒÿaböìÙ
+
+bu…±yel!AÀ¥D'O†L&ƒN§³‰ø¶µµQ%6ØÎ®r9.ôoùòå º][t´oÿ~H¥Rtvvš¼¹¾¾©ÿı/>ûôS*+Œş72‰3>ù„:äéM×.\hQıá
+~Şµs'"çÌ1Qœ¬ùywëVVˆN¶ú
+GáœDÄW9ÌŠğQÑÑğöö†B¡@õÙ³¦lšæK·†ÑŸ™“¨/­\¥¥¥¥3‚lll¤Ü­Ö6åayŞĞåmbİÉd2!%%Å&%¨¸¨ˆ/¿àd×/q³t¥%%fï«­­E{{»Y}[÷GÂ’+Œ¤ÆÀÔT\½zõáTz¨ıÖ×ñ?LÌ¢¹Â˜gŒ½ˆ1–‘gf²Ö„
+C®R‰İ»w÷h„<q)))(.*‚L&c=3ç`ºçM$	~~Tw÷ô´4¬Zµ
+Z­ ë7l@á‘#Tü%H¥R$%%áØñãT°´Á`Àºµk)bµâ7¿±XÑRğ3ia+är¹™ÅKâ‹H¼‘³A2S
+
+
+L$?:lğ%©¥Ìt_º/=sï^¼÷Ş{È’ËÍ&T~^Ş{ï=ìIMĞXIü~æ(9Ğ[tttàHa!2>şØâØ‰<wî\¸õñfı°š7›!A6lÀîİ»YUÒ¶¶6dÉåØ½{7.X€÷Ş{Úˆ˜ÊíÃÒ¢¥?`†‘ü«±dÌsrrLÖÚÚZ* ˜m]‘ëÌèc£¢'W=5>++ë¡z†¤[AK,ELïSü˜;w.ëc/üıı­Vk¦şâKHĞë¯½†,¹ÜÌ°ª¬¨Àîİ»±aÃjÏafŸÓÏŒ%K—šÕQ2ëFHĞçŸN?K¥RÄI¥‰Dœ©ï–@ªİEÑ~ñË_bêÔ©œ¯·üL*IGEGcµşÇÊŠ
+lÜ¸
+…Âìš’yó R©PT\LIsöÀ–.Ş¤!*³@[õÙ³P©Tpss³Záˆ‹‹Cuu5
+FŒaâ—%Yer¹ÅEE(.*â”IŸ2f»];w¢¼¬QÑÑ½²B¬íæÍuû÷íƒ\.‡——U«Â°·<]M‰‰‰yà
+·ÅÅÅA§Ó!W©Äˆ#L’Hm*@ ¹\NeîdÈàLH$HæÍ3[c?öúá[´ô“&áHa!ÊÊËM6}¡PHuğŞ»w/öÒJYòCº}jâ“ïKR}2‹ï2~êôiä*•ğööF\\\¯>Ï–}š™3gÚÔ¬ÚÈÃÃåee&‡MÔŸûÿÃf,]¿~
+…ãÆwHy‚øøxä*•HMMÅpFÉƒÈÈHˆD"ªxfO¥n¸Ên^›”Úh‘ ôÆo ++ß}÷
+
+%±&&&r¦À)ŒÙdÆÄ
+™:mâããñÈ#XKÁÏDÁ‰`øò¬™l(/+3«	$‘H ºåûÕ«m®¶iKo©TŠ)"g\¹†ØÆâz±11(.*âœL‘‘‘P©T8öí·f÷)•JÆªìedd Õ¨ÅØYñØÚnŞ2™!O?Íz………Ø´i%É:´×°·İàé
+ ,_¾ükäƒÁ@sYµz5—-ƒ<3Z­–5µ]&“ÁİÃÃ¤É/¤ŒÁ`@Ll¬Ó«Ùş0)0“Q^V†ıûö™šU«WcŠHDeaÑ.&ùimmµ{Ïqô<$‡á‘ÈÄøqww‡L&CyYr•J»	-û4JKK©qr$	*.*Byy9ë¾w?ã˜˜%£²²Û·mCXhh¯««õoOj*¶oÛÁğá&ó“a	/¾…Bl£øAd^³í;&gWl,ëŞìÊusƒÆ/Ÿs"#QZR‚úúz444PJ[Ğüüü0ş|«{‘T6fúsyYÊËÊl#ŠŠBmm-²
+ˆhªón¼¶Âİªßİº
+…AAA6Uö€é3f˜L¦fƒÁÌ’’H$H$Vßç®;©	”´fM¯ŞŒQ~€n×—µ]Ï	Hwaf¼„#Ÿ›\.‡÷˜1ˆ·"-ÔËÓ5èÎ¼¡ÏpGgâX»	‘Vr¹7oŞ„lÉ¨»»;¥2¬g¬K`¶? …ğ&p5^¤Ï7g)^b±5ÕÕËå.˜bôô„”;P^V±XŒéÓ§ß·q¤†r¹ÜìŞ‰" ÑhP[[kÑÄµ¾z»ŞéíXØmíAÀÄ‰(.*‚F£a%@÷;şÇä^®°‚‚Èår›öKêé/¸iÓ¦îºŒs‹Ô´ÅûDVËW¬À<Lr×.4fÌŠ•¯¯G]}=ÎŸ?úº:ÎL???ˆ¦N…¯¯/üııáêêjÓ p•²¶Wı¡Pt4²²² P(ìêÄ•¶Ş[TŸ=K›hwk…¸¸8xxx eÇ¤¦¦âÔéÓ¬®¤@¯ŞÚÓ¢Ã¥¯\oÀ<@Åb±ÍÄ°/	¹\ŠÊJ«×8İLBİ=<àááü¼<¨Tªî`Â_´+CQ£Ñ˜VR=Ú^ÙœXÁ¾6v¯'D’IN¨p÷x&æ³$–ª3Õ®éÓ§C,C­VcOj*š3…Çš='((È¡.eú3³¥Qp\\._¾Œü¼<ìÚ¹“õ Ôh4¸¢ÓY$@Ş‡^|r¹5=ÔYbëµÇ5Â#"ÕáÃX±b…IUìcÇ±¦n["İÎº+ŒnaïZMHH€‡‡ö¤¦Rç–T*µ+ËŒ(EdÜbbc-]61“	6tpïÂÃÃ)¥f ‘¨ddd@¡P    W…Öbbc)+ƒ ıûöQ‡½%¦=#(999P>ŒiÓ¦ÙL,(‚×ÚÚíhn6qN
+„X,îU°Û¼yóà=f”¹¹İÒjYÕŞ §\¨R©¨{!“8<"±11˜>c†urnPä™™P(˜9k–]ã£Ñh R©Ğl0Pî///Ì‹mV~˜›LzZZ¯HöJ°•1[AAA8RX•J…i?;vìÇ9x²Ûüıı±zõjä*•ËåËåTÅtÁğáT_6¥ƒ<+¦LMTk\ƒ3gÍBNNÉsª>{Öî²$¦…î&jllDÆÇw± lo­â à`TVT ##			hmm¥R†]’´½ ­uJJJ ôõ¥š.3
+¹\n²¶‚‚‚0K,ÆÈ‘#{½¶Æ‡E‹›<³`çrLLòóòÌ\ù…ÆõbÂ¶¾Ò»qÒ¤I_„ÊŠ
+bÜøñğññÁ'Æ,\¦wÁÛÛ›j-“²c—-ƒe„’5dòı‚ƒáíím2¯;F²³y0ØöæÂÂBÊ“cKğ;q…¥¦¦Â`0 iÍ¸»»÷j­ÆÅÅ!`âD“s‹œW–Üëdïimi1qmZ—9àÈ‘#]ıÉšD[[ÒÓÓ©ÀK:’Ö¬±J°„İ»w³^{ùŠfşåjFQ1EVU£ÆQ°å€·¥ø_‰Zen®Í­>¬aÎ\ã“«TRY\€X,FìüùVÇüpOFF†Io3G#*:š5¨š£(×<‹ÅNíådÍüikkC®R‰üü|‹}Á,ÍŸğğpN¿»=óÇŞqaë™ei^ÙS\³D­ÆV–1±±ˆÇèÑ£íW‡­lkQ^VµZF{NEÀÍÍ.E•m|¸Ö[hkMe¤2±déR%ÑÖõåüßÿıgPOç×¶íÛÍå«W¯"++‹õõ\cÈ5FÌ×ÓÇ‡kmÍ;×æy`i¾YZ«Ö¬¯ÊŠ
+äåçÛ••¨¨(«E„~I€ØˆŠ-‡²­$((8±11¬®'¶fëfÃu°9¾¾¾6±e{6h’UwõÚ5ÖEF¬†€‰©`ñŞlĞ'O´»'‘¯¯/‚‚‚à6l˜]º¥ñ±—Z³è¸¬KØÑ£GQ¢VC¯×Û} 9ƒ ÑAzåYš;ŞŞŞTAÎ¨èh›Ü>lãCGBæ|´Dªí­.~òÄ	Êzuù±… Q‡Ge%šôz”––²ö$¼öª_\ãsøğaä*•T9{É×xríÿ–ÆÇû´‰BiE&	êIMg¾Ş·1}Ì¹^ÏúÚê­²~ãÆ),¤ˆ¦5{˜-ë‹bmííÈU*Yë‹Ñ÷k®Š õT÷“Æ‚üøğãÃ?>üøğãÃãà<xğàÁƒŸxÄƒ<xğà	<xğàÁƒO€xğàÁƒ<xÄƒ<xğàÁ <xğàÁƒ ñàÁƒ<xôg¸òu,ƒ~|øñáÇ‡~|øñyøÆ‡W€xğàÁƒ?9ğˆ<xğàÁ <xğàÁƒ ñàÁƒ<xğˆ<xğàÁãÁ†+?<xğàÁÃY¸rå
+rrrP_W‡öövÎ×¹¹¹ÁÏßñññxä‘G~Ÿ}ö*+*PUU ˜:u*V®Z…Ç{¬ÏÇäøñã(-)A}}½Å×ùùù!((Ï<Ó§÷wäÈäçåQcE0uêT$.[‘HôPÌM^âÁƒNN§Ãßÿö7T>m‘ü @{{;ªNŸÆÿ;nİºåĞûxÿı÷ñÙ§ŸšèUUUØºeîÜ¹Óçäç³O?í‘ü @}}=öíÛ‡ÿë_ø¡îóÈ‘#øÇ˜‘2fkßzæ¡˜Ÿ¼Äƒ<+W®àƒ¿ÿJ¥x5)	€óõƒ[6o†J¥BVVV¬Xáû¸té¾ùúk¼ûî» ¬Zµ
+åeeHOOÇK/½Ô'cr¾¾Ÿ}ú) `ı†J¥_¯R©²cÎ=‹¬¬,üòùç~ùyyœ÷—’’‚ô´4dÉåx{ãÆ~ò
+<xğp8jª«)ò³~Ã‹ä õºªÓ§ÑÖÖæû¨:}  ‘H(ò III  ‹Òá,ÔUŸÄeËz$?äwíŞİ}ŸƒSïïÈ‘#¨ªª‚P(d½¿ÄÄD”——?*O€xğàÁƒ‡ãûº: 0!=¡'’äHˆD"ÔÖÖâFSS¿G¡P‰D‚ÖÖVÔÇÔY êOâ²eœÏ'ÎHŒ²är ñàÁƒL444PDÃ¬[»ƒ~~~6l˜Cîcb@  °*¡¡¡ €Ó}¤ùûù ÒÓÒ P(l&†íN»·Ô‚ÄÄD À±cÇpéÒ¥z>Ğ1@ííí(-)AGGÔj5k¯¯/‚‚‚  ³Äb:ô'µ	UVV¢I¯GuMj8ú°ˆÅbŒ9ò¡Ÿò²2¨ÕjjC‹ÅÆÇ;ôz±óç[5vÈU*ÑÒÒoooÄÄÆ"..®Wßïä‰Pææ¢¸¨ ‹ÄÄD‹ˆ"+jµÚ¦ñÈU*©uæëë±XÜ£ußÑÑeNÔj5ÜÜÜ ‹Ûãgegg#W©„N§ƒ‡‡bbc‘`óØĞÇ;   1±±˜7oM×¨­­E‰ZÊÊJ›Ÿ7ëó:yjµšZ½êš\µjëßÜİİ/“9ì³àîîN¹è*“H$‚J¥‚F£ADD„Ó¿÷??<ÿ«_á³O?Å–Í›±eóf3µgÿ÷å™ıƒKı¡“1©T
+…B,¹¯ÿîw'*Q«¡ÌÍEeE…ÍöööFTT<<<íĞ›fn =Y!ä ÊÉÉÁÌ™31sÖ,øúúöêz36Ì1òööF¸ıĞ±äud|Äb1Æ
+…6n[[ÒÓÓ‘«T:mÂ#6&³Äb«^Ÿ«T¢  €õûÚsè=z‡d½^O‡âîİ»MÆF§ÓaOj*ZZZì:Ün7Ã†Ì¾3±ÔØHüûwss³HL˜ïihhÀŞ½{ÑÖŞÙ³gs¾>ÛÛÛQPP ·aÃ,¾‡9N---ÈÜ»---X¹r¥ÕcÃ¼Nmm-Rvì@KK‹Õ¤óäÉ“HOK³ëyÛ:¬‡F®R‰ÚÚÚûº¶g¦ÁO›6ååå(//‡D"ùQ
+RRú4è©§ «Òàû
+ååå&ãÃ©-[…B£G"^&Ã¸qã.”‘‘Ì½{í¾°N§Czz: `çÎVY¥¶Zbt¤L&ƒëƒU©Thmi\.Gii)JKK{uĞ37VGŒ‘wzºCÔ€£G¢D­†^¯ĞD'ôõEXh(«µŞØØ¹\n6>öX¥Î&? PYQÊŠ
+,_±¢Ç±". üõı÷‰ê³g!—Ë¡P(0V(ÄÌ™3m&¾ °qãF,Z¼HOKƒ\.ÇÈ‘#1'2’ÓºÊU*!‘H [²!!!(,,Ä[o¾‰Ì½{›Ç#77 °bÅ
+¬Z½Úä~FefIëõz¨Õj…BlüÃ  ¯¼ü2Ôj5'jhh€Z­†H$Âk¯¿ìß·›6mÂ¡ƒ777³÷ÕTWC­V#4,7nDyY6mÚ„µš“ ét:ä*•
+…xíõ×‰ÂÂBìIME®R	ooo«ÖQØî9W©´zròÚë¯#!!Ád|m%Ñ—µZŠüë;v©©©P«Õ˜>}:&õĞ½;;;{RSº¶–,]j7!·“&MÂË¯¼âôÏ™"Q»ô4ÒÓ³ÏH!Bd]nİ²å¾Ï'•šÅa1U3¢T¨¨¨Ï÷AvZŸ NG‘rpØ
+­V…Bfƒ
+…¹J%._¾l·…A·äCÃÂ “É¬º/‘HDù ×%'C¡P [¡@ii)¬’ñ{Ú í#mCT*ö¤¦B§Ó!>>£GîÕÉd2$.[ÆJ
+éğññ¡²!Ö%'c×ÎËå6[¥ùyyÈU*!•J±|ÅŠ?×^Ørˆ•–”PÖ
+yN“'#4,
+…5ÕÕ6 ÊÊJèõzH$,Z¼˜¿E‹C.—£²²’“ wÒyó ˆŒŒDâ²eHOKC~^Í²KKòóò °jõjê~^|r¹ùùùf×¬©© „……Q÷!‘H R©PYYI¹‹ÙÆ1N*¥Ş³hñbœ>}
+…•••¬ãXM>+4”§ÔÔThµZèõzxyy™½çŠN×½ÁúúRÏ,22Í6mÚ„=©©·¸>®^½J‘™LfrÏäóu:¼½½-¯^¯GMu5„B!E|||¸lNŸ>µZ___«÷²¦V¬XA]/$$%%%(/+CCCCˆ„€;cmõ†÷WL›6@·ëÆıRBC¡R©pºªªOÜ`ıtõ‡Ä÷0[6Z"‘@¡Pà«£GÁƒ?pßİ…ËZe¶B("))	ë7lÀÁC‡ “ÉPYQen.N8a÷Á¾bÅ
+ìÚµËîû’J¥ÈøäÈd2JÆ?zô¨Õï'c#™7¯Wä‡>Fï¾÷şùÑGH$ÈU*‘••es
+èÑ£G©1Ú¸q#Ö%'S$¤±±)))X´p!BzŠúY·vm÷†@ÃªÕ«ñöÆƒZ­¶ZÑ©=w²´œE~È!&
+¡Óé 3–¶‚bâµ$ÆŒÍ"&ÈaÂLc%Á†ùùù6’±ÇX$Ÿaí&4ºƒ›8îŸ(®Liœlˆ\®h¶ X*˜“£(	X=ÃX]´x1U&++Ë²5küûŠ+LHBcc#´Z-<<<z$? àåå777hµZ466š2#±T«Õè°"0õèÑ£(--…H$¢È*A³ñy¹õ “9/
+N~È“gzÎÁîµû‘HdÄ¶<,Åı©ş @¶B•JeöûĞ°0„†…áòåË=®ÉŠ 9>>>X—œlB‚ì=Ø™›™¸)))ˆœ3Çä€_µjRRRL6/‚uÉÉxíõ× ‡4#œ›Ğ•+&‡£‚ød2r•JÊ5f-˜®‚ŒŒ¼òòËHOKƒV«5yJ¥ÂªU«ğîÖ­&¿ŒŒ¤›‚‚\f¼'RÛx;ÒJµåëôt¨€÷˜1”êÇ$O"‘:Îæ˜b¢*1ˆ	™ËAÁÁæ‡ºQâo İ‡%BØĞĞ€öövÊUÀ´œ š‹ 3D¦Ğ9d¸bğHÌ Á`@FF†ÉßH	ş\¥‡f}?q}…†…™s·•5AØb£Z-g¤ü.Z¼˜2¢Z¼FGGµ>eE®úìY*ˆM}3™CŞŞğöö†V«Åş}ûÀÃN¨¼œ•È÷ePÁ¥K—,ª?
+…£‡­Ñ2ã{z{?ájë!ÿîÖ­f›Ó¢
+…-Ywww3ÒÑÙÙ	…Bü  ƒ£é>s6É—ÏÁ†ò²²îJŸiiÉdX—œlòw"Coß¶jµ3‚‚z•ÕÓØĞ¥ÃĞ°0³TCwww$.[†’’ÊÅcÍ!_ZZ
+½^©TjF~¶oÛFmä?Ÿ=ÛÄíPYY‰ÒÒRÈår7
+!d¯½ş:56²%K,ŞCTt4êêë¡P(zLïärÏY;~¶bıQÑÑHOOG¶BA¹éóA£Ñ ¸¸F¤G"n$L„@1‰- „‡‡›½Ï×¬HWX,)Xäwl{@ €@ €Á`@{{»IP{{;ÚÛÛ©×XC~¨gƒü¼<È33!‘H¨yâîî™LF¹@ÃÃÃMb
+ëêêL\_ôı§°°
+f¶%Înöœ9(((@zZ¢}“'›2¹\‚‚L
+ä|vÊœèõzÈd2³=ŒÌ÷¹sç²ÆQ±Íû=©©Ø´i6mÚd×\dÛ µµ•š­œ‡ú[PR$	«úCW~²
+3£"4,B¡UUU8räæÌ™óğ*@Z­¶ÇJ¡P %%¯¼ü2«•gƒäO÷™37â¯V(ğõõÅüùó±éwğ·¿ÿúyùå—M,¸w·n5S'¬¶ä,¡¼¬ÌêÃ[¥RQ)ÕgÏš©e¶ºEè1&›kf& `éÒ¥ÆÇ›Å\aîÜ¹ €ÔÔT³{Y´hE”¬Abb¢UÄD.—³•5ãŒäää>Òt<<<ƒÁ`&'SkÂèÒ²Jı¡¹b™kT£ÑÀÛÛ›õ@vssƒ¯¯/EHÈ@Ô¦DW‰˜àRìQüıı­Vk–E”—ÚÚZ3•”NwO·¶¶RskùŠ6Å¶¸¹¹á¹Xç§¥"—pd\’ŒU¡Phvxddd@¡P ((ÈjB‡¤5k¬&Ê\ëÍ¥‘²cbbcªø3ˆEíïëz@ıEı!ál©ïZ­åeecT¯¹[ò^[ö¯~­ õoooüëßÿfı[~^êêë‘«TbÓ¦M3±ôél»¥¥…s¡]ÖjQZZ
+¡Phæö"ÊF£±˜­4)0“1sæL¨ÕjjcZ?tKnöœ9VYb–è,³â¢"TTVRj=#™¤fVVT ,²$l‡”V«…V«…———Å Í€€ <·`<¹\nr/Ö¸vè6lV®\i1U9K.ïÑ½w€‘&ü° "<ÅEEP>lb
+„†…¡¼¬•¬®+³9Äáş"s***Šó½^^^hhh€V«¥æŒP(„Á`€^¯7!($¾‡>‡ÊËÊ¨“:*&.®9I>ß2]S]¹\‘Hdb ÑUÒà  Ì‹‘ü¼<H$³ı"eÇ”—•Ùe9{öl\ºx
+…ãÆ7!ß			8}êT*Æ=j–İFŒ8Ù’%&û`õÙ³”:kkRÈ¼yól®eD/Q!“ÉÌæQ_Ã#"ÿÖ$bÆİÏz@ıEı!­JØ^²—L›6^^^¨ªª2YûR©éii¨ªªÂ·ß~‹§Ÿ~úáT€¬ATt4V®\‰%K—rZõ„m[òÒ76¦'òCÇX¡Ï-X€   ÈårìÚ¹ÓÌ’#,–¨)ÎDxDV¯^ à`(
+3‹„ÖÄ„p¹(†Nm|=iÎ=nnnP((¤©`DÁë)3…‡õÏİÃÃ*•ÊÌŸf\V¨mİ_ÆØKu¥Á¡}rÅ1ç)`Gæ¬µï£[ŞÖÌ§aÃ†Qªˆ\.7B6î$©‚r}1ö‹ıûöA.—ÃÛÛ»W;!)Û·m3SJÉg:x7nÜøQ‘R*QS]©Tj¦XÒ]_}àn¢“Ÿ¤5kLşF2?cWê§ıÄã€zR²‰1Me\*Ôû¡$@t+…¾!ÓA²N¸²xÚÛÛQZZ
+àG7}U(˜hS¡C‡R›Xjj*g6ùÜ¾@°Ñb.c,F[@b š››M~/ “ÉĞŞŞeNN$ˆ¸
+ßzóM¬[»[6o¦”,ñ}*Œö0‚Ä½e36[Ü`\î¯ò²2hµZ[Œc#@lq@lĞd$ÿ%.®FIüŞ*@d‰‰…F£1s…%$$@*•š$U¬X±‚Jy~¬qtÇÎôæ` ÜÅL£.$$„J nôËZ­II
+:ìq}õ¤n™D"Aâ²e&±QH5’Ç˜ØXLŸ1ã¡^S82¾”¾`B^^Eõ‡i¡¡¡‰DˆŠ‚@ €J¥2Kä û×ƒØ$ÕiˆlÀZ+2ˆ˜ ñlYÄwİSÆ×&Fê•0}àÄšÖëõ6§G;¶¤1»¹¹ÁÍÍƒÁŒÔ%.[™LµZÍï¼CY¤lˆ‰¥1U*
+ÜÜÜ0wî\LŸ>g.RŒÉÌùGÜ`---=fTp¹¿È5#X‚ŸMK 4›’ÃtiµZê3ˆ- ‰ĞŞŞnò^¦DÜ¾¾¾6¹˜ ¹\nSHˆEqQ¤R©™ë+=-Æ!FÉ	
+
+‚B¡àÌPS«ÕT«BÊèÓ½q}ÙzAH¦®°°º—å+VØìV{  ŸpĞ¦&|eTâ8z~Q‰F%y¤§'e\°©@ô¢Ä_|ş9O€ˆºcOº¸¥ÀËŞ úû¸êĞ7~gƒ¸;ˆûƒi)[›æÍõˆk(Aøè£ğû7Ş@ÆÇãHa¡‰Å‹Mï¼ƒ„_„lÉlzç.Ûª¿#   Ğh4f–!4¤h"jkkQ[[kRà“f²1õÔV…-šMÉa#1DA¢¿—¹nôz=ÚÛÛ!
+mÎ cÂ’+,pòd|úé§J¥¬*që$ZGg-è®0ú½5 Û}_ZZÊÔ—®¯Ã‡³„dªcK–.uA|À×ê&xƒ‰„õŒÕh4(/+ÃØ±cM2I¹Ôkº±"
+ñİwßAçÄR(ÊÎÎîŞÔY¬
+­‘àpğ\È^+’ÀfHÜŒ•A¿öÃ,¹7nDeE¤R©YP™¥4æPkk«	Z—œŒƒ‡!qÙ2ê³*++‘““ƒ­[¶à÷o¼EVu€ÙÜ"‚GïU B€ˆ‹‹DbÎ²)ÅËdV)‡ÄEÈ6IW'éëlëÌ5Ä\7pÑaÉ8y2ÖoØ`¢²466R1±±ë*N,q…qe¨‘ïÏŒGêK×W‰Z”; t·İ ‘·¶¶"=-
+Ğ2*¦ıDã€¦MJ¹³èuóÈOÂ/  
+	1©î,‰0uêTÖ÷EÎ™­V‹'Ÿ|ŞN,†ëH8´|[[[w“¾sçP\TDµ¬`‚L<®lR‘VÈ°íµ"™ğõõECC4É&mo…`æµĞ˜6ÛØ,×ıûöQ«µMd'B,CmÜôØj|Ğ[^ÃW£Ñ@uø0´Z-Ôj5Ôj5¼¼¼0K,¶Ø¬’GïÀUˆ4"T©T(.*bUrzrYKš}}}QYYiReŠHÔİ’áÒ%ø‡

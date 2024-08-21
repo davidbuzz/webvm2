@@ -1,0 +1,2648 @@
+  return;
+    }
+
+    struct log_tailsitter pkt = {
+        LOG_PACKET_HEADER_INIT(LOG_TSIT_MSG),
+        time_us             : AP_HAL::micros64(),
+        throttle_scaler     : log_data.throttle_scaler,
+        speed_scaler        : log_data.speed_scaler,
+        min_throttle        : log_data.min_throttle,
+    };
+    plane.logger.WriteBlock(&pkt, sizeof(pkt));
+}
+#endif  // HAL_LOGGING_ENABLED
+
+// return true if pitch control should be relaxed
+// on vectored belly sitters the pitch control is not relaxed in order to keep motors pointing and avoid risk of props hitting the ground
+// always relax after a transition
+bool Tailsitter::relax_pitch()
+{
+    return !enabled() || !_is_vectored || (transition->vtol_limit_start_ms != 0);
+}
+
+/*
+  update for transition from quadplane to fixed wing mode
+ */
+void Tailsitter_Transition::update()
+{
+    const uint32_t now = millis();
+
+    float aspeed;
+    bool have_airspeed = quadplane.ahrs.airspeed_estimate(aspeed);
+    quadplane.assisted_flight = quadplane.assist.should_assist(aspeed, have_airspeed);
+
+    if (transition_state < TRANSITION_DONE) {
+        // during transition we ask TECS to use a synthetic
+        // airspeed. Otherwise the pitch limits will throw off the
+        // throttle calculation which is driven by pitch
+        plane.TECS_controller.use_synthetic_airspeed();
+    }
+
+    switch (transition_state) {
+
+    case TRANSITION_ANGLE_WAIT_FW: {
+        if (tailsitter.transition_fw_complete()) {
+            transition_state = TRANSITION_DONE;
+            if (plane.arming.is_armed_and_safety_off()) {
+                fw_limit_start_ms = now;
+                fw_limit_initial_pitch = constrain_float(quadplane.ahrs.pitch_sensor,-8500,8500);
+                plane.nav_pitch_cd = fw_limit_initial_pitch;
+                plane.nav_roll_cd = 0;
+            }
+            break;
+        }
+        quadplane.set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+        quadplane.assisted_flight = true;
+        uint32_t dt = now - fw_transition_start_ms;
+        // multiply by 0.1 to convert (degrees/second * milliseconds) to centi degrees
+        plane.nav_pitch_cd = constrain_float(fw_transition_initial_pitch - (quadplane.tailsitter.transition_rate_fw * dt) * 0.1f * (plane.fly_inverted()?-1.0f:1.0f), -8500, 8500);
+        plane.nav_roll_cd = 0;
+        quadplane.disable_yaw_rate_time_constant();
+        quadplane.attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw(plane.nav_roll_cd,
+                                                                      plane.nav_pitch_cd,
+                                                                      0);
+        // set throttle at either hover throttle or current throttle, whichever is higher, through the transition
+        quadplane.attitude_control->set_throttle_out(MAX(motors->get_throttle_hover(),quadplane.attitude_control->get_throttle_in()), true, 0);
+        quadplane.motors_output();
+        break;
+    }
+
+    case TRANSITION_ANGLE_WAIT_VTOL:
+        // nothing to do, this is handled in the fixed wing attitude controller
+        break;
+
+    case TRANSITION_DONE:
+        break;
+    }
+}
+
+void Tailsitter_Transition::VTOL_update()
+{
+    const uint32_t now = AP_HAL::millis();
+
+    if ((now - last_vtol_mode_ms) > 1000) {
+        /*
+          we are just entering a VTOL mode as a tailsitter, set
+          our transition state so the fixed wing controller brings
+          the nose up before we start trying to fly as a
+          multicopter
+         */
+        transition_state = TRANSITION_ANGLE_WAIT_VTOL;
+    }
+    last_vtol_mode_ms = now;
+
+    if (transition_state == TRANSITION_ANGLE_WAIT_VTOL) {
+        float aspeed;
+        bool have_airspeed = quadplane.ahrs.airspeed_estimate(aspeed);
+        // provide assistance in forward flight portion of tailsitter transition
+        quadplane.assisted_flight = quadplane.assist.should_assist(aspeed, have_airspeed);
+        if (!quadplane.tailsitter.transition_vtol_complete()) {
+            return;
+        }
+        // transition to VTOL complete, if armed set vtol rate limit starting point
+        if (plane.arming.is_armed_and_safety_off()) {
+            vtol_limit_start_ms = now;
+            vtol_limit_initial_pitch = quadplane.ahrs_view->pitch_sensor;
+        }
+    } else {
+        // Keep assistance reset while not checking
+        quadplane.assist.reset();
+    }
+    restart();
+}
+
+// return true if we should show VTOL view
+bool Tailsitter_Transition::show_vtol_view() const
+{
+    bool show_vtol = quadplane.in_vtol_mode();
+
+    if (show_vtol && (transition_state == TRANSITION_ANGLE_WAIT_VTOL)) {
+        // in a vtol mode but still transitioning from forward flight
+        return false;
+    }
+    if (!show_vtol && (transition_state == TRANSITION_ANGLE_WAIT_FW)) {
+        // not in VTOL mode but still transitioning from VTOL
+        return true;
+    }
+    return show_vtol;
+}
+
+void Tailsitter_Transition::set_FW_roll_pitch(int32_t& nav_pitch_cd, int32_t& nav_roll_cd)
+{
+    uint32_t now = AP_HAL::millis();
+    if (tailsitter.in_vtol_transition(now)) {
+        /*
+          during transition to vtol in a tailsitter try to raise the
+          nose while keeping the wings level
+         */
+        uint32_t dt = now - vtol_transition_start_ms;
+        // multiply by 0.1 to convert (degrees/second * milliseconds) to centi degrees
+        nav_pitch_cd = constrain_float(vtol_transition_initial_pitch + (tailsitter.transition_rate_vtol * dt) * 0.1f, -8500, 8500);
+        nav_roll_cd = 0;
+
+    } else if (transition_state == TRANSITION_DONE) {
+        // still in FW, reset transition starting point
+        vtol_transition_start_ms = now;
+        vtol_transition_initial_pitch = constrain_float(plane.nav_pitch_cd,-8500,8500);
+
+        // rate limit initial pitch down
+        if (fw_limit_start_ms != 0) {
+            const float pitch_limit_cd = fw_limit_initial_pitch - (now - fw_limit_start_ms) * tailsitter.transition_rate_fw * 0.1;
+            if ((pitch_limit_cd <= 0) || (nav_pitch_cd >= pitch_limit_cd)) {
+                // never limit past 0, never limit to a smaller pitch angle
+                fw_limit_start_ms = 0;
+            } else {
+                nav_pitch_cd = pitch_limit_cd;
+                nav_roll_cd = 0;
+            }
+        }
+    }
+}
+
+bool Tailsitter_Transition::allow_stick_mixing() const
+{
+    // Transitioning into VTOL flight, inital pitch up
+    if (tailsitter.in_vtol_transition()) {
+        return false;
+    }
+    // Transitioning into fixed wing flight, levelling off
+    if ((transition_state == TRANSITION_DONE) && (fw_limit_start_ms != 0)) {
+        return false;
+    }
+    return true;
+}
+
+bool Tailsitter_Transition::set_VTOL_roll_pitch_limit(int32_t& nav_roll_cd, int32_t& nav_pitch_cd)
+{
+    if (vtol_limit_start_ms == 0) {
+        return false;
+    }
+    // prevent pitching towards 0 too quickly
+    const float pitch_change_cd = (AP_HAL::millis() - vtol_limit_start_ms) * tailsitter.transition_rate_vtol * 0.1;
+    if (pitch_change_cd > fabsf(vtol_limit_initial_pitch)) {
+        // limit has passed 0, nothing to do
+        vtol_limit_start_ms = 0;
+        return false;
+    }
+    // continue limiting while limit angle is larger than desired angle
+    if (is_negative(vtol_limit_initial_pitch)) {
+        const float pitch_limit = vtol_limit_initial_pitch + pitch_change_cd;
+        if (nav_pitch_cd > pitch_limit) {
+            nav_pitch_cd = pitch_limit;
+            nav_roll_cd = 0;
+            return true;
+        }
+    } else {
+        const float pitch_limit = vtol_limit_initial_pitch - pitch_change_cd;
+        if (nav_pitch_cd < pitch_limit) {
+            nav_pitch_cd = pitch_limit;
+            nav_roll_cd = 0;
+            return true;
+        }
+    }
+    vtol_limit_start_ms = 0;
+    return false;
+}
+
+// setup for the transition back to fixed wing
+void Tailsitter_Transition::restart()
+{
+    transition_state = TRANSITION_ANGLE_WAIT_FW;
+    fw_transition_start_ms = AP_HAL::millis();
+    fw_transition_initial_pitch = constrain_float(quadplane.attitude_control->get_attitude_target_quat().get_euler_pitch() * degrees(100.0),-8500,8500);
+}
+
+// force state to FW and setup for the transition back to VTOL
+void Tailsitter_Transition::force_transition_complete()
+{
+    transition_state = TRANSITION_DONE;
+    vtol_transition_start_ms = AP_HAL::millis();
+    vtol_transition_initial_pitch = constrain_float(plane.nav_pitch_cd,-8500,8500);
+    fw_limit_start_ms = 0;
+
+    quadplane.assist.reset();
+}
+
+MAV_VTOL_STATE Tailsitter_Transition::get_mav_vtol_state() const
+{
+    switch (transition_state) {
+        case TRANSITION_ANGLE_WAIT_VTOL:
+            return MAV_VTOL_STATE_TRANSITION_TO_MC;
+
+        case TRANSITION_DONE:
+            return MAV_VTOL_STATE_FW;
+
+        case TRANSITION_ANGLE_WAIT_FW: {
+            if (quadplane.in_vtol_mode()) {
+                return MAV_VTOL_STATE_MC;
+            }
+            return MAV_VTOL_STATE_TRANSITION_TO_FW;
+        }
+    }
+
+    return MAV_VTOL_STATE_UNDEFINED;
+}
+
+// only allow to weathervane once transition is complete and desired pitch has been reached
+bool Tailsitter_Transition::allow_weathervane()
+{
+    return !tailsitter.in_vtol_transition() && (vtol_limit_start_ms == 0);
+}
+
+#endif  // HAL_QUADPLANE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <AP_Param/AP_Param.h>
+#include "transition.h"
+#include <AP_Motors/AP_MotorsTailsitter.h>
+#include <AP_Logger/LogStructure.h>
+
+class QuadPlane;
+class AP_MotorsMulticopter;
+class Tailsitter_Transition;
+class Tailsitter
+{
+friend class QuadPlane;
+friend class Plane;
+public:
+
+    Tailsitter(QuadPlane& _quadplane, AP_MotorsMulticopter*& _motors);
+
+    bool enabled() const { return (enable > 0) && setup_complete;}
+
+    void setup();
+
+    // return true when flying a control surface only tailsitter
+    bool is_control_surface_tailsitter(void) const;
+
+    // return true when flying a tailsitter in VTOL
+    bool active(void);
+    
+    // create outputs for tailsitters
+    void output(void);
+
+    // handle different tailsitter input types
+    void check_input(void);
+
+    // check if we have completed transition to fixed wing
+    bool transition_fw_complete(void);
+
+    // return true if we are a tailsitter in FW flight
+    bool is_in_fw_flight(void) const;
+
+    // check if we have completed transition to vtol
+    bool transition_vtol_complete(void) const;
+
+    // return true if transition to VTOL flight
+    bool in_vtol_transition(uint32_t now = 0) const;
+
+    // account for control surface speed scaling in VTOL modes
+    void speed_scaling(void);
+
+    // return the transition_angle_vtol value
+    int8_t get_transition_angle_vtol() const;
+
+    // return true if pitch control should be relaxed
+    bool relax_pitch();
+
+    // Write tailsitter specific log
+    void write_log();
+
+    // tailsitter speed scaler
+    float last_spd_scaler = 1.0f; // used to slew rate limiting with TAILSITTER_GSCL_ATT_THR option
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // bit 0 enables plane mode and bit 1 enables body-frame roll mode
+    enum input {
+        TAILSITTER_INPUT_PLANE   = (1U<<0),
+        TAILSITTER_INPUT_BF_ROLL = (1U<<1)
+    };
+
+    enum gscl_mask {
+        TAILSITTER_GSCL_THROTTLE = (1U<<0),
+        TAILSITTER_GSCL_ATT_THR = (1U<<1),
+        TAILSITTER_GSCL_DISK_THEORY = (1U<<2),
+        TAILSITTER_GSCL_ALTITUDE = (1U<<3),
+    };
+
+    AP_Int8 enable;
+    AP_Int8 transition_angle_fw;
+    AP_Float transition_rate_fw;
+    AP_Int8 transition_angle_vtol;
+    AP_Float transition_rate_vtol;
+    AP_Float transition_throttle_vtol;
+    AP_Int8 input_type;
+    AP_Float vectored_forward_gain;
+    AP_Float vectored_hover_gain;
+    AP_Float vectored_hover_power;
+    AP_Float throttle_scale_max;
+    AP_Float gain_scaling_min;
+    AP_Float max_roll_angle;
+    AP_Int16 motor_mask;
+    AP_Float scaling_speed_min;
+    AP_Float scaling_speed_max;
+    AP_Int16 gain_scaling_mask;
+    AP_Float disk_loading;
+    AP_Float VTOL_roll_scale;
+    AP_Float VTOL_pitch_scale;
+    AP_Float VTOL_yaw_scale;
+    AP_Float disk_loading_min_outflow;
+
+    AP_MotorsTailsitter* tailsitter_motors;
+
+private:
+
+    // Tailsitter specific log message
+    struct PACKED log_tailsitter {
+        LOG_PACKET_HEADER;
+        uint64_t time_us;
+        float throttle_scaler;
+        float speed_scaler;
+        float min_throttle;
+    };
+
+    // Data to be logged
+    struct {
+        float throttle_scaler;
+        float speed_scaler;
+        float min_throttle;
+    } log_data;
+
+
+    bool setup_complete;
+
+    // true when flying a tilt-vectored tailsitter
+    bool _is_vectored;
+
+    // true is outputs are configured
+    bool _have_elevator;
+    bool _have_aileron;
+    bool _have_rudder;
+    bool _have_elevon;
+    bool _have_v_tail;
+
+    // refences for convenience
+    QuadPlane& quadplane;
+    AP_MotorsMulticopter*& motors;
+
+    // transition logic
+    Tailsitter_Transition* transition;
+
+};
+
+
+// Transition for tailsitters
+class Tailsitter_Transition : public Transition
+{
+friend class Tailsitter;
+public:
+
+    Tailsitter_Transition(QuadPlane& _quadplane, AP_MotorsMulticopter*& _motors, Tailsitter& _tailsitter):Transition(_quadplane, _motors), tailsitter(_tailsitter) {};
+
+    void update() override;
+
+    void VTOL_update() override;
+
+    void force_transition_complete() override;
+
+    bool complete() const override { return transition_state == TRANSITION_DONE; }
+
+    // setup for the transition back to fixed wing
+    void restart() override;
+
+    uint8_t get_log_transition_state() const override { return static_cast<uint8_t>(transition_state); }
+
+    bool active() const override { return transition_state != TRANSITION_DONE; }
+
+    bool show_vtol_view() const override;
+
+    void set_FW_roll_pitch(int32_t& nav_pitch_cd, int32_t& nav_roll_cd) override;
+
+    bool allow_stick_mixing() const override;
+
+    MAV_VTOL_STATE get_mav_vtol_state() const override;
+
+    bool set_VTOL_roll_pitch_limit(int32_t& nav_roll_cd, int32_t& nav_pitch_cd) override;
+
+    bool allow_weathervane() override;
+
+private:
+
+    enum {
+        TRANSITION_ANGLE_WAIT_FW,
+        TRANSITION_ANGLE_WAIT_VTOL,
+        TRANSITION_DONE
+    } transition_state;
+
+    // for transition to VTOL flight
+    uint32_t vtol_transition_start_ms;
+    float vtol_transition_initial_pitch;
+
+    // for rate limit of VTOL flight
+    uint32_t vtol_limit_start_ms;
+    float vtol_limit_initial_pitch;
+
+    // for rate limit of FW flight
+    uint32_t fw_limit_start_ms;
+    float fw_limit_initial_pitch;
+
+    // for transition to FW flight
+    uint32_t fw_transition_start_ms;
+    float fw_transition_initial_pitch;
+
+    // time when we were last in a vtol control mode
+    uint32_t last_vtol_mode_ms;
+
+    Tailsitter& tailsitter;
+
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #include "Plane.h"
+
+/*   Check for automatic takeoff conditions being met using the following sequence:
+ *   1) Check for adequate GPS lock - if not return false
+ *   2) Check the gravity compensated longitudinal acceleration against the threshold and start the timer if true
+ *   3) Wait until the timer has reached the specified value (increments of 0.1 sec) and then check the GPS speed against the threshold
+ *   4) If the GPS speed is above the threshold and the attitude is within limits then return true and reset the timer
+ *   5) If the GPS speed and attitude within limits has not been achieved after 2.5 seconds, return false and reset the timer
+ *   6) If the time lapsed since the last timecheck is greater than 0.2 seconds, return false and reset the timer
+ *   NOTE : This function relies on the TECS 50Hz processing for its acceleration measure.
+ */
+bool Plane::auto_takeoff_check(void)
+{
+    // this is a more advanced check that relies on TECS
+    uint32_t now = millis();
+    uint16_t wait_time_ms = MIN(uint16_t(g.takeoff_throttle_delay)*100,12700);
+
+    // reset all takeoff state if disarmed
+    if (!arming.is_armed_and_safety_off()) {
+        memset(&takeoff_state, 0, sizeof(takeoff_state));
+        auto_state.baro_takeoff_alt = barometer.get_altitude();
+        return false;
+    }
+
+    // Reset states if process has been interrupted
+    if (takeoff_state.last_check_ms && (now - takeoff_state.last_check_ms) > 200) {
+        memset(&takeoff_state, 0, sizeof(takeoff_state));
+        return false;
+    }
+
+    takeoff_state.last_check_ms = now;
+    
+    //check if waiting for rudder neutral after rudder arm
+    if (plane.arming.last_arm_method() == AP_Arming::Method::RUDDER &&
+        !seen_neutral_rudder) {
+        // we were armed with rudder but have not seen rudder neutral yet
+        takeoff_state.waiting_for_rudder_neutral = true;
+        // warn if we have been waiting a long time
+        if (now - takeoff_state.rudder_takeoff_warn_ms > TAKEOFF_RUDDER_WARNING_TIMEOUT) {
+            gcs().send_text(MAV_SEVERITY_WARNING, "Takeoff waiting for rudder release");
+            takeoff_state.rudder_takeoff_warn_ms = now;
+        }
+        // since we are still waiting, dont takeoff
+        return false;
+    } else {
+       // we did not arm by rudder or rudder has returned to neutral
+       // make sure we dont indicate we are in the waiting state with servo position indicator
+       takeoff_state.waiting_for_rudder_neutral = false;
+    }  
+
+    // Check for bad GPS
+    if (gps.status() < AP_GPS::GPS_OK_FIX_3D) {
+        // no auto takeoff without GPS lock
+        return false;
+    }
+
+    bool do_takeoff_attitude_check = !(flight_option_enabled(FlightOptions::DISABLE_TOFF_ATTITUDE_CHK));
+#if HAL_QUADPLANE_ENABLED
+    // disable attitude check on tailsitters
+    do_takeoff_attitude_check = !quadplane.tailsitter.enabled();
+#endif
+
+    if (!takeoff_state.launchTimerStarted && !is_zero(g.takeoff_throttle_min_accel)) {
+        // we are requiring an X acceleration event to launch
+        float xaccel = TECS_controller.get_VXdot();
+        if (g2.takeoff_throttle_accel_count <= 1) {
+            if (xaccel < g.takeoff_throttle_min_accel) {
+                goto no_launch;
+            }
+        } else {
+            // we need multiple accel events
+            if (now - takeoff_state.accel_event_ms > 500) {
+                takeoff_state.accel_event_counter = 0;
+            }
+            bool odd_event = ((takeoff_state.accel_event_counter & 1) != 0);
+            bool got_event = (odd_event?xaccel < -g.takeoff_throttle_min_accel : xaccel > g.takeoff_throttle_min_accel);
+            if (got_event) {
+                takeoff_state.accel_event_counter++;
+                takeoff_state.accel_event_ms = now;
+            }
+            if (takeoff_state.accel_event_counter < g2.takeoff_throttle_accel_count) {
+                goto no_launch;
+            }
+        }
+    }
+
+    // we've reached the acceleration threshold, so start the timer
+    if (!takeoff_state.launchTimerStarted) {
+        takeoff_state.launchTimerStarted = true;
+        takeoff_state.last_tkoff_arm_time = now;
+        if (now - takeoff_state.last_report_ms > 2000) {
+            gcs().send_text(MAV_SEVERITY_INFO, "Armed AUTO, xaccel = %.1f m/s/s, waiting %.1f sec",
+                              (double)TECS_controller.get_VXdot(), (double)(wait_time_ms*0.001f));
+            takeoff_state.last_report_ms = now;
+        }
+    }
+
+    // Only perform velocity check if not timed out
+    if ((now - takeoff_state.last_tkoff_arm_time) > wait_time_ms+100U) {
+        if (now - takeoff_state.last_report_ms > 2000) {
+            gcs().send_text(MAV_SEVERITY_WARNING, "Timeout AUTO");
+            takeoff_state.last_report_ms = now;
+        }
+        goto no_launch;
+    }
+
+    if (do_takeoff_attitude_check) {
+        // Check aircraft attitude for bad launch
+        if (ahrs.pitch_sensor <= -3000 || ahrs.pitch_sensor >= 4500 ||
+            (!fly_inverted() && labs(ahrs.roll_sensor) > 3000)) {
+            gcs().send_text(MAV_SEVERITY_WARNING, "Bad launch AUTO");
+            takeoff_state.accel_event_counter = 0;
+            goto no_launch;
+        }
+    }
+
+    // Check ground speed and time delay
+    if (((gps.ground_speed() > g.takeoff_throttle_min_speed || is_zero(g.takeoff_throttle_min_speed))) &&
+        ((now - takeoff_state.last_tkoff_arm_time) >= wait_time_ms)) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Triggered AUTO. GPS speed = %.1f", (double)gps.ground_speed());
+        takeoff_state.launchTimerStarted = false;
+        takeoff_state.last_tkoff_arm_time = 0;
+        takeoff_state.start_time_ms = now;
+        steer_state.locked_course_err = 0; // use current heading without any error offset
+        return true;
+    }
+
+    // we're not launching yet, but the timer is still going
+    return false;
+
+no_launch:
+    takeoff_state.launchTimerStarted = false;
+    takeoff_state.last_tkoff_arm_time = 0;
+    return false;
+}
+
+/*
+  calculate desired bank angle during takeoff, setting nav_roll_cd
+ */
+void Plane::takeoff_calc_roll(void)
+{
+    if (steer_state.hold_course_cd == -1) {
+        // we don't yet have a heading to hold - just level
+        // the wings until we get up enough speed to get a GPS heading
+        nav_roll_cd = 0;
+        return;
+    }
+
+    calc_nav_roll();
+
+    // during takeoff use the level flight roll limit to prevent large
+    // wing strike. Slowly allow for more roll as we get higher above
+    // the takeoff altitude
+    int32_t takeoff_roll_limit_cd = roll_limit_cd;
+
+    if (auto_state.highest_airspeed < g.takeoff_rotate_speed) {
+        // before Vrotate (aka, on the ground)
+        takeoff_roll_limit_cd = g.level_roll_limit * 100;
+    } else {
+        // lim1 - below altitude TKOFF_LVL_ALT, restrict roll to LEVEL_ROLL_LIMIT
+        // lim2 - above altitude (TKOFF_LVL_ALT * 3) allow full flight envelope of ROLL_LIMIT_DEG
+        // In between lim1 and lim2 use a scaled roll limit.
+        // The *3 scheme should scale reasonably with both small and large aircraft
+        const float lim1 = MAX(mode_takeoff.level_alt, 0);
+        const float lim2 = MIN(mode_takeoff.level_alt*3, mode_takeoff.target_alt);
+        const float current_baro_alt = barometer.get_altitude();
+
+        takeoff_roll_limit_cd = linear_interpolate(g.level_roll_limit*100, roll_limit_cd,
+                                        current_baro_alt,
+                                        auto_state.baro_takeoff_alt+lim1, auto_state.baro_takeoff_alt+lim2);
+    }
+
+    nav_roll_cd = constrain_int32(nav_roll_cd, -takeoff_roll_limit_cd, takeoff_roll_limit_cd);
+}
+
+        
+/*
+  calculate desired pitch angle during takeoff, setting nav_pitch_cd
+ */
+void Plane::takeoff_calc_pitch(void)
+{
+    if (auto_state.highest_airspeed < g.takeoff_rotate_speed) {
+        // we have not reached rotate speed, use the specified takeoff target pitch angle
+        nav_pitch_cd = int32_t(100.0f * mode_takeoff.ground_pitch);
+        return;
+    }
+
+    if (ahrs.using_airspeed_sensor()) {
+        int16_t takeoff_pitch_min_cd = get_takeoff_pitch_min_cd();
+        calc_nav_pitch();
+        if (nav_pitch_cd < takeoff_pitch_min_cd) {
+            nav_pitch_cd = takeoff_pitch_min_cd;
+        }
+    } else {
+        if (g.takeoff_rotate_speed > 0) {
+            // Rise off ground takeoff so delay rotation until ground speed indicates adequate airspeed
+            nav_pitch_cd = (gps.ground_speed() / (float)aparm.airspeed_cruise) * auto_state.takeoff_pitch_cd;
+            nav_pitch_cd = constrain_int32(nav_pitch_cd, 500, auto_state.takeoff_pitch_cd); 
+        } else {
+            // Doing hand or catapult launch so need at least 5 deg pitch to prevent initial height loss
+            nav_pitch_cd = MAX(auto_state.takeoff_pitch_cd, 500);
+        }
+    }
+
+    if (aparm.stall_prevention != 0) {
+        if (mission.get_current_nav_cmd().id == MAV_CMD_NAV_TAKEOFF ||
+            control_mode == &mode_takeoff) {
+            // during takeoff we want to prioritise roll control over
+            // pitch. Apply a reduction in pitch demand if our roll is
+            // significantly off. The aim of this change is to
+            // increase the robustness of hand launches, particularly
+            // in cross-winds. If we start to roll over then we reduce
+            // pitch demand until the roll recovers
+            float roll_error_rad = radians(constrain_float(labs(nav_roll_cd - ahrs.roll_sensor) * 0.01, 0, 90));
+            float reduction = sq(cosf(roll_error_rad));
+            nav_pitch_cd *= reduction;
+        }
+    }
+}
+
+/*
+ * Set the throttle limits to run at during a takeoff.
+ */
+void Plane::takeoff_calc_throttle(const bool use_max_throttle) {
+    // This setting will take effect at the next run of TECS::update_pitch_throttle().
+
+    // Set the maximum throttle limit.
+    if (aparm.takeoff_throttle_max != 0) {
+        TECS_controller.set_throttle_max(0.01f*aparm.takeoff_throttle_max);
+    }
+
+    // Set the minimum throttle limit.
+    const bool use_throttle_range = (aparm.takeoff_options & (uint32_t)AP_FixedWing::TakeoffOption::THROTTLE_RANGE);
+    if (!use_throttle_range || !ahrs.using_airspeed_sensor() || use_max_throttle) { // Traditional takeoff throttle limit.
+        float min_throttle = (aparm.takeoff_throttle_max != 0) ? 0.01f*aparm.takeoff_throttle_max : 0.01f*aparm.throttle_max;
+        TECS_controller.set_throttle_min(min_throttle);
+    } else { // TKOFF_MODE == 1, allow for a throttle range.
+        if (aparm.takeoff_throttle_min != 0) { // Override THR_MIN.
+            TECS_controller.set_throttle_min(0.01f*aparm.takeoff_throttle_min);
+        }
+    }
+    calc_throttle();
+}
+
+/* get the pitch min used during takeoff. This matches the mission pitch until near the end where it allows it to levels off
+ */
+int16_t Plane::get_takeoff_pitch_min_cd(void)
+{
+    if (flight_stage != AP_FixedWing::FlightStage::TAKEOFF) {
+        return auto_state.takeoff_pitch_cd;
+    }
+
+    int32_t relative_alt_cm = adjusted_relative_altitude_cm();
+    int32_t remaining_height_to_target_cm = (auto_state.takeoff_altitude_rel_cm - relative_alt_cm);
+
+    // seconds to target alt method
+    if (g.takeoff_pitch_limit_reduction_sec > 0) {
+        // if height-below-target has been initialized then use it to create and apply a scaler to the pitch_min
+        if (auto_state.height_below_takeoff_to_level_off_cm != 0) {
+            float scalar = remaining_height_to_target_cm / (float)auto_state.height_below_takeoff_to_level_off_cm;
+            return auto_state.takeoff_pitch_cd * scalar;
+        }
+
+        // are we entering the region where we want to start levelling off before we reach takeoff alt?
+        if (auto_state.sink_rate < -0.1f) {
+            float sec_to_target = (remaining_height_to_target_cm * 0.01f) / (-auto_state.sink_rate);
+            if (sec_to_target > 0 &&
+                relative_alt_cm >= 1000 &&
+                sec_to_target <= g.takeoff_pitch_limit_reduction_sec) {
+                // make a note of that altitude to use it as a start height for scaling
+                gcs().send_text(MAV_SEVERITY_INFO, "Takeoff level-off starting at %dm", int(remaining_height_to_target_cm/100));
+                auto_state.height_below_takeoff_to_level_off_cm = remaining_height_to_target_cm;
+            }
+        }
+    }
+    return auto_state.takeoff_pitch_cd;
+}
+
+/*
+  return a tail hold percentage during initial takeoff for a tail
+  dragger
+
+  This can be used either in auto-takeoff or in FBWA mode with
+  FBWA_TDRAG_CHAN enabled
+ */
+int8_t Plane::takeoff_tail_hold(void)
+{
+    bool in_takeoff = ((plane.flight_stage == AP_FixedWing::FlightStage::TAKEOFF) ||
+                       (control_mode == &mode_fbwa && auto_state.fbwa_tdrag_takeoff_mode));
+    if (!in_takeoff) {
+        // not in takeoff
+        return 0;
+    }
+    if (g.takeoff_tdrag_elevator == 0) {
+        // no takeoff elevator set
+        goto return_zero;
+    }
+    if (auto_state.highest_airspeed >= g.takeoff_tdrag_speed1) {
+        // we've passed speed1. We now raise the tail and aim for
+        // level pitch. Return 0 meaning no fixed elevator setting
+        goto return_zero;
+    }
+    if (ahrs.pitch_sensor > auto_state.initial_pitch_cd + 1000) {
+        // the pitch has gone up by more then 10 degrees over the
+        // initial pitch. This may mean the nose is coming up for an
+        // early liftoff, perhaps due to a bad setting of
+        // g.takeoff_tdrag_speed1. Go to level flight to prevent a
+        // stall
+        goto return_zero;
+    }
+    // we are holding the tail down
+    return g.takeoff_tdrag_elevator;
+
+return_zero:
+    if (auto_state.fbwa_tdrag_takeoff_mode) {
+        gcs().send_text(MAV_SEVERITY_NOTICE, "FBWA tdrag off");
+        auto_state.fbwa_tdrag_takeoff_mode = false;
+    }
+    return 0;
+}
+
+#if AP_LANDINGGEAR_ENABLED
+/*
+  update landing gear
+ */
+void Plane::landing_gear_update(void)
+{
+    g2.landing_gear.update(relative_ground_altitude(g.rangefinder_landing));
+}
+#endif
+
+/*
+ check takeoff_timeout; checks time after the takeoff start time; returns true if timeout has occurred and disarms on timeout
+*/
+
+bool Plane::check_takeoff_timeout(void)
+{
+    if (takeoff_state.start_time_ms != 0 && g2.takeoff_timeout > 0) {
+        const float ground_speed = AP::gps().ground_speed();
+        const float takeoff_min_ground_speed = 4;
+        if (ground_speed >= takeoff_min_ground_speed) {
+            takeoff_state.start_time_ms = 0;
+            return false;
+        } else {
+            uint32_t now = AP_HAL::millis();
+            if (now - takeoff_state.start_time_ms > (uint32_t)(1000U * g2.takeoff_timeout)) {
+                gcs().send_text(MAV_SEVERITY_INFO, "Takeoff timeout: %.1f m/s speed < 4m/s", ground_speed);
+                arming.disarm(AP_Arming::Method::TAKEOFFTIMEOUT);
+                takeoff_state.start_time_ms = 0;
+                return true;
+            }
+        }
+     }
+     return false;
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #include "tiltrotor.h"
+#include "Plane.h"
+
+#if HAL_QUADPLANE_ENABLED
+const AP_Param::GroupInfo Tiltrotor::var_info[] = {
+
+    // @Param: ENABLE
+    // @DisplayName: Enable Tiltrotor functionality
+    // @Values: 0:Disable, 1:Enable
+    // @Description: This enables Tiltrotor functionality
+    // @User: Standard
+    // @RebootRequired: True
+    AP_GROUPINFO_FLAGS("ENABLE", 1, Tiltrotor, enable, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: MASK
+    // @DisplayName: Tiltrotor mask
+    // @Description: This is a bitmask of motors that are tiltable in a tiltrotor (or tiltwing). The mask is in terms of the standard motor order for the frame type.
+    // @User: Standard
+    // @Bitmask: 0:Motor 1, 1:Motor 2, 2:Motor 3, 3:Motor 4, 4:Motor 5, 5:Motor 6, 6:Motor 7, 7:Motor 8, 8:Motor 9, 9:Motor 10, 10:Motor 11, 11:Motor 12
+    AP_GROUPINFO("MASK", 2, Tiltrotor, tilt_mask, 0),
+
+    // @Param: RATE_UP
+    // @DisplayName: Tiltrotor upwards tilt rate
+    // @Description: This is the maximum speed at which the motor angle will change for a tiltrotor when moving from forward flight to hover
+    // @Units: deg/s
+    // @Increment: 1
+    // @Range: 10 300
+    // @User: Standard
+    AP_GROUPINFO("RATE_UP", 3, Tiltrotor, max_rate_up_dps, 40),
+
+    // @Param: MAX
+    // @DisplayName: Tiltrotor maximum VTOL angle
+    // @Description: This is the maximum angle of the tiltable motors at which multicopter control will be enabled. Beyond this angle the plane will fly solely as a fixed wing aircraft and the motors will tilt to their maximum angle at the TILT_RATE
+    // @Units: deg
+    // @Increment: 1
+    // @Range: 20 80
+    // @User: Standard
+    AP_GROUPINFO("MAX", 4, Tiltrotor, max_angle_deg, 45),
+
+    // @Param: TYPE
+    // @DisplayName: Tiltrotor type
+    // @Description: This is the type of tiltrotor when TILT_MASK is non-zero. A continuous tiltrotor can tilt the rotors to any angle on demand. A binary tiltrotor assumes a retract style servo where the servo is either fully forward or fully up. In both cases the servo can't move faster than Q_TILT_RATE. A vectored yaw tiltrotor will use the tilt of the motors to control yaw in hover, Bicopter tiltrotor must use the tailsitter frame class (10)
+    // @Values: 0:Continuous,1:Binary,2:VectoredYaw,3:Bicopter
+    AP_GROUPINFO("TYPE", 5, Tiltrotor, type, TILT_TYPE_CONTINUOUS),
+
+    // @Param: RATE_DN
+    // @DisplayName: Tiltrotor downwards tilt rate
+    // @Description: This is the maximum speed at which the motor angle will change for a tiltrotor when moving from hover to forward flight. When this is zero the Q_TILT_RATE_UP value is used.
+    // @Units: deg/s
+    // @Increment: 1
+    // @Range: 10 300
+    // @User: Standard
+    AP_GROUPINFO("RATE_DN", 6, Tiltrotor, max_rate_down_dps, 0),
+
+    // @Param: YAW_ANGLE
+    // @DisplayName: Tilt minimum angle for vectored yaw
+    // @Description: This is the angle of the tilt servos when in VTOL mode and at minimum output (fully back). This needs to be set in addition to Q_TILT_TYPE=2, to enable vectored control for yaw in tilt quadplanes. This is also used to limit the forward travel of bicopter tilts(Q_TILT_TYPE=3) when in VTOL modes.
+    // @Range: 0 30
+    AP_GROUPINFO("YAW_ANGLE", 7, Tiltrotor, tilt_yaw_angle, 0),
+
+    // @Param: FIX_ANGLE
+    // @DisplayName: Fixed wing tiltrotor angle
+    // @Description: This is the angle the motors tilt down when at maximum output for forward flight. Set this to a non-zero value to enable vectoring for roll/pitch in forward flight on tilt-vectored aircraft
+    // @Units: deg
+    // @Range: 0 30
+    // @User: Standard
+    AP_GROUPINFO("FIX_ANGLE", 8, Tiltrotor, fixed_angle, 0),
+
+    // @Param: FIX_GAIN
+    // @DisplayName: Fixed wing tiltrotor gain
+    // @Description: This is the gain for use of tilting motors in fixed wing flight for tilt vectored quadplanes
+    // @Range: 0 1
+    // @User: Standard
+    AP_GROUPINFO("FIX_GAIN", 9, Tiltrotor, fixed_gain, 0),
+
+    // @Param: WING_FLAP
+    // @DisplayName: Tiltrotor tilt angle that will be used as flap
+    // @Description: For use on tilt wings, the wing will tilt up to this angle for flap, transition will be complete when the wing reaches this angle from the forward fight position, 0 disables
+    // @Units: deg
+    // @Increment: 1
+    // @Range: 0 15
+    // @User: Standard
+    AP_GROUPINFO("WING_FLAP", 10, Tiltrotor, flap_angle_deg, 0),
+
+    AP_GROUPEND
+};
+
+/*
+  control code for tiltrotors and tiltwings. Enabled by setting
+  Q_TILT_MASK to a non-zero value
+ */
+
+Tiltrotor::Tiltrotor(QuadPlane& _quadplane, AP_MotorsMulticopter*& _motors):quadplane(_quadplane),motors(_motors)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+void Tiltrotor::setup()
+{
+
+    if (!enable.configured() && ((tilt_mask != 0) || (type == TILT_TYPE_BICOPTER))) {
+        enable.set_and_save(1);
+    }
+
+    if (enable <= 0) {
+        return;
+    }
+
+    _is_vectored = tilt_mask != 0 && type == TILT_TYPE_VECTORED_YAW;
+
+    // true if a fixed forward motor is configured, either throttle, throttle left  or throttle right.
+    // bicopter tiltrotors use throttle left and right as tilting motors, so they don't count in that case.
+    _have_fw_motor = SRV_Channels::function_assigned(SRV_Channel::k_throttle) ||
+                    ((SRV_Channels::function_assigned(SRV_Channel::k_throttleLeft) || SRV_Channels::function_assigned(SRV_Channel::k_throttleRight))
+                        && (type != TILT_TYPE_BICOPTER));
+
+
+    // check if there are any permanent VTOL motors
+    for (uint8_t i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; ++i) {
+        if (motors->is_motor_enabled(i) && ((tilt_mask & (1U<<1)) == 0)) {
+            // enabled motor not set in tilt mask
+            _have_vtol_motor = true;
+            break;
+        }
+    }
+
+    if (_is_vectored) {
+        // we will be using vectoring for yaw
+        motors->disable_yaw_torque();
+    }
+
+    if (tilt_mask != 0) {
+        // setup tilt compensation
+        motors->set_thrust_compensation_callback(FUNCTOR_BIND_MEMBER(&Tiltrotor::tilt_compensate, void, float *, uint8_t));
+        if (type == TILT_TYPE_VECTORED_YAW) {
+            // setup tilt servos for vectored yaw
+            SRV_Channels::set_range(SRV_Channel::k_tiltMotorLeft,  1000);
+            SRV_Channels::set_range(SRV_Channel::k_tiltMotorRight, 1000);
+            SRV_Channels::set_range(SRV_Channel::k_tiltMotorRear,  1000);
+            SRV_Channels::set_range(SRV_Channel::k_tiltMotorRearLeft, 1000);
+            SRV_Channels::set_range(SRV_Channel::k_tiltMotorRearRight, 1000);
+        }
+    }
+
+    transition = NEW_NOTHROW Tiltrotor_Transition(quadplane, motors, *this);
+    if (!transition) {
+        AP_BoardConfig::allocation_error("tiltrotor transition");
+    }
+    quadplane.transition = transition;
+
+    setup_complete = true;
+}
+
+/*
+  calculate maximum tilt change as a proportion from 0 to 1 of tilt
+ */
+float Tiltrotor::tilt_max_change(bool up, bool in_flap_range) const
+{
+    float rate;
+    if (up || max_rate_down_dps <= 0) {
+        rate = max_rate_up_dps;
+    } else {
+        rate = max_rate_down_dps;
+    }
+    if (type != TILT_TYPE_BINARY && !up && !in_flap_range) {
+        bool fast_tilt = false;
+        if (plane.control_mode == &plane.mode_manual) {
+            fast_tilt = true;
+        }
+        if (plane.arming.is_armed_and_safety_off() && !quadplane.in_vtol_mode() && !quadplane.assisted_flight) {
+            fast_tilt = true;
+        }
+        if (fast_tilt) {
+            // allow a minimum of 90 DPS in manual or if we are not
+            // stabilising, to give fast control
+            rate = MAX(rate, 90);
+        }
+    }
+    return rate * plane.G_Dt * (1/90.0);
+}
+
+/*
+  output a slew limited tiltrotor angle. tilt is from 0 to 1
+ */
+void Tiltrotor::slew(float newtilt)
+{
+    float max_change = tilt_max_change(newtilt<current_tilt, newtilt > get_fully_forward_tilt());
+    current_tilt = constrain_float(newtilt, current_tilt-max_change, current_tilt+max_change);
+
+    angle_achieved = is_equal(newtilt, current_tilt);
+
+    // translate to 0..1000 range and output
+    SRV_Channels::set_output_scaled(SRV_Channel::k_motor_tilt, 1000 * current_tilt);
+}
+
+// return the current tilt value that represents forward flight
+// tilt wings can sustain forward flight with some amount of wing tilt
+float Tiltrotor::get_fully_forward_tilt() const
+{
+    return 1.0 - (flap_angle_deg * (1/90.0));
+}
+
+// return the target tilt value for forward flight
+float Tiltrotor::get_forward_flight_tilt() const
+{
+    return 1.0 - ((flap_angle_deg * (1/90.0)) * SRV_Channels::get_slew_limited_output_scaled(SRV_Channel::k_flap_auto) * 0.01);
+}
+
+/*
+  update motor tilt for continuous tilt servos
+ */
+void Tiltrotor::continuous_update(void)
+{
+    // default to inactive
+    _motors_active = false;
+
+    // the maximum rate of throttle change
+    float max_change;
+
+    if (!quadplane.in_vtol_mode() && (!plane.arming.is_armed_and_safety_off() || !quadplane.assisted_flight)) {
+        // we are in pure fixed wing mode. Move the tiltable motors all the way forward and run them as
+        // a forward motor
+
+        // option set then if disarmed move to VTOL position to prevent ground strikes, allow tilt forward in manual mode for testing
+        const bool disarmed_tilt_up = !plane.arming.is_armed_and_safety_off() && (plane.control_mode != &plane.mode_manual) && quadplane.option_is_set(QuadPlane::OPTION::DISARMED_TILT_UP);
+        slew(disarmed_tilt_up ? 0.0 : get_forward_flight_tilt());
+
+        max_change = tilt_max_change(false);
+
+        float new_throttle = constrain_float(SRV_Channels::get_output_scaled(SRV_Channel::k_throttle)*0.01, 0, 1);
+        if (current_tilt < get_fully_forward_tilt()) {
+            current_throttle = constrain_float(new_throttle,
+                                                    current_throttle-max_change,
+                                                    current_throttle+max_change);
+        } else {
+            current_throttle = new_throttle;
+        }
+        if (!plane.arming.is_armed_and_safety_off()) {
+            current_throttle = 0;
+        } else {
+            // prevent motor shutdown
+            _motors_active = true;
+        }
+        if (!quadplane.motor_test.running) {
+            // the motors are all the way forward, start using them for fwd thrust
+            const uint16_t mask = is_zero(current_throttle)?0U:tilt_mask.get();
+            motors->output_motor_mask(current_throttle, mask, plane.rudder_dt);
+        }
+        return;
+    }
+
+    // remember the throttle level we're using for VTOL flight
+    float motors_throttle = motors->get_throttle();
+    max_change = tilt_max_change(motors_throttle<current_throttle);
+    current_throttle = constrain_float(motors_throttle,
+                                            current_throttle-max_change,
+                                            current_throttle+max_change);
+
+    /*
+      we are in a VTOL mode. We need to work out how much tilt is
+      needed. There are 5 strategies we will use:
+
+      1) With use of a forward throttle controlled by Q_FWD_THR_GAIN in
+         VTOL modes except Q_AUTOTUNE determined by Q_FWD_THR_USE. We set the angle based on a calculated
+         forward throttle.
+
+      2) With manual forward throttle control we set the angle based on the
+         RC input demanded forward throttle for QACRO, QSTABILIZE and QHOVER.
+
+      3) Without a RC input or calculated forward throttle value, the angle
+         will be set to zero in QAUTOTUNE, QACRO, QSTABILIZE and QHOVER.
+         This enables these modes to be used as a safe recovery mode.
+
+      4) In fixed wing assisted flight or velocity controlled modes we will
+         set the angle based on the demanded forward throttle, with a maximum
+         tilt given by Q_TILT_MAX. This relies on Q_FWD_THR_GAIN or Q_VFWD_GAIN
+         being set.
+
+      5) if we are in TRANSITION_TIMER mode then we are transitioning
+         to forward flight and should put the rotors all the way forward
+    */
+
+#if QAUTOTUNE_ENABLED
+    if (plane.control_mode == &plane.mode_qautotune) {
+        slew(0);
+        return;
+    }
+#endif
+
+    if (!quadplane.assisted_flight &&
+        quadplane.get_vfwd_method() == QuadPlane::ActiveFwdThr::NEW &&
+        quadplane.is_flying_vtol())
+    {
+        // We are using the rotor tilt functionality controlled by Q_FWD_THR_GAIN which can
+        // operate in all VTOL modes except Q_AUTOTUNE. Forward rotor tilt is used to produce
+        // forward thrust equivalent to what would have been produced by a forward thrust motor
+        // set to quadplane.forward_throttle_pct()
+        const float fwd_g_demand = 0.01 * quadplane.forward_throttle_pct();
+        const float fwd_tilt_deg = MIN(degrees(atanf(fwd_g_demand)), (float)max_angle_deg);
+        slew(MIN(fwd_tilt_deg * (1/90.0), get_forward_flight_tilt()));
+        return;
+    } else if (!quadplane.assisted_flight &&
+               (plane.control_mode == &plane.mode_qacro ||
+               plane.control_mode == &plane.mode_qstabilize ||
+               plane.control_mode == &plane.mode_qhover))
+    {
+        if (quadplane.rc_fwd_thr_ch == nullptr) {
+            // no manual throttle control, set angle to zero
+            slew(0);
+        } else {
+            // manual control of forward throttle up to max VTOL angle
+            float settilt = .01f * quadplane.forward_throttle_pct();
+            slew(MIN(settilt * max_angle_deg * (1/90.0), get_forward_flight_tilt())); 
+        }
+        return;
+    }
+
+    if (quadplane.assisted_flight &&
+        transition->transition_state >= Tiltrotor_Transition::TRANSITION_TIMER) {
+        // we are transitioning to fixed wing - tilt the motors all
+        // the way forward
+        slew(get_forward_flight_tilt());
+    } else {
+        // until we have completed the transition we limit the tilt to
+        // Q_TILT_MAX. Anything above 50% throttle gets
+        // Q_TILT_MAX. Below 50% throttle we decrease linearly. This
+        // relies heavily on Q_VFWD_GAIN being set appropriately.
+       float settilt = constrain_float((SRV_Channels::get_output_scaled(SRV_Channel::k_throttle)-MAX(plane.aparm.throttle_min.get(),0)) * 0.02, 0, 1);
+       slew(MIN(settilt * max_angle_deg * (1/90.0), get_forward_flight_tilt())); 
+    }
+}
+
+
+/*
+  output a slew limited tiltrotor angle. tilt is 0 or 1
+ */
+void Tiltrotor::binary_slew(bool forward)
+{
+    // The servo output is binary, not slew rate limited
+    SRV_Channels::set_output_scaled(SRV_Channel::k_motor_tilt, forward?1000:0);
+
+    // rate limiting current_tilt has the effect of delaying throttle in tiltrotor_binary_update
+    float max_change = tilt_max_change(!forward);
+    if (forward) {
+        current_tilt = constrain_float(current_tilt+max_change, 0, 1);
+    } else {
+        current_tilt = constrain_float(current_tilt-max_change, 0, 1);
+    }
+}
+
+/*
+  update motor tilt for binary tilt servos
+ */
+void Tiltrotor::binary_update(void)
+{
+    // motors always active
+    _motors_active = true;
+
+    if (!quadplane.in_vtol_mode()) {
+        // we are in pure fixed wing mode. Move the tiltable motors
+        // all the way forward and run them as a forward motor
+        binary_slew(true);
+
+        float new_throttle = SRV_Channels::get_output_scaled(SRV_Channel::k_throttle)*0.01f;
+        if (current_tilt >= 1) {
+            const uint16_t mask = is_zero(new_throttle)?0U:tilt_mask.get();
+            // the motors are all the way forward, start using them for fwd thrust
+            motors->output_motor_mask(new_throttle, mask, plane.rudder_dt);
+        }
+    } else {
+        binary_slew(false);
+    }
+}
+
+
+/*
+  update motor tilt
+ */
+void Tiltrotor::update(void)
+{
+    if (!enabled() || tilt_mask == 0) {
+        // no motors to tilt
+        return;
+    }
+
+    if (type == TILT_TYPE_BINARY) {
+        binary_update();
+    } else {
+        continuous_update();
+    }
+
+    if (type == TILT_TYPE_VECTORED_YAW) {
+        vectoring();
+    }
+}
+
+#if HAL_LOGGING_ENABLED
+// Write tiltrotor specific log
+void Tiltrotor::write_log()
+{
+    struct log_tiltrotor pkt {
+        LOG_PACKET_HEADER_INIT(LOG_TILT_MSG),
+        time_us      : AP_HAL::micros64(),
+        current_tilt : current_tilt * 90.0,
+    };
+
+    if (type != TILT_TYPE_VECTORED_YAW) {
+        // Left and right tilt are invalid
+        pkt.front_left_tilt = plane.logger.quiet_nanf();
+        pkt.front_right_tilt = plane.logger.quiet_nanf();
+
+    } else {
+        // Calculate tilt angle from servo outputs
+        const float total_angle = 90.0 + tilt_yaw_angle + fixed_angle;
+        const float scale = total_angle * 0.001;
+        pkt.front_left_tilt = (SRV_Channels::get_output_scaled(SRV_Channel::k_tiltMotorLeft) * scale) - tilt_yaw_angle;
+        pkt.front_right_tilt = (SRV_Channels::get_output_scaled(SRV_Channel::k_tiltMotorRight) * scale) - tilt_yaw_angle;
+    }
+
+    plane.logger.WriteBlock(&pkt, sizeof(pkt));
+}
+#endif
+
+/*
+  tilt compensation for angle of tilt. When the rotors are tilted the
+  roll effect of differential thrust on the tilted rotors is decreased
+  and the yaw effect increased
+  We have two factors we apply.
+
+  1) when we are transitioning to fwd flight we scale the tilted rotors by 1/cos(angle). This pushes us towards more flight speed
+
+  2) when we are transitioning to hover we scale the non-tilted rotors by cos(angle). This pushes us towards lower fwd thrust
+
+  We also apply an equalisation to the tilted motors in proportion to
+  how much tilt we have. This smoothly reduces the impact of the roll
+  gains as we tilt further forward.
+
+  For yaw, we apply differential thrust in proportion to the demanded
+  yaw control and sin of the tilt angle
+
+  Finally we ensure no requested thrust is over 1 by scaling back all
+  motors so the largest thrust is at most 1.0
+ */
+void Tiltrotor::tilt_compensate_angle(float *thrust, uint8_t num_motors, float non_tilted_mul, float tilted_mul)
+{
+    float tilt_total = 0;
+    uint8_t tilt_count = 0;
+    
+    // apply tilt_factors first
+    for (uint8_t i=0; i<num_motors; i++) {
+        if (!is_motor_tilting(i)) {
+            thrust[i] *= non_tilted_mul;
+        } else {
+            thrust[i] *= tilted_mul;
+            tilt_total += thrust[i];
+            tilt_count++;
+        }
+    }
+
+    float largest_tilted = 0;
+    const float sin_tilt = sinf(radians(current_tilt*90));
+    // yaw_gain relates the amount of differential thrust we get from
+    // tilt, so that the scaling of the yaw control is the same at any
+    // tilt angle
+    const float yaw_gain = sinf(radians(tilt_yaw_angle));
+    const float avg_tilt_thrust = tilt_total / tilt_count;
+
+    for (uint8_t i=0; i<num_motors; i++) {
+        if (is_motor_tilting(i)) {
+            // as we tilt we need to reduce the impact of the roll
+            // controller. This simple method keeps the same average,
+            // but moves us to no roll control as the angle increases
+            thrust[i] = current_tilt * avg_tilt_thrust + thrust[i] * (1-current_tilt);
+            // add in differential thrust for yaw control, scaled by tilt angle
+            const float diff_thrust = motors->get_roll_factor(i) * (motors->get_yaw()+motors->get_yaw_ff()) * sin_tilt * yaw_gain;
+            thrust[i] += diff_thrust;
+            largest_tilted = MAX(largest_tilted, thrust[i]);
+        }
+    }
+
+    // if we are saturating one of the motors then reduce all motors
+    // to keep them in proportion to the original thrust. This helps
+    // maintain stability when tilted at a large angle
+    if (largest_tilted > 1.0f) {
+        float scale = 1.0f / largest_tilted;
+        for (uint8_t i=0; i<num_motors; i++) {
+            thrust[i] *= scale;
+        }
+    }
+}
+
+/*
+  choose up or down tilt compensation based on flight mode When going
+  to a fixed wing mode we use tilt_compensate_down, when going to a
+  VTOL mode we use tilt_compensate_up
+ */
+void Tiltrotor::tilt_compensate(float *thrust, uint8_t num_motors)
+{
+    if (current_tilt <= 0) {
+        // the motors are not tilted, no compensation needed
+        return;
+    }
+    if (quadplane.in_vtol_mode()) {
+        // we are transitioning to VTOL flight
+        const float tilt_factor = cosf(radians(current_tilt*90));
+        tilt_compensate_angle(thrust, num_motors, tilt_factor, 1);
+    } else {
+        float inv_tilt_factor;
+        if (current_tilt > 0.98f) {
+            inv_tilt_factor = 1.0 / cosf(radians(0.98f*90));
+        } else {
+            inv_tilt_factor = 1.0 / cosf(radians(current_tilt*90));
+        }
+        tilt_compensate_angle(thrust, num_motors, 1, inv_tilt_factor);
+    }
+}
+
+/*
+  return true if the rotors are fully tilted forward
+ */
+bool Tiltrotor::fully_fwd(void) const
+{
+    if (!enabled() || (tilt_mask == 0)) {
+        return false;
+    }
+    return (current_tilt >= get_fully_forward_tilt());
+}
+
+/*
+  return true if the rotors are fully tilted up
+ */
+bool Tiltrotor::fully_up(void) const
+{
+    if (!enabled() || (tilt_mask == 0)) {
+        return false;
+    }
+    return (current_tilt <= 0);
+}
+
+/*
+  control vectoring for tilt multicopters
+ */
+void Tiltrotor::vectoring(void)
+{
+    // total angle the tilt can go through
+    const float total_angle = 90 + tilt_yaw_angle + fixed_angle;
+    // output value (0 to 1) to get motors pointed straight up
+    const float zero_out = tilt_yaw_angle / total_angle;
+    const float fixed_tilt_limit = fixed_angle / total_angle;
+    const float level_out = 1.0 - fixed_tilt_limit;
+
+    // calculate the basic tilt amount from current_tilt
+    float base_output = zero_out + (current_tilt * (level_out - zero_out));
+    // for testing when disarmed, apply vectored yaw in proportion to rudder stick
+    // Wait TILT_DELAY_MS after disarming to allow props to spin down first.
+    constexpr uint32_t TILT_DELAY_MS = 3000;
+    uint32_t now = AP_HAL::millis();
+    if (!plane.arming.is_armed_and_safety_off() && plane.quadplane.option_is_set(QuadPlane::OPTION::DISARMED_TILT)) {
+        // this test is subject to wrapping at ~49 days, but the consequences are insignificant
+        if ((now - hal.util->get_last_armed_change()) > TILT_DELAY_MS) {
+            if (quadplane.in_vtol_mode()) {
+                float yaw_out = plane.channel_rudder->get_control_in();
+                yaw_out /= plane.channel_rudder->get_range();
+                float yaw_range = zero_out;
+
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft,  1000 * constrain_float(base_output + yaw_out * yaw_range,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight, 1000 * constrain_float(base_output - yaw_out * yaw_range,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRear,  1000 * constrain_float(base_output,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearLeft,  1000 * constrain_float(base_output + yaw_out * yaw_range,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearRight, 1000 * constrain_float(base_output - yaw_out * yaw_range,0,1));
+            } else {
+                // fixed wing tilt
+                const float gain = fixed_gain * fixed_tilt_limit;
+                // base the tilt on elevon mixing, which means it
+                // takes account of the MIXING_GAIN. The rear tilt is
+                // based on elevator
+                const float right = gain * SRV_Channels::get_output_scaled(SRV_Channel::k_elevon_right) * (1/4500.0);
+                const float left  = gain * SRV_Channels::get_output_scaled(SRV_Channel::k_elevon_left) * (1/4500.0);
+                const float mid  = gain * SRV_Channels::get_output_scaled(SRV_Channel::k_elevator) * (1/4500.0);
+                // front tilt is effective canards, so need to swap and use negative. Rear motors are treated live elevons.
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft,1000 * constrain_float(base_output - right,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight,1000 * constrain_float(base_output - left,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearLeft,1000 * constrain_float(base_output + left,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearRight,1000 * constrain_float(base_output + right,0,1));
+                SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRear,  1000 * constrain_float(base_output + mid,0,1));
+            }
+        }
+        return;
+    }
+
+    const bool no_yaw = tilt_over_max_angle();
+    if (no_yaw) {
+        // fixed wing  We need to apply inverse scaling with throttle, and remove the surface speed scaling as
+        // we don't want tilt impacted by airspeed
+        const float scaler = plane.control_mode == &plane.mode_manual?1:(quadplane.FW_vector_throttle_scaling() / plane.get_speed_scaler());
+        const float gain = fixed_gain * fixed_tilt_limit * scaler;
+        const float right = gain * SRV_Channels::get_output_scaled(SRV_Channel::k_elevon_right) * (1/4500.0);
+        const float left  = gain * SRV_Channels::get_output_scaled(SRV_Channel::k_elevon_left) * (1/4500.0);
+        const float mid  = gain * SRV_Channels::get_output_scaled(SRV_Channel::k_elevator) * (1/4500.0);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft,1000 * constrain_float(base_output - right,0,1));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight,1000 * constrain_float(base_output - left,0,1));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearLeft,1000 * constrain_float(base_output + left,0,1));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearRight,1000 * constrain_float(base_output + right,0,1));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRear,  1000 * constrain_float(base_output + mid,0,1));
+    } else {
+        const float yaw_out = motors->get_yaw()+motors->get_yaw_ff();
+        const float roll_out = motors->get_roll()+motors->get_roll_ff();
+        const float yaw_range = zero_out;
+
+        // Scaling yaw with throttle
+        const float throttle = motors->get_throttle_out();
+        const float scale_min = 0.5;
+        const float scale_max = 2.0;
+        float throttle_scaler = scale_max;
+        if (is_positive(throttle)) {
+            throttle_scaler = constrain_float(motors->get_throttle_hover() / throttle, scale_min, scale_max);
+        }
+
+        // now apply vectored thrust for yaw and roll.
+        const float tilt_rad = radians(current_tilt*90);
+        const float sin_tilt = sinf(tilt_rad);
+        const float cos_tilt = cosf(tilt_rad);
+        // the MotorsMatrix library normalises roll factor to 0.5, so
+        // we need to use the same factor here to keep the same roll
+        // gains when tilted as we have when not tilted
+        const float avg_roll_factor = 0.5;
+        float tilt_scale = throttle_scaler * yaw_out * cos_tilt + avg_roll_factor * roll_out * sin_tilt;
+
+        if (fabsf(tilt_scale) > 1.0) {
+            tilt_scale = constrain_float(tilt_scale, -1.0, 1.0);
+            motors->limit.yaw = true;
+        }
+
+        const float tilt_offset = tilt_scale * yaw_range;
+
+        float left_tilt = base_output + tilt_offset;
+        float right_tilt = base_output - tilt_offset;
+
+        // if output saturation of both left and right then set yaw limit flag
+        if (((left_tilt > 1.0) || (left_tilt < 0.0)) &&
+            ((right_tilt > 1.0) || (right_tilt < 0.0))) {
+            motors->limit.yaw = true;
+        }
+
+        // constrain and scale to ouput range
+        left_tilt = constrain_float(left_tilt,0.0,1.0) * 1000.0;
+        right_tilt = constrain_float(right_tilt,0.0,1.0) * 1000.0;
+
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft, left_tilt);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight, right_tilt);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRear, 1000.0 * constrain_float(base_output,0.0,1.0));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearLeft, left_tilt);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRearRight, right_tilt);
+    }
+}
+
+/*
+  control bicopter tiltrotors
+ */
+void Tiltrotor::bicopter_output(void)
+{
+    if (type != TILT_TYPE_BICOPTER || quadplane.motor_test.running) {
+        // don't override motor test with motors_output
+        return;
+    }
+
+    if (!quadplane.in_vtol_mode() && fully_fwd()) {
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft,  -SERVO_MAX);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight, -SERVO_MAX);
+        return;
+    }
+
+    float throttle = SRV_Channels::get_output_scaled(SRV_Channel::k_throttle);
+    if (quadplane.assisted_flight) {
+        quadplane.hold_stabilize(throttle * 0.01f);
+        quadplane.motors_output(true);
+    } else {
+        quadplane.motors_output(false);
+    }
+
+    // bicopter assumes that trim is up so we scale down so match
+    float tilt_left = SRV_Channels::get_output_scaled(SRV_Channel::k_tiltMotorLeft);
+    float tilt_right = SRV_Channels::get_output_scaled(SRV_Channel::k_tiltMotorRight);
+
+    if (is_negative(tilt_left)) {
+        tilt_left *= tilt_yaw_angle * (1/90.0);
+    }
+    if (is_negative(tilt_right)) {
+        tilt_right *= tilt_yaw_angle * (1/90.0);
+    }
+
+    // reduce authority of bicopter as motors are tilted forwards
+    const float scaling = cosf(current_tilt * M_PI_2);
+    tilt_left  *= scaling;
+    tilt_right *= scaling;
+
+    // add current tilt and constrain
+    tilt_left  = constrain_float(-(current_tilt * SERVO_MAX) + tilt_left,  -SERVO_MAX, SERVO_MAX);
+    tilt_right = constrain_float(-(current_tilt * SERVO_MAX) + tilt_right, -SERVO_MAX, SERVO_MAX);
+
+    SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft,  tilt_left);
+    SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight, tilt_right);
+}
+
+/*
+  when doing a forward transition of a tilt-vectored quadplane we use
+  euler angle control to maintain good yaw. This updates the yaw
+  target based on pilot input and target roll
+ */
+void Tiltrotor::update_yaw_target(void)
+{
+    uint32_t now = AP_HAL::millis();
+    if (now - transition_yaw_set_ms > 100 ||
+        !is_zero(quadplane.get_pilot_input_yaw_rate_cds())) {
+        // lock initial yaw when transition is started or when
+        // pilot commands a yaw change. This allows us to track
+        // straight in transitions for tilt-vectored planes, but
+        // allows for turns when level transition is not wanted
+        transition_yaw_cd = quadplane.ahrs.yaw_sensor;
+    }
+
+    /*
+      now calculate the equivalent yaw rate for a coordinated turn for
+      the desired bank angle given the airspeed
+     */
+    float aspeed;
+    bool have_airspeed = quadplane.ahrs.airspeed_estimate(aspeed);
+    if (have_airspeed && labs(plane.nav_roll_cd)>1000) {
+        float dt = (now - transition_yaw_set_ms) * 0.001;
+        // calculate the yaw rate to achieve the desired turn rate
+        const float airspeed_min = MAX(plane.aparm.airspeed_min,5);
+        const float yaw_rate_cds = fixedwing_turn_rate(plane.nav_roll_cd*0.01, MAX(aspeed,airspeed_min))*100;
+        transition_yaw_cd += yaw_rate_cds * dt;
+    }
+    transition_yaw_set_ms = now;
+}
+
+bool Tiltrotor_Transition::update_yaw_target(float& yaw_target_cd)
+{
+    if (!(tiltrotor.is_vectored() &&
+        transition_state <= TRANSITION_TIMER)) {
+        return false;
+    }
+    tiltrotor.update_yaw_target();
+    yaw_target_cd = tiltrotor.transition_yaw_cd;
+    return true;
+}
+
+// return true if we should show VTOL view
+bool Tiltrotor_Transition::show_vtol_view() const
+{
+    bool show_vtol = quadplane.in_vtol_mode();
+
+    if (!show_vtol && tiltrotor.is_vectored() && transition_state <= TRANSITION_TIMER) {
+        // we use multirotor controls during fwd transition for
+        // vectored yaw vehicles
+        return true;
+    }
+
+    return show_vtol;
+}
+
+// return true if we are tilted over the max angle threshold
+bool Tiltrotor::tilt_over_max_angle(void) const
+{
+    const float tilt_threshold = (max_angle_deg/90.0f);
+    return (current_tilt > MIN(tilt_threshold, get_forward_flight_tilt()));
+}
+
+#endif  // HAL_QUADPLANE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <AP_Param/AP_Param.h>
+#include "transition.h"
+#include <AP_Logger/LogStructure.h>
+
+class QuadPlane;
+class AP_MotorsMulticopter;
+class Tiltrotor_Transition;
+class Tiltrotor
+{
+friend class QuadPlane;
+friend class Plane;
+friend class Tiltrotor_Transition;
+public:
+
+    Tiltrotor(QuadPlane& _quadplane, AP_MotorsMulticopter*& _motors);
+
+    bool enabled() const { return (enable > 0) && setup_complete;}
+
+    void setup();
+
+    void slew(float tilt);
+    void binary_slew(bool forward);
+    void update();
+    void continuous_update();
+    void binary_update();
+    void vectoring();
+    void bicopter_output();
+    void tilt_compensate_angle(float *thrust, uint8_t num_motors, float non_tilted_mul, float tilted_mul);
+    void tilt_compensate(float *thrust, uint8_t num_motors);
+    bool tilt_over_max_angle(void) const;
+
+    bool is_motor_tilting(uint8_t motor) const {
+        return tilt_mask.get() & (1U<<motor);
+    }
+
+    bool fully_fwd() const;
+    bool fully_up() const;
+    float tilt_max_change(bool up, bool in_flap_range = false) const;
+    float get_fully_forward_tilt() const;
+    float get_forward_flight_tilt() const;
+
+    // update yaw target for tiltrotor transition
+    void update_yaw_target();
+
+    bool is_vectored() const { return enabled() && _is_vectored; }
+
+    bool has_fw_motor() const { return _have_fw_motor; }
+
+    bool has_vtol_motor() const { return _have_vtol_motor; }
+
+    bool motors_active() const { return enabled() && _motors_active; }
+
+    // true if the tilts have completed slewing
+    // always return true if not enabled or not a continuous type
+    bool tilt_angle_achieved() const { return !enabled() || (type != TILT_TYPE_CONTINUOUS) || angle_achieved; }
+
+    // Write tiltrotor specific log
+    void write_log();
+
+    AP_Int8 enable;
+    AP_Int16 tilt_mask;
+    AP_Int16 max_rate_up_dps;
+    AP_Int16 max_rate_down_dps;
+    AP_Int8  max_angle_deg;
+    AP_Int8  type;
+    AP_Float tilt_yaw_angle;
+    AP_Float fixed_angle;
+    AP_Float fixed_gain;
+    AP_Float flap_angle_deg;
+
+    float current_tilt;
+    float current_throttle;
+    bool _motors_active:1;
+    float transition_yaw_cd;
+    uint32_t transition_yaw_set_ms;
+    bool _is_vectored;
+
+    // types of tilt mechanisms
+    enum {TILT_TYPE_CONTINUOUS    =0,
+          TILT_TYPE_BINARY        =1,
+          TILT_TYPE_VECTORED_YAW  =2,
+          TILT_TYPE_BICOPTER      =3
+    };
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+private:
+
+    // Tiltrotor specific log message
+    struct PACKED log_tiltrotor {
+        LOG_PACKET_HEADER;
+        uint64_t time_us;
+        float current_tilt;
+        float front_left_tilt;
+        float front_right_tilt;
+    };
+
+    bool setup_complete;
+
+    // true if a fixed forward motor is setup
+    bool _have_fw_motor;
+
+    // true if all motors tilt with no fixed VTOL motor
+    bool _have_vtol_motor;
+
+    // true if the current tilt angle is equal to the desired
+    // with slow tilt rates the tilt angle can lag
+    bool angle_achieved;
+
+    // refences for convenience
+    QuadPlane& quadplane;
+    AP_MotorsMulticopter*& motors;
+
+    Tiltrotor_Transition* transition;
+
+};
+
+// Transition for separate left thrust quadplanes
+class Tiltrotor_Transition : public SLT_Transition
+{
+friend class Tiltrotor;
+public:
+
+    Tiltrotor_Transition(QuadPlane& _quadplane, AP_MotorsMulticopter*& _motors, Tiltrotor& _tiltrotor):SLT_Transition(_quadplane, _motors), tiltrotor(_tiltrotor) {};
+
+    bool update_yaw_target(float& yaw_target_cd) override;
+
+    bool show_vtol_view() const override;
+
+private:
+
+    Tiltrotor& tiltrotor;
+
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+/*
+  This is the main Sub class
+ */
+
+////////////////////////////////////////////////////////////////////////////////
+// Header includes
+////////////////////////////////////////////////////////////////////////////////
+
+#include <cmath>
+#include <stdio.h>
+#include <stdarg.h>
+
+#include <AP_HAL/AP_HAL.h>
+
+// Common dependencies
+#include <AP_Common/AP_Common.h>
+#include <AP_Common/Location.h>
+#include <AP_Param/AP_Param.h>
+#include <StorageManager/StorageManager.h>
+#include <AP_AccelCal/AP_AccelCal.h>                // interface and maths for accelerometer calibration
+#include <AP_Math/AP_Math.h>            // ArduPilot Mega Vector/Matrix math Library
+#include <AP_Declination/AP_Declination.h>     // ArduPilot Mega Declination Helper Library
+
+// Application dependencies
+#include <AP_GPS/AP_GPS.h>             // ArduPilot GPS library
+#include <AP_Logger/AP_Logger.h>          // ArduPilot Mega Flash Memory Library
+#include <AP_Baro/AP_Baro.h>
+#include <AP_Compass/AP_Compass.h>         // ArduPilot Mega Magnetometer Library
+#include <AP_InertialSensor/AP_InertialSensor.h>  // ArduPilot Mega Inertial Sensor (accel & gyro) Library
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Mission/AP_Mission.h>         // Mission command library
+#include <AC_AttitudeControl/AC_AttitudeControl_Sub.h> // Attitude control library
+#include <AC_AttitudeControl/AC_PosControl.h>      // Position control library
+#include <AP_Motors/AP_Motors.h>          // AP Motors library
+#include <Filter/Filter.h>             // Filter library
+#include <AP_Relay/AP_Relay.h>           // APM relay
+#include <AP_Mount/AP_Mount.h>           // Camera/Antenna mount
+#include <AP_Vehicle/AP_Vehicle.h>         // needed for AHRS build
+#include <AP_InertialNav/AP_InertialNav.h>     // inertial navigation library
+#include <AC_WPNav/AC_WPNav.h>           // Waypoint navigation library
+#include <AC_WPNav/AC_Loiter.h>
+#include <AC_WPNav/AC_Circle.h>          // circle navigation library
+#include <AP_Scheduler/AP_Scheduler.h>       // main loop scheduler
+#include <AP_Scheduler/PerfInfo.h>       // loop perf monitoring
+#include <AP_BattMonitor/AP_BattMonitor.h>     // Battery monitor library
+#include <AP_Terrain/AP_Terrain.h>
+#include <AP_JSButton/AP_JSButton.h>   // Joystick/gamepad button function assignment
+#include <AP_LeakDetector/AP_LeakDetector.h> // Leak detector
+#include <AP_Proximity/AP_Proximity.h>
+#include <AP_Rally/AP_Rally.h>
+
+// Local modules
+#include "defines.h"
+#include "config.h"
+#include "GCS_Mavlink.h"
+#include "RC_Channel.h"         // RC Channel Library
+#include "Parameters.h"
+#include "AP_Arming_Sub.h"
+#include "GCS_Sub.h"
+#include "mode.h"
+#include "script_button.h"
+
+#include <AP_OpticalFlow/AP_OpticalFlow.h>     // Optical Flow library
+
+// libraries which are dependent on #defines in defines.h and/or config.h
+#if RCMAP_ENABLED == ENABLED
+#include <AP_RCMapper/AP_RCMapper.h>        // RC input mapping library
+#endif
+
+#include <AP_RPM/AP_RPM_config.h>
+
+#if AP_RPM_ENABLED
+#include <AP_RPM/AP_RPM.h>
+#endif
+
+#if AVOIDANCE_ENABLED == ENABLED
+#include <AC_Avoidance/AC_Avoid.h>           // Stop at fence library
+#endif
+
+#include <AP_Camera/AP_Camera.h>          // Photo or video camera
+
+#if AP_SCRIPTING_ENABLED
+#include <AP_Scripting/AP_Scripting.h>
+#endif
+
+class Sub : public AP_Vehicle {
+public:
+    friend class GCS_MAVLINK_Sub;
+    friend class GCS_Sub;
+    friend class Parameters;
+    friend class ParametersG2;
+    friend class AP_Arming_Sub;
+    friend class RC_Channels_Sub;
+    friend class Mode;
+    friend class ModeManual;
+    friend class ModeStabilize;
+    friend class ModeAcro;
+    friend class ModeAlthold;
+    friend class ModeSurftrak;
+    friend class ModeGuided;
+    friend class ModePoshold;
+    friend class ModeAuto;
+    friend class ModeCircle;
+    friend class ModeSurface;
+    friend class ModeMotordetect;
+
+    Sub(void);
+
+protected:
+
+    bool should_zero_rc_outputs_on_reboot() const override { return true; }
+
+private:
+
+    // key aircraft parameters passed to multiple libraries
+    AP_MultiCopter aparm;
+
+    // Global parameters are all contained within the 'g' class.
+    Parameters g;
+    ParametersG2 g2;
+
+    // primary input control channels
+    RC_Channel *channel_roll;
+    RC_Channel *channel_pitch;
+    RC_Channel *channel_throttle;
+    RC_Channel *channel_yaw;
+    RC_Channel *channel_forward;
+    RC_Channel *channel_lateral;
+
+    AP_LeakDetector leak_detector;
+
+    struct {
+        bool enabled:1;
+        bool alt_healthy:1; // true if we can trust the altitude from the rangefinder
+        int16_t alt_cm;     // tilt compensated altitude (in cm) from rangefinder
+        int16_t min_cm;     // min rangefinder distance (in cm)
+        int16_t max_cm;     // max rangefinder distance (in cm)
+        uint32_t last_healthy_ms;
+        float inertial_alt_cm;                  // inertial alt at time of last rangefinder sample
+        float rangefinder_terrain_offset_cm;    // terrain height above EKF origin
+        LowPassFilterFloat alt_cm_filt;         // altitude filter
+    } rangefinder_state = { false, false, 0, 0, 0, 0, 0, 0 };
+
+#if AP_RPM_ENABLED
+    AP_RPM rpm_sensor;
+#endif
+
+    // Mission library
+    AP_Mission mission{
+            FUNCTOR_BIND_MEMBER(&Sub::start_command, bool, const AP_Mission::Mission_Command &),
+            FUNCTOR_BIND_MEMBER(&Sub::verify_command_callback, bool, const AP_Mission::Mission_Command &),
+            FUNCTOR_BIND_MEMBER(&Sub::exit_mission, void)};
+
+    // Optical flow sensor
+#if AP_OPTICALFLOW_ENABLED
+    AP_OpticalFlow optflow;
+#endif
+
+    // system time in milliseconds of last recorded yaw reset from ekf
+    uint32_t ekfYawReset_ms = 0;
+
+    // GCS selection
+    GCS_Sub _gcs; // avoid using this; use gcs()
+    GCS_Sub &gcs() { return _gcs; }
+
+    // User variables
+#ifdef USERHOOK_VARIABLES
+# include USERHOOK_VARIABLES
+#endif
+
+    // Documentation of Globals:
+    union {
+        struct {
+            uint8_t pre_arm_check       : 1; // true if all pre-arm checks (rc, accel calibration, gps lock) have been performed
+            uint8_t logging_started     : 1; // true if logging has started
+            uint8_t compass_mot         : 1; // true if we are currently performing compassmot calibration
+            uint8_t motor_test          : 1; // true if we are currently performing the motors test
+            uint8_t initialised         : 1; // true once the init_ardupilot function has completed.  Extended status to GCS is not sent until this completes
+            uint8_t gps_base_pos_set    : 1; // true when the gps base position has been set (used for RTK gps only)
+            uint8_t at_bottom           : 1; // true if we are at the bottom
+            uint8_t at_surface          : 1; // true if we are at the surface
+            uint8_t depth_sensor_present: 1; // true if there is a depth sensor detected at boot
+            uint8_t unused1             : 1; // was compass_init_location; true when the compass's initial location has been set
+        };
+        uint32_t value;
+    } ap;
+
+    // This is the state of the flight control system
+    // There are multiple states defined such as STABILIZE, ACRO,
+    Mode::Number control_mode;
+
+    Mode::Number prev_control_mode;
+
+#if RCMAP_ENABLED == ENABLED
+    RCMapper rcmap;
+#endif
+
+    // Failsafe
+    struct {
+        uint32_t last_leak_warn_ms;      // last time a leak warning was sent to gcs
+        uint32_t last_gcs_warn_ms;
+        uint32_t last_pilot_input_ms; // last time we received pilot input in the form of MANUAL_CONTROL or RC_CHANNELS_OVERRIDE messages
+        uint32_t terrain_first_failure_ms;  // the first time terrain data access failed - used to calculate the duration of the failure
+        uint32_t terrain_last_failure_ms;   // the most recent time terrain data access failed
+        uint32_t last_crash_warn_ms; // last time a crash warning was sent to gcs
+        uint32_t last_ekf_warn_ms; // last time an ekf warning was sent to gcs
+
+        uint8_t pilot_input          : 1; // true if pilot input failsafe is active, handles things like joystick being disconnected during operation
+        uint8_t gcs                  : 1; // A status flag for the ground station failsafe
+        uint8_t ekf                  : 1; // true if ekf failsafe has occurred
+        uint8_t terrain              : 1; // true if the missing terrain data failsafe has occurred
+        uint8_t leak                 : 1; // true if leak recently detected
+        uint8_t internal_pressure    : 1; // true if internal pressure is over threshold
+        uint8_t internal_temperature : 1; // true if temperature is over threshold
+        uint8_t crash                : 1; // true if we are crashed
+        uint8_t sensor_health        : 1; // true if at least one sensor has triggered a failsafe (currently only used for depth in depth enabled modes)
+    } failsafe;
+
+    bool any_failsafe_triggered() const {
+        return (
+            failsafe.pilot_input
+            || battery.has_failsafed()
+            || failsafe.gcs
+            || failsafe.ekf
+            || failsafe.terrain
+            || failsafe.leak
+            || failsafe.internal_pressure
+            || failsafe.internal_temperature
+            || failsafe.crash
+            || failsafe.sensor_health
+        );
+    }
+
+    // sensor health for logging
+    struct {
+        uint8_t depth       : 1;    // true if depth sensor is healthy
+        uint8_t compass     : 1;    // true if compass is healthy
+    } sensor_health;
+
+    // Baro sensor instance index of the external water pressure sensor
+    uint8_t depth_sensor_idx;
+
+    AP_Motors6DOF motors;
+
+    // Circle
+    bool circle_pilot_yaw_override; // true if pilot is overriding yaw
+
+    // Stores initial bearing when armed
+    int32_t initial_armed_bearing;
+
+    // Throttle variables
+    int16_t desired_climb_rate;          // pilot desired climb rate - for logging purposes only
+
+    // Loiter control
+    uint16_t loiter_time_max;                // How long we should stay in Loiter Mode for mission scripting (time in seconds)
+    uint32_t loiter_time;                    // How long have we been loitering - The start time in millis
+
+    // Delay the next navigation command
+    uint32_t nav_delay_time_max_ms;  // used for delaying the navigation commands
+    uint32_t nav_delay_time_start_ms;
+
+    // Battery Sensors
+    AP_BattMonitor battery{MASK_LOG_CURRENT,
+                           FUNCTOR_BIND_MEMBER(&Sub::handle_battery_failsafe, void, const char*, const int8_t),
+                           _failsafe_priorities};
+
+    AP_Arming_Sub arming;
+
+    // Altitude
+    // The cm/s we are moving up or down based on filtered data - Positive = UP
+    int16_t climb_rate;
+
+    // Turn counter
+    int32_t quarter_turn_count;
+    uint8_t last_turn_state;
+
+    // Input gain
+    float gain;
+
+    // Flag indicating if we are currently using input hold
+    bool input_hold_engaged;
+
+    // Flag indicating if we are currently controlling Pitch and Roll instead of forward/lateral
+    bool roll_pitch_flag = false;
+
+    // 3D Location vectors
+    // Current location of the Sub (altitude is relative to home)
+    Location current_loc;
+
+    // Navigation Yaw control
+    // auto flight mode's yaw mode
+    uint8_t auto_yaw_mode;
+    
+    // Parameter to set yaw rate only
+    bool yaw_rate_only;
+
+    // Yaw will point at this location if auto_yaw_mode is set to AUTO_YAW_ROI
+    Vector3f roi_WP;
+
+    // bearing from current location to the yaw_look_at_WP
+    float yaw_look_at_WP_bearing;
+
+    float yaw_xtrack_correct_heading;
+
+    // yaw used for YAW_LOOK_AT_HEADING yaw_mode
+    int32_t yaw_look_at_heading;
+
+    // Deg/s we should turn
+    int16_t yaw_look_at_heading_slew;
+
+    // heading when in yaw_look_ahead_bearing
+    float yaw_look_ahead_bearing;
+
+    // Delay Mission Scripting Command
+    int32_t condition_value;  // used in condition commands (eg delay, change alt, etc.)
+    uint32_t condition_start;
+
+    // Inertial Navigation
+    AP_InertialNav inertial_nav;
+
+    AP_AHRS_View ahrs_view;
+
+    // Attitude, Position and Waypoint navigation objects
+    // To-Do: move inertial nav up or other navigation variables down here
+    AC_AttitudeControl_Sub attitude_control;
+
+    AC_PosControl pos_control;
+
+    AC_WPNav wp_nav;
+    AC_Loiter loiter_nav;
+    AC_Circle circle_nav;
+
+    // Camera
+#if AP_CAMERA_ENABLED
+    AP_Camera camera{MASK_LOG_CAMERA};
+#endif
+
+    // Camera/Antenna mount tracking and stabilisation stuff
+#if HAL_MOUNT_ENABLED
+    AP_Mount camera_mount;
+#endif
+
+#if AVOIDANCE_ENABLED == ENABLED
+    AC_Avoid avoid;
+#endif
+
+    // Rally library
+#if HAL_RALLY_ENABLED
+    AP_Rally rally;
+#endif
+
+    // terrain handling
+#if AP_TERRAIN_AVAILABLE
+    AP_Terrain terrain;
+#endif
+
+    // used to allow attitude and depth control without a position system
+    struct attitude_no_gps_struct {
+        uint32_t last_message_ms;
+        mavlink_set_attitude_target_t packet;
+    };
+
+    attitude_no_gps_struct set_attitude_target_no_gps {0};
+
+    // Top-level logic
+    // setup the var_info table
+    AP_Param param_loader;
+
+    uint32_t last_pilot_heading;
+    uint32_t last_pilot_yaw_input_ms;
+    uint32_t fs_terrain_recover_start_ms;
+
+    static const AP_Scheduler::Task scheduler_tasks[];
+    static const AP_Param::Info var_info[];
+    static const struct LogStructure log_structure[];
+
+    void run_rate_controller();
+    void fifty_hz_loop();
+    void update_batt_compass(void);
+    void ten_hz_logging_loop();
+    void twentyfive_hz_logging();
+    void three_hz_loop();
+    void one_hz_loop();
+    void update_turn_counter();
+    void read_AHRS(void);
+    void update_altitude();
+    float get_smoothing_gain();
+    void get_pilot_desired_lean_angles(float roll_in, float pitch_in, float &roll_out, float &pitch_out, float angle_max);
+    float get_pilot_desired_yaw_rate(int16_t stick_angle) const;
+    void check_ekf_yaw_reset();
+    float get_roi_yaw();
+    float get_look_ahead_yaw();
+    float get_pilot_desired_climb_rate(float throttle_control);
+    void rotate_body_frame_to_NE(float &x, float &y);
+#if HAL_LOGGING_ENABLED
+    // methods for AP_Vehicle:
+    const AP_Int32 &get_log_bitmask() override { return g.log_bitmask; }
+    const struct LogStructure *get_log_structures() const override {
+        return log_structure;
+    }
+    uint8_t get_num_log_structures() const override;
+
+    void Log_Write_Control_Tuning();
+    void Log_Write_Attitude();
+    void Log_Write_Data(LogDataID id, int32_t value);
+    void Log_Write_Data(LogDataID id, uint32_t value);
+    void Log_Write_Data(LogDataID id, int16_t value);
+    void Log_Write_Data(LogDataID id, uint16_t value);
+    void Log_Write_Data(LogDataID id, float value);
+    void Log_Write_GuidedTarget(uint8_t target_type, const Vector3f& pos_target, const Vector3f& vel_target);
+    void Log_Write_Vehicle_Startup_Messages();
+#endif
+    void load_parameters(void) override;
+    void userhook_init();
+    void userhook_FastLoop();
+    void userhook_50Hz();
+    void userhook_MediumLoop();
+    void userhook_SlowLoop();
+    void userhook_SuperSlowLoop();
+    void update_home_from_EKF();
+    void set_home_to_current_location_inflight();
+    bool set_home_to_current_location(bool lock) override WARN_IF_UNUSED;
+    bool set_home(const Location& loc, bool lock) override WARN_IF_UNUSED;
+    float get_alt_rel() const WARN_IF_UNUSED;
+    float get_alt_msl() const WARN_IF_UNUSED;
+    void exit_mission();
+    void set_origin(const Location& loc);
+    bool ensure_ekf_origin();
+    bool verify_loiter_unlimited();
+    bool verify_loiter_time();
+    bool verify_wait_delay();
+    bool verify_within_distance();
+    bool verify_yaw();
+
+    void failsafe_sensors_check(void);
+    void failsafe_crash_check();
+ #include "Rover.h"
+
+// set ahrs home to current location from inertial-nav location
+bool Rover::set_home_to_current_location(bool lock)
+{
+    Location temp_loc;
+    if (ahrs.have_inertial_nav() && ahrs.get_location(temp_loc)) {
+        if (!set_home(temp_loc, lock)) {
+            return false;
+        }
+        // we have successfully set AHRS home, set it for SmartRTL
+        g2.smart_rtl.set_home(true);
+        return true;
+    }
+    return false;
+}
+
+// sets ahrs home to specified location
+// returns true if home location set successfully
+bool Rover::set_home(const Location& loc, bool lock)
+{
+    // set ahrs home
+    if (!ahrs.set_home(loc)) {
+        return false;
+    }
+
+    // lock home position
+    if (lock) {
+        ahrs.lock_home();
+    }
+
+    // Save Home to EEPROM
+    mode_auto.mission.write_home_to_storage();
+
+    // send text of home position to ground stations
+    gcs().send_text(MAV_SEVERITY_INFO, "Set HOME to %.6f %.6f at %.2fm",
+            static_cast<double>(loc.lat * 1.0e-7f),
+            static_cast<double>(loc.lng * 1.0e-7f),
+            static_cast<double>(loc.alt * 0.01f));
+
+    // return success
+    return true;
+}
+
+// called periodically while disarmed to update our home position to
+// our current location
+void Rover::update_home()
+{
+    if (ahrs.home_is_locked()) {
+        // we've been explicitly told our home location
+        return;
+    }
+
+    Location loc{};
+    if (!ahrs.get_location(loc)) {
+        return;
+    }
+
+    barometer.update_calibration();
+
+    if (ahrs.home_is_set() &&
+        loc.get_distance(ahrs.get_home()) < DISTANCE_HOME_MINCHANGE) {
+        // insufficiently moved from current home - don't change it
+        return;
+    }
+
+    IGNORE_RETURN(ahrs.set_home(loc));
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #include "Rover.h"
+
+/**
+ *
+ * Detects failures of the ekf and triggers a failsafe
+ *
+ */
+
+#ifndef EKF_CHECK_ITERATIONS_MAX
+ # define EKF_CHECK_ITERATIONS_MAX          10      // 1 second (ie. 10 iterations at 10hz) of bad variances signals a failure
+#endif
+
+#ifndef EKF_CHECK_WARNING_TIME
+ # define EKF_CHECK_WARNING_TIME            (30*1000)   // warning text messages are sent to ground no more than every 30 seconds
+#endif
+
+
+// EKF_check structure
+static struct {
+    uint8_t fail_count;         // number of iterations ekf or dcm have been out of tolerances
+    uint8_t bad_variance : 1;   // true if ekf should be considered untrusted (fail_count has exceeded EKF_CHECK_ITERATIONS_MAX)
+    uint32_t last_warn_time;    // system time of last warning in milliseconds.  Used to throttle text warnings sent to GCS
+} ekf_check_state;
+
+// ekf_check - detects if ekf variance are out of tolerance and triggers failsafe
+// should be called at 10hz
+void Rover::ekf_check()
+{
+    // exit immediately if ekf has no origin yet - this assumes the origin can never become unset
+    Location temp_loc;
+    if (!ahrs.get_origin(temp_loc)) {
+        return;
+    }
+
+    // return immediately if motors are not armed, or ekf check is disabled
+    if (!arming.is_armed() || (g.fs_ekf_thresh <= 0.0f)) {
+        ekf_check_state.fail_count = 0;
+        ekf_check_state.bad_variance = false;
+        AP_Notify::flags.ekf_bad = ekf_check_state.bad_variance;
+        failsafe_ekf_off_event();   // clear failsafe
+        return;
+    }
+
+    // compare compass and velocity variance vs threshold
+    if (ekf_over_threshold()) {
+        // if compass is not yet flagged as bad
+        if (!ekf_check_state.bad_variance) {
+            // increase counter
+            ekf_check_state.fail_count++;
+            // if counter above max then trigger failsafe
+            if (ekf_check_state.fail_count >= EKF_CHECK_ITERATIONS_MAX) {
+                // limit count from climbing too high
+                ekf_check_state.fail_count = EKF_CHECK_ITERATIONS_MAX;
+                ekf_check_state.bad_variance = true;
+
+                LOGGER_WRITE_ERROR(LogErrorSubsystem::EKFCHECK,
+                                         LogErrorCode::EKFCHECK_BAD_VARIANCE);
+                // send message to gcs
+                if ((AP_HAL::millis() - ekf_check_state.last_warn_time) > EKF_CHECK_WARNING_TIME) {
+                    gcs().send_text(MAV_SEVERITY_CRITICAL,"EKF variance");
+                    ekf_check_state.last_warn_time = AP_HAL::millis();
+                }
+                failsafe_ekf_event();
+            }
+        }
+    } else {
+        // reduce counter
+        if (ekf_check_state.fail_count > 0) {
+            ekf_check_state.fail_count--;
+
+            // if variance is flagged as bad and the counter reaches zero then clear flag
+            if (ekf_check_state.bad_variance && ekf_check_state.fail_count == 0) {
+                ekf_check_state.bad_variance = false;
+                LOGGER_WRITE_ERROR(LogErrorSubsystem::EKFCHECK,
+                                         LogErrorCode::EKFCHECK_VARIANCE_CLEARED);
+                // clear failsafe
+                failsafe_ekf_off_event();
+            }
+        }
+    }
+
+    // set AP_Notify flags
+    AP_Notify::flags.ekf_bad = ekf_check_state.bad_variance;
+}
+
+// returns true if the ekf's variance are over the tolerance
+bool Rover::ekf_over_threshold()
+{
+    // return false immediately if disabled
+    if (g.fs_ekf_thresh <= 0.0f) {
+        return false;
+    }
+
+    // use EKF to get variance
+    float position_variance, vel_variance, height_variance, tas_variance;
+    Vector3f mag_variance;
+    ahrs.get_variances(vel_variance, position_variance, height_variance, mag_variance, tas_variance);
+
+    // return true if two of compass, velocity and position variances are over the threshold
+    uint8_t over_thresh_count = 0;
+    if (mag_variance.length() >= g.fs_ekf_thresh) {
+        over_thresh_count++;
+    }
+    if (vel_variance >= g.fs_ekf_thresh) {
+        over_thresh_count++;
+    }
+    if (position_variance >= g.fs_ekf_thresh) {
+        over_thresh_count++;
+    }
+
+    bool optflow_healthy = false;
+#if AP_OPTICALFLOW_ENABLED
+    optflow_healthy = optflow.healthy();
+#endif
+    if (!optflow_healthy && (vel_variance >= (2.0f * g.fs_ekf_thresh))) {
+        over_thresh_count += 2;
+    } else if (vel_variance >= g.fs_ekf_thresh) {
+        over_thresh_count++;
+    }
+    
+    if (over_thresh_count >= 2) {
+        return true;
+    }
+
+    return !ekf_position_ok();
+}
+
+// ekf_position_ok - returns true if the ekf claims it's horizontal absolute position estimate is ok and home position is set
+bool Rover::ekf_position_ok()
+{
+    if (!ahrs.have_inertial_nav()) {
+        // do not allow navigation with dcm position
+        return false;
+    }
+
+    // get EKF filter status
+    nav_filter_status filt_status;
+    rover.ahrs.get_filter_status(filt_status);
+
+    // if disarmed we accept a predicted horizontal absolute or relative position
+    if (!arming.is_armed()) {
+        return (filt_status.flags.horiz_pos_abs || filt_status.flags.pred_horiz_pos_abs || filt_status.flags.horiz_pos_rel || filt_status.flags.pred_horiz_pos_rel);
+    } else {
+        // once armed we require a good absolute or relative position and EKF must not be in const_pos_mode
+        return ((filt_status.flags.horiz_pos_abs || filt_status.flags.horiz_pos_rel) && !filt_status.flags.const_pos_mode);
+    }
+}
+
+// perform ekf failsafe
+void Rover::failsafe_ekf_event()
+{
+    // return immediately if ekf failsafe already triggered
+    if (failsafe.ekf) {
+        return;
+    }
+
+    // EKF failsafe event has occurred
+    failsafe.ekf = true;
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_EKFINAV,
+                             LogErrorCode::FAILSAFE_OCCURRED);
+
+    // does this mode require position?
+    if (!control_mode->requires_position()) {
+        return;
+    }
+
+    // take action based on fs_ekf_action parameter
+    switch ((enum fs_ekf_action)g.fs_ekf_action.get()) {
+        case FS_EKF_DISABLE:
+            // do nothing
+            return;
+        case FS_EKF_REPORT_ONLY:
+            break;
+        case FS_EKF_HOLD:
+        default:
+            set_mode(mode_hold, ModeReason::EKF_FAILSAFE);
+            break;
+    }
+
+    gcs().send_text(MAV_SEVERITY_CRITICAL,"EKF failsafe");
+}
+
+// failsafe_ekf_off_event - actions to take when EKF failsafe is cleared
+void Rover::failsafe_ekf_off_event(void)
+{
+    // return immediately if not in ekf failsafe
+    if (!failsafe.ekf) {
+        return;
+    }
+
+    failsafe.ekf = false;
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_EKFINAV,
+                             LogErrorCode::FAILSAFE_RESOLVED);
+    gcs().send_text(MAV_SEVERITY_CRITICAL,"EKF failsafe cleared");
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+  failsafe support
+  Andrew Tridgell, December 2011
+ */
+
+#include "Rover.h"
+
+#include <stdio.h>
+
+/*
+  our failsafe strategy is to detect main loop lockup and disarm.
+ */
+
+/*
+  this failsafe_check function is called from the core timer interrupt
+  at 1kHz.
+ */
+void Rover::failsafe_check()
+{
+    static uint16_t last_ticks;
+    static uint32_t last_timestamp;
+    const uint32_t tnow = AP_HAL::micros();
+
+    const uint16_t ticks = scheduler.ticks();
+    if (ticks != last_ticks) {
+        // the main loop is running, all is OK
+        last_ticks = ticks;
+        last_timestamp = tnow;
+        return;
+    }
+
+    if (tnow - last_timestamp > 200000) {
+        // we have gone at least 0.2 seconds since the main loop
+        // ran. That means we're in trouble, or perhaps are in
+        // an initialisation routine or log erase. disarm the motors
+        // To-Do: log error
+        if (arming.is_armed()) {
+            // disarm motors
+            arming.disarm(AP_Arming::Method::CPUFAILSAFE);
+        }
+    }
+}
+
+/*
+  called to set/unset a failsafe event.
+ */
+void Rover::failsafe_trigger(uint8_t failsafe_type, const char* type_str, bool on)
+{
+    uint8_t old_bits = failsafe.bits;
+    if (on) {
+        failsafe.bits |= failsafe_type;
+    } else {
+        failsafe.bits &= ~failsafe_type;
+    }
+    if (old_bits == 0 && failsafe.bits != 0) {
+        // a failsafe event has started
+        failsafe.start_time = millis();
+    }
+    if (failsafe.triggered != 0 && failsafe.bits == 0) {
+        // a failsafe event has ended
+        gcs().send_text(MAV_SEVERITY_INFO, "%s Failsafe Cleared", type_str);
+    }
+
+    failsafe.triggered &= failsafe.bits;
+
+    if ((failsafe.triggered == 0) &&
+        (failsafe.bits != 0) &&
+        (millis() - failsafe.start_time > g.fs_timeout * 1000) &&
+        (control_mode != &mode_rtl) &&
+        ((control_mode != &mode_hold || (g2.fs_options & (uint32_t)Failsafe_Options::Failsafe_Option_Active_In_Hold)))) {
+        failsafe.triggered = failsafe.bits;
+        gcs().send_text(MAV_SEVERITY_WARNING, "%s Failsafe", type_str);
+
+        // clear rc overrides
+        RC_Channels::clear_overrides();
+
+        if ((control_mode == &mode_auto) &&
+            ((failsafe_type == FAILSAFE_EVENT_THROTTLE && g.fs_throttle_enabled == FS_THR_ENABLED_CONTINUE_MISSION) ||
+             (failsafe_type == FAILSAFE_EVENT_GCS && g.fs_gcs_enabled == FS_GCS_ENABLED_CONTINUE_MISSION))) {
+            // continue with mission in auto mode
+            gcs().send_text(MAV_SEVERITY_WARNING, "Failsafe - Continuing Auto Mode");
+        } else {
+            switch ((FailsafeAction)g.fs_action.get()) {
+            case FailsafeAction::None:
+                break;
+            case FailsafeAction::SmartRTL:
+                if (set_mode(mode_smartrtl, ModeReason::FAILSAFE)) {
+                    break;
+                }
+                FALLTHROUGH;
+            case FailsafeAction::RTL:
+                if (set_mode(mode_rtl, ModeReason::FAILSAFE)) {
+                    break;
+                }
+                FALLTHROUGH;
+            case FailsafeAction::Hold:
+                set_mode(mode_hold, ModeReason::FAILSAFE);
+                break;
+            case FailsafeAction::SmartRTL_Hold:
+                if (!set_mode(mode_smartrtl, ModeReason::FAILSAFE)) {
+                    set_mode(mode_hold, ModeReason::FAILSAFE);
+                }
+                break;
+            case FailsafeAction::Terminate:
+                arming.disarm(AP_Arming::Method::FAILSAFE_ACTION_TERMINATE);
+                break;
+            }
+        }
+    }
+}
+
+void Rover::handle_battery_failsafe(const char* type_str, const int8_t action)
+{
+        switch ((FailsafeAction)action) {
+            case FailsafeAction::None:
+                break;
+            case FailsafeAction::SmartRTL:
+                if (set_mode(mode_smartrtl, ModeReason::BATTERY_FAILSAFE)) {
+                    break;
+                }
+                FALLTHROUGH;
+            case FailsafeAction::RTL:
+                if (set_mode(mode_rtl, ModeReason::BATTERY_FAILSAFE)) {
+                    break;
+                }
+                FALLTHROUGH;
+            case FailsafeAction::Hold:
+                set_mode(mode_hold, ModeReason::BATTERY_FAILSAFE);
+                break;
+            case FailsafeAction::SmartRTL_Hold:
+                if (!set_mode(mode_smartrtl, ModeReason::BATTERY_FAILSAFE)) {
+                    set_mode(mode_hold, ModeReason::BATTERY_FAILSAFE);
+                }
+                break;
+            case FailsafeAction::Terminate:
+#if AP_ROVER_ADVANCED_FAILSAFE_ENABLED
+                char battery_type_str[17];
+                snprintf(battery_type_str, 17, "%s battery", type_str);
+                g2.afs.gcs_terminate(true, battery_type_str);
+#else
+                arming.disarm(AP_Arming::Method::BATTERYFAILSAFE);
+#endif // AP_ROVER_ADVANCED_FAILSAFE_ENABLED
+                break;
+        }
+}
+
+#if AP_ROVER_ADVANCED_FAILSAFE_ENABLED
+/*
+   check for AFS failsafe check
+ */
+void Rover::afs_fs_check(void)
+{
+    // perform AFS failsafe checks
+    g2.afs.check(failsafe.last_valid_rc_ms);
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       QGC WPL 110
+0	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071766	-105.230202	0.000000	0
+1	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071014	-105.230247	0.000000	0
+2	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071014	-105.228821	0.000000	0
+3	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071609	-105.228867	0.000000	0
+4	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071602	-105.228172	0.000000	0
+5	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.070858	-105.227982	0.000000	0
+6	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.070789	-105.226219	0.000000	0
+7	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.072453	-105.226379	0.000000	0
+8	0	0	5004	20.000000	0.000000	0.000000	0.000000	40.071609	-105.228172	0.000000	0
+9	0	0	5004	20.000000	0.000000	0.000000	0.000000	40.071625	-105.227982	0.000000	0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  QGC WPL 110
+0	0	0	16	0.000000	0.000000	0.000000	0.000000	40.071377	-105.229790	0.000000	1
+1	0	3	16	0.000000	0.000000	0.000000	0.000000	40.071260	-105.227000	100.000000	1
+2	0	0	20	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	1
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            QGC WPL 110
+0	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071766	-105.230202	0.000000	0
+1	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071014	-105.230247	0.000000	0
+2	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071014	-105.228821	0.000000	0
+3	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071609	-105.228867	0.000000	0
+4	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.071602	-105.228172	0.000000	0
+5	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.070858	-105.227982	0.000000	0
+6	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.070789	-105.226219	0.000000	0
+7	0	0	5001	8.000000	0.000000	0.000000	0.000000	40.072453	-105.226379	0.000000	0
+8	0	0	5004	20.000000	0.000000	0.000000	0.000000	40.071609	-105.228172	0.000000	0
+9	0	0	5004	20.000000	0.000000	0.000000	0.000000	40.071625	-105.227982	0.000000	0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  RALLY 40.071553	-105.229401	0.000000	40.000000	0.000000	0
+RALLY 40.072265	-105.231136	0.000000	40.000000	0.000000	0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            

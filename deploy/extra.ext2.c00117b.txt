@@ -1,0 +1,3667 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simple socket handling class for systems with BSD socket API
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Networking/AP_Networking_Config.h>
+#if AP_NETWORKING_SOCKETS_ENABLED
+
+#ifndef SOCKET_CLASS_NAME
+#define SOCKET_CLASS_NAME SocketAPM
+#endif
+
+#ifndef IN_SOCKET_NATIVE_CPP
+#include "Socket.hpp"
+#endif
+
+#if AP_NETWORKING_BACKEND_CHIBIOS || AP_NETWORKING_BACKEND_PPP
+#include <lwip/sockets.h>
+#else
+// SITL or Linux
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#endif
+
+#include <errno.h>
+
+#if AP_NETWORKING_BACKEND_CHIBIOS || AP_NETWORKING_BACKEND_PPP
+#define CALL_PREFIX(x) ::lwip_##x
+#else
+#define CALL_PREFIX(x) ::x
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+/*
+  constructor
+ */
+SOCKET_CLASS_NAME::SOCKET_CLASS_NAME(bool _datagram) :
+    SOCKET_CLASS_NAME(_datagram,
+              CALL_PREFIX(socket)(AF_INET, _datagram?SOCK_DGRAM:SOCK_STREAM, 0))
+{
+    static_assert(sizeof(SOCKET_CLASS_NAME::last_in_addr) >= sizeof(struct sockaddr_in), "last_in_addr must be at least sockaddr_in size");
+}
+
+SOCKET_CLASS_NAME::SOCKET_CLASS_NAME(bool _datagram, int _fd) :
+    datagram(_datagram),
+    fd(_fd)
+{
+#ifdef FD_CLOEXEC
+    CALL_PREFIX(fcntl)(fd, F_SETFD, FD_CLOEXEC);
+#endif
+    if (!datagram) {
+        int one = 1;
+        CALL_PREFIX(setsockopt)(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+}
+
+SOCKET_CLASS_NAME::~SOCKET_CLASS_NAME()
+{
+    if (fd != -1) {
+        CALL_PREFIX(close)(fd);
+    }
+    if (fd_in != -1) {
+        CALL_PREFIX(close)(fd_in);
+    }
+}
+
+void SOCKET_CLASS_NAME::make_sockaddr(const char *address, uint16_t port, struct sockaddr_in &sockaddr)
+{
+    memset(&sockaddr, 0, sizeof(sockaddr));
+
+#ifdef HAVE_SOCK_SIN_LEN
+    sockaddr.sin_len = sizeof(sockaddr);
+#endif
+    sockaddr.sin_port = htons(port);
+    sockaddr.sin_family = AF_INET;
+    sockaddr.sin_addr.s_addr = htonl(inet_str_to_addr(address));
+}
+
+#if !defined(HAL_BOOTLOADER_BUILD)
+/*
+  connect the socket
+ */
+bool SOCKET_CLASS_NAME::connect(const char *address, uint16_t port)
+{
+    if (fd == -1) {
+        return false;
+    }
+    struct sockaddr_in sockaddr;
+    int ret;
+    int one = 1;
+    make_sockaddr(address, port, sockaddr);
+
+    if (datagram && is_multicast_address(sockaddr)) {
+        /*
+          connect fd_in as a multicast UDP socket
+         */
+        fd_in = CALL_PREFIX(socket)(AF_INET, SOCK_DGRAM, 0);
+        if (fd_in == -1) {
+            return false;
+        }
+        struct sockaddr_in sockaddr_mc = sockaddr;
+        struct ip_mreq mreq {};
+#ifdef FD_CLOEXEC
+        CALL_PREFIX(fcntl)(fd_in, F_SETFD, FD_CLOEXEC);
+#endif
+        IGNORE_RETURN(CALL_PREFIX(setsockopt)(fd_in, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)));
+
+#if defined(__CYGWIN__) || defined(__CYGWIN64__) || defined(CYGWIN_BUILD)
+        /*
+          on cygwin you need to bind to INADDR_ANY then use the multicast
+          IP_ADD_MEMBERSHIP to get on the right address
+        */
+        sockaddr_mc.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
+    
+        ret = CALL_PREFIX(bind)(fd_in, (struct sockaddr *)&sockaddr_mc, sizeof(sockaddr));
+        if (ret == -1) {
+            goto fail_multi;
+        }
+
+        mreq.imr_multiaddr.s_addr = sockaddr.sin_addr.s_addr;
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+
+        ret = CALL_PREFIX(setsockopt)(fd_in, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+        if (ret == -1) {
+            goto fail_multi;
+        }
+    }
+
+    if (datagram && sockaddr.sin_addr.s_addr == INADDR_BROADCAST) {
+        // setup for bi-directional UDP broadcast
+        set_broadcast();
+        reuseaddress();
+    }
+
+    ret = CALL_PREFIX(connect)(fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr));
+    if (ret != 0) {
+        return false;
+    }
+    connected = true;
+
+    if (datagram && sockaddr.sin_addr.s_addr == INADDR_BROADCAST) {
+        // for bi-directional UDP broadcast we need 2 sockets
+        struct sockaddr_in send_addr;
+        socklen_t send_len = sizeof(send_addr);
+        ret = CALL_PREFIX(getsockname)(fd, (struct sockaddr *)&send_addr, &send_len);
+        fd_in = CALL_PREFIX(socket)(AF_INET, SOCK_DGRAM, 0);
+        if (fd_in == -1) {
+            goto fail_multi;
+        }
+        CALL_PREFIX(setsockopt)(fd_in, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        // 2nd socket needs to be bound to wildcard
+        send_addr.sin_addr.s_addr = INADDR_ANY;
+        ret = CALL_PREFIX(bind)(fd_in, (struct sockaddr *)&send_addr, sizeof(send_addr));
+        if (ret == -1) {
+            goto fail_multi;
+        }
+    }
+    return true;
+
+fail_multi:
+    CALL_PREFIX(close)(fd_in);
+    fd_in = -1;
+    return false;
+}
+#endif // HAL_BOOTLOADER_BUILD
+
+/*
+  connect the socket with a timeout
+ */
+bool SOCKET_CLASS_NAME::connect_timeout(const char *address, uint16_t port, uint32_t timeout_ms)
+{
+    if (fd == -1) {
+        return false;
+    }
+    struct sockaddr_in sockaddr;
+    make_sockaddr(address, port, sockaddr);
+
+    set_blocking(false);
+
+    int ret = CALL_PREFIX(connect)(fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr));
+    if (ret == 0) {
+        // instant connect?
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        return false;
+    }
+    bool pollret = pollout(timeout_ms);
+    if (!pollret) {
+        return false;
+    }
+    int sock_error = 0;
+    socklen_t len = sizeof(sock_error);
+    if (CALL_PREFIX(getsockopt)(fd, SOL_SOCKET, SO_ERROR, (void*)&sock_error, &len) != 0) {
+        return false;
+    }
+    connected = sock_error == 0;
+    return connected;
+}
+
+/*
+  bind the socket
+ */
+bool SOCKET_CLASS_NAME::bind(const char *address, uint16_t port)
+{
+    if (fd == -1) {
+        return false;
+    }
+    struct sockaddr_in sockaddr;
+    make_sockaddr(address, port, sockaddr);
+
+    reuseaddress();
+    if (CALL_PREFIX(bind)(fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) != 0) {
+        return false;
+    }
+    return true;
+}
+
+
+/*
+  set SO_REUSEADDR
+ */
+bool SOCKET_CLASS_NAME::reuseaddress(void) const
+{
+    if (fd == -1) {
+        return false;
+    }
+    int one = 1;
+    return (CALL_PREFIX(setsockopt)(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != -1);
+}
+
+/*
+  set blocking state
+ */
+bool SOCKET_CLASS_NAME::set_blocking(bool blocking) const
+{
+    if (fd == -1) {
+        return false;
+    }
+    int fcntl_ret;
+    if (blocking) {
+        fcntl_ret = CALL_PREFIX(fcntl)(fd, F_SETFL, CALL_PREFIX(fcntl)(fd, F_GETFL, 0) & ~O_NONBLOCK);
+        if (fd_in != -1) {
+            fcntl_ret |= CALL_PREFIX(fcntl)(fd_in, F_SETFL, CALL_PREFIX(fcntl)(fd_in, F_GETFL, 0) & ~O_NONBLOCK);
+        }
+    } else {
+        fcntl_ret = CALL_PREFIX(fcntl)(fd, F_SETFL, CALL_PREFIX(fcntl)(fd, F_GETFL, 0) | O_NONBLOCK);
+        if (fd_in != -1) {
+            fcntl_ret |= CALL_PREFIX(fcntl)(fd_in, F_SETFL, CALL_PREFIX(fcntl)(fd_in, F_GETFL, 0) | O_NONBLOCK);
+        }
+    }
+    return fcntl_ret != -1;
+}
+
+/*
+  set cloexec state
+ */
+bool SOCKET_CLASS_NAME::set_cloexec() const
+{
+    if (fd == -1) {
+        return false;
+    }
+#ifdef FD_CLOEXEC
+    return (CALL_PREFIX(fcntl)(fd, F_SETFD, FD_CLOEXEC) != -1);
+#else
+    return false;
+#endif
+}
+
+/*
+  send some data
+ */
+ssize_t SOCKET_CLASS_NAME::send(const void *buf, size_t size) const
+{
+    if (fd == -1) {
+        return -1;
+    }
+    return CALL_PREFIX(send)(fd, buf, size, MSG_NOSIGNAL);
+}
+
+/*
+  send some data with address as a uint32_t
+ */
+ssize_t SOCKET_CLASS_NAME::sendto(const void *buf, size_t size, uint32_t address, uint16_t port)
+{
+    if (fd == -1) {
+        return -1;
+    }
+    struct sockaddr_in sockaddr = {};
+
+#ifdef HAVE_SOCK_SIN_LEN
+    sockaddr.sin_len = sizeof(sockaddr);
+#endif
+    sockaddr.sin_port = htons(port);
+    sockaddr.sin_family = AF_INET;
+    sockaddr.sin_addr.s_addr = htonl(address);
+
+    return CALL_PREFIX(sendto)(fd, buf, size, 0, (struct sockaddr *)&sockaddr, sizeof(sockaddr));
+}
+
+/*
+  send some data with address as a string
+ */
+ssize_t SOCKET_CLASS_NAME::sendto(const void *buf, size_t size, const char *address, uint16_t port)
+{
+    if (fd == -1) {
+        return -1;
+    }
+    struct sockaddr_in sockaddr;
+    make_sockaddr(address, port, sockaddr);
+    return CALL_PREFIX(sendto)(fd, buf, size, 0, (struct sockaddr *)&sockaddr, sizeof(sockaddr));
+}
+
+/*
+  receive some data
+ */
+ssize_t SOCKET_CLASS_NAME::recv(void *buf, size_t size, uint32_t timeout_ms)
+{
+    if (!pollin(timeout_ms)) {
+        errno = EWOULDBLOCK;
+        return -1;
+    }
+    socklen_t len = sizeof(struct sockaddr_in);
+    int fin = get_read_fd();
+    ssize_t ret;
+    uint32_t in_addr[4] = {};
+    ret = CALL_PREFIX(recvfrom)(fin, buf, size, MSG_DONTWAIT, (sockaddr *)&in_addr[0], &len);
+    if (ret > 0) {
+        // only update last_in_addr if we received data
+        memcpy(last_in_addr, in_addr, sizeof(last_in_addr));
+    } else {
+        if (!datagram && connected && ret == 0) {
+            // remote host has closed connection
+            connected = false;
+        }
+        return ret;
+    }
+    if (fd_in != -1) {
+        /*
+          for multicast check we are not receiving from ourselves
+         */
+        struct sockaddr_in send_addr;
+        socklen_t send_len = sizeof(send_addr);
+        if (CALL_PREFIX(getsockname)(fd, (struct sockaddr *)&send_addr, &send_len) != 0) {
+            return -1;
+        }
+        const struct sockaddr_in &sin = *(struct sockaddr_in *)&last_in_addr[0];
+        if (sin.sin_port == send_addr.sin_port &&
+            sin.sin_family == send_addr.sin_family &&
+            sin.sin_addr.s_addr == send_addr.sin_addr.s_addr) {
+            // discard packets from ourselves
+            return -1;
+        }
+    }
+    return ret;
+}
+
+/*
+  return the IP address and port of the last received packet
+ */
+void SOCKET_CLASS_NAME::last_recv_address(const char *&ip_addr, uint16_t &port) const
+{
+    static char buf[IP4_STR_LEN];
+    auto *str = last_recv_address(buf, sizeof(buf), port);
+    ip_addr = str;
+}
+
+/*
+  return the IP address and port of the last received packet, using caller supplied buffer
+ */
+const char *SOCKET_CLASS_NAME::last_recv_address(char *ip_addr_buf, uint8_t buflen, uint16_t &port) const
+{
+    const struct sockaddr_in &sin = *(struct sockaddr_in *)&last_in_addr[0];
+
+    const char *ret = inet_addr_to_str(ntohl(sin.sin_addr.s_addr), ip_addr_buf, buflen);
+    if (ret == nullptr) {
+        return nullptr;
+    }
+    port = ntohs(sin.sin_port);
+    return ret;
+}
+
+/*
+  return the IP address and port of the last received packet
+ */
+bool SOCKET_CLASS_NAME::last_recv_address(uint32_t &ip_addr, uint16_t &port) const
+{
+    const struct sockaddr_in &sin = *(struct sockaddr_in *)&last_in_addr[0];
+    if (sin.sin_family != AF_INET) {
+        return false;
+    }
+    ip_addr = ntohl(sin.sin_addr.s_addr);
+    port = ntohs(sin.sin_port);
+    if (ip_addr == 0 ||
+        port == 0) {
+        return false;
+    }
+    return true;
+}
+
+void SOCKET_CLASS_NAME::set_broadcast(void) const
+{
+    if (fd == -1) {
+        return;
+    }
+    int one = 1;
+    CALL_PREFIX(setsockopt)(fd,SOL_SOCKET,SO_BROADCAST,(char *)&one,sizeof(one));
+}
+
+/*
+  return true if there is pending data for input
+ */
+bool SOCKET_CLASS_NAME::pollin(uint32_t timeout_ms)
+{
+    fd_set fds;
+    struct timeval tv;
+
+    FD_ZERO(&fds);
+    int fin = get_read_fd();
+    if (fin == -1) {
+        return false;
+    }
+    FD_SET(fin, &fds);
+
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000UL;
+
+    if (CALL_PREFIX(select)(fin+1, &fds, nullptr, nullptr, &tv) != 1) {
+        return false;
+    }
+    return true;
+}
+
+
+/*
+  return true if there is room for output data
+ */
+bool SOCKET_CLASS_NAME::pollout(uint32_t timeout_ms)
+{
+    if (fd == -1) {
+        return false;
+    }
+    fd_set fds;
+    struct timeval tv;
+
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000UL;
+
+    if (CALL_PREFIX(select)(fd+1, nullptr, &fds, nullptr, &tv) != 1) {
+        return false;
+    }
+    return true;
+}
+
+/* 
+   start listening for new tcp connections
+ */
+bool SOCKET_CLASS_NAME::listen(uint16_t backlog) const
+{
+    if (fd == -1) {
+        return false;
+    }
+    return CALL_PREFIX(listen)(fd, (int)backlog) == 0;
+}
+
+/*
+  accept a new connection. Only valid for TCP connections after
+  listen has been used. A new socket is returned
+*/
+SOCKET_CLASS_NAME *SOCKET_CLASS_NAME::accept(uint32_t timeout_ms)
+{
+    if (fd == -1) {
+        return nullptr;
+    }
+    if (!pollin(timeout_ms)) {
+        return nullptr;
+    }
+
+    struct sockaddr_in &sin = *(struct sockaddr_in *)&last_in_addr[0];
+    socklen_t len = sizeof(sin);
+    int newfd = CALL_PREFIX(accept)(fd, (sockaddr *)&sin, &len);
+    if (newfd == -1) {
+        return nullptr;
+    }
+    auto *ret = NEW_NOTHROW SOCKET_CLASS_NAME(false, newfd);
+    if (ret != nullptr) {
+        ret->connected = true;
+        ret->reuseaddress();
+    }
+    return ret;
+}
+
+/*
+  return true if an address is in the multicast range
+ */
+bool SOCKET_CLASS_NAME::is_multicast_address(struct sockaddr_in &addr) const
+{
+    const uint32_t mc_lower = 0xE0000000; // 224.0.0.0
+    const uint32_t mc_upper = 0xEFFFFFFF; // 239.255.255.255
+    const uint32_t haddr = ntohl(addr.sin_addr.s_addr);
+    return haddr >= mc_lower && haddr <= mc_upper;
+}
+
+void SOCKET_CLASS_NAME::close(void)
+{
+    if (fd != -1) {
+        CALL_PREFIX(close)(fd);
+        fd = -1;
+    }
+    if (fd_in != -1) {
+        CALL_PREFIX(close)(fd_in);
+        fd_in = -1;
+    }
+}
+
+/*
+  duplicate a socket, giving a new object with the same contents,
+  the fd in the old object is set to -1
+ */
+SOCKET_CLASS_NAME *SOCKET_CLASS_NAME::duplicate(void)
+{
+    auto *ret = NEW_NOTHROW SOCKET_CLASS_NAME(datagram, fd);
+    if (ret == nullptr) {
+        return nullptr;
+    }
+    ret->fd_in = fd_in;
+    ret->connected = connected;
+    fd = -1;
+    fd_in = -1;
+    return ret;
+}
+
+// access to inet_ntop, takes host order ipv4 as uint32_t
+const char *SOCKET_CLASS_NAME::inet_addr_to_str(uint32_t addr, char *dst, uint16_t len)
+{
+    addr = htonl(addr);
+    return CALL_PREFIX(inet_ntop)(AF_INET, (void*)&addr, dst, len);
+}
+
+// access to inet_pton, returns host order ipv4 as uint32_t
+uint32_t SOCKET_CLASS_NAME::inet_str_to_addr(const char *ipstr)
+{
+    uint32_t ret = 0;
+    CALL_PREFIX(inet_pton)(AF_INET, ipstr, &ret);
+    return ntohl(ret);
+
+}
+
+#endif // AP_NETWORKING_BACKEND_ANY
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+#pragma once
+
+#include <hal.h>
+#include "AP_HAL_ChibiOS.h"
+#include <AP_HAL/Semaphores.h>
+#include <AP_ESC_Telem/AP_ESC_Telem.h>
+
+#include "shared_dma.h"
+
+#if HAL_USE_PWM == TRUE
+
+#if defined(STM32F1)
+#ifdef HAL_WITH_BIDIR_DSHOT
+typedef uint16_t dmar_uint_t; // save memory to allow dshot on IOMCU
+typedef int16_t dmar_int_t;
+#else
+typedef uint8_t dmar_uint_t; // save memory to allow dshot on IOMCU
+typedef int8_t dmar_int_t;
+#endif
+#else
+typedef uint32_t dmar_uint_t;
+typedef int32_t dmar_int_t;
+#endif
+
+#ifdef AP_RCOUT_USE_32BIT_TIME
+typedef uint32_t rcout_timer_t;
+#define rcout_micros() AP_HAL::micros()
+#else
+typedef uint64_t rcout_timer_t;
+#define rcout_micros() AP_HAL::micros64()
+#endif
+
+#define RCOU_DSHOT_TIMING_DEBUG 0
+
+class ChibiOS::RCOutput : public AP_HAL::RCOutput
+#ifdef HAL_WITH_BIDIR_DSHOT
+  , AP_ESC_Telem_Backend
+#endif
+{
+public:
+    // disabled channel marker
+    const static uint8_t CHAN_DISABLED = 255;
+
+    void     init() override;
+    void     set_freq(uint32_t chmask, uint16_t freq_hz) override;
+    uint16_t get_freq(uint8_t ch) override;
+    void     enable_ch(uint8_t ch) override;
+    void     disable_ch(uint8_t ch) override;
+    void     write(uint8_t ch, uint16_t period_us) override;
+    uint16_t read(uint8_t ch) override;
+    void     read(uint16_t* period_us, uint8_t len) override;
+    uint16_t read_last_sent(uint8_t ch) override;
+    void     read_last_sent(uint16_t* period_us, uint8_t len) override;
+
+    // surface dshot telemetry for use by the harmonic notch and status information
+#ifdef HAL_WITH_BIDIR_DSHOT
+    uint16_t get_erpm(uint8_t chan) const override { return _bdshot.erpm[chan]; }
+    float get_erpm_error_rate(uint8_t chan) const override {
+      return 100.0f * float(_bdshot.erpm_errors[chan]) / (1 + _bdshot.erpm_errors[chan] + _bdshot.erpm_clean_frames[chan]);
+    }
+    /*
+      allow all erpm values to be read and for new updates to be detected - primarily for IOMCU
+     */
+    bool  new_erpm() override { return _bdshot.update_mask != 0; }
+    uint32_t read_erpm(uint16_t* erpm, uint8_t len) override;
+#endif
+    void set_output_mode(uint32_t mask, const enum output_mode mode) override;
+    enum output_mode get_output_mode(uint32_t& mask) override;
+    bool get_output_mode_banner(char banner_msg[], uint8_t banner_msg_len) const override;
+
+    /*
+     * return mask of channels that must be disabled because they share a group with a digital channel
+     */
+    uint32_t get_disabled_channels(uint32_t digital_mask) override;
+
+    void     cork(void) override;
+    void     push(void) override;
+
+    /*
+      force the safety switch on, disabling PWM output from the IO board
+     */
+    bool force_safety_on(void) override;
+
+    /*
+      force the safety switch off, enabling PWM output from the IO board
+     */
+    void force_safety_off(void) override;
+
+    bool enable_px4io_sbus_out(uint16_t rate_hz) override;
+
+    /*
+      set default update rate
+     */
+    void set_default_rate(uint16_t rate_hz) override;
+
+    /*
+      timer push (for oneshot min rate)
+     */
+    void timer_tick(rcout_timer_t cycle_start_us, rcout_timer_t timeout_period_us);
+
+    /*
+      LED push
+     */
+    void led_timer_tick(rcout_timer_t cycle_start_us, rcout_timer_t timeout_period_us);
+
+#if defined(IOMCU_FW) && HAL_DSHOT_ENABLED
+    void timer_tick() override;
+    static void dshot_send_trampoline(void *p);
+#endif
+    /*
+      setup for serial output to a set of ESCs, using the given
+      baudrate. Assumes 1 start bit, 1 stop bit, LSB first and 8
+      databits. This is used for ESC configuration and firmware
+      flashing
+     */
+#if HAL_SERIAL_ESC_COMM_ENABLED
+    bool setup_serial_output(uint32_t chan_mask, ByteBuffer *buffer, uint32_t baudrate);
+
+    /*
+      setup for serial output to an ESC using the given
+      baudrate. Assumes 1 start bit, 1 stop bit, LSB first and 8
+      databits. This is used for passthrough ESC configuration and
+      firmware flashing
+
+      While serial output is active normal output to this channel is
+      suspended. Output to some other channels (such as those in the
+      same channel timer group) may also be stopped, depending on the
+      implementation
+     */
+    bool serial_setup_output(uint8_t chan, uint32_t baudrate, uint32_t motor_mask) override;
+
+    /*
+      write a set of bytes to an ESC, using settings from
+      serial_setup_output. This is a blocking call
+     */
+    bool serial_write_bytes(const uint8_t *bytes, uint16_t len) override;
+
+    /*
+      read a byte from a port, using serial parameters from serial_setup_output()
+      return the number of bytes read
+     */
+    uint16_t serial_read_bytes(uint8_t *buf, uint16_t len) override;
+
+    /*
+      stop serial output. This restores the previous output mode for
+      the channel and any other channels that were stopped by
+      serial_setup_output()
+     */
+    void serial_end(void) override;
+#endif
+
+    /*
+      enable telemetry request for a mask of channels. This is used
+      with Dshot to get telemetry feedback
+      The mask uses servo channel numbering
+     */
+    void set_telem_request_mask(uint32_t mask) override;
+
+    /*
+      enable bi-directional telemetry request for a mask of channels. This is used
+      with Dshot to get telemetry feedback
+      The mask uses servo channel numbering
+     */
+    void set_bidir_dshot_mask(uint32_t mask) override;
+#ifdef HAL_WITH_BIDIR_DSHOT
+    void set_motor_poles(uint8_t poles) override { _bdshot.motor_poles = poles; }
+#endif
+
+    /*
+      Set the dshot rate as a multiple of the loop rate
+     */
+    void set_dshot_rate(uint8_t dshot_rate, uint16_t loop_rate_hz) override;
+
+#if defined(IOMCU_FW)
+    /*
+      Get/Set the dshot period in us, only for use by the IOMCU
+     */
+    void set_dshot_period(uint32_t period_us, uint8_t dshot_rate) override {
+      _dshot_period_us = period_us;
+      _dshot_rate = dshot_rate;
+    }
+    uint32_t get_dshot_period_us() const override { return _dshot_period_us; }
+#endif
+
+#if HAL_DSHOT_ENABLED
+    /*
+      Set/get the dshot esc_type
+     */
+    void set_dshot_esc_type(DshotEscType dshot_esc_type) override;
+
+    DshotEscType get_dshot_esc_type() const override { return _dshot_esc_type; }
+#endif
+
+    /*
+      get safety switch state, used by Util.cpp
+    */
+    AP_HAL::Util::safety_state _safety_switch_state(void);
+
+    /*
+      set PWM to send to a set of channels if the FMU firmware dies
+     */
+    void set_failsafe_pwm(uint32_t chmask, uint16_t period_us) override;
+
+    /*
+      set safety mask for IOMCU
+     */
+    void set_safety_mask(uint32_t mask) { safety_mask = mask; }
+
+#if HAL_DSHOT_ENABLED
+    /*
+     * mark the channels in chanmask as reversible. This is needed for some ESC types (such as Dshot)
+     * so that output scaling can be performed correctly. The chanmask passed is added (ORed) into any existing mask.
+     * The mask uses servo channel numbering
+     */
+    void set_reversible_mask(uint32_t chanmask) override;
+
+    /*
+     * mark the channels in chanmask as reversed.
+     * The chanmask passed is added (ORed) into any existing mask.
+     * The mask uses servo channel numbering
+     */
+    void set_reversed_mask(uint32_t chanmask) override;
+    uint32_t get_reversed_mask() override { return _reversed_mask; }
+
+    /*
+      mark escs as active for the purpose of sending dshot commands
+      The mask uses servo channel numbering
+     */
+    void set_active_escs_mask(uint32_t chanmask) override { _active_escs_mask |= (chanmask >> chan_offset); }
+
+    /*
+      Send a dshot command, if command timout is 0 then 10 commands are sent
+      chan is the servo channel to send the command to
+     */
+    void send_dshot_command(uint8_t command, uint8_t chan = ALL_CHANNELS, uint32_t command_timeout_ms = 0, uint16_t repeat_count = 10, bool priority = false) override;
+
+    /*
+     * Update channel masks at 1Hz allowing for actions such as dshot commands to be sent
+     */
+    void update_channel_masks() override;
+
+    /*
+     * Allow channel mask updates to be temporarily suspended
+     */
+    void disable_channel_mask_updates() override { _disable_channel_mask_updates = true; }
+    void enable_channel_mask_updates() override { _disable_channel_mask_updates = false; }
+#endif
+
+    /*
+      setup serial LED output for a given channel number, with
+      the given max number of LEDs in the chain.
+     */
+#if HAL_SERIALLED_ENABLED
+    bool set_serial_led_num_LEDs(const uint16_t chan, uint8_t num_leds, output_mode mode = MODE_PWM_NONE, uint32_t clock_mask = 0) override;
+
+    /*
+      setup serial LED output data for a given output channel
+      and LEDs number. LED -1 is all LEDs
+     */
+    bool set_serial_led_rgb_data(const uint16_t chan, int8_t led, uint8_t red, uint8_t green, uint8_t blue) override;
+
+    /*
+      trigger send of serial LED data
+     */
+    bool serial_led_send(const uint16_t chan) override;
+#endif
+    /*
+      rcout thread
+     */
+    void rcout_thread();
+
+    /*
+     timer information
+     */
+    void timer_info(ExpandingString &str) override;
+
+private:
+    enum class DshotState {
+      IDLE = 0,
+      SEND_START = 1,
+      SEND_COMPLETE = 2,
+      RECV_START = 3,
+      RECV_COMPLETE = 4,
+      RECV_FAILED = 5
+    };
+
+    struct PACKED SerialLed {
+      uint8_t red;
+      uint8_t green;
+      uint8_t blue;
+    };
+
+    /*
+      DShot handling
+     */
+    // the pre-bit is needed with TIM5, or we can get some corrupt frames
+    static const uint8_t dshot_pre = 1;
+    static const uint8_t dshot_post = 2;
+    static const uint16_t dshot_bit_length = 16 + dshot_pre + dshot_post;
+    static const uint16_t DSHOT_BUFFER_LENGTH = dshot_bit_length * 4 * sizeof(dmar_uint_t);
+    static const uint16_t MIN_GCR_BIT_LEN = 7;
+    static const uint16_t MAX_GCR_BIT_LEN = 22;
+    static const uint16_t TELEM_IC_SAMPLE = 16;
+    static const uint16_t GCR_TELEMETRY_BIT_LEN = MAX_GCR_BIT_LEN;
+    // input capture is expecting TELEM_IC_SAMPLE (16) ticks per transition (22) so the maximum
+    // value of the counter in CCR registers is 16*22 == 352, so must be 16-bit
+    static const uint16_t GCR_TELEMETRY_BUFFER_LEN = GCR_TELEMETRY_BIT_LEN*sizeof(dmar_uint_t);
+    static const uint16_t INVALID_ERPM = 0xffffU;
+    static const uint16_t ZERO_ERPM = 0x0fffU;
+
+    struct pwm_group {
+        // only advanced timers can do high clocks needed for more than 400Hz
+        bool advanced_timer;
+        uint8_t chan[4]; // chan number, zero based, 255 for disabled
+        PWMConfig pwm_cfg;
+        PWMDriver* pwm_drv;
+        uint8_t timer_id;
+        bool have_up_dma; // can we do DMAR outputs for DShot?
+        uint8_t dma_up_stream_id;
+        uint8_t dma_up_channel;
+#ifdef HAL_WITH_BIDIR_DSHOT
+        struct {
+            bool have_dma;
+            uint8_t stream_id;
+            uint8_t channel;
+        } dma_ch[4];
+#ifdef HAL_TIM_UP_SHARED
+        bool shared_up_dma; // do we need to wait for TIMx_UP DMA to be finished after use
+#endif
+#endif
+        uint8_t alt_functions[4];
+        ioline_t pal_lines[4];
+        // below this line is not initialised by hwdef.h
+        enum output_mode current_mode;
+        uint16_t frequency_hz;
+        // mask of channels that are able to be enabled
+        uint32_t ch_mask;
+        // mask of channels that are enabled and active
+        uint32_t en_mask;
+        const stm32_dma_stream_t *dma;
+#if AP_HAL_SHARED_DMA_ENABLED
+        Shared_DMA *dma_handle;
+#endif
+        dmar_uint_t *dma_buffer;
+        uint16_t dma_buffer_len;
+        bool pwm_started;
+        uint32_t bit_width_mul;
+        uint32_t rc_frequency;
+        bool in_serial_dma;
+        rcout_timer_t last_dmar_send_us;
+        rcout_timer_t dshot_pulse_time_us;
+        rcout_timer_t dshot_pulse_send_time_us;
+        virtual_timer_t dma_timeout;
+#if HAL_SERIALLED_ENABLED
+        // serial LED support
+        volatile uint8_t serial_nleds;
+        uint8_t clock_mask;
+        enum output_mode led_mode;
+        volatile bool serial_led_pending;
+        volatile bool prepared_send;
+        HAL_Semaphore serial_led_mutex;
+        // structure to hold serial LED data until it can be transferred
+        // to the DMA buffer
+        SerialLed* serial_led_data[4];
+#endif
+
+        eventmask_t dshot_event_mask;
+        thread_t* dshot_waiter;
+#if HAL_SERIAL_ESC_COMM_ENABLED
+        // serial output
+        struct {
+            // expected time per bit
+            uint16_t bit_time_us;
+
+            // channel to output to within group (0 to 3)
+            uint8_t chan;
+
+            // thread waiting for byte to be written
+            thread_t *waiter;
+        } serial;
+#endif
+
+        // support for bi-directional dshot
+        volatile DshotState dshot_state;
+#ifdef HAL_WITH_BIDIR_DSHOT
+        struct {
+            uint16_t erpm[4];
+            volatile bool enabled;
+            const stm32_dma_stream_t *ic_dma[4];
+            uint16_t dma_tx_size; // save tx value from last read
+            Shared_DMA *ic_dma_handle[4];
+            uint8_t telem_tim_ch[4];
+            uint8_t curr_telem_chan;
+            uint8_t prev_telem_chan;
+            Shared_DMA *curr_ic_dma_handle; // a shortcut to avoid logic errors involving the wrong lock
+            uint16_t telempsc;
+            dmar_uint_t dma_buffer_copy[GCR_TELEMETRY_BUFFER_LEN];
+#if RCOU_DSHOT_TIMING_DEBUG
+            uint16_t telem_rate[4];
+            uint16_t telem_err_rate[4];
+            rcout_timer_t last_print;  // debug
+#endif
+        } bdshot;
+
+        // do we have an input capture dma channel
+        bool has_ic_dma() const {
+          return bdshot.ic_dma_handle[bdshot.curr_telem_chan] != nullptr;
+        }
+
+        bool has_shared_ic_up_dma() const {
+          return bdshot.ic_dma_handle[bdshot.curr_telem_chan] == dma_handle;
+        }
+
+        // is input capture currently enabled
+        bool ic_dma_enabled() const {
+          return bdshot.enabled && has_ic_dma() && bdshot.ic_dma[bdshot.curr_telem_chan] != nullptr;
+        }
+
+        bool has_ic() const {
+          return has_ic_dma() || has_shared_ic_up_dma();
+        }
+
+        // do we have any kind of input capture
+        bool ic_enabled() const {
+          return bdshot.enabled && has_ic();
+        }
+#endif // HAL_WITH_BIDIR_DSHOT
+        // are we safe to send another pulse?
+        bool can_send_dshot_pulse() const {
+          return is_dshot_protocol(current_mode) && AP_HAL::micros64() - last_dmar_send_us > (dshot_pulse_time_us + 50);
+        }
+
+        // return whether the group channel is both enabled in the group and for output
+        bool is_chan_enabled(uint8_t c) const {
+          return chan[c] != CHAN_DISABLED && (en_mask & (1U << chan[c]));
+        }
+    };
+    /*
+      timer thread for use by dshot events
+     */
+    thread_t *rcout_thread_ctx;
+
+#if HAL_SERIALLED_ENABLED
+    /*
+      timer thread for use by led events
+     */
+    thread_t *led_thread_ctx;
+
+    /*
+      mutex to control LED thread creation
+     */
+    HAL_Semaphore led_thread_sem;
+    bool led_thread_created;
+#endif
+
+#if HAL_SERIAL_ESC_COMM_ENABLED
+    /*
+      structure for IRQ handler for soft-serial input
+     */
+    static struct irq_state {
+        // ioline for port being read
+        ioline_t line;
+
+        // time the current byte started
+        uint16_t byte_start_tick;
+
+        // number of bits we have read in this byte
+        uint8_t nbits;
+
+        // bitmask of bits so far (includes start and stop bits)
+        uint16_t bitmask;
+
+        // value of completed byte (includes start and stop bits)
+        uint16_t byteval;
+
+        // expected time per bit in micros
+        uint16_t bit_time_tick;
+
+        // the bit value of the last bit received
+        uint8_t last_bit;
+
+        // thread waiting for byte to be read
+        thread_t *waiter;
+
+        // timeout for byte read
+        virtual_timer_t serial_timeout;
+        bool timed_out;
+    } irq;
+
+    // the group being used for serial output
+    struct pwm_group *serial_group;
+    thread_t *serial_thread;
+    tprio_t serial_priority;
+#endif // HAL_SERIAL_ESC_COMM_ENABLED
+
+    static bool soft_serial_waiting() {
+#if HAL_SERIAL_ESC_COMM_ENABLED
+      return irq.waiter != nullptr;
+#else
+      return false;
+#endif
+    }
+
+    bool in_soft_serial() const {
+#if HAL_SERIAL_ESC_COMM_ENABLED
+      return serial_group != nullptr;
+#else
+      return false;
+#endif
+    }
+
+    static pwm_group pwm_group_list[];
+    static const uint8_t NUM_GROUPS;
+
+#if HAL_WITH_IO_MCU
+    // cached values of AP_BoardConfig::io_enabled() and AP_BoardConfig::io_dshot()
+    // in case the user changes them
+    bool iomcu_enabled;
+    bool iomcu_dshot;
+#endif
+
+    // offset of first local channel
+    uint8_t chan_offset;
+
+    // total number of channels on FMU
+    uint8_t num_fmu_channels;
+
+    // number of active fmu channels
+    uint8_t active_fmu_channels;
+
+#if NUM_SERVO_CHANNELS >= 17
+    static const uint8_t max_channels = 32;
+#else
+    static const uint8_t max_channels = 16;
+#endif
+
+    // last sent values are for all channels
+    uint16_t last_sent[max_channels];
+
+    // these values are for the local channels. Non-local channels are handled by IOMCU
+    uint32_t en_mask;
+    uint16_t period[max_channels];
+
+    // handling of bi-directional dshot
+    struct {
+        uint32_t mask;
+        uint32_t disabled_mask; // record of channels that were tried, but failed
+        uint16_t erpm[max_channels];
+        volatile uint32_t update_mask;
+#ifdef HAL_WITH_BIDIR_DSHOT
+        uint16_t erpm_errors[max_channels];
+        uint16_t erpm_clean_frames[max_channels];
+        uint32_t erpm_last_stats_ms[max_channels];
+        uint8_t motor_poles;
+#endif
+    } _bdshot;
+
+    // dshot period
+    rcout_timer_t _dshot_period_us = 400;
+    // dshot rate as a multiple of loop rate or 0 for 1Khz
+    uint8_t _dshot_rate;
+    // dshot periods since the last push()
+    uint8_t _dshot_cycle;
+    // virtual timer for post-push() pulses
+    virtual_timer_t _dshot_rate_timer;
+
+#if HAL_DSHOT_ENABLED
+    // dshot commands
+    // RingBuffer to store outgoing request.
+    struct DshotCommandPacket {
+      uint8_t command;
+      uint32_t cycle;
+      uint8_t chan;
+    };
+
+    ObjectBuffer<DshotCommandPacket> _dshot_command_queue{8};
+    DshotCommandPacket _dshot_current_command;
+
+    DshotEscType _dshot_esc_type;
+
+    // control updates to channel masks
+    bool _disable_channel_mask_updates;
+
+    bool dshot_command_is_active(const pwm_group& group) const {
+      return (_dshot_current_command.chan == RCOutput::ALL_CHANNELS || (group.ch_mask & (1UL << _dshot_current_command.chan)))
+                && _dshot_current_command.cycle > 0;
+    }
+#endif // HAL_DSHOT_ENABLED
+    bool corked;
+    // mask of channels that are running in high speed
+    uint32_t fast_channel_mask;
+    uint32_t io_fast_channel_mask;
+    // mask of channels that are 3D capable
+    uint32_t _reversible_mask;
+    // mask of channels that should be reversed at startup
+    uint32_t _reversed_mask;
+    // mask of active ESCs
+    uint32_t _active_escs_mask;
+
+    // last time pulse was triggererd used to prevent overlap
+    rcout_timer_t last_pulse_trigger_us;
+
+    // mutex for oneshot triggering
+    mutex_t trigger_mutex;
+
+    // which output groups need triggering
+    uint8_t trigger_groupmask;
+
+    // widest pulse for oneshot triggering
+    uint16_t trigger_widest_pulse;
+
+    bool dshot_timer_setup;
+
+    volatile bool _initialised;
+
+    bool is_bidir_dshot_enabled(const pwm_group& group) const { return (_bdshot.mask & group.ch_mask) != 0; }
+
+    static bool is_dshot_send_allowed(DshotState state) {
+      return state == DshotState::IDLE || state == DshotState::RECV_COMPLETE || state == DshotState::RECV_FAILED;
+    }
+
+    // are all the ESCs returning data
+    bool group_escs_active(const pwm_group& group) const {
+      return group.en_mask > 0 && (group.en_mask & _active_escs_mask) == group.en_mask;
+    }
+
+    // find a channel group given a channel number
+    struct pwm_group *find_chan(uint8_t chan, uint8_t &group_idx);
+
+    // push out values to local PWM
+    void push_local(void);
+
+    // trigger group pulses
+    void trigger_groups(void);
+
+    // setup output frequency for a group
+    void set_freq_group(pwm_group &group);
+
+    // safety switch state
+    AP_HAL::Util::safety_state safety_state;
+    uint32_t safety_update_ms;
+    uint8_t led_counter;
+    int8_t safety_button_counter;
+    uint8_t safety_press_count; // 0.1s units
+
+    // mask of channels to allow when safety on
+    uint32_t safety_mask;
+
+    // update safety switch and LED
+    void safety_update(void);
+
+    // LED thread
+    void led_thread();
+    bool start_led_thread();
+
+    uint32_t telem_request_mask;
+
+    /*
+      Serial lED handling. Max of 32 LEDs uses max 12k of memory per group
+      return true if send was successful
+    */
+    static const eventmask_t serial_event_mask = EVENT_MASK(10);
+    bool serial_led_send(pwm_group &group);
+    void serial_led_set_single_rgb_data(pwm_group& group, uint8_t idx, uint8_t led, uint8_t red, uint8_t green, uint8_t blue);
+    void fill_DMA_buffer_serial_led(pwm_group& group);
+    volatile bool serial_led_pending;
+
+    void dma_allocate(Shared_DMA *ctx);
+    void dma_deallocate(Shared_DMA *ctx);
+    uint16_t create_dshot_packet(const uint16_t value, bool telem_request, bool bidir_telem);
+    void fill_DMA_buffer_dshot(dmar_uint_t *buffer, uint8_t stride, uint16_t packet, uint16_t clockmul);
+
+    // event to allow dshot cascading
+#if defined(HAL_TIM_UP_SHARED)
+    static const eventmask_t DSHOT_CASCADE = EVENT_MASK(16);
+#else
+    static const eventmask_t DSHOT_CASCADE = 0;
+#endif
+    static const eventmask_t EVT_PWM_SEND  = EVENT_MASK(11);
+    static const eventmask_t EVT_PWM_SYNTHETIC_SEND  = EVENT_MASK(13);
+
+    void dshot_send_groups(rcout_timer_t cycle_start_us, rcout_timer_t timeout_us);
+    void dshot_send(pwm_group &group, rcout_timer_t cycle_start_us, rcout_timer_t timeout_us);
+    bool dshot_send_command(pwm_group &group, uint8_t command, uint8_t chan);
+    static void dshot_update_tick(virtual_timer_t*, void* p);
+    static void dshot_send_next_group(void* p);
+    // release locks on the groups that are pending in reverse order
+    sysinterval_t calc_ticks_remaining(pwm_group &group, rcout_timer_t cycle_start_us, rcout_timer_t timeout_period_us, rcout_timer_t output_period_us);
+    void dshot_collect_dma_locks(rcout_timer_t cycle_start_us, rcout_timer_t timeout_period_us, bool led_thread = false);
+    static void dma_up_irq_callback(void *p, uint32_t flags);
+    static void dma_unlock(virtual_timer_t*, void *p);
+    void dma_cancel(pwm_group& group);
+    bool mode_requires_dma(enum output_mode mode) const;
+    bool setup_group_DMA(pwm_group &group, uint32_t bitrate, uint32_t bit_width, bool active_high,
+                         const uint16_t buffer_length, rcout_timer_t pulse_time_us,
+                         bool at_least_freq);
+    void send_pulses_DMAR(pwm_group &group, uint32_t buffer_length);
+    void set_group_mode(pwm_group &group);
+    static uint32_t protocol_bitrate(const enum output_mode mode);
+    void print_group_setup_error(pwm_group &group, const char* error_string);
+
+    /*
+      Support for bi-direction dshot
+     */
+    void bdshot_ic_dma_allocate(Shared_DMA *ctx);
+    void bdshot_ic_dma_deallocate(Shared_DMA *ctx);
+    static uint32_t bdshot_decode_telemetry_packet(dmar_uint_t* buffer, uint32_t count);
+    static uint32_t bdshot_decode_telemetry_packet_f1(dmar_uint_t* buffer, uint32_t count, bool reversed);
+    bool bdshot_decode_telemetry_from_erpm(uint16_t erpm, uint8_t chan);
+    bool bdshot_decode_dshot_telemetry(pwm_group& group, uint8_t chan);
+    static uint8_t bdshot_find_next_ic_channel(const pwm_group& group);
+    static void bdshot_dma_ic_irq_callback(void *p, uint32_t flags);
+    static void bdshot_finish_dshot_gcr_transaction(virtual_timer_t* vt, void *p);
+    bool bdshot_setup_group_ic_DMA(pwm_group &group);
+    void bdshot_prepare_for_next_pulse(pwm_group& group);
+    static void bdshot_receive_pulses_DMAR(pwm_group* group);
+    static void bdshot_receive_pulses_DMAR_f1(pwm_group* group);
+    static void bdshot_reset_pwm(pwm_group& group, uint8_t telem_channel);
+    static void bdshot_reset_pwm_f1(pwm_group& group, uint8_t telem_channel);
+    static void bdshot_disable_pwm_f1(pwm_group& group);
+    static void bdshot_config_icu_dshot(stm32_tim_t* TIMx, uint8_t chan, uint8_t ccr_ch);
+    static void bdshot_config_icu_dshot_f1(stm32_tim_t* TIMx, uint8_t chan, uint8_t ccr_ch);
+    static uint32_t bdshot_get_output_rate_hz(const enum output_mode mode);
+
+    /*
+      setup neopixel (WS2812B) output data for a given output channel
+     */
+    void _set_neopixel_rgb_data(pwm_group *grp, uint8_t idx, uint8_t led, uint8_t red, uint8_t green, uint8_t blue);
+
+    /*
+      setup ProfiLED output data for a given output channel
+     */
+    void _set_profiled_rgb_data(pwm_group *grp, uint8_t idx, uint8_t led, uint8_t red, uint8_t green, uint8_t blue);
+    void _set_profiled_clock(pwm_group *grp, uint8_t idx, uint8_t led);
+    void _set_profiled_blank_frame(pwm_group *grp, uint8_t idx, uint8_t led);
+#if AP_HAL_SHARED_DMA_ENABLED
+    // serial output support
+    bool serial_write_byte(uint8_t b);
+    bool serial_read_byte(uint8_t &b);
+    void fill_DMA_buffer_byte(dmar_uint_t *buffer, uint8_t stride, uint8_t b , uint32_t bitval);
+    static void serial_bit_irq(void);
+    static void serial_byte_timeout(virtual_timer_t* vt, void *ctx);
+#endif
+};
+
+#if RCOU_DSHOT_TIMING_DEBUG
+#define TOGGLE_PIN_DEBUG(pin) do { palToggleLine(HAL_GPIO_LINE_GPIO ## pin); } while (0)
+#else
+#define TOGGLE_PIN_DEBUG(pin) do {} while (0)
+#endif
+
+#endif // HAL_USE_PWM
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Bi-directional dshot based on Betaflight, code by Andy Piper and Siddharth Bharat Purohit
+ */
+
+#include <hal.h>
+#include "RCOutput.h"
+#include <AP_Math/AP_Math.h>
+#include "hwdef/common/stm32_util.h"
+#include <AP_InternalError/AP_InternalError.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+#if HAL_WITH_IO_MCU
+#include <AP_IOMCU/AP_IOMCU.h>
+extern AP_IOMCU iomcu;
+#endif
+
+#if defined(IOMCU_FW)
+#undef INTERNAL_ERROR
+#define INTERNAL_ERROR(x) do {} while (0)
+#endif
+
+using namespace ChibiOS;
+
+extern const AP_HAL::HAL& hal;
+
+#if HAL_USE_PWM
+/*
+ * enable bi-directional telemetry request for a mask of channels. This is used
+ * with DShot to get telemetry feedback
+ */
+void RCOutput::set_bidir_dshot_mask(uint32_t mask)
+{
+#if HAL_WITH_IO_MCU_BIDIR_DSHOT
+    const uint32_t iomcu_mask = ((1U<<chan_offset)-1);
+    if (iomcu_dshot && (mask & iomcu_mask)) {
+        iomcu.set_bidir_dshot_mask(mask & iomcu_mask);
+    }
+#endif
+#ifdef HAL_WITH_BIDIR_DSHOT
+    const uint32_t local_mask = (mask >> chan_offset) & ~_bdshot.disabled_mask;
+    _bdshot.mask = local_mask;
+    // we now need to reconfigure the DMA channels since they are affected by the value of the mask
+    for (uint8_t i = 0; i < NUM_GROUPS; i++ ) {
+        pwm_group &group = pwm_group_list[i];
+        if ((group.ch_mask & local_mask) == 0) {
+            // this group is not affected
+            continue;
+        }
+        set_group_mode(group);
+    }
+#endif
+}
+#endif // HAL_USE_PWM
+
+#ifdef HAL_WITH_BIDIR_DSHOT
+
+#if RCOU_DSHOT_TIMING_DEBUG
+#define DEBUG_CHANNEL 1
+#define TOGGLE_PIN_CH_DEBUG(pin, channel) do { if (channel == DEBUG_CHANNEL) palToggleLine(HAL_GPIO_LINE_GPIO ## pin); } while (0)
+#else
+#define TOGGLE_PIN_CH_DEBUG(pin, channel) do {} while (0)
+#endif
+
+bool RCOutput::bdshot_setup_group_ic_DMA(pwm_group &group)
+{
+    // check if already allocated
+    if (group.has_ic_dma()) {
+        return true;
+    }
+
+    // allocate input capture DMA handles
+    for (uint8_t i = 0; i < 4; i++) {
+        if (!group.is_chan_enabled(i) ||
+            !group.dma_ch[i].have_dma || !(_bdshot.mask & (1 << group.chan[i]))) {
+            continue;
+        }
+        pwmmode_t mode = group.pwm_cfg.channels[i].mode;
+        if (mode == PWM_COMPLEMENTARY_OUTPUT_ACTIVE_LOW ||
+            mode == PWM_COMPLEMENTARY_OUTPUT_ACTIVE_HIGH) {
+            // Complementary channels don't support input capture
+            // Return error
+            return false;
+        }
+
+        if (!group.bdshot.ic_dma_handle[i]) {
+            // share up channel if required
+            if (group.dma_ch[i].stream_id == group.dma_up_stream_id) {
+                group.bdshot.ic_dma_handle[i] = group.dma_handle;
+            } else {
+                group.bdshot.ic_dma_handle[i] = NEW_NOTHROW Shared_DMA(group.dma_ch[i].stream_id, SHARED_DMA_NONE,
+                                                FUNCTOR_BIND_MEMBER(&RCOutput::bdshot_ic_dma_allocate, void, Shared_DMA *),
+                                                FUNCTOR_BIND_MEMBER(&RCOutput::bdshot_ic_dma_deallocate, void, Shared_DMA *));
+            }
+            if (!group.bdshot.ic_dma_handle[i]) {
+                goto ic_dma_fail;
+            }
+        }
+    }
+
+    // We might need to do sharing of timers for telemetry feedback
+    // due to lack of available DMA channels
+    for (uint8_t i = 0; i < 4; i++) {
+        // we must pull all the allocated channels high to prevent them going low
+        // when the pwm peripheral is stopped
+        if (group.chan[i] != CHAN_DISABLED && _bdshot.mask & group.ch_mask) {
+            // bi-directional dshot requires less than MID2 speed and PUSHPULL in order to avoid noise on the line
+            // when switching from output to input
+#if defined(STM32F1)
+            // on F103 the line mode has to be managed manually
+            // PAL_MODE_STM32_ALTERNATE_PUSHPULL is 50Mhz, similar to the medieum speed on other MCUs
+            palSetLineMode(group.pal_lines[i], PAL_MODE_STM32_ALTERNATE_PUSHPULL);
+#else
+            palSetLineMode(group.pal_lines[i], PAL_MODE_ALTERNATE(group.alt_functions[i])
+                | PAL_STM32_OTYPE_PUSHPULL | PAL_STM32_PUPDR_PULLUP |
+#ifdef PAL_STM32_OSPEED_MID1
+                PAL_STM32_OSPEED_MID1
+#elif defined(PAL_STM32_OSPEED_MEDIUM)
+                PAL_STM32_OSPEED_MEDIUM
+#else
+#error "Cannot set bdshot line speed"
+#endif
+                );
+#endif
+        }
+
+        if (!group.is_chan_enabled(i) || !(_bdshot.mask & (1 << group.chan[i]))) {
+            continue;
+        }
+        uint8_t curr_chan = i;
+        if (group.bdshot.ic_dma_handle[i]) {
+            // we are all good just set and continue
+            group.bdshot.telem_tim_ch[i] = curr_chan;
+        } else {
+            // I guess we have to share, but only channels 1 & 2 or 3 & 4
+            if (curr_chan % 2 == 0) {
+                curr_chan = curr_chan + 1;
+            } else {
+                curr_chan = curr_chan - 1;
+            }
+            if (!group.dma_ch[curr_chan].have_dma) {
+                // We can't find a DMA channel to use so
+                // return error
+                goto ic_dma_fail;
+            }
+            if (group.bdshot.ic_dma_handle[i]) {
+                INTERNAL_ERROR(AP_InternalError::error_t::dma_fail);
+                goto ic_dma_fail;
+            }
+            // share up channel if required
+            if (group.dma_ch[curr_chan].stream_id == group.dma_up_stream_id) {
+                group.bdshot.ic_dma_handle[i] = group.dma_handle;
+            } else {
+                // we can use the next channel
+                group.bdshot.ic_dma_handle[i] = NEW_NOTHROW Shared_DMA(group.dma_ch[curr_chan].stream_id, SHARED_DMA_NONE,
+                                            FUNCTOR_BIND_MEMBER(&RCOutput::bdshot_ic_dma_allocate, void, Shared_DMA *),
+                                            FUNCTOR_BIND_MEMBER(&RCOutput::bdshot_ic_dma_deallocate, void, Shared_DMA *));
+            }
+            if (!group.bdshot.ic_dma_handle[i]) {
+                goto ic_dma_fail;
+            }
+            group.bdshot.telem_tim_ch[i] = curr_chan;
+            group.dma_ch[i] = group.dma_ch[curr_chan];
+        }
+    }
+
+    // now allocate the starting channel
+    for (uint8_t i = 0; i < 4; i++) {
+        if (group.chan[i] != CHAN_DISABLED && group.bdshot.ic_dma_handle[i] != nullptr) {
+            group.bdshot.curr_telem_chan = i;
+            break;
+        }
+    }
+
+    return true;
+
+ic_dma_fail:
+    for (uint8_t i = 0; i < 4; i++) {
+        if (group.bdshot.ic_dma_handle[i] != group.dma_handle) {
+            delete group.bdshot.ic_dma_handle[i];
+        }
+        group.bdshot.ic_dma_handle[i] = nullptr;
+    }
+    return false;
+}
+
+/*
+  allocate DMA channel
+ */
+void RCOutput::bdshot_ic_dma_allocate(Shared_DMA *ctx)
+{
+    for (uint8_t i = 0; i < NUM_GROUPS; i++ ) {
+        pwm_group &group = pwm_group_list[i];
+        for (uint8_t icuch = 0; icuch < 4; icuch++) {
+            if (group.bdshot.ic_dma_handle[icuch] == ctx && group.bdshot.ic_dma[icuch] == nullptr) {
+                chSysLock();
+                group.bdshot.ic_dma[icuch] = dmaStreamAllocI(group.dma_ch[icuch].stream_id, 10, bdshot_dma_ic_irq_callback, &group);
+#if STM32_DMA_SUPPORTS_DMAMUX
+                if (group.bdshot.ic_dma[icuch]) {
+                    dmaSetRequestSource(group.bdshot.ic_dma[icuch], group.dma_ch[icuch].channel);
+                }
+#endif
+                chSysUnlock();
+            }
+        }
+    }
+}
+
+/*
+  deallocate DMA channel
+ */
+void RCOutput::bdshot_ic_dma_deallocate(Shared_DMA *ctx)
+{
+    for (uint8_t i = 0; i < NUM_GROUPS; i++ ) {
+        pwm_group &group = pwm_group_list[i];
+        for (uint8_t icuch = 0; icuch < 4; icuch++) {
+            chSysLock();
+            if (group.bdshot.ic_dma_handle[icuch] == ctx && group.bdshot.ic_dma[icuch] != nullptr) {
+                dmaStreamFreeI(group.bdshot.ic_dma[icuch]);
+#if defined(STM32F1)
+                if (group.bdshot.ic_dma_handle[icuch]->is_shared()) {
+                    bdshot_disable_pwm_f1(group);
+                }
+#endif
+                group.bdshot.ic_dma[icuch] = nullptr;
+            }
+            chSysUnlock();
+        }
+    }
+}
+
+// setup bdshot for sending and receiving the next pulse
+void RCOutput::bdshot_prepare_for_next_pulse(pwm_group& group)
+{
+    // assume that we won't be able to get the input capture lock
+    group.bdshot.enabled = false;
+
+    uint32_t active_channels = group.ch_mask & group.en_mask;
+    // now grab the input capture lock if we are able, we can only enable bi-dir on a group basis
+    if (((_bdshot.mask & active_channels) == active_channels) && group.has_ic()) {
+        if (group.has_shared_ic_up_dma()) {
+            // no locking required
+            group.bdshot.enabled = true;
+        } else {
+            osalDbgAssert(!group.bdshot.curr_ic_dma_handle, "IC DMA handle has not been released");
+            group.bdshot.curr_ic_dma_handle = group.bdshot.ic_dma_handle[group.bdshot.curr_telem_chan];
+#ifdef HAL_TIM_UP_SHARED
+            osalDbgAssert(group.shared_up_dma || !group.bdshot.curr_ic_dma_handle->is_locked(), "IC DMA handle is already locked");
+#else
+            osalDbgAssert(!group.bdshot.curr_ic_dma_handle->is_locked(), "IC DMA handle is already locked");
+#endif
+            group.bdshot.curr_ic_dma_handle->lock();
+            group.bdshot.enabled = true;
+        }
+    }
+
+    // if the last transaction returned telemetry, decode it
+    if (group.dshot_state == DshotState::RECV_COMPLETE) {
+        uint8_t chan = group.chan[group.bdshot.prev_telem_chan];
+        uint32_t now = AP_HAL::millis();
+        if (bdshot_decode_dshot_telemetry(group, group.bdshot.prev_telem_chan)) {
+            _bdshot.erpm_clean_frames[chan]++;
+            _active_escs_mask |= (1<<chan); // we know the ESC is functional at this point
+        } else {
+            _bdshot.erpm_errors[chan]++;
+        }
+        // reset statistics periodically
+        if (now - _bdshot.erpm_last_stats_ms[chan] > 5000) {
+            _bdshot.erpm_clean_frames[chan] = 0;
+            _bdshot.erpm_errors[chan] = 0;
+            _bdshot.erpm_last_stats_ms[chan] = now;
+        }
+    } else if (group.dshot_state == DshotState::RECV_FAILED) {
+        _bdshot.erpm_errors[group.bdshot.curr_telem_chan]++;
+    }
+
+    if (group.bdshot.enabled) {
+        if (group.pwm_started) {
+            bdshot_reset_pwm(group, group.bdshot.prev_telem_chan);
+        }
+        else {
+            pwmStart(group.pwm_drv, &group.pwm_cfg);
+            group.pwm_started = true;
+        }
+
+        // we can be more precise for capture timer
+        group.bdshot.telempsc = (uint16_t)(lrintf(((float)group.pwm_drv->clock / bdshot_get_output_rate_hz(group.current_mode) + 0.01f)/TELEM_IC_SAMPLE) - 1);
+    }
+}
+
+// reset pwm driver to output mode without resetting the clock or the peripheral
+// the code here is the equivalent of pwmStart()/pwmStop()
+void RCOutput::bdshot_reset_pwm(pwm_group& group, uint8_t telem_channel)
+{
+#if defined(STM32F1)
+    bdshot_reset_pwm_f1(group, telem_channel);
+#else
+    // on more capable MCUs we can do something very simple
+    pwmStop(group.pwm_drv);
+    pwmStart(group.pwm_drv, &group.pwm_cfg);
+#endif
+}
+
+// see https://github.com/betaflight/betaflight/pull/8554#issuecomment-512507625
+// called from the interrupt
+#pragma GCC push_options
+#pragma GCC optimize("O2")
+#if !defined(STM32F1)
+void RCOutput::bdshot_receive_pulses_DMAR(pwm_group* group)
+{
+    // make sure the transaction finishes or times out, this function takes a little time to run so the most
+    // accurate timing is from the beginning. the pulse time is slightly longer than we need so an extra 10U
+    // should be plenty
+    chVTSetI(&group->dma_timeout, chTimeUS2I(group->dshot_pulse_send_time_us + 30U + 10U),
+        bdshot_finish_dshot_gcr_transaction, group);
+
+    group->pwm_drv->tim->CR1 = 0;
+
+    // Configure Timer
+    group->pwm_drv->tim->SR = 0;
+    group->pwm_drv->tim->CCER = 0;
+    group->pwm_drv->tim->CCMR1 = 0;
+    group->pwm_drv->tim->CCMR2 = 0;
+    group->pwm_drv->tim->DIER = 0;
+    group->pwm_drv->tim->CR2 = 0;
+    group->pwm_drv->tim->PSC = group->bdshot.telempsc;
+
+    group->dshot_state = DshotState::RECV_START;
+
+    //TOGGLE_PIN_CH_DEBUG(54, curr_ch);
+    group->pwm_drv->tim->ARR = 0xFFFF;  // count forever
+    group->pwm_drv->tim->CNT = 0;
+    uint8_t curr_ch = group->bdshot.curr_telem_chan;
+
+    // Initialise ICU channels
+    bdshot_config_icu_dshot(group->pwm_drv->tim, curr_ch, group->bdshot.telem_tim_ch[curr_ch]);
+
+    // do a little DMA dance when sharing with UP
+#if STM32_DMA_SUPPORTS_DMAMUX
+    if (group->has_shared_ic_up_dma()) {
+        dmaSetRequestSource(group->dma, group->dma_ch[curr_ch].channel);
+    }
+#endif
+    const stm32_dma_stream_t *ic_dma =
+        group->has_shared_ic_up_dma() ? group->dma : group->bdshot.ic_dma[curr_ch];
+
+    // Configure DMA
+    dmaStreamSetPeripheral(ic_dma, &(group->pwm_drv->tim->DMAR));
+    dmaStreamSetMemory0(ic_dma, group->dma_buffer);
+    dmaStreamSetTransactionSize(ic_dma, GCR_TELEMETRY_BIT_LEN);
+#if STM32_DMA_ADVANCED
+    dmaStreamSetFIFO(ic_dma, STM32_DMA_FCR_DMDIS | STM32_DMA_FCR_FTH_FULL);
+#endif
+    dmaStreamSetMode(ic_dma,
+                    STM32_DMA_CR_CHSEL(group->dma_ch[curr_ch].channel) |
+                    STM32_DMA_CR_DIR_P2M |
+                    STM32_DMA_CR_PSIZE_WORD |
+                    STM32_DMA_CR_MSIZE_WORD |
+                    STM32_DMA_CR_MINC | STM32_DMA_CR_PL(3) |
+                    STM32_DMA_CR_TEIE | STM32_DMA_CR_TCIE);
+
+    // setup for transfers. 0x0D is the register
+    // address offset of the CCR registers in the timer peripheral
+    const uint8_t ccr_ofs = offsetof(stm32_tim_t, CCR)/4 + group->bdshot.telem_tim_ch[curr_ch];
+    group->pwm_drv->tim->DCR = STM32_TIM_DCR_DBA(ccr_ofs) | STM32_TIM_DCR_DBL(0);
+
+    // Start Timer
+    group->pwm_drv->tim->EGR |= STM32_TIM_EGR_UG;
+    group->pwm_drv->tim->SR = 0;
+    group->pwm_drv->tim->CR1 = TIM_CR1_ARPE | STM32_TIM_CR1_URS | STM32_TIM_CR1_UDIS | STM32_TIM_CR1_CEN;
+    dmaStreamEnable(ic_dma);
+}
+
+
+void RCOutput::bdshot_config_icu_dshot(stm32_tim_t* TIMx, uint8_t chan, uint8_t ccr_ch)
+{
+    switch(ccr_ch) {
+    case 0: {
+        /* Disable the Channel 1: Reset the CC1E Bit */
+        TIMx->CCER &= (uint32_t)~TIM_CCER_CC1E;
+
+        const uint32_t CCMR1_FILT = TIM_CCMR1_IC1F_1;   // 4 samples per output transition
+        // Select the Input and set the filter and the prescaler value
+        if (chan == 0) {
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC1S | TIM_CCMR1_IC1F | TIM_CCMR1_IC1PSC),
+                        (TIM_CCMR1_CC1S_0 | CCMR1_FILT));
+        } else {
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC1S | TIM_CCMR1_IC1F | TIM_CCMR1_IC1PSC),
+                        (TIM_CCMR1_CC1S_1 | CCMR1_FILT));
+        }
+        // Select the Polarity as Both Edge and set the CC1E Bit
+        MODIFY_REG(TIMx->CCER,
+                    (TIM_CCER_CC1P | TIM_CCER_CC1NP | TIM_CCER_CC1E),
+                    (TIM_CCER_CC1P | TIM_CCER_CC1NP | TIM_CCER_CC1E));
+        MODIFY_REG(TIMx->DIER, TIM_DIER_CC1DE, TIM_DIER_CC1DE);
+        break;
+    }
+    case 1: {
+        // Disable the Channel 2: Reset the CC2E Bit
+        TIMx->CCER &= (uint32_t)~TIM_CCER_CC2E;
+
+        const uint32_t CCMR1_FILT = TIM_CCMR1_IC2F_1;
+        // Select the Input and set the filter and the prescaler value
+        if (chan == 0) {
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC2S | TIM_CCMR1_IC2F | TIM_CCMR1_IC2PSC),
+                        (TIM_CCMR1_CC2S_1 | CCMR1_FILT));
+        } else {
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC2S | TIM_CCMR1_IC2F | TIM_CCMR1_IC2PSC),
+                        (TIM_CCMR1_CC2S_0 | CCMR1_FILT));
+        }
+
+        // Select the Polarity as Both Edge and set the CC2E Bit
+        MODIFY_REG(TIMx->CCER,
+                    TIM_CCER_CC2P | TIM_CCER_CC2NP | TIM_CCER_CC2E,
+                    (TIM_CCER_CC2P | TIM_CCER_CC2NP | TIM_CCER_CC2E));
+        MODIFY_REG(TIMx->DIER, TIM_DIER_CC2DE, TIM_DIER_CC2DE);
+        break;
+    }
+    case 2: {
+        // Disable the Channel 3: Reset the CC3E Bit
+        TIMx->CCER &= (uint32_t)~TIM_CCER_CC3E;
+
+        const uint32_t CCMR2_FILT = TIM_CCMR2_IC3F_1;
+        // Select the Input and set the filter and the prescaler value
+        if (chan == 2) {
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC3S | TIM_CCMR2_IC3F | TIM_CCMR2_IC3PSC),
+                        (TIM_CCMR2_CC3S_0 | CCMR2_FILT));
+        } else {
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC3S | TIM_CCMR2_IC3F | TIM_CCMR2_IC3PSC),
+                        (TIM_CCMR2_CC3S_1 | CCMR2_FILT));
+        }
+
+        // Select the Polarity as Both Edge and set the CC3E Bit
+        MODIFY_REG(TIMx->CCER,
+                    (TIM_CCER_CC3P | TIM_CCER_CC3NP | TIM_CCER_CC3E),
+                    (TIM_CCER_CC3P | TIM_CCER_CC3NP | TIM_CCER_CC3E));
+        MODIFY_REG(TIMx->DIER, TIM_DIER_CC3DE, TIM_DIER_CC3DE);
+        break;
+    }
+    case 3: {
+        // Disable the Channel 4: Reset the CC4E Bit
+        TIMx->CCER &= (uint32_t)~TIM_CCER_CC4E;
+
+        const uint32_t CCMR2_FILT = TIM_CCMR2_IC4F_1;
+        // Select the Input and set the filter and the prescaler value
+        if (chan == 2) {
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC4S | TIM_CCMR2_IC4F | TIM_CCMR2_IC4PSC),
+                        (TIM_CCMR2_CC4S_1 | CCMR2_FILT));
+        } else {
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC4S | TIM_CCMR2_IC4F | TIM_CCMR2_IC4PSC),
+                        (TIM_CCMR2_CC4S_0 | CCMR2_FILT));
+        }
+
+        // Select the Polarity as Both Edge and set the CC4E Bit
+        MODIFY_REG(TIMx->CCER,
+                    (TIM_CCER_CC4P | TIM_CCER_CC4NP | TIM_CCER_CC4E),
+                    (TIM_CCER_CC4P | TIM_CCER_CC4NP | TIM_CCER_CC4E));
+
+        MODIFY_REG(TIMx->DIER, TIM_DIER_CC4DE, TIM_DIER_CC4DE);
+        break;
+    }
+    default:
+        break;
+    }
+}
+#endif  // !defined(STM32F1)
+
+/*
+  unlock DMA channel after a bi-directional dshot transaction completes
+ */
+__RAMFUNC__ void RCOutput::bdshot_finish_dshot_gcr_transaction(virtual_timer_t* vt, void *p)
+{
+    pwm_group *group = (pwm_group *)p;
+    chSysLockFromISR();
+#ifdef HAL_GPIO_LINE_GPIO56
+    TOGGLE_PIN_DEBUG(56);
+#endif
+    uint8_t curr_telem_chan = group->bdshot.curr_telem_chan;
+
+    // the DMA buffer is either the regular outbound one because we are sharing UP and CH
+    // or the input channel buffer
+    const stm32_dma_stream_t *dma =
+        group->has_shared_ic_up_dma() ? group->dma : group->bdshot.ic_dma[curr_telem_chan];
+    osalDbgAssert(dma, "No DMA channel");
+    // record the transaction size before the stream is released
+    dmaStreamDisable(dma);
+    group->bdshot.dma_tx_size = MIN(uint16_t(GCR_TELEMETRY_BIT_LEN),
+        GCR_TELEMETRY_BIT_LEN - dmaStreamGetTransactionSize(dma));
+
+    stm32_cacheBufferInvalidate(group->dma_buffer, group->bdshot.dma_tx_size);
+    memcpy(group->bdshot.dma_buffer_copy, group->dma_buffer, sizeof(dmar_uint_t) * group->bdshot.dma_tx_size);
+
+#ifdef HAL_TIM_UP_SHARED
+    // although it should be possible to start the next DMAR transaction concurrently with receiving 
+    // telemetry, in practice it seems to interfere with the DMA engine
+    if (group->shared_up_dma && group->bdshot.enabled) {
+        // next dshot pulse can go out now
+        chEvtSignalI(group->dshot_waiter, DSHOT_CASCADE);
+    }
+#endif
+    // if using input capture DMA and sharing the UP and CH channels then clean up
+    // by assigning the source back to UP
+#if STM32_DMA_SUPPORTS_DMAMUX
+    if (group->has_shared_ic_up_dma()) {
+        dmaSetRequestSource(group->dma, group->dma_up_channel);
+    }
+#endif
+
+    group->bdshot.prev_telem_chan = group->bdshot.curr_telem_chan;
+    // rotate to the next input channel, we have to rotate even on failure otherwise
+    // we will not get data from active channels
+    group->bdshot.curr_telem_chan = bdshot_find_next_ic_channel(*group);
+
+    // dshot commands are issued without a response coming back, this allows
+    // us to handle the next packet correctly without it looking like a failure
+    if (group->bdshot.dma_tx_size > 0) {
+        group->dshot_state = DshotState::RECV_COMPLETE;
+    } else {
+        group->dshot_state = DshotState::RECV_FAILED;
+    }
+
+    // tell the waiting process we've done the DMA
+    chEvtSignalI(group->dshot_waiter, group->dshot_event_mask);
+#ifdef HAL_GPIO_LINE_GPIO56
+    TOGGLE_PIN_DEBUG(56);
+#endif
+    chSysUnlockFromISR();
+}
+
+/*
+  decode returned data from bi-directional dshot
+ */
+bool RCOutput::bdshot_decode_dshot_telemetry(pwm_group& group, uint8_t chan)
+{
+    if (!group.is_chan_enabled(chan)) {
+        return true;
+    }
+
+    // evaluate dshot telemetry
+#if defined(STM32F1)
+    const bool reversed = (group.bdshot.telem_tim_ch[chan] & 1U) == 0;
+    group.bdshot.erpm[chan] = bdshot_decode_telemetry_packet_f1(group.bdshot.dma_buffer_copy, group.bdshot.dma_tx_size, reversed);
+#else
+    group.bdshot.erpm[chan] = bdshot_decode_telemetry_packet(group.bdshot.dma_buffer_copy, group.bdshot.dma_tx_size);
+#endif
+
+    group.dshot_state = DshotState::IDLE;
+
+#if RCOU_DSHOT_TIMING_DEBUG
+    // Record Stats
+    if (group.bdshot.erpm[chan] != 0xFFFF) {
+        group.bdshot.telem_rate[chan]++;
+    } else {
+#ifdef HAL_GPIO_LINE_GPIO57
+        TOGGLE_PIN_DEBUG(57);
+#endif
+        group.bdshot.telem_err_rate[chan]++;
+#ifdef HAL_GPIO_LINE_GPIO57
+        TOGGLE_PIN_DEBUG(57);
+#endif
+    }
+#if !defined(IOMCU_FW)
+    rcout_timer_t now = rcout_micros();
+    if (chan == DEBUG_CHANNEL && (now  - group.bdshot.last_print) > 1000000) {
+        hal.console->printf("TELEM: %d <%d Hz, %.1f%% err>", group.bdshot.erpm[chan], group.bdshot.telem_rate[chan],
+            100.0f * float(group.bdshot.telem_err_rate[chan]) / (group.bdshot.telem_err_rate[chan] + group.bdshot.telem_rate[chan]));
+        hal.console->printf(" %ld ", group.bdshot.dma_buffer_copy[0]);
+        for (uint8_t l = 1; l < group.bdshot.dma_tx_size; l++) {
+            hal.console->printf(" +%ld ", group.bdshot.dma_buffer_copy[l] - group.bdshot.dma_buffer_copy[l-1]);
+        }
+        hal.console->printf("\n");
+
+        group.bdshot.telem_rate[chan] = 0;
+        group.bdshot.telem_err_rate[chan] = 0;
+        group.bdshot.last_print = now;
+    }
+#endif
+#endif
+    return group.bdshot.erpm[chan] != 0xFFFF;
+}
+
+// Find next valid channel for dshot telem
+uint8_t RCOutput::bdshot_find_next_ic_channel(const pwm_group& group)
+{
+    uint8_t chan = group.bdshot.curr_telem_chan;
+    for (uint8_t i = 1; i < 4; i++) {
+        const uint8_t next_chan = (chan + i) % 4;
+        if (group.is_chan_enabled(next_chan) &&
+            group.bdshot.ic_dma_handle[next_chan] != nullptr) {
+            return next_chan;
+        }
+    }
+    return chan;
+}
+
+/*
+  DMA UP channel interrupt handler. Used to mark DMA send completed for DShot
+ */
+__RAMFUNC__ void RCOutput::dma_up_irq_callback(void *p, uint32_t flags)
+{
+    pwm_group *group = (pwm_group *)p;
+    chSysLockFromISR();
+
+    // there is a small chance the shared UP CH codepath will get here
+    if (group->bdshot.enabled && group->dshot_state == DshotState::RECV_START) {
+        chSysUnlockFromISR();
+        return;
+    }
+
+    // check nothing bad happened
+    if ((flags & (STM32_DMA_ISR_TEIF | STM32_DMA_ISR_DMEIF)) != 0) {
+        INTERNAL_ERROR(AP_InternalError::error_t::dma_fail);
+    }
+    dmaStreamDisable(group->dma);
+
+    if (soft_serial_waiting()) {
+#if HAL_SERIAL_ESC_COMM_ENABLED
+        // tell the waiting process we've done the DMA
+        chEvtSignalI(irq.waiter, serial_event_mask);
+#endif
+    } else if (!group->in_serial_dma && group->bdshot.enabled) {
+        group->dshot_state = DshotState::SEND_COMPLETE;
+        // sending is done, in 30us the ESC will send telemetry
+#if defined(STM32F1)
+        bdshot_receive_pulses_DMAR_f1(group);
+#else
+        bdshot_receive_pulses_DMAR(group);
+#endif
+    } else {
+        // non-bidir case, this prevents us ever having two dshot pulses too close together
+        if (is_dshot_protocol(group->current_mode)) {
+            // since we could be sending a dshot command, wait the full telemetry pulse width
+            // dshot mandates a minimum pulse separation of 40us
+            chVTSetI(&group->dma_timeout, chTimeUS2I(group->dshot_pulse_send_time_us + 30U + 40U), dma_unlock, p);
+        } else {
+            // WS2812 mandates a minimum pulse separation of 50us
+            chVTSetI(&group->dma_timeout, chTimeUS2I(50U), dma_unlock, p);
+        }
+    }
+
+    chSysUnlockFromISR();
+}
+
+// DMA IC channel handler. Used to mark DMA receive completed for DShot
+__RAMFUNC__ void RCOutput::bdshot_dma_ic_irq_callback(void *p, uint32_t flags)
+{
+    chSysLockFromISR();
+
+    // check nothing bad happened
+    if ((flags & (STM32_DMA_ISR_TEIF | STM32_DMA_ISR_DMEIF)) != 0) {
+        INTERNAL_ERROR(AP_InternalError::error_t::dma_fail);
+    }
+
+    chSysUnlockFromISR();
+}
+
+/*
+    returns the bitrate in Hz of the given output_mode
+*/
+uint32_t RCOutput::bdshot_get_output_rate_hz(const enum output_mode mode)
+{
+    switch (mode) {
+    case MODE_PWM_DSHOT150:
+        return 150000U * 5 / 4;
+    case MODE_PWM_DSHOT300:
+        return 300000U * 5 / 4;
+    case MODE_PWM_DSHOT600:
+        return 600000U * 5 / 4;
+    case MODE_PWM_DSHOT1200:
+        return 1200000U * 5 / 4;
+    default:
+        // use 1 to prevent a possible divide-by-zero
+        return 1;
+    }
+}
+
+// decode a telemetry packet from a GCR encoded stride buffer, take from betaflight decodeTelemetryPacket
+// see https://github.com/betaflight/betaflight/pull/8554#issuecomment-512507625 for a description of the protocol
+uint32_t RCOutput::bdshot_decode_telemetry_packet(dmar_uint_t* buffer, uint32_t count)
+{
+    uint32_t value = 0;
+    uint32_t bits = 0;
+    uint32_t len;
+
+    dmar_uint_t oldValue = buffer[0];
+
+    for (uint32_t i = 1; i <= count; i++) {
+        if (i < count) {
+            dmar_int_t diff = buffer[i] - oldValue;
+            if (bits >= 21U) {
+                break;
+            }
+            len = (diff + TELEM_IC_SAMPLE/2U) / TELEM_IC_SAMPLE;
+        } else {
+            len = 21U - bits;
+        }
+
+        value <<= len;
+        value |= 1U << (len - 1U);
+        oldValue = buffer[i];
+        bits += len;
+    }
+
+    if (bits != 21U) {
+        return INVALID_ERPM;
+    }
+
+    static const uint32_t decode[32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10, 11, 0, 13, 14, 15,
+        0, 0, 2, 3, 0, 5, 6, 7, 0, 0, 8, 1, 0, 4, 12, 0 };
+
+    uint32_t decodedValue = decode[value & 0x1fU];
+    decodedValue |= decode[(value >> 5U) & 0x1fU] << 4U;
+    decodedValue |= decode[(value >> 10U) & 0x1fU] << 8U;
+    decodedValue |= decode[(value >> 15U) & 0x1fU] << 12U;
+
+    uint32_t csum = decodedValue;
+    csum = csum ^ (csum >> 8U); // xor bytes
+    csum = csum ^ (csum >> 4U); // xor nibbles
+
+    if ((csum & 0xfU) != 0xfU) {
+        return INVALID_ERPM;
+    }
+    decodedValue >>= 4;
+
+    return decodedValue;
+}
+#pragma GCC pop_options
+
+// update ESC telemetry information. Returns true if valid eRPM data was decoded.
+bool RCOutput::bdshot_decode_telemetry_from_erpm(uint16_t encodederpm, uint8_t chan)
+{
+    if (encodederpm == INVALID_ERPM) {
+        return false;
+    }
+
+    // eRPM = m << e (see https://github.com/bird-sanctuary/extended-dshot-telemetry)
+    uint8_t expo = ((encodederpm & 0xfffffe00U) >> 9U) & 0xffU; // 3bits
+    uint16_t value = (encodederpm & 0x000001ffU);               // 9bits
+#if HAL_WITH_ESC_TELEM
+    uint8_t normalized_chan = chan;
+#if HAL_WITH_IO_MCU
+    if (iomcu_enabled) {
+        normalized_chan = chan + chan_offset;
+    }
+#endif
+#endif // HAL_WITH_ESC_TELEM: one can possibly imagine a FC with IOMCU but with ESC_TELEM compiled out...
+
+    if (!(value & 0x100U) && (_dshot_esc_type == DSHOT_ESC_BLHELI_EDT || _dshot_esc_type == DSHOT_ESC_BLHELI_EDT_S)) {
+        switch (expo) {
+        case 0b001: { // Temperature C
+    #if HAL_WITH_ESC_TELEM
+            TelemetryData t {
+                .temperature_cdeg = int16_t(value * 100)
+            };
+            update_telem_data(normalized_chan, t, AP_ESC_Telem_Backend::TelemetryType::TEMPERATURE);
+    #endif
+            return false;
+            }
+            break;
+        case 0b010: { // Voltage 0.25v
+    #if HAL_WITH_ESC_TELEM
+            TelemetryData t {
+                .voltage = 0.25f * value
+            };
+            update_telem_data(normalized_chan, t, AP_ESC_Telem_Backend::TelemetryType::VOLTAGE);
+    #endif
+            return false;
+            }
+            break;
+        case 0b011: { // Current A
+    #if HAL_WITH_ESC_TELEM
+            TelemetryData t {
+                .current = float(value)
+            };
+            update_telem_data(normalized_chan, t, AP_ESC_Telem_Backend::TelemetryType::CURRENT);
+    #endif
+            return false;
+            }
+            break;
+        case 0b100:  // Debug 1
+        case 0b101:  // Debug 2
+            return false;
+            break;
+        case 0b110: { // Stress level
+    #if HAL_WITH_ESC_TELEM && AP_EXTENDED_DSHOT_TELEM_V2_ENABLED
+            TelemetryData t {
+                .edt2_stress = value
+            };
+            update_telem_data(normalized_chan, t, AP_ESC_Telem_Backend::TelemetryType::EDT2_STRESS);
+    #endif
+            return false;
+            }
+            break;
+        case 0b111: { // Status
+    #if HAL_WITH_ESC_TELEM && AP_EXTENDED_DSHOT_TELEM_V2_ENABLED
+            TelemetryData t {
+                .edt2_status = value
+            };
+            update_telem_data(normalized_chan, t, AP_ESC_Telem_Backend::TelemetryType::EDT2_STATUS);
+    #endif
+            return false;
+            }
+            break;
+        default:     // eRPM
+            break;
+        }
+    }
+
+    uint16_t erpm = value << expo;
+
+    if (!erpm) {    // decoded as 0 is an error
+        return false;
+    }
+
+    erpm = (1000000U * 60U / 100U + erpm / 2U) / erpm;
+
+    if (encodederpm == ZERO_ERPM) { // the special 0 encoding
+        erpm = 0;
+    }
+
+    // update the ESC telemetry data
+    if (erpm < INVALID_ERPM) {
+        _bdshot.erpm[chan] = erpm;
+        _bdshot.update_mask |= 1U<<chan;
+#if HAL_WITH_ESC_TELEM
+        update_rpm(normalized_chan, erpm * 200U / _bdshot.motor_poles, get_erpm_error_rate(chan));
+#endif
+    }
+    return erpm < INVALID_ERPM;
+}
+
+uint32_t RCOutput::read_erpm(uint16_t* erpm, uint8_t len)
+{
+    const uint8_t READ_LEN = MIN(len, uint8_t(max_channels));
+    memcpy(erpm, _bdshot.erpm, sizeof(uint16_t) * READ_LEN);
+    const uint32_t mask = _bdshot.update_mask;
+    _bdshot.update_mask = 0;
+    return mask;
+}
+
+#endif // HAL_WITH_BIDIR_DSHOT
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andy Piper and Siddharth Bharat Purohit
+ * 
+ * There really is no dshot reference. For information try these resources:
+ * https://blck.mn/2016/11/dshot-the-new-kid-on-the-block/
+ * https://www.swallenhardware.io/battlebots/2019/4/20/a-developers-guide-to-dshot-escs
+ */
+
+#include <hal.h>
+
+#if defined(IOMCU_FW) && HAL_DSHOT_ENABLED
+// need to give the little guy as much help as possible
+#pragma GCC optimize("O2")
+
+#include "RCOutput.h"
+#include <AP_Math/AP_Math.h>
+#include "GPIO.h"
+#include "Scheduler.h"
+
+#if HAL_USE_PWM == TRUE
+
+using namespace ChibiOS;
+
+extern const AP_HAL::HAL& hal;
+
+#ifdef HAL_WITH_BIDIR_DSHOT
+THD_WORKING_AREA(dshot_thread_wa, 512);
+#else
+THD_WORKING_AREA(dshot_thread_wa, 64);
+#endif
+static const char* rcout_thread_name = "rcout";
+
+void RCOutput::timer_tick()
+{
+    if (dshot_timer_setup) {
+        return;
+    }
+
+    uint32_t dshot_mask;
+    if (is_dshot_protocol(get_output_mode(dshot_mask))) {
+        chThdCreateStatic(dshot_thread_wa, sizeof(dshot_thread_wa),
+                            APM_RCOUT_PRIORITY, &RCOutput::dshot_send_trampoline, this);
+        dshot_timer_setup = true;
+    }
+}
+
+void RCOutput::dshot_send_trampoline(void *p)
+{
+    RCOutput *rcout = (RCOutput *)p;
+    rcout->rcout_thread();
+}
+
+/*
+  thread for handling RCOutput send on IOMCU
+ */
+void RCOutput::rcout_thread() {
+    // don't start outputting until fully configured
+    while (!hal.scheduler->is_system_initialized()) {
+        hal.scheduler->delay_microseconds(1000);
+    }
+
+    rcout_thread_ctx = chThdGetSelfX();
+    chRegSetThreadNameX(rcout_thread_ctx, rcout_thread_name);
+
+    rcout_timer_t last_cycle_run_us = 0;
+
+    while (true) {
+        chEvtWaitOne(EVT_PWM_SEND | EVT_PWM_SYNTHETIC_SEND);
+
+        // start the clock
+        const rcout_timer_t last_thread_run_us = rcout_micros();
+
+        // this is when the cycle is supposed to start
+        if (_dshot_cycle == 0) {
+            last_cycle_run_us = rcout_micros();
+            // register a timer for the next tick if push() will not be providing it
+            if (_dshot_rate != 1) {
+                chVTSet(&_dshot_rate_timer, chTimeUS2I(_dshot_period_us), dshot_update_tick, this);
+            }
+        }
+
+        // if DMA sharing is in effect there can be quite a delay between the request to begin the cycle and
+        // actually sending out data - thus we need to work out how much time we have left to collect the locks
+        const rcout_timer_t timeout_period_us = _dshot_rate ? (_dshot_cycle + 1) * _dshot_period_us : _dshot_period_us;
+        // timeout is measured from the beginning of the push() that initiated it to preserve periodicity
+        const rcout_timer_t cycle_start_us = _dshot_rate ? last_cycle_run_us : last_thread_run_us;
+
+        // DMA channel sharing on F10x is complicated. The allocations are
+        // TIM2_UP  - (1,2)
+        // TIM4_UP  - (1,7)
+        // TIM3_UP  - (1,3)
+        // TIM2_CH2 - (1,7) - F103 only
+        // TIM4_CH3 - (1,5) - F103 only
+        // TIM3_CH4 - (1,3) - F103 only
+        // and (1,7) is also shared with USART2_TX
+        // locks have to be unlocked in reverse order, and shared CH locks do not need to be taken so the
+        // ordering that will work follows. This relies on recursive lock behaviour that allows us to relock
+        // a mutex without releasing it first:
+        // TIM4_UP  - lock   (shared)
+        // TIM4     - dshot send
+        // TIM4_CH3 - lock
+        // TIM2_UP  - lock
+        // TIM2_CH2 - lock recursive (shared)
+        // TIM2     - dshot send
+        // TIM3_UP  - lock
+        // [TIM3_CH4 - shared lock]
+        // TIM3     - dshot send
+        // [TIM3_CH4 - shared unlock]
+        // TIM3_UP  - unlock
+        // TIM2_CH2 - unlock recursive (shared)
+        // TIM2_UP  - unlock
+        // TIM4_CH3 - unlock
+        // TIM4_UP  - unlock
+
+        dshot_send_groups(cycle_start_us, timeout_period_us);
+#if AP_HAL_SHARED_DMA_ENABLED
+        dshot_collect_dma_locks(cycle_start_us, timeout_period_us);
+#endif
+        if (_dshot_rate > 0) {
+            _dshot_cycle = (_dshot_cycle + 1) % _dshot_rate;
+        }
+    }
+}
+
+#if defined(STM32F1)
+void RCOutput::bdshot_disable_pwm_f1(pwm_group& group)
+{
+    stm32_tim_t* TIMx = group.pwm_drv->tim;
+    // pwmStop sets these
+    TIMx->CR1  = 0;                    /* Timer disabled.              */
+    TIMx->DIER = 0;                    /* All IRQs disabled.           */
+    TIMx->SR   = 0;                    /* Clear eventual pending IRQs. */
+    TIMx->CNT  = 0;
+    TIMx->CCR[0] = 0;                  /* Comparator 1 disabled.       */
+    TIMx->CCR[1] = 0;                  /* Comparator 2 disabled.       */
+    TIMx->CCR[2] = 0;                  /* Comparator 3 disabled.       */
+    TIMx->CCR[3] = 0;                  /* Comparator 4 disabled.       */
+}
+#endif
+
+#if defined(HAL_WITH_BIDIR_DSHOT) && defined(STM32F1)
+// reset pwm driver to output mode without resetting the clock or the peripheral
+// the code here is the equivalent of pwmStart()/pwmStop()
+void RCOutput::bdshot_reset_pwm_f1(pwm_group& group, uint8_t telem_channel)
+{
+    osalSysLock();
+
+    stm32_tim_t* TIMx = group.pwm_drv->tim;
+    bdshot_disable_pwm_f1(group);
+
+    // at the point this is called we will have done input capture on two CC channels
+    // we need to switch those channels back to output and the default settings
+    // all other channels will not have been modified
+    switch (group.bdshot.telem_tim_ch[telem_channel]) {
+    case 0: // CC1
+    case 1: // CC2
+        MODIFY_REG(TIMx->CCER, TIM_CCER_CC2E | TIM_CCER_CC1E, 0);   // disable CC so that it can be modified
+        MODIFY_REG(TIMx->CCMR1, (TIM_CCMR1_CC1S | TIM_CCMR1_IC1F | TIM_CCMR1_IC1PSC),
+            STM32_TIM_CCMR1_OC1M(6) | STM32_TIM_CCMR1_OC1PE);
+        MODIFY_REG(TIMx->CCMR1, (TIM_CCMR1_CC2S | TIM_CCMR1_IC2F | TIM_CCMR1_IC2PSC),
+            STM32_TIM_CCMR1_OC2M(6) | STM32_TIM_CCMR1_OC2PE);
+        MODIFY_REG(TIMx->CCER, (TIM_CCER_CC1P | TIM_CCER_CC2P),
+            (TIM_CCER_CC1P | TIM_CCER_CC2P | TIM_CCER_CC1E | TIM_CCER_CC2E));
+        break;
+    case 2: // CC3
+    case 3: // CC4
+        MODIFY_REG(TIMx->CCER, TIM_CCER_CC3E | TIM_CCER_CC4E, 0);   // disable CC so that it can be modified
+        MODIFY_REG(TIMx->CCMR2, (TIM_CCMR2_CC3S | TIM_CCMR2_IC3F | TIM_CCMR2_IC3PSC),
+            STM32_TIM_CCMR2_OC3M(6) | STM32_TIM_CCMR2_OC3PE);
+        MODIFY_REG(TIMx->CCMR2, (TIM_CCMR2_CC4S | TIM_CCMR2_IC4F | TIM_CCMR2_IC4PSC),
+            STM32_TIM_CCMR2_OC4M(6) | STM32_TIM_CCMR2_OC4PE);
+        MODIFY_REG(TIMx->CCER, (TIM_CCER_CC3P | TIM_CCER_CC4P),
+            (TIM_CCER_CC3P | TIM_CCER_CC4P | TIM_CCER_CC3E | TIM_CCER_CC4E));
+        break;
+    default:
+        break;
+    }
+    // pwmStart sets these
+    uint32_t psc = (group.pwm_drv->clock / group.pwm_drv->config->frequency) - 1;
+    TIMx->PSC  = psc;
+    TIMx->ARR  = group.pwm_drv->period - 1;
+    TIMx->CR2  = group.pwm_drv->config->cr2;
+    TIMx->EGR   = STM32_TIM_EGR_UG;      /* Update event.                */
+    TIMx->SR    = 0;                     /* Clear pending IRQs.          */
+    TIMx->DIER  = group.pwm_drv->config->dier &   /* DMA-related DIER settings.   */
+                        ~STM32_TIM_DIER_IRQ_MASK;
+    if (group.pwm_drv->has_bdtr) {
+        TIMx->BDTR  = group.pwm_drv->config->bdtr | STM32_TIM_BDTR_MOE;
+    }
+
+    // we need to switch every output on the same input channel to avoid
+    // spurious line changes
+    for (uint8_t i = 0; i<4; i++) {
+        if (group.chan[i] == CHAN_DISABLED) {
+            continue;
+        }
+        if (group.bdshot.telem_tim_ch[telem_channel] == group.bdshot.telem_tim_ch[i]) {
+            palSetLineMode(group.pal_lines[i], PAL_MODE_STM32_ALTERNATE_PUSHPULL);
+        }
+    }
+
+    /* Timer configured and started.*/
+    TIMx->CR1   = STM32_TIM_CR1_ARPE | STM32_TIM_CR1_URS | STM32_TIM_CR1_CEN;
+
+    osalSysUnlock();
+}
+
+// see https://github.com/betaflight/betaflight/pull/8554#issuecomment-512507625
+// called from the interrupt
+void RCOutput::bdshot_receive_pulses_DMAR_f1(pwm_group* group)
+{
+    // make sure the transaction finishes or times out, this function takes a little time to run so the most
+    // accurate timing is from the beginning. the pulse time is slightly longer than we need so an extra 10U
+    // should be plenty
+    chVTSetI(&group->dma_timeout, chTimeUS2I(group->dshot_pulse_send_time_us + 30U + 10U),
+        bdshot_finish_dshot_gcr_transaction, group);
+
+    group->pwm_drv->tim->CR1 = 0;
+
+    // Configure Timer
+    group->pwm_drv->tim->SR = 0;
+    // do NOT set CCER to 0 here - this pulls the line low on F103 (at least)
+    // and since we are already doing bdshot the relevant options that are set for output
+    // also apply to input and bdshot_config_icu_dshot() will disable any channels that need
+    // disabling
+    group->pwm_drv->tim->DIER = 0;
+    group->pwm_drv->tim->CR2 = 0;
+    group->pwm_drv->tim->PSC = group->bdshot.telempsc;
+
+    group->dshot_state = DshotState::RECV_START;
+
+    //TOGGLE_PIN_CH_DEBUG(54, curr_ch);
+    group->pwm_drv->tim->ARR = 0xFFFF;  // count forever
+    group->pwm_drv->tim->CNT = 0;
+    uint8_t curr_ch = group->bdshot.curr_telem_chan;
+
+    // we need to switch every input on the same input channel to allow
+    // the ESCs to drive the lines
+    for (uint8_t i = 0; i<4; i++) {
+        if (group->chan[i] == CHAN_DISABLED) {
+            continue;
+        }
+        if (group->bdshot.telem_tim_ch[curr_ch] == group->bdshot.telem_tim_ch[i]) {
+            palSetLineMode(group->pal_lines[i], PAL_MODE_INPUT_PULLUP);
+        }
+    }
+
+    // Initialise ICU channels
+    bdshot_config_icu_dshot_f1(group->pwm_drv->tim, curr_ch, group->bdshot.telem_tim_ch[curr_ch]);
+
+    const stm32_dma_stream_t *ic_dma =
+        group->has_shared_ic_up_dma() ? group->dma : group->bdshot.ic_dma[curr_ch];
+
+    // Configure DMA
+    dmaStreamSetPeripheral(ic_dma, &(group->pwm_drv->tim->DMAR));
+    dmaStreamSetMemory0(ic_dma, group->dma_buffer);
+    dmaStreamSetTransactionSize(ic_dma, GCR_TELEMETRY_BIT_LEN);
+    dmaStreamSetMode(ic_dma,
+                    STM32_DMA_CR_CHSEL(group->dma_ch[curr_ch].channel) |
+                    STM32_DMA_CR_DIR_P2M |
+                    STM32_DMA_CR_PSIZE_HWORD |
+                    STM32_DMA_CR_MSIZE_HWORD |
+                    STM32_DMA_CR_MINC | STM32_DMA_CR_PL(3) |
+                    STM32_DMA_CR_TEIE | STM32_DMA_CR_TCIE);
+
+    // setup for transfers. 0x0D is the register
+    // address offset of the CCR registers in the timer peripheral
+    uint8_t telem_ch_pair = group->bdshot.telem_tim_ch[curr_ch] & ~1U; // round to the lowest of the channel pair
+    const uint8_t ccr_ofs = offsetof(stm32_tim_t, CCR)/4 + telem_ch_pair;
+    group->pwm_drv->tim->DCR = STM32_TIM_DCR_DBA(ccr_ofs) | STM32_TIM_DCR_DBL(1); // read two registers at a time
+
+    // Start Timer
+    group->pwm_drv->tim->EGR |= STM32_TIM_EGR_UG;
+    group->pwm_drv->tim->SR = 0;
+    group->pwm_drv->tim->CR1 = TIM_CR1_ARPE | STM32_TIM_CR1_URS | STM32_TIM_CR1_UDIS | STM32_TIM_CR1_CEN;
+    dmaStreamEnable(ic_dma);
+}
+
+void RCOutput::bdshot_config_icu_dshot_f1(stm32_tim_t* TIMx, uint8_t chan, uint8_t ccr_ch)
+{
+    // F103 does not support both edges input capture so we need to set up two channels
+    // both pointing at the same input to capture the data. The triggered channel
+    // needs to handle the second edge - so rising or falling - so that we get an
+    // even number of half-words in the DMA buffer
+    switch(ccr_ch) {
+    case 0:
+    case 1: {
+        // Disable the IC1 and IC2: Reset the CCxE Bit
+        MODIFY_REG(TIMx->CCER, TIM_CCER_CC1E | TIM_CCER_CC2E, 0);
+        // Select the Input and set the filter and the prescaler value
+        if (chan == 0) {    // TI1
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC1S | TIM_CCMR1_IC1F | TIM_CCMR1_IC1PSC),
+                        (TIM_CCMR1_CC1S_0 | TIM_CCMR1_IC1F_1));// 4 samples per output transition
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC2S | TIM_CCMR1_IC2F | TIM_CCMR1_IC2PSC),
+                        (TIM_CCMR1_CC2S_1 | TIM_CCMR1_IC2F_1));
+        } else {            // TI2
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC1S | TIM_CCMR1_IC1F | TIM_CCMR1_IC1PSC),
+                        (TIM_CCMR1_CC1S_1 | TIM_CCMR1_IC1F_1));
+            MODIFY_REG(TIMx->CCMR1,
+                        (TIM_CCMR1_CC2S | TIM_CCMR1_IC2F | TIM_CCMR1_IC2PSC),
+                        (TIM_CCMR1_CC2S_0 | TIM_CCMR1_IC2F_1));
+        }
+        if (ccr_ch == 0) {
+            // Select the Polarity as falling on IC2 and rising on IC1
+            MODIFY_REG(TIMx->CCER, TIM_CCER_CC1P | TIM_CCER_CC2P, TIM_CCER_CC2P | TIM_CCER_CC1E | TIM_CCER_CC2E);
+            MODIFY_REG(TIMx->DIER, TIM_DIER_CC1DE | TIM_DIER_CC2DE, TIM_DIER_CC1DE);
+        } else {
+            // Select the Polarity as falling on IC1 and rising on IC2
+            MODIFY_REG(TIMx->CCER, TIM_CCER_CC1P | TIM_CCER_CC2P, TIM_CCER_CC1P | TIM_CCER_CC1E | TIM_CCER_CC2E);
+            MODIFY_REG(TIMx->DIER, TIM_DIER_CC1DE | TIM_DIER_CC2DE, TIM_DIER_CC2DE);
+        }
+        break;
+    }
+    case 2:
+    case 3: {
+        MODIFY_REG(TIMx->CCER, TIM_CCER_CC3E | TIM_CCER_CC4E, 0);
+        // Select the Input and set the filter and the prescaler value
+        if (chan == 2) {    // TI3
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC3S | TIM_CCMR2_IC3F | TIM_CCMR2_IC3PSC),
+                        (TIM_CCMR2_CC3S_0 | TIM_CCMR2_IC3F_1));
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC4S | TIM_CCMR2_IC4F | TIM_CCMR2_IC4PSC),
+                        (TIM_CCMR2_CC4S_1 | TIM_CCMR2_IC4F_1));
+        } else {            // TI4
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC3S | TIM_CCMR2_IC3F | TIM_CCMR2_IC3PSC),
+                        (TIM_CCMR2_CC3S_1 | TIM_CCMR2_IC3F_1));
+            MODIFY_REG(TIMx->CCMR2,
+                        (TIM_CCMR2_CC4S | TIM_CCMR2_IC4F | TIM_CCMR2_IC4PSC),
+                        (TIM_CCMR2_CC4S_0 | TIM_CCMR2_IC4F_1));
+        }
+        if (ccr_ch == 2) {
+            // Select the Polarity as falling on IC4 and rising on IC3
+            MODIFY_REG(TIMx->CCER, TIM_CCER_CC3P | TIM_CCER_CC4P, TIM_CCER_CC4P | TIM_CCER_CC3E | TIM_CCER_CC4E);
+            MODIFY_REG(TIMx->DIER, TIM_DIER_CC3DE | TIM_DIER_CC4DE, TIM_DIER_CC3DE);
+        } else {
+            // Select the Polarity as falling on IC3 and rising on IC4
+            MODIFY_REG(TIMx->CCER, TIM_CCER_CC3P | TIM_CCER_CC4P, TIM_CCER_CC3P | TIM_CCER_CC3E | TIM_CCER_CC4E);
+            MODIFY_REG(TIMx->DIER, TIM_DIER_CC3DE | TIM_DIER_CC4DE, TIM_DIER_CC4DE);
+        }
+        break;
+
+    }
+    default:
+        break;
+    }
+}
+
+// decode a telemetry packet from a GCR encoded stride buffer, take from betaflight decodeTelemetryPacket
+// see https://github.com/betaflight/betaflight/pull/8554#issuecomment-512507625 for a description of the protocol
+uint32_t RCOutput::bdshot_decode_telemetry_packet_f1(dmar_uint_t* buffer, uint32_t count, bool reversed)
+{
+    if (!reversed) {
+        return bdshot_decode_telemetry_packet(buffer, count);
+    }
+
+    uint32_t value = 0;
+    uint32_t bits = 0;
+    uint32_t len;
+
+    // on F103 we are reading one edge with ICn and the other with ICn+1, the DMA architecture only
+    // allows to trigger on a single register dictated by the DMA input capture channel being used.
+    // even though we are reading multiple registers per transfer we always cannot trigger on one or other
+    // of the registers and if the one we trigger on is the one that is numerically first each register
+    // pair that we read will be swapped in time. in this case we trigger on ICn and then read CCRn and CCRn+1
+    // giving us the new value of ICn and the old value of ICn+1. in order to avoid reading garbage on the
+    // first read we trigger ICn on the rising edge. this gives us all the data but with each pair of bytes
+    // transposed. we thus need to untranspose as we decode
+    dmar_uint_t oldValue = buffer[1];
+
+    for (int32_t i = 0; i <= count+1; ) {
+        if (i < count) {
+            dmar_int_t diff = buffer[i] - oldValue;
+            if (bits >= 21U) {
+                break;
+            }
+            len = (diff + TELEM_IC_SAMPLE/2U) / TELEM_IC_SAMPLE;
+        } else {
+            len = 21U - bits;
+        }
+
+        value <<= len;
+        value |= 1U << (len - 1U);
+        oldValue = buffer[i];
+        bits += len;
+
+        i += (i%2 ? -1 : 3);
+    }
+
+
+    if (bits != 21U) {
+        return INVALID_ERPM;
+    }
+
+    static const uint32_t decode[32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10, 11, 0, 13, 14, 15,
+        0, 0, 2, 3, 0, 5, 6, 7, 0, 0, 8, 1, 0, 4, 12, 0 };
+
+    uint32_t decodedValue = decode[value & 0x1fU];
+    decodedValue |= decode[(value >> 5U) & 0x1fU] << 4U;
+    decodedValue |= decode[(value >> 10U) & 0x1fU] << 8U;
+    decodedValue |= decode[(value >> 15U) & 0x1fU] << 12U;
+
+    uint32_t csum = decodedValue;
+    csum = csum ^ (csum >> 8U); // xor bytes
+    csum = csum ^ (csum >> 4U); // xor nibbles
+
+    if ((csum & 0xfU) != 0xfU) {
+        return INVALID_ERPM;
+    }
+    decodedValue >>= 4;
+
+    return decodedValue;
+}
+
+#endif // HAL_WITH_BIDIR_DSHOT && STM32F1
+
+#endif // HAL_USE_PWM
+
+#endif // IOMCU_FW && HAL_DSHOT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <hal.h>
+#include "RCOutput.h"
+#include <AP_Math/AP_Math.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include "hwdef/common/stm32_util.h"
+#include <AP_InternalError/AP_InternalError.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+#if HAL_USE_PWM == TRUE
+#if HAL_DSHOT_ENABLED
+
+#if HAL_WITH_IO_MCU
+#include <AP_IOMCU/AP_IOMCU.h>
+extern AP_IOMCU iomcu;
+#endif
+
+using namespace ChibiOS;
+
+extern const AP_HAL::HAL& hal;
+
+bool RCOutput::dshot_send_command(pwm_group& group, uint8_t command, uint8_t chan)
+{
+    if (!group.can_send_dshot_pulse()) {
+        return false;
+    }
+
+    if (soft_serial_waiting() || !is_dshot_send_allowed(group.dshot_state)) {
+        // doing serial output or DMAR input, don't send DShot pulses
+        return false;
+    }
+
+#ifdef HAL_GPIO_LINE_GPIO81
+    TOGGLE_PIN_DEBUG(81);
+#endif
+    // first make sure we have the DMA channel before anything else
+#if AP_HAL_SHARED_DMA_ENABLED
+    osalDbgAssert(!group.dma_handle->is_locked(), "DMA handle is already locked");
+    group.dma_handle->lock();
+#endif
+
+    // only the timer thread releases the locks
+    group.dshot_waiter = rcout_thread_ctx;
+    bool bdshot_telem = false;
+#ifdef HAL_WITH_BIDIR_DSHOT
+    bdshot_prepare_for_next_pulse(group);
+    bdshot_telem = group.bdshot.enabled;
+#endif    
+
+    memset((uint8_t *)group.dma_buffer, 0, DSHOT_BUFFER_LENGTH);
+
+    // keep the other ESCs armed rather than sending nothing
+    const uint16_t zero_packet = create_dshot_packet(0, false, bdshot_telem);
+    const uint16_t packet = create_dshot_packet(command, true, bdshot_telem);
+
+    for (uint8_t i = 0; i < 4; i++) {
+        if (!group.is_chan_enabled(i)) {
+            continue;
+        }
+
+        if (group.chan[i] == chan || chan == RCOutput::ALL_CHANNELS) {
+            fill_DMA_buffer_dshot(group.dma_buffer + i, 4, packet, group.bit_width_mul);
+        } else {
+            fill_DMA_buffer_dshot(group.dma_buffer + i, 4, zero_packet, group.bit_width_mul);
+        }
+    }
+
+    chEvtGetAndClearEvents(group.dshot_event_mask);
+    // start sending the pulses out
+    send_pulses_DMAR(group, DSHOT_BUFFER_LENGTH);
+#ifdef HAL_GPIO_LINE_GPIO81
+    TOGGLE_PIN_DEBUG(81);
+#endif
+
+    return true;
+}
+
+// Send a dshot command, if command timout is 0 then 10 commands are sent
+// chan is the servo channel to send the command to
+void RCOutput::send_dshot_command(uint8_t command, uint8_t chan, uint32_t command_timeout_ms, uint16_t repeat_count, bool priority)
+{
+    // once armed only priority commands will be accepted
+    if (hal.util->get_soft_armed() && !priority) {
+        return;
+    }
+    // not an FMU channel
+    if (chan < chan_offset || chan == ALL_CHANNELS) {
+#if HAL_WITH_IO_MCU
+        if (iomcu_dshot) {
+            iomcu.send_dshot_command(command, chan, command_timeout_ms, repeat_count, priority);
+        }
+#endif
+        if (chan != ALL_CHANNELS) {
+            return;
+        }
+    }
+
+    DshotCommandPacket pkt;
+    pkt.command = command;
+    if (chan != ALL_CHANNELS) {
+        pkt.chan = chan - chan_offset;
+    } else {
+        pkt.chan = ALL_CHANNELS;
+    }
+    if (command_timeout_ms == 0) {
+        pkt.cycle = MAX(10, repeat_count);
+    } else {
+        pkt.cycle = MAX(command_timeout_ms * 1000 / _dshot_period_us, repeat_count);
+    }
+
+    // prioritize anything that is not an LED or BEEP command
+    if (!_dshot_command_queue.push(pkt) && priority) {
+        _dshot_command_queue.push_force(pkt);
+    }
+}
+
+// Set the dshot outputs that should be reversed (as opposed to 3D)
+// The chanmask passed is added (ORed) into any existing mask.
+// The mask uses servo channel numbering
+void RCOutput::set_reversed_mask(uint32_t chanmask) {
+    _reversed_mask |= chanmask;
+}
+
+// Set the dshot outputs that should be reversible/3D
+// The chanmask passed is added (ORed) into any existing mask.
+// The mask uses servo channel numbering
+void RCOutput::set_reversible_mask(uint32_t chanmask) {
+    _reversible_mask |= chanmask;
+}
+
+// Update the dshot outputs that should be reversible/3D at 1Hz
+void RCOutput::update_channel_masks() {
+
+    // post arming dshot commands will not be accepted
+    if (hal.util->get_soft_armed() || _disable_channel_mask_updates) {
+        return;
+    }
+
+#if HAL_PWM_COUNT > 0
+    for (uint8_t i=chan_offset; i<HAL_PWM_COUNT+chan_offset; i++) {
+        switch (_dshot_esc_type) {
+            case DSHOT_ESC_BLHELI:
+            case DSHOT_ESC_BLHELI_S:
+            case DSHOT_ESC_BLHELI_EDT:
+            case DSHOT_ESC_BLHELI_EDT_S:
+                if (_reversible_mask & (1U<<i)) {
+                    send_dshot_command(DSHOT_3D_ON, i, 0, 10, true);
+                }
+                if (_reversed_mask & (1U<<i)) {
+                    send_dshot_command(DSHOT_REVERSE, i, 0, 10, true);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (_dshot_esc_type == DSHOT_ESC_BLHELI_EDT || _dshot_esc_type == DSHOT_ESC_BLHELI_EDT_S) {
+        send_dshot_command(DSHOT_EXTENDED_TELEMETRY_ENABLE, ALL_CHANNELS, 0, 10, true);
+    }
+#endif
+}
+
+#endif // HAL_DSHOT_ENABLED
+#endif // HAL_USE_PWM
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <hal.h>
+#include "SPIDevice.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_HAL/utility/OwnPtr.h>
+#include <AP_InternalError/AP_InternalError.h>
+#include "Util.h"
+#include "Scheduler.h"
+#include "Semaphores.h"
+#include <stdio.h>
+#include "hwdef/common/stm32_util.h"
+
+#if HAL_USE_SPI == TRUE
+
+using namespace ChibiOS;
+extern const AP_HAL::HAL& hal;
+
+// SPI mode numbers
+#if defined(STM32H7)
+#define SPIDEV_MODE0    0
+#define SPIDEV_MODE1    SPI_CFG2_CPHA
+#define SPIDEV_MODE2    SPI_CFG2_CPOL
+#define SPIDEV_MODE3    SPI_CFG2_CPOL | SPI_CFG2_CPHA
+
+#define SPI1_CLOCK  STM32_SPI1CLK
+#define SPI2_CLOCK  STM32_SPI2CLK
+#define SPI3_CLOCK  STM32_SPI3CLK
+#define SPI4_CLOCK  STM32_SPI4CLK
+#define SPI5_CLOCK  STM32_SPI5CLK
+#define SPI6_CLOCK  STM32_SPI6CLK
+
+#else // F4 and F7
+#define SPIDEV_MODE0    0
+#define SPIDEV_MODE1    SPI_CR1_CPHA
+#define SPIDEV_MODE2    SPI_CR1_CPOL
+#define SPIDEV_MODE3    SPI_CR1_CPOL | SPI_CR1_CPHA
+
+#define SPI1_CLOCK  STM32_PCLK2
+#define SPI2_CLOCK  STM32_PCLK1
+#define SPI3_CLOCK  STM32_PCLK1
+#define SPI4_CLOCK  STM32_PCLK2
+#define SPI5_CLOCK  STM32_PCLK2
+#define SPI6_CLOCK  STM32_PCLK2
+#endif
+
+// expected bus clock speeds
+static const uint32_t bus_clocks[6] = {
+    SPI1_CLOCK, SPI2_CLOCK, SPI3_CLOCK, SPI4_CLOCK, SPI5_CLOCK, SPI6_CLOCK
+};
+
+static const struct SPIDriverInfo {
+    SPIDriver *driver;
+    uint8_t busid; // used for device IDs in parameters
+    uint8_t dma_channel_rx;
+    uint8_t dma_channel_tx;
+    ioline_t sck_line;
+} spi_devices[] = { HAL_SPI_BUS_LIST };
+
+// device list comes from hwdef.dat
+ChibiOS::SPIDesc SPIDeviceManager::device_table[] = { HAL_SPI_DEVICE_LIST };
+
+SPIBus::SPIBus(uint8_t _bus) :
+    DeviceBus(APM_SPI_PRIORITY),
+    bus(_bus)
+{
+    chMtxObjectInit(&dma_lock);
+
+    // allow for sharing of DMA channels with other peripherals
+    dma_handle = NEW_NOTHROW Shared_DMA(spi_devices[bus].dma_channel_rx,
+                                spi_devices[bus].dma_channel_tx,
+                                FUNCTOR_BIND_MEMBER(&SPIBus::dma_allocate, void, Shared_DMA *),
+                                FUNCTOR_BIND_MEMBER(&SPIBus::dma_deallocate, void, Shared_DMA *));
+
+    // remember the SCK line for stop_peripheral()/start_peripheral()
+#if HAL_SPI_SCK_SAVE_RESTORE
+    sck_mode = palReadLineMode(spi_devices[bus].sck_line);
+#endif
+}
+
+/*
+  allocate DMA channel
+ */
+void SPIBus::dma_allocate(Shared_DMA *ctx)
+{
+    // nothing to do as we call spiStart() on each transaction
+}
+
+/*
+  deallocate DMA channel
+ */
+void SPIBus::dma_deallocate(Shared_DMA *ctx)
+{
+    chMtxLock(&dma_lock);
+    // another non-SPI peripheral wants one of our DMA channels
+    stop_peripheral();
+    chMtxUnlock(&dma_lock);
+}
+
+
+SPIDevice::SPIDevice(SPIBus &_bus, SPIDesc &_device_desc)
+    : bus(_bus)
+    , device_desc(_device_desc)
+{
+    set_device_bus(spi_devices[_bus.bus].busid);
+    set_device_address(_device_desc.device);
+    freq_flag_low = derive_freq_flag(device_desc.lowspeed);
+    freq_flag_high = derive_freq_flag(device_desc.highspeed);
+
+    set_speed(AP_HAL::Device::SPEED_LOW);
+
+    asprintf(&pname, "SPI:%s:%u:%u",
+             device_desc.name,
+             (unsigned)bus.bus, (unsigned)device_desc.device);
+    AP_HAL::SPIDevice::setup_bankselect_callback(device_desc.bank_select_cb);
+    AP_HAL::SPIDevice::set_register_rw_callback(device_desc.register_rw_cb);
+    //printf("SPI device %s on %u:%u at speed %u mode %u\n",
+    //       device_desc.name,
+    //       (unsigned)bus.bus, (unsigned)device_desc.device,
+    //       (unsigned)frequency, (unsigned)device_desc.mode);
+}
+
+SPIDevice::~SPIDevice()
+{
+    //printf("SPI device %s on %u:%u closed\n", device_desc.name,
+    //       (unsigned)bus.bus, (unsigned)device_desc.device);
+    free(pname);
+}
+
+SPIDriver * SPIDevice::get_driver() {
+	return spi_devices[device_desc.bus].driver;
+}
+
+bool SPIDevice::set_speed(AP_HAL::Device::Speed speed)
+{
+    switch (speed) {
+    case AP_HAL::Device::SPEED_HIGH:
+        freq_flag = freq_flag_high;
+        break;
+    case AP_HAL::Device::SPEED_LOW:
+        freq_flag = freq_flag_low;
+        break;
+    }
+    return true;
+}
+
+/*
+  setup a bus slowdown factor for high speed mode
+ */
+void SPIDevice::set_slowdown(uint8_t slowdown)
+{
+    slowdown = constrain_int16(slowdown+1, 1, 32);
+    freq_flag_high = derive_freq_flag(device_desc.highspeed / slowdown);
+}
+
+/*
+  low level transfer function
+ */
+bool SPIDevice::do_transfer(const uint8_t *send, uint8_t *recv, uint32_t len)
+{
+    bool old_cs_forced = cs_forced;
+
+    if (!set_chip_select(true)) {
+        return false;
+    }
+
+    bool ret = true;
+
+#if defined(HAL_SPI_USE_POLLED)
+    for (uint32_t i=0; i<len; i++) {
+        const uint8_t b = spiPolledExchange(spi_devices[device_desc.bus].driver, send?send[i]:0);
+        if (recv) {
+            recv[i] = b;
+        }
+    }
+#else
+    if (!bus.bouncebuffer_setup(send, len, recv, len)) {
+        set_chip_select(old_cs_forced);
+        return false;
+    }
+    osalSysLock();
+    hal.util->persistent_data.spi_count++;
+    if (send == nullptr) {
+        spiStartReceiveI(spi_devices[device_desc.bus].driver, len, recv);
+    } else if (recv == nullptr) {
+        spiStartSendI(spi_devices[device_desc.bus].driver, len, send);
+    } else {
+        spiStartExchangeI(spi_devices[device_desc.bus].driver, len, send, recv);
+    }
+    // we allow SPI transfers to take a maximum of 20ms plus 32us per
+    // byte. This covers all use cases in ArduPilot. We don't ever
+    // expect this timeout to trigger unless there is a severe MCU
+    // error
+    const uint32_t timeout_us = 20000U + len * 32U;
+    msg_t msg = osalThreadSuspendTimeoutS(&spi_devices[device_desc.bus].driver->thread, TIME_US2I(timeout_us));
+    osalSysUnlock();
+    if (msg == MSG_TIMEOUT) {
+        ret = false;
+        if (!hal.scheduler->in_expected_delay()) {
+            INTERNAL_ERROR(AP_InternalError::error_t::spi_fail);
+        }
+        spiAbort(spi_devices[device_desc.bus].driver);
+    }
+    bus.bouncebuffer_finish(send, recv, len);
+#endif
+    set_chip_select(old_cs_forced);
+    return ret;
+}
+
+/*
+  this pulses the clock for n bytes. The data is ignored.
+ */
+bool SPIDevice::clock_pulse(uint32_t n)
+{
+    msg_t msg;
+    const uint32_t timeout_us = 20000U + n * 32U;
+    if (!cs_forced) {
+        //special mode to init sdcard without cs asserted
+        bus.semaphore.take_blocking();
+        acquire_bus(true, true);
+        osalSysLock();
+        spiStartIgnoreI(spi_devices[device_desc.bus].driver, n);
+        msg = osalThreadSuspendTimeoutS(&spi_devices[device_desc.bus].driver->thread, TIME_US2I(timeout_us));
+        osalSysUnlock();
+        if (msg == MSG_TIMEOUT) {
+            spiAbort(spi_devices[device_desc.bus].driver);
+        }
+        acquire_bus(false, true);
+        bus.semaphore.give();
+    } else {
+        if (!bus.semaphore.check_owner()) {
+            return false;
+        }
+        osalSysLock();
+        spiStartIgnoreI(spi_devices[device_desc.bus].driver, n);
+        msg = osalThreadSuspendTimeoutS(&spi_devices[device_desc.bus].driver->thread, TIME_US2I(timeout_us));
+        osalSysUnlock();
+        if (msg == MSG_TIMEOUT) {
+            spiAbort(spi_devices[device_desc.bus].driver);
+        }
+    }
+    return msg != MSG_TIMEOUT;
+}
+
+uint32_t SPIDevice::derive_freq_flag_bus(uint8_t busid, uint32_t _frequency)
+{
+    uint32_t spi_clock_freq = SPI1_CLOCK;
+    if (busid > 0 && uint8_t(busid-1) < ARRAY_SIZE(bus_clocks)) {
+        spi_clock_freq = bus_clocks[busid-1] / 2;
+    }
+
+    // find first divisor that brings us below the desired SPI clock
+    uint32_t i = 0;
+    while (spi_clock_freq > _frequency && i<7) {
+        spi_clock_freq >>= 1;
+        i++;
+    }
+
+    // assuming the bitrate bits are consecutive in the CR1 register,
+    // we can just multiply by BR_0 to get the right bits for the desired
+    // scaling
+#if defined(STM32H7)
+    return (i * SPI_CFG1_MBR_0) | SPI_CFG1_DSIZE_VALUE(7); // 8 bit transfers
+#else
+    return i * SPI_CR1_BR_0;
+#endif
+}
+
+uint32_t SPIDevice::derive_freq_flag(uint32_t _frequency)
+{
+    uint8_t busid = spi_devices[device_desc.bus].busid;
+    return derive_freq_flag_bus(busid, _frequency);
+}
+
+bool SPIDevice::transfer(const uint8_t *send, uint32_t send_len,
+                         uint8_t *recv, uint32_t recv_len)
+{
+    if (!bus.semaphore.check_owner()) {
+        return false;
+    }
+    if ((send_len == recv_len && send == recv) || !send || !recv) {
+        // simplest cases, needed for DMA
+        return do_transfer(send, recv, recv_len?recv_len:send_len);
+    }
+    uint8_t buf[send_len+recv_len];
+    if (send_len > 0) {
+        memcpy(buf, send, send_len);
+    }
+    if (recv_len > 0) {
+        memset(&buf[send_len], 0, recv_len);
+    }
+    bool ret = do_transfer(buf, buf, send_len+recv_len);
+    if (ret && recv_len > 0) {
+        memcpy(recv, &buf[send_len], recv_len);
+    }
+    return ret;
+}
+
+bool SPIDevice::transfer_fullduplex(const uint8_t *send, uint8_t *recv, uint32_t len)
+{
+    if (!bus.semaphore.check_owner()) {
+        return false;
+    }
+    uint8_t buf[len];
+    memcpy(buf, send, len);
+    bool ret = do_transfer(buf, buf, len);
+    if (ret) {
+        memcpy(recv, buf, len);
+    }
+    return ret;
+}
+
+AP_HAL::Semaphore *SPIDevice::get_semaphore()
+{
+    return &bus.semaphore;
+}
+
+
+AP_HAL::Device::PeriodicHandle SPIDevice::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    return bus.register_periodic_callback(period_usec, cb, this);
+}
+
+bool SPIDevice::adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec)
+{
+    return bus.adjust_timer(h, period_usec);
+}
+
+/*
+  stop the SPI peripheral and set the SCK line as a GPIO to prevent the clock
+  line floating while we are waiting for the next spiStart()
+ */
+void SPIBus::stop_peripheral(void)
+{
+    if (!spi_started) {
+        return;
+    }
+    const auto &sbus = spi_devices[bus];
+#if HAL_SPI_SCK_SAVE_RESTORE
+    if (spi_mode == SPIDEV_MODE0 || spi_mode == SPIDEV_MODE1) {
+        // Clock polarity is 0, so we need to set the clock line low before spi reset
+        palClearLine(sbus.sck_line);
+    } else {
+        // Clock polarity is 1, so we need to set the clock line high before spi reset
+        palSetLine(sbus.sck_line);
+    }
+    palSetLineMode(sbus.sck_line, PAL_MODE_OUTPUT_PUSHPULL);
+#endif
+    spiStop(sbus.driver);
+    spi_started = false;
+}
+
+/*
+  start the SPI peripheral and restore the IO mode of the SCK line
+ */
+void SPIBus::start_peripheral(void)
+{
+    if (spi_started) {
+        return;
+    }
+
+    /* start driver and setup transfer parameters */
+    spiStart(spi_devices[bus].driver, &spicfg);
+#if HAL_SPI_SCK_SAVE_RESTORE
+    // restore sck pin mode from stop_peripheral()
+    palSetLineMode(spi_devices[bus].sck_line, sck_mode);
+#endif
+    spi_started = true;
+}
+
+/*
+ used to acquire bus and (optionally) assert cs
+*/
+bool SPIDevice::acquire_bus(bool set, bool skip_cs)
+{
+    if (!bus.semaphore.check_owner()) {
+        return false;
+    }
+    if (set && cs_forced) {
+        return true;
+    }
+    if (!set && !cs_forced) {
+        return false;
+    }
+    if (!set && cs_forced) {
+        if(!skip_cs) {
+            spiUnselectI(spi_devices[device_desc.bus].driver);          /* Slave Select de-assertion.       */
+        }
+        spiReleaseBus(spi_devices[device_desc.bus].driver);              /* Ownership release.               */
+        cs_forced = false;
+        bus.dma_handle->unlock();
+    } else {
+        bus.dma_handle->lock();
+        spiAcquireBus(spi_devices[device_desc.bus].driver);              /* Acquire ownership of the bus.    */
+        bus.spicfg.ssport = PAL_PORT(device_desc.pal_line);
+        bus.spicfg.sspad = PAL_PAD(device_desc.pal_line);
+        bus.spicfg.end_cb = nullptr;
+#if defined(STM32H7)
+        bus.spicfg.cfg1 = freq_flag;
+        bus.spicfg.cfg2 = device_desc.mode;
+        if (bus.spicfg.dummytx == nullptr) {
+            bus.spicfg.dummytx = (uint32_t *)malloc_dma(4);
+            memset(bus.spicfg.dummytx, 0xFF, 4);
+        }
+        if (bus.spicfg.dummyrx == nullptr) {
+            bus.spicfg.dummyrx = (uint32_t *)malloc_dma(4);
+        }
+#else
+        bus.spicfg.cr1 = (uint16_t)(freq_flag | device_desc.mode);
+        bus.spicfg.cr2 = 0;
+#endif
+        bus.spi_mode = device_desc.mode;
+        bus.stop_peripheral();
+        bus.start_peripheral();
+        if(!skip_cs) {
+            spiSelectI(spi_devices[device_desc.bus].driver);                /* Slave Select assertion.          */
+        }
+        cs_forced = true;
+    }
+    return true;
+}
+
+/*
+  allow for control of SPI chip select pin
+ */
+bool SPIDevice::set_chip_select(bool set) {
+    return acquire_bus(set, false);
+}
+
+/*
+  return a SPIDevice given a string device name
+ */
+AP_HAL::OwnPtr<AP_HAL::SPIDevice>
+SPIDeviceManager::get_device(const char *name)
+{
+    /* Find the bus description in the table */
+    uint8_t i;
+    for (i = 0; i<ARRAY_SIZE(device_table); i++) {
+        if (strcmp(device_table[i].name, name) == 0) {
+            break;
+        }
+    }
+    if (i == ARRAY_SIZE(device_table)) {
+        return AP_HAL::OwnPtr<AP_HAL::SPIDevice>(nullptr);
+    }
+
+    SPIDesc &desc = device_table[i];
+
+    // find the bus
+    SPIBus *busp;
+    for (busp = buses; busp; busp = (SPIBus *)busp->next) {
+        if (busp->bus == desc.bus) {
+            break;
+        }
+    }
+    if (busp == nullptr) {
+        // create a new one
+        busp = NEW_NOTHROW SPIBus(desc.bus);
+        if (busp == nullptr) {
+            return nullptr;
+        }
+        busp->next = buses;
+        busp->bus = desc.bus;
+
+        buses = busp;
+    }
+
+    return AP_HAL::OwnPtr<AP_HAL::SPIDevice>(NEW_NOTHROW SPIDevice(*busp, desc));
+}
+
+void SPIDeviceManager::set_register_rw_callback(const char* name, AP_HAL::Device::RegisterRWCb cb)
+{
+    /* Find the bus description in the table */
+    uint8_t i;
+    for (i = 0; i<ARRAY_SIZE(device_table); i++) {
+        if (strcmp(device_table[i].name, name) == 0) {
+            break;
+        }
+    }
+    if (i == ARRAY_SIZE(device_table)) {
+        return;
+    }
+
+    device_table[i].register_rw_cb = cb;
+
+}
+
+
+#ifdef HAL_SPI_CHECK_CLOCK_FREQ
+
+/*
+  test clock frequencies. This measures the actual SPI clock
+  frequencies on all configured SPI buses. Used during board bringup
+  to validate clock configuration
+ */
+void SPIDevice::test_clock_freq(void)
+{
+    // delay for USB to come up
+    DEV_PRINTF("Waiting for USB\n");
+    for (uint8_t i=0; i<3; i++) {
+        hal.scheduler->delay(1000);
+        DEV_PRINTF("Waiting %u\n", (unsigned)AP_HAL::millis());
+    }
+    DEV_PRINTF("CLOCKS=\n");
+    for (uint8_t i=0; i<ARRAY_SIZE(bus_clocks); i++) {
+        DEV_PRINTF("%u:%u ", unsigned(i+1), unsigned(bus_clocks[i]));
+    }
+    DEV_PRINTF("\n");
+
+    // we will send 1024 bytes without any CS asserted and measure the
+    // time it takes to do the transfer
+    uint16_t len = 1024;
+    uint8_t *buf1 = (uint8_t *)hal.util->malloc_type(len, AP_HAL::Util::MEM_DMA_SAFE);
+    uint8_t *buf2 = (uint8_t *)hal.util->malloc_type(len, AP_HAL::Util::MEM_DMA_SAFE);
+    for (uint8_t i=0; i<ARRAY_SIZE(spi_devices); i++) {
+        SPIConfig spicfg {};
+        const uint32_t target_freq = 2000000UL;
+        // use a clock divisor of 256 for maximum resolution
+#if defined(STM32H7)
+        spicfg.cfg1 = derive_freq_flag_bus(spi_devices[i].busid, target_freq);
+#else
+        spicfg.cr1 = derive_freq_flag_bus(spi_devices[i].busid, target_freq);
+#endif
+        spiAcquireBus(spi_devices[i].driver);
+        spiStart(spi_devices[i].driver, &spicfg);
+        uint32_t t0 = AP_HAL::micros();
+        spiStartExchange(spi_devices[i].driver, len, buf1, buf2);
+        chSysLock();
+        msg_t msg = osalThreadSuspendTimeoutS(&spi_devices[i].driver->thread, chTimeMS2I(100));
+        chSysUnlock();
+   (_in_io_proc) {
+        return;
+    }
+    _in_io_proc = true;
+
+    int num_procs = 0;
+    chBSemWait(&_io_semaphore);
+    num_procs = _num_io_procs;
+    chBSemSignal(&_io_semaphore);
+    // now call the IO based drivers
+    for (int i = 0; i < num_procs; i++) {
+        if (_io_proc[i]) {
+            _io_proc[i]();
+        }
+    }
+
+    _in_io_proc = false;
+}
+
+void Scheduler::_io_thread(void* arg)
+{
+    Scheduler *sched = (Scheduler *)arg;
+    chRegSetThreadName("io");
+    while (!sched->_hal_initialized) {
+        sched->delay_microseconds(1000);
+    }
+#if HAL_LOGGING_ENABLED
+    uint32_t last_sd_start_ms = AP_HAL::millis();
+#endif
+#if CH_DBG_ENABLE_STACK_CHECK == TRUE
+    uint32_t last_stack_check_ms = 0;
+#endif
+    while (true) {
+        sched->delay_microseconds(1000);
+
+        // run registered IO processes
+        sched->_run_io();
+
+#if HAL_LOGGING_ENABLED || CH_DBG_ENABLE_STACK_CHECK == TRUE
+        uint32_t now = AP_HAL::millis();
+#endif
+
+#if HAL_LOGGING_ENABLED
+        if (!hal.util->get_soft_armed()) {
+            // if sdcard hasn't mounted then retry it every 3s in the IO
+            // thread when disarmed
+            if (now - last_sd_start_ms > 3000) {
+                last_sd_start_ms = now;
+                AP::FS().retry_mount();
+            }
+        }
+#endif
+#if CH_DBG_ENABLE_STACK_CHECK == TRUE
+        if (now - last_stack_check_ms > 1000) {
+            last_stack_check_ms = now;
+            sched->check_stack_free();
+        }
+#endif
+    }
+}
+
+#if defined(STM32H7)
+/*
+  the H7 has 64k of ITCM memory at address zero. We reserve 1k of it
+  to prevent nullptr being valid. This function checks that memory is
+  always zero
+ */
+void Scheduler::check_low_memory_is_zero()
+{
+    const uint32_t *lowmem = nullptr;
+    // we start at address 0x1 as reading address zero causes a fault
+    for (uint16_t i=1; i<256; i++) {
+        if (lowmem[i] != 0) {
+            // re-use memory guard internal error
+            AP_memory_guard_error(1023);
+            break;
+        }
+    }
+    // we can't do address 0, but can check next 3 bytes
+    const uint8_t *addr0 = (const uint8_t *)0;
+    for (uint8_t i=1; i<4; i++) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+        if (addr0[i] != 0) {
+            AP_memory_guard_error(1023);
+            break;
+        }
+#pragma GCC diagnostic pop
+    }
+}
+#endif // STM32H7
+
+void Scheduler::_storage_thread(void* arg)
+{
+    Scheduler *sched = (Scheduler *)arg;
+    chRegSetThreadName("storage");
+    while (!sched->_hal_initialized) {
+        sched->delay_microseconds(10000);
+    }
+#if defined STM32H7
+    uint16_t memcheck_counter=0;
+#endif
+    while (true) {
+        sched->delay_microseconds(1000);
+
+        // process any pending storage writes
+        hal.storage->_timer_tick();
+
+#if defined STM32H7
+        if (memcheck_counter++ % 500 == 0) {
+            // run check at 2Hz
+            sched->check_low_memory_is_zero();
+        }
+#endif
+    }
+}
+
+void Scheduler::set_system_initialized()
+{
+    if (_initialized) {
+        AP_HAL::panic("PANIC: scheduler::set_system_initialized called"
+                      "more than once");
+    }
+    _initialized = true;
+}
+
+/*
+  disable interrupts and return a context that can be used to
+  restore the interrupt state. This can be used to protect
+  critical regions
+*/
+void *Scheduler::disable_interrupts_save(void)
+{
+    return (void *)(uintptr_t)chSysGetStatusAndLockX();
+}
+
+/*
+  restore interrupt state from disable_interrupts_save()
+*/
+void Scheduler::restore_interrupts(void *state)
+{
+    chSysRestoreStatusX((syssts_t)(uintptr_t)state);
+}
+
+/*
+  trampoline for thread create
+*/
+void Scheduler::thread_create_trampoline(void *ctx)
+{
+    AP_HAL::MemberProc *t = (AP_HAL::MemberProc *)ctx;
+    (*t)();
+    free(t);
+}
+
+// calculates an integer to be used as the priority for a newly-created thread
+uint8_t Scheduler::calculate_thread_priority(priority_base base, int8_t priority) const
+{
+    uint8_t thread_priority = APM_IO_PRIORITY;
+    static const struct {
+        priority_base base;
+        uint8_t p;
+    } priority_map[] = {
+        { PRIORITY_BOOST, APM_MAIN_PRIORITY_BOOST},
+        { PRIORITY_MAIN, APM_MAIN_PRIORITY},
+        { PRIORITY_SPI, APM_SPI_PRIORITY},
+        { PRIORITY_I2C, APM_I2C_PRIORITY},
+        { PRIORITY_CAN, APM_CAN_PRIORITY},
+        { PRIORITY_TIMER, APM_TIMER_PRIORITY},
+        { PRIORITY_RCOUT, APM_RCOUT_PRIORITY},
+        { PRIORITY_LED, APM_LED_PRIORITY},
+        { PRIORITY_RCIN, APM_RCIN_PRIORITY},
+        { PRIORITY_IO, APM_IO_PRIORITY},
+        { PRIORITY_UART, APM_UART_PRIORITY},
+        { PRIORITY_STORAGE, APM_STORAGE_PRIORITY},
+        { PRIORITY_SCRIPTING, APM_SCRIPTING_PRIORITY},
+        { PRIORITY_NET, APM_NET_PRIORITY},
+    };
+    for (uint8_t i=0; i<ARRAY_SIZE(priority_map); i++) {
+        if (priority_map[i].base == base) {
+            thread_priority = constrain_int16(priority_map[i].p + priority, LOWPRIO, HIGHPRIO);
+            break;
+        }
+    }
+    return thread_priority;
+}
+
+/*
+  create a new thread
+*/
+bool Scheduler::thread_create(AP_HAL::MemberProc proc, const char *name, uint32_t stack_size, priority_base base, int8_t priority)
+{
+    // take a copy of the MemberProc, it is freed after thread exits
+    AP_HAL::MemberProc *tproc = (AP_HAL::MemberProc *)malloc(sizeof(proc));
+    if (!tproc) {
+        return false;
+    }
+    *tproc = proc;
+
+    const uint8_t thread_priority = calculate_thread_priority(base, priority);
+
+    thread_t *thread_ctx = thread_create_alloc(THD_WORKING_AREA_SIZE(stack_size),
+                                               name,
+                                               thread_priority,
+                                               thread_create_trampoline,
+                                               tproc);
+    if (thread_ctx == nullptr) {
+        free(tproc);
+        return false;
+    }
+    return true;
+}
+
+/*
+  inform the scheduler that we are calling an operation from the
+  main thread that may take an extended amount of time. This can
+  be used to prevent watchdog reset during expected long delays
+  A value of zero cancels the previous expected delay
+*/
+void Scheduler::_expect_delay_ms(uint32_t ms)
+{
+    if (!in_main_thread()) {
+        // only for main thread
+        return;
+    }
+
+    // pat once immediately
+    watchdog_pat();
+
+    WITH_SEMAPHORE(expect_delay_sem);
+
+    if (ms == 0) {
+        if (expect_delay_nesting > 0) {
+            expect_delay_nesting--;
+        }
+        if (expect_delay_nesting == 0) {
+            expect_delay_start = 0;
+        }
+    } else {
+        uint32_t now = AP_HAL::millis();
+        if (expect_delay_start != 0) {
+            // we already have a delay running, possibly extend it
+            uint32_t done = now - expect_delay_start;
+            if (expect_delay_length > done) {
+                ms = MAX(ms, expect_delay_length - done);
+            }
+        }
+        expect_delay_start = now;
+        expect_delay_length = ms;
+        expect_delay_nesting++;
+
+        // also put our priority below timer thread if we are boosted
+        boost_end();
+    }
+}
+
+/*
+  this is _expect_delay_ms() with check that we are in the main thread
+ */
+void Scheduler::expect_delay_ms(uint32_t ms)
+{
+    if (!in_main_thread()) {
+        // only for main thread
+        return;
+    }
+    _expect_delay_ms(ms);
+}
+
+// pat the watchdog
+void Scheduler::watchdog_pat(void)
+{
+    stm32_watchdog_pat();
+    last_watchdog_pat_ms = AP_HAL::millis();
+#if defined(HAL_GPIO_PIN_EXT_WDOG)
+    ext_watchdog_pat(last_watchdog_pat_ms);
+#endif
+}
+
+#if defined(HAL_GPIO_PIN_EXT_WDOG)
+// toggle the external watchdog gpio pin
+void Scheduler::ext_watchdog_pat(uint32_t now_ms)
+{
+    // toggle watchdog GPIO every WDI_OUT_INTERVAL_TIME_MS
+    if ((now_ms - last_ext_watchdog_ms) >= EXT_WDOG_INTERVAL_MS) {
+        palToggleLine(HAL_GPIO_PIN_EXT_WDOG);
+        last_ext_watchdog_ms = now_ms;
+    }
+}
+#endif
+
+#if CH_DBG_ENABLE_STACK_CHECK == TRUE
+/*
+  check we have enough stack free on all threads and the ISR stack
+ */
+void Scheduler::check_stack_free(void)
+{
+    // we raise an internal error stack_overflow when the available
+    // stack on any thread or the ISR stack drops below this
+    // thres

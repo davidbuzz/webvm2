@@ -1,0 +1,2925 @@
+#include "Copter.h"
+
+/*
+ *       This event will be called when the failsafe changes
+ *       boolean failsafe reflects the current state
+ */
+
+bool Copter::failsafe_option(FailsafeOption opt) const
+{
+    return (g2.fs_options & (uint32_t)opt);
+}
+
+void Copter::failsafe_radio_on_event()
+{
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_RADIO, LogErrorCode::FAILSAFE_OCCURRED);
+
+    // set desired action based on FS_THR_ENABLE parameter
+    FailsafeAction desired_action;
+    switch (g.failsafe_throttle) {
+        case FS_THR_DISABLED:
+            desired_action = FailsafeAction::NONE;
+            break;
+        case FS_THR_ENABLED_ALWAYS_RTL:
+        case FS_THR_ENABLED_CONTINUE_MISSION:
+            desired_action = FailsafeAction::RTL;
+            break;
+        case FS_THR_ENABLED_ALWAYS_SMARTRTL_OR_RTL:
+            desired_action = FailsafeAction::SMARTRTL;
+            break;
+        case FS_THR_ENABLED_ALWAYS_SMARTRTL_OR_LAND:
+            desired_action = FailsafeAction::SMARTRTL_LAND;
+            break;
+        case FS_THR_ENABLED_ALWAYS_LAND:
+            desired_action = FailsafeAction::LAND;
+            break;
+        case FS_THR_ENABLED_AUTO_RTL_OR_RTL:
+            desired_action = FailsafeAction::AUTO_DO_LAND_START;
+            break;
+        case FS_THR_ENABLED_BRAKE_OR_LAND:
+            desired_action = FailsafeAction::BRAKE_LAND;
+            break;
+        default:
+            desired_action = FailsafeAction::LAND;
+    }
+
+    // Conditions to deviate from FS_THR_ENABLE selection and send specific GCS warning
+    if (should_disarm_on_failsafe()) {
+        // should immediately disarm when we're on the ground
+        announce_failsafe("Radio", "Disarming");
+        arming.disarm(AP_Arming::Method::RADIOFAILSAFE);
+        desired_action = FailsafeAction::NONE;
+
+    } else if (flightmode->is_landing() && ((battery.has_failsafed() && battery.get_highest_failsafe_priority() <= FAILSAFE_LAND_PRIORITY))) {
+        // Allow landing to continue when battery failsafe requires it (not a user option)
+        announce_failsafe("Radio + Battery", "Continuing Landing");
+        desired_action = FailsafeAction::LAND;
+
+    } else if (flightmode->is_landing() && failsafe_option(FailsafeOption::CONTINUE_IF_LANDING)) {
+        // Allow landing to continue when FS_OPTIONS is set to continue landing
+        announce_failsafe("Radio", "Continuing Landing");
+        desired_action = FailsafeAction::LAND;
+
+    } else if (flightmode->mode_number() == Mode::Number::AUTO && failsafe_option(FailsafeOption::RC_CONTINUE_IF_AUTO)) {
+        // Allow mission to continue when FS_OPTIONS is set to continue mission
+        announce_failsafe("Radio", "Continuing Auto");
+        desired_action = FailsafeAction::NONE;
+
+    } else if ((flightmode->in_guided_mode()) && failsafe_option(FailsafeOption::RC_CONTINUE_IF_GUIDED)) {
+        // Allow guided mode to continue when FS_OPTIONS is set to continue in guided mode
+        announce_failsafe("Radio", "Continuing Guided Mode");
+        desired_action = FailsafeAction::NONE;
+
+    } else {
+        announce_failsafe("Radio");
+    }
+
+    // Call the failsafe action handler
+    do_failsafe_action(desired_action, ModeReason::RADIO_FAILSAFE);
+}
+
+// failsafe_off_event - respond to radio contact being regained
+void Copter::failsafe_radio_off_event()
+{
+    // no need to do anything except log the error as resolved
+    // user can now override roll, pitch, yaw and throttle and even use flight mode switch to restore previous flight mode
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_RADIO, LogErrorCode::FAILSAFE_RESOLVED);
+    gcs().send_text(MAV_SEVERITY_WARNING, "Radio Failsafe Cleared");
+}
+
+void Copter::announce_failsafe(const char *type, const char *action_undertaken)
+{
+    if (action_undertaken != nullptr) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "%s Failsafe - %s", type, action_undertaken);
+    } else {
+        gcs().send_text(MAV_SEVERITY_WARNING, "%s Failsafe", type);
+    }
+}
+
+void Copter::handle_battery_failsafe(const char *type_str, const int8_t action)
+{
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_BATT, LogErrorCode::FAILSAFE_OCCURRED);
+
+    FailsafeAction desired_action = (FailsafeAction)action;
+
+    // Conditions to deviate from BATT_FS_XXX_ACT parameter setting
+    if (should_disarm_on_failsafe()) {
+        // should immediately disarm when we're on the ground
+        arming.disarm(AP_Arming::Method::BATTERYFAILSAFE);
+        desired_action = FailsafeAction::NONE;
+        announce_failsafe("Battery", "Disarming");
+
+    } else if (flightmode->is_landing() && failsafe_option(FailsafeOption::CONTINUE_IF_LANDING) && desired_action != FailsafeAction::NONE) {
+        // Allow landing to continue when FS_OPTIONS is set to continue when landing
+        desired_action = FailsafeAction::LAND;
+        announce_failsafe("Battery", "Continuing Landing");
+    } else {
+        announce_failsafe("Battery");
+    }
+
+    // Battery FS options already use the Failsafe_Options enum. So use them directly.
+    do_failsafe_action(desired_action, ModeReason::BATTERY_FAILSAFE);
+
+}
+
+// failsafe_gcs_check - check for ground station failsafe
+void Copter::failsafe_gcs_check()
+{
+    // Bypass GCS failsafe checks if disabled or GCS never connected
+    if (g.failsafe_gcs == FS_GCS_DISABLED) {
+        return;
+    }
+
+    const uint32_t gcs_last_seen_ms = gcs().sysid_myggcs_last_seen_time_ms();
+    if (gcs_last_seen_ms == 0) {
+        return;
+    }
+
+    // calc time since last gcs update
+    // note: this only looks at the heartbeat from the device id set by g.sysid_my_gcs
+    const uint32_t last_gcs_update_ms = millis() - gcs_last_seen_ms;
+    const uint32_t gcs_timeout_ms = uint32_t(constrain_float(g2.fs_gcs_timeout * 1000.0f, 0.0f, UINT32_MAX));
+
+    // Determine which event to trigger
+    if (last_gcs_update_ms < gcs_timeout_ms && failsafe.gcs) {
+        // Recovery from a GCS failsafe
+        set_failsafe_gcs(false);
+        failsafe_gcs_off_event();
+
+    } else if (last_gcs_update_ms < gcs_timeout_ms && !failsafe.gcs) {
+        // No problem, do nothing
+
+    } else if (last_gcs_update_ms > gcs_timeout_ms && failsafe.gcs) {
+        // Already in failsafe, do nothing
+
+    } else if (last_gcs_update_ms > gcs_timeout_ms && !failsafe.gcs) {
+        // New GCS failsafe event, trigger events
+        set_failsafe_gcs(true);
+        failsafe_gcs_on_event();
+    }
+}
+
+// failsafe_gcs_on_event - actions to take when GCS contact is lost
+void Copter::failsafe_gcs_on_event(void)
+{
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_GCS, LogErrorCode::FAILSAFE_OCCURRED);
+    RC_Channels::clear_overrides();
+
+    // convert the desired failsafe response to the FailsafeAction enum
+    FailsafeAction desired_action;
+    switch (g.failsafe_gcs) {
+        case FS_GCS_DISABLED:
+            desired_action = FailsafeAction::NONE;
+            break;
+        case FS_GCS_ENABLED_ALWAYS_RTL:
+        case FS_GCS_ENABLED_CONTINUE_MISSION:
+            desired_action = FailsafeAction::RTL;
+            break;
+        case FS_GCS_ENABLED_ALWAYS_SMARTRTL_OR_RTL:
+            desired_action = FailsafeAction::SMARTRTL;
+            break;
+        case FS_GCS_ENABLED_ALWAYS_SMARTRTL_OR_LAND:
+            desired_action = FailsafeAction::SMARTRTL_LAND;
+            break;
+        case FS_GCS_ENABLED_ALWAYS_LAND:
+            desired_action = FailsafeAction::LAND;
+            break;
+        case FS_GCS_ENABLED_AUTO_RTL_OR_RTL:
+            desired_action = FailsafeAction::AUTO_DO_LAND_START;
+            break;
+        case FS_GCS_ENABLED_BRAKE_OR_LAND:
+            desired_action = FailsafeAction::BRAKE_LAND;
+            break;
+        default: // if an invalid parameter value is set, the fallback is RTL
+            desired_action = FailsafeAction::RTL;
+    }
+
+    // Conditions to deviate from FS_GCS_ENABLE parameter setting
+    if (!motors->armed()) {
+        desired_action = FailsafeAction::NONE;
+        announce_failsafe("GCS");
+
+    } else if (should_disarm_on_failsafe()) {
+        // should immediately disarm when we're on the ground
+        arming.disarm(AP_Arming::Method::GCSFAILSAFE);
+        desired_action = FailsafeAction::NONE;
+        announce_failsafe("GCS", "Disarming");
+
+    } else if (flightmode->is_landing() && ((battery.has_failsafed() && battery.get_highest_failsafe_priority() <= FAILSAFE_LAND_PRIORITY))) {
+        // Allow landing to continue when battery failsafe requires it (not a user option)
+        announce_failsafe("GCS + Battery", "Continuing Landing");
+        desired_action = FailsafeAction::LAND;
+
+    } else if (flightmode->is_landing() && failsafe_option(FailsafeOption::CONTINUE_IF_LANDING)) {
+        // Allow landing to continue when FS_OPTIONS is set to continue landing
+        announce_failsafe("GCS", "Continuing Landing");
+        desired_action = FailsafeAction::LAND;
+
+    } else if (flightmode->mode_number() == Mode::Number::AUTO && failsafe_option(FailsafeOption::GCS_CONTINUE_IF_AUTO)) {
+        // Allow mission to continue when FS_OPTIONS is set to continue mission
+        announce_failsafe("GCS", "Continuing Auto Mode");
+        desired_action = FailsafeAction::NONE;
+
+    } else if (failsafe_option(FailsafeOption::GCS_CONTINUE_IF_PILOT_CONTROL) && !flightmode->is_autopilot()) {
+        // should continue when in a pilot controlled mode because FS_OPTIONS is set to continue in pilot controlled modes
+        announce_failsafe("GCS", "Continuing Pilot Control");
+        desired_action = FailsafeAction::NONE;
+    } else {
+        announce_failsafe("GCS");
+    }
+
+    // Call the failsafe action handler
+    do_failsafe_action(desired_action, ModeReason::GCS_FAILSAFE);
+}
+
+// failsafe_gcs_off_event - actions to take when GCS contact is restored
+void Copter::failsafe_gcs_off_event(void)
+{
+    gcs().send_text(MAV_SEVERITY_WARNING, "GCS Failsafe Cleared");
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_GCS, LogErrorCode::FAILSAFE_RESOLVED);
+}
+
+// executes terrain failsafe if data is missing for longer than a few seconds
+void Copter::failsafe_terrain_check()
+{
+    // trigger within <n> milliseconds of failures while in various modes
+    bool timeout = (failsafe.terrain_last_failure_ms - failsafe.terrain_first_failure_ms) > FS_TERRAIN_TIMEOUT_MS;
+    bool trigger_event = timeout && flightmode->requires_terrain_failsafe();
+
+    // check for clearing of event
+    if (trigger_event != failsafe.terrain) {
+        if (trigger_event) {
+            failsafe_terrain_on_event();
+        } else {
+            LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_TERRAIN, LogErrorCode::ERROR_RESOLVED);
+            failsafe.terrain = false;
+        }
+    }
+}
+
+// set terrain data status (found or not found)
+void Copter::failsafe_terrain_set_status(bool data_ok)
+{
+    uint32_t now = millis();
+
+    // record time of first and latest failures (i.e. duration of failures)
+    if (!data_ok) {
+        failsafe.terrain_last_failure_ms = now;
+        if (failsafe.terrain_first_failure_ms == 0) {
+            failsafe.terrain_first_failure_ms = now;
+        }
+    } else {
+        // failures cleared after 0.1 seconds of persistent successes
+        if (now - failsafe.terrain_last_failure_ms > 100) {
+            failsafe.terrain_last_failure_ms = 0;
+            failsafe.terrain_first_failure_ms = 0;
+        }
+    }
+}
+
+// terrain failsafe action
+void Copter::failsafe_terrain_on_event()
+{
+    failsafe.terrain = true;
+    gcs().send_text(MAV_SEVERITY_CRITICAL,"Failsafe: Terrain data missing");
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_TERRAIN, LogErrorCode::FAILSAFE_OCCURRED);
+
+    if (should_disarm_on_failsafe()) {
+        arming.disarm(AP_Arming::Method::TERRAINFAILSAFE);
+#if MODE_RTL_ENABLED == ENABLED
+    } else if (flightmode->mode_number() == Mode::Number::RTL) {
+        mode_rtl.restart_without_terrain();
+#endif
+    } else {
+        set_mode_RTL_or_land_with_pause(ModeReason::TERRAIN_FAILSAFE);
+    }
+}
+
+// check for gps glitch failsafe
+void Copter::gpsglitch_check()
+{
+    // get filter status
+    nav_filter_status filt_status = inertial_nav.get_filter_status();
+    bool gps_glitching = filt_status.flags.gps_glitching;
+
+    // log start or stop of gps glitch.  AP_Notify update is handled from within AP_AHRS
+    if (ap.gps_glitching != gps_glitching) {
+        ap.gps_glitching = gps_glitching;
+        if (gps_glitching) {
+            LOGGER_WRITE_ERROR(LogErrorSubsystem::GPS, LogErrorCode::GPS_GLITCH);
+            gcs().send_text(MAV_SEVERITY_CRITICAL,"GPS Glitch or Compass error");
+        } else {
+            LOGGER_WRITE_ERROR(LogErrorSubsystem::GPS, LogErrorCode::ERROR_RESOLVED);
+            gcs().send_text(MAV_SEVERITY_CRITICAL,"Glitch cleared");
+        }
+    }
+}
+
+// dead reckoning alert and failsafe
+void Copter::failsafe_deadreckon_check()
+{
+    // update dead reckoning state
+    const char* dr_prefix_str = "Dead Reckoning";
+
+    // get EKF filter status
+    bool ekf_dead_reckoning = inertial_nav.get_filter_status().flags.dead_reckoning;
+
+    // alert user to start or stop of dead reckoning
+    const uint32_t now_ms = AP_HAL::millis();
+    if (dead_reckoning.active != ekf_dead_reckoning) {
+        dead_reckoning.active = ekf_dead_reckoning;
+        if (dead_reckoning.active) {
+            dead_reckoning.start_ms = now_ms;
+            gcs().send_text(MAV_SEVERITY_CRITICAL,"%s started", dr_prefix_str);
+        } else {
+            dead_reckoning.start_ms = 0;
+            dead_reckoning.timeout = false;
+            gcs().send_text(MAV_SEVERITY_CRITICAL,"%s stopped", dr_prefix_str);
+        }
+    }
+
+    // check for timeout
+    if (dead_reckoning.active && !dead_reckoning.timeout) {
+        const uint32_t dr_timeout_ms = uint32_t(constrain_float(g2.failsafe_dr_timeout * 1000.0f, 0.0f, UINT32_MAX));
+        if (now_ms - dead_reckoning.start_ms > dr_timeout_ms) {
+            dead_reckoning.timeout = true;
+            gcs().send_text(MAV_SEVERITY_CRITICAL,"%s timeout", dr_prefix_str);
+        }
+    }
+
+    // exit immediately if deadreckon failsafe is disabled
+    if (g2.failsafe_dr_enable <= 0) {
+        failsafe.deadreckon = false;
+        return;
+    }
+
+    // check for failsafe action
+    if (failsafe.deadreckon != ekf_dead_reckoning) {
+        failsafe.deadreckon = ekf_dead_reckoning;
+
+        // only take action in modes requiring position estimate
+        if (failsafe.deadreckon && copter.flightmode->requires_GPS()) {
+
+            // log error
+            LOGGER_WRITE_ERROR(LogErrorSubsystem::FAILSAFE_DEADRECKON, LogErrorCode::FAILSAFE_OCCURRED);
+
+            // immediately disarm while landed
+            if (should_disarm_on_failsafe()) {
+                arming.disarm(AP_Arming::Method::DEADRECKON_FAILSAFE);
+                return;
+            }
+
+            // take user specified action
+            do_failsafe_action((FailsafeAction)g2.failsafe_dr_enable.get(), ModeReason::DEADRECKON_FAILSAFE);
+        }
+    }
+}
+
+// set_mode_RTL_or_land_with_pause - sets mode to RTL if possible or LAND with 4 second delay before descent starts
+//  this is always called from a failsafe so we trigger notification to pilot
+void Copter::set_mode_RTL_or_land_with_pause(ModeReason reason)
+{
+#if MODE_RTL_ENABLED
+    // attempt to switch to RTL, if this fails then switch to Land
+    if (set_mode(Mode::Number::RTL, reason)) {
+        AP_Notify::events.failsafe_mode_change = 1;
+        return;
+    }
+#endif
+    // set mode to land will trigger mode change notification to pilot
+    set_mode_land_with_pause(reason);
+}
+
+// set_mode_SmartRTL_or_land_with_pause - sets mode to SMART_RTL if possible or LAND with 4 second delay before descent starts
+// this is always called from a failsafe so we trigger notification to pilot
+void Copter::set_mode_SmartRTL_or_land_with_pause(ModeReason reason)
+{
+#if MODE_SMARTRTL_ENABLED
+    // attempt to switch to SMART_RTL, if this failed then switch to Land
+    if (set_mode(Mode::Number::SMART_RTL, reason)) {
+        AP_Notify::events.failsafe_mode_change = 1;
+        return;
+    }
+#endif
+    gcs().send_text(MAV_SEVERITY_WARNING, "SmartRTL Unavailable, Using Land Mode");
+    set_mode_land_with_pause(reason);
+}
+
+// set_mode_SmartRTL_or_RTL - sets mode to SMART_RTL if possible or RTL if possible or LAND with 4 second delay before descent starts
+// this is always called from a failsafe so we trigger notification to pilot
+void Copter::set_mode_SmartRTL_or_RTL(ModeReason reason)
+{
+#if MODE_SMARTRTL_ENABLED
+    // attempt to switch to SmartRTL, if this failed then attempt to RTL
+    // if that fails, then land
+    if (set_mode(Mode::Number::SMART_RTL, reason)) {
+        AP_Notify::events.failsafe_mode_change = 1;
+        return;
+    }
+#endif
+    gcs().send_text(MAV_SEVERITY_WARNING, "SmartRTL Unavailable, Trying RTL Mode");
+    set_mode_RTL_or_land_with_pause(reason);
+}
+
+// Sets mode to Auto and jumps to DO_LAND_START, as set with AUTO_RTL param
+// This can come from failsafe or RC option
+void Copter::set_mode_auto_do_land_start_or_RTL(ModeReason reason)
+{
+#if MODE_AUTO_ENABLED == ENABLED
+    if (set_mode(Mode::Number::AUTO_RTL, reason)) {
+        AP_Notify::events.failsafe_mode_change = 1;
+        return;
+    }
+#endif
+
+    gcs().send_text(MAV_SEVERITY_WARNING, "Trying RTL Mode");
+    set_mode_RTL_or_land_with_pause(reason);
+}
+
+// Sets mode to Brake or LAND with 4 second delay before descent starts
+// This can come from failsafe or RC option
+void Copter::set_mode_brake_or_land_with_pause(ModeReason reason)
+{
+#if MODE_BRAKE_ENABLED == ENABLED
+    if (set_mode(Mode::Number::BRAKE, reason)) {
+        AP_Notify::events.failsafe_mode_change = 1;
+        return;
+    }
+#endif
+
+    gcs().send_text(MAV_SEVERITY_WARNING, "Trying Land Mode");
+    set_mode_land_with_pause(reason);
+}
+
+bool Copter::should_disarm_on_failsafe() {
+    if (ap.in_arming_delay) {
+        return true;
+    }
+
+    switch (flightmode->mode_number()) {
+        case Mode::Number::STABILIZE:
+        case Mode::Number::ACRO:
+            // if throttle is zero OR vehicle is landed disarm motors
+            return ap.throttle_zero || ap.land_complete;
+        case Mode::Number::AUTO:
+        case Mode::Number::AUTO_RTL:
+            // if mission has not started AND vehicle is landed, disarm motors
+            return !ap.auto_armed && ap.land_complete;
+        default:
+            // used for AltHold, Guided, Loiter, RTL, Circle, Drift, Sport, Flip, Autotune, PosHold
+            // if landed disarm
+            return ap.land_complete;
+    }
+}
+
+
+void Copter::do_failsafe_action(FailsafeAction action, ModeReason reason){
+
+    // Execute the specified desired_action
+    switch (action) {
+        case FailsafeAction::NONE:
+            return;
+        case FailsafeAction::LAND:
+            set_mode_land_with_pause(reason);
+            break;
+        case FailsafeAction::RTL:
+            set_mode_RTL_or_land_with_pause(reason);
+            break;
+        case FailsafeAction::SMARTRTL:
+            set_mode_SmartRTL_or_RTL(reason);
+            break;
+        case FailsafeAction::SMARTRTL_LAND:
+            set_mode_SmartRTL_or_land_with_pause(reason);
+            break;
+        case FailsafeAction::TERMINATE: {
+#if ADVANCED_FAILSAFE == ENABLED
+            g2.afs.gcs_terminate(true, "Failsafe");
+#else
+            arming.disarm(AP_Arming::Method::FAILSAFE_ACTION_TERMINATE);
+#endif
+            break;
+        }
+        case FailsafeAction::AUTO_DO_LAND_START:
+            set_mode_auto_do_land_start_or_RTL(reason);
+            break;
+        case FailsafeAction::BRAKE_LAND:
+            set_mode_brake_or_land_with_pause(reason);
+            break;
+    }
+
+#if AP_GRIPPER_ENABLED
+    if (failsafe_option(FailsafeOption::RELEASE_GRIPPER)) {
+        gripper.release();
+    }
+#endif
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #include "Copter.h"
+
+// read_inertia - read inertia in from accelerometers
+void Copter::read_inertia()
+{
+    // inertial altitude estimates. Use barometer climb rate during high vibrations
+    inertial_nav.update(vibration_check.high_vibes);
+
+    // pull position from ahrs
+    Location loc;
+    ahrs.get_location(loc);
+    current_loc.lat = loc.lat;
+    current_loc.lng = loc.lng;
+
+    // exit immediately if we do not have an altitude estimate
+    if (!inertial_nav.get_filter_status().flags.vert_pos) {
+        return;
+    }
+
+    // current_loc.alt is alt-above-home, converted from inertial nav's alt-above-ekf-origin
+    const int32_t alt_above_origin_cm = inertial_nav.get_position_z_up_cm();
+    current_loc.set_alt_cm(alt_above_origin_cm, Location::AltFrame::ABOVE_ORIGIN);
+    if (!ahrs.home_is_set() || !current_loc.change_alt_frame(Location::AltFrame::ABOVE_HOME)) {
+        // if home has not been set yet we treat alt-above-origin as alt-above-home
+        current_loc.set_alt_cm(alt_above_origin_cm, Location::AltFrame::ABOVE_HOME);
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 oll_out_cd = 0.0;
+        pitch_out_cd = 0.0;
+        return;
+    }
+
+    //transform pilot's normalised roll or pitch stick input into a roll and pitch euler angle command
+    float roll_out_deg;
+    float pitch_out_deg;
+    rc_input_to_roll_pitch(channel_roll->get_control_in()*(1.0/ROLL_PITCH_YAW_INPUT_MAX), channel_pitch->get_control_in()*(1.0/ROLL_PITCH_YAW_INPUT_MAX), angle_max_cd * 0.01,  angle_limit_cd * 0.01, roll_out_deg, pitch_out_deg);
+
+    // Convert to centi-degrees
+    roll_out_cd = roll_out_deg * 100.0;
+    pitch_out_cd = pitch_out_deg * 100.0;
+}
+
+// transform pilot's roll or pitch input into a desired velocity
+Vector2f Mode::get_pilot_desired_velocity(float vel_max) const
+{
+    Vector2f vel;
+
+    // throttle failsafe check
+    if (copter.failsafe.radio || !rc().has_ever_seen_rc_input()) {
+        return vel;
+    }
+    // fetch roll and pitch inputs
+    float roll_out = channel_roll->get_control_in();
+    float pitch_out = channel_pitch->get_control_in();
+
+    // convert roll and pitch inputs to -1 to +1 range
+    float scaler = 1.0 / (float)ROLL_PITCH_YAW_INPUT_MAX;
+    roll_out *= scaler;
+    pitch_out *= scaler;
+
+    // convert roll and pitch inputs into velocity in NE frame
+    vel = Vector2f(-pitch_out, roll_out);
+    if (vel.is_zero()) {
+        return vel;
+    }
+    copter.rotate_body_frame_to_NE(vel.x, vel.y);
+
+    // Transform square input range to circular output
+    // vel_scaler is the vector to the edge of the +- 1.0 square in the direction of the current input
+    Vector2f vel_scaler = vel / MAX(fabsf(vel.x), fabsf(vel.y));
+    // We scale the output by the ratio of the distance to the square to the unit circle and multiply by vel_max
+    vel *= vel_max / vel_scaler.length();
+    return vel;
+}
+
+bool Mode::_TakeOff::triggered(const float target_climb_rate) const
+{
+    if (!copter.ap.land_complete) {
+        // can't take off if we're already flying
+        return false;
+    }
+    if (target_climb_rate <= 0.0f) {
+        // can't takeoff unless we want to go up...
+        return false;
+    }
+
+    if (copter.motors->get_spool_state() != AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
+        // hold aircraft on the ground until rotor speed runup has finished
+        return false;
+    }
+
+    return true;
+}
+
+bool Mode::is_disarmed_or_landed() const
+{
+    if (!motors->armed() || !copter.ap.auto_armed || copter.ap.land_complete) {
+        return true;
+    }
+    return false;
+}
+
+void Mode::zero_throttle_and_relax_ac(bool spool_up)
+{
+    if (spool_up) {
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    } else {
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::GROUND_IDLE);
+    }
+    attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw(0.0f, 0.0f, 0.0f);
+    attitude_control->set_throttle_out(0.0f, false, copter.g.throttle_filt);
+}
+
+void Mode::zero_throttle_and_hold_attitude()
+{
+    // run attitude controller
+    attitude_control->input_rate_bf_roll_pitch_yaw(0.0f, 0.0f, 0.0f);
+    attitude_control->set_throttle_out(0.0f, false, copter.g.throttle_filt);
+}
+
+// handle situations where the vehicle is on the ground waiting for takeoff
+// force_throttle_unlimited should be true in cases where we want to keep the motors spooled up
+// (instead of spooling down to ground idle).  This is required for tradheli's in Guided and Auto
+// where we always want the motor spooled up in Guided or Auto mode.  Tradheli's main rotor stops 
+// when spooled down to ground idle.
+// ultimately it forces the motor interlock to be obeyed in auto and guided modes when on the ground.
+void Mode::make_safe_ground_handling(bool force_throttle_unlimited)
+{
+    if (force_throttle_unlimited) {
+        // keep rotors turning 
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    } else {
+        // spool down to ground idle
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::GROUND_IDLE);
+    }
+
+    // aircraft is landed, integrator terms must be reset regardless of spool state
+    attitude_control->reset_rate_controller_I_terms_smoothly();
+ 
+    switch (motors->get_spool_state()) {
+    case AP_Motors::SpoolState::SHUT_DOWN:
+    case AP_Motors::SpoolState::GROUND_IDLE:
+        // reset yaw targets and rates during idle states
+        attitude_control->reset_yaw_target_and_rate();
+        break;
+    case AP_Motors::SpoolState::SPOOLING_UP:
+    case AP_Motors::SpoolState::THROTTLE_UNLIMITED:
+    case AP_Motors::SpoolState::SPOOLING_DOWN:
+        // while transitioning though active states continue to operate normally
+        break;
+    }
+
+    pos_control->relax_velocity_controller_xy();
+    pos_control->update_xy_controller();
+    pos_control->relax_z_controller(0.0f);   // forces throttle output to decay to zero
+    pos_control->update_z_controller();
+    // we may need to move this out
+    attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw(0.0f, 0.0f, 0.0f);
+}
+
+/*
+  get a height above ground estimate for landing
+ */
+int32_t Mode::get_alt_above_ground_cm(void)
+{
+    int32_t alt_above_ground_cm;
+    if (copter.get_rangefinder_height_interpolated_cm(alt_above_ground_cm)) {
+        return alt_above_ground_cm;
+    }
+    if (!pos_control->is_active_xy()) {
+        return copter.current_loc.alt;
+    }
+    if (copter.current_loc.get_alt_cm(Location::AltFrame::ABOVE_TERRAIN, alt_above_ground_cm)) {
+        return alt_above_ground_cm;
+    }
+
+    // Assume the Earth is flat:
+    return copter.current_loc.alt;
+}
+
+void Mode::land_run_vertical_control(bool pause_descent)
+{
+    float cmb_rate = 0;
+    bool ignore_descent_limit = false;
+    if (!pause_descent) {
+
+        // do not ignore limits until we have slowed down for landing
+        ignore_descent_limit = (MAX(g2.land_alt_low,100) > get_alt_above_ground_cm()) || copter.ap.land_complete_maybe;
+
+        float max_land_descent_velocity;
+        if (g.land_speed_high > 0) {
+            max_land_descent_velocity = -g.land_speed_high;
+        } else {
+            max_land_descent_velocity = pos_control->get_max_speed_down_cms();
+        }
+
+        // Don't speed up for landing.
+        max_land_descent_velocity = MIN(max_land_descent_velocity, -abs(g.land_speed));
+
+        // Compute a vertical velocity demand such that the vehicle approaches g2.land_alt_low. Without the below constraint, this would cause the vehicle to hover at g2.land_alt_low.
+        cmb_rate = sqrt_controller(MAX(g2.land_alt_low,100)-get_alt_above_ground_cm(), pos_control->get_pos_z_p().kP(), pos_control->get_max_accel_z_cmss(), G_Dt);
+
+        // Constrain the demanded vertical velocity so that it is between the configured maximum descent speed and the configured minimum descent speed.
+        cmb_rate = constrain_float(cmb_rate, max_land_descent_velocity, -abs(g.land_speed));
+
+#if AC_PRECLAND_ENABLED
+        const bool navigating = pos_control->is_active_xy();
+        bool doing_precision_landing = !copter.ap.land_repo_active && copter.precland.target_acquired() && navigating;
+
+        if (doing_precision_landing) {
+            // prec landing is active
+            Vector2f target_pos;
+            float target_error_cm = 0.0f;
+            if (copter.precland.get_target_position_cm(target_pos)) {
+                const Vector2f current_pos = inertial_nav.get_position_xy_cm();
+                // target is this many cm away from the vehicle
+                target_error_cm = (target_pos - current_pos).length();
+            }
+            // check if we should descend or not
+            const float max_horiz_pos_error_cm = copter.precland.get_max_xy_error_before_descending_cm();
+            Vector3f target_pos_meas;
+            copter.precland.get_target_position_measurement_cm(target_pos_meas);
+            if (target_error_cm > max_horiz_pos_error_cm && !is_zero(max_horiz_pos_error_cm)) {
+                // doing precland but too far away from the obstacle
+                // do not descend
+                cmb_rate = 0.0f;
+            } else if (target_pos_meas.z > 35.0f && target_pos_meas.z < 200.0f && !copter.precland.do_fast_descend()) {
+                // very close to the ground and doing prec land, lets slow down to make sure we land on target
+                // compute desired descent velocity
+                const float precland_acceptable_error_cm = 15.0f;
+                const float precland_min_descent_speed_cms = 10.0f;
+                const float max_descent_speed_cms = abs(g.land_speed)*0.5f;
+                const float land_slowdown = MAX(0.0f, target_error_cm*(max_descent_speed_cms/precland_acceptable_error_cm));
+                cmb_rate = MIN(-precland_min_descent_speed_cms, -max_descent_speed_cms+land_slowdown);
+            }
+        }
+#endif
+    }
+
+    // update altitude target and call position controller
+    pos_control->land_at_climb_rate_cm(cmb_rate, ignore_descent_limit);
+    pos_control->update_z_controller();
+}
+
+void Mode::land_run_horizontal_control()
+{
+    Vector2f vel_correction;
+
+    // relax loiter target if we might be landed
+    if (copter.ap.land_complete_maybe) {
+        pos_control->soften_for_landing_xy();
+    }
+
+    // process pilot inputs
+    if (!copter.failsafe.radio) {
+        if ((g.throttle_behavior & THR_BEHAVE_HIGH_THROTTLE_CANCELS_LAND) != 0 && copter.rc_throttle_control_in_filter.get() > LAND_CANCEL_TRIGGER_THR){
+            LOGGER_WRITE_EVENT(LogEvent::LAND_CANCELLED_BY_PILOT);
+            // exit land if throttle is high
+            if (!set_mode(Mode::Number::LOITER, ModeReason::THROTTLE_LAND_ESCAPE)) {
+                set_mode(Mode::Number::ALT_HOLD, ModeReason::THROTTLE_LAND_ESCAPE);
+            }
+        }
+
+        if (g.land_repositioning) {
+            // apply SIMPLE mode transform to pilot inputs
+            update_simple_mode();
+
+            // convert pilot input to reposition velocity
+            // use half maximum acceleration as the maximum velocity to ensure aircraft will
+            // stop from full reposition speed in less than 1 second.
+            const float max_pilot_vel = wp_nav->get_wp_acceleration() * 0.5;
+            vel_correction = get_pilot_desired_velocity(max_pilot_vel);
+
+            // record if pilot has overridden roll or pitch
+            if (!vel_correction.is_zero()) {
+                if (!copter.ap.land_repo_active) {
+                    LOGGER_WRITE_EVENT(LogEvent::LAND_REPO_ACTIVE);
+                }
+                copter.ap.land_repo_active = true;
+#if AC_PRECLAND_ENABLED
+            } else {
+                // no override right now, check if we should allow precland
+                if (copter.precland.allow_precland_after_reposition()) {
+                    copter.ap.land_repo_active = false;
+                }
+#endif
+            }
+        }
+    }
+
+    // this variable will be updated if prec land target is in sight and pilot isn't trying to reposition the vehicle
+    copter.ap.prec_land_active = false;
+#if AC_PRECLAND_ENABLED
+    copter.ap.prec_land_active = !copter.ap.land_repo_active && copter.precland.target_acquired();
+    // run precision landing
+    if (copter.ap.prec_land_active) {
+        Vector2f target_pos, target_vel;
+        if (!copter.precland.get_target_position_cm(target_pos)) {
+            target_pos = inertial_nav.get_position_xy_cm();
+        }
+         // get the velocity of the target
+        copter.precland.get_target_velocity_cms(inertial_nav.get_velocity_xy_cms(), target_vel);
+
+        Vector2f zero;
+        Vector2p landing_pos = target_pos.topostype();
+        // target vel will remain zero if landing target is stationary
+        pos_control->input_pos_vel_accel_xy(landing_pos, target_vel, zero);
+    }
+#endif
+
+    if (!copter.ap.prec_land_active) {
+        Vector2f accel;
+        pos_control->input_vel_accel_xy(vel_correction, accel);
+    }
+
+    // run pos controller
+    pos_control->update_xy_controller();
+    Vector3f thrust_vector = pos_control->get_thrust_vector();
+
+    if (g2.wp_navalt_min > 0) {
+        // user has requested an altitude below which navigation
+        // attitude is limited. This is used to prevent commanded roll
+        // over on landing, which particularly affects helicopters if
+        // there is any position estimate drift after touchdown. We
+        // limit attitude to 7 degrees below this limit and linearly
+        // interpolate for 1m above that
+        const float attitude_limit_cd = linear_interpolate(700, copter.aparm.angle_max, get_alt_above_ground_cm(),
+                                                     g2.wp_navalt_min*100U, (g2.wp_navalt_min+1)*100U);
+        const float thrust_vector_max = sinf(radians(attitude_limit_cd * 0.01f)) * GRAVITY_MSS * 100.0f;
+        const float thrust_vector_mag = thrust_vector.xy().length();
+        if (thrust_vector_mag > thrust_vector_max) {
+            float ratio = thrust_vector_max / thrust_vector_mag;
+            thrust_vector.x *= ratio;
+            thrust_vector.y *= ratio;
+
+            // tell position controller we are applying an external limit
+            pos_control->set_externally_limited_xy();
+        }
+    }
+
+    // call attitude controller
+    attitude_control->input_thrust_vector_heading(thrust_vector, auto_yaw.get_heading());
+
+}
+
+// run normal or precision landing (if enabled)
+// pause_descent is true if vehicle should not descend
+void Mode::land_run_normal_or_precland(bool pause_descent)
+{
+#if AC_PRECLAND_ENABLED
+    if (pause_descent || !copter.precland.enabled()) {
+        // we don't want to start descending immediately or prec land is disabled
+        // in both cases just run simple land controllers
+        land_run_horiz_and_vert_control(pause_descent);
+    } else {
+        // prec land is enabled and we have not paused descent
+        // the state machine takes care of the entire prec landing procedure
+        precland_run();
+    }
+#else
+    land_run_horiz_and_vert_control(pause_descent);
+#endif
+}
+
+#if AC_PRECLAND_ENABLED
+// Go towards a position commanded by prec land state machine in order to retry landing
+// The passed in location is expected to be NED and in m
+void Mode::precland_retry_position(const Vector3f &retry_pos)
+{
+    if (!copter.failsafe.radio) {
+        if ((g.throttle_behavior & THR_BEHAVE_HIGH_THROTTLE_CANCELS_LAND) != 0 && copter.rc_throttle_control_in_filter.get() > LAND_CANCEL_TRIGGER_THR){
+            LOGGER_WRITE_EVENT(LogEvent::LAND_CANCELLED_BY_PILOT);
+            // exit land if throttle is high
+            if (!set_mode(Mode::Number::LOITER, ModeReason::THROTTLE_LAND_ESCAPE)) {
+                set_mode(Mode::Number::ALT_HOLD, ModeReason::THROTTLE_LAND_ESCAPE);
+            }
+        }
+
+        // allow user to take control during repositioning. Note: copied from land_run_horizontal_control()
+        // To-Do: this code exists at several different places in slightly different forms and that should be fixed
+        if (g.land_repositioning) {
+            float target_roll = 0.0f;
+            float target_pitch = 0.0f;
+            // convert pilot input to lean angles
+            get_pilot_desired_lean_angles(target_roll, target_pitch, loiter_nav->get_angle_max_cd(), attitude_control->get_althold_lean_angle_max_cd());
+
+            // record if pilot has overridden roll or pitch
+            if (!is_zero(target_roll) || !is_zero(target_pitch)) {
+                if (!copter.ap.land_repo_active) {
+                    LOGGER_WRITE_EVENT(LogEvent::LAND_REPO_ACTIVE);
+                }
+                // this flag will be checked by prec land state machine later and any further landing retires will be cancelled
+                copter.ap.land_repo_active = true;
+            }
+        }
+    }
+
+    Vector3p retry_pos_NEU{retry_pos.x, retry_pos.y, retry_pos.z * -1.0f};
+    // pos controller expects input in NEU cm's
+    retry_pos_NEU = retry_pos_NEU * 100.0f;
+    pos_control->input_pos_xyz(retry_pos_NEU, 0.0f, 1000.0f);
+
+    // run position controllers
+    pos_control->update_xy_controller();
+    pos_control->update_z_controller();
+
+    // call attitude controller
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
+
+}
+
+// Run precland statemachine. This function should be called from any mode that wants to do precision landing.
+// This handles everything from prec landing, to prec landing failures, to retries and failsafe measures
+void Mode::precland_run()
+{
+    // if user is taking control, we will not run the statemachine, and simply land (may or may not be on target)
+    if (!copter.ap.land_repo_active) {
+        // This will get updated later to a retry pos if needed
+        Vector3f retry_pos;
+
+        switch (copter.precland_statemachine.update(retry_pos)) {
+        case AC_PrecLand_StateMachine::Status::RETRYING:
+            // we want to retry landing by going to another position
+            precland_retry_position(retry_pos);
+            break;
+
+        case AC_PrecLand_StateMachine::Status::FAILSAFE: {
+            // we have hit a failsafe. Failsafe can only mean two things, we either want to stop permanently till user takes over or land
+            switch (copter.precland_statemachine.get_failsafe_actions()) {
+            case AC_PrecLand_StateMachine::FailSafeAction::DESCEND:
+                // descend normally, prec land target is definitely not in sight
+                land_run_horiz_and_vert_control();
+                break;
+            case AC_PrecLand_StateMachine::FailSafeAction::HOLD_POS:
+                // sending "true" in this argument will stop the descend
+                land_run_horiz_and_vert_control(true);
+                break;
+            }
+            break;
+        }
+        case AC_PrecLand_StateMachine::Status::ERROR:
+            // should never happen, is certainly a bug. Report then descend
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+            FALLTHROUGH;
+        case AC_PrecLand_StateMachine::Status::DESCEND:
+            // run land controller. This will descend towards the target if prec land target is in sight
+            // else it will just descend vertically
+            land_run_horiz_and_vert_control();
+            break;
+        }
+    } else {
+        // just land, since user has taken over controls, it does not make sense to run any retries or failsafe measures
+        land_run_horiz_and_vert_control();
+    }
+}
+#endif
+
+float Mode::throttle_hover() const
+{
+    return motors->get_throttle_hover();
+}
+
+// transform pilot's manual throttle input to make hover throttle mid stick
+// used only for manual throttle modes
+// thr_mid should be in the range 0 to 1
+// returns throttle output 0 to 1
+float Mode::get_pilot_desired_throttle() const
+{
+    const float thr_mid = throttle_hover();
+    int16_t throttle_control = channel_throttle->get_control_in();
+
+    int16_t mid_stick = copter.get_throttle_mid();
+    // protect against unlikely divide by zero
+    if (mid_stick <= 0) {
+        mid_stick = 500;
+    }
+
+    // ensure reasonable throttle values
+    throttle_control = constrain_int16(throttle_control,0,1000);
+
+    // calculate normalised throttle input
+    float throttle_in;
+    if (throttle_control < mid_stick) {
+        throttle_in = ((float)throttle_control)*0.5f/(float)mid_stick;
+    } else {
+        throttle_in = 0.5f + ((float)(throttle_control-mid_stick)) * 0.5f / (float)(1000-mid_stick);
+    }
+
+    const float expo = constrain_float(-(thr_mid-0.5f)/0.375f, -0.5f, 1.0f);
+    // calculate the output throttle using the given expo function
+    float throttle_out = throttle_in*(1.0f-expo) + expo*throttle_in*throttle_in*throttle_in;
+    return throttle_out;
+}
+
+float Mode::get_avoidance_adjusted_climbrate(float target_rate)
+{
+#if AP_AVOIDANCE_ENABLED
+    AP::ac_avoid()->adjust_velocity_z(pos_control->get_pos_z_p().kP(), pos_control->get_max_accel_z_cmss(), target_rate, G_Dt);
+    return target_rate;
+#else
+    return target_rate;
+#endif
+}
+
+// send output to the motors, can be overridden by subclasses
+void Mode::output_to_motors()
+{
+    motors->output();
+}
+
+Mode::AltHoldModeState Mode::get_alt_hold_state(float target_climb_rate_cms)
+{
+    // Alt Hold State Machine Determination
+    if (!motors->armed()) {
+        // the aircraft should moved to a shut down state
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::SHUT_DOWN);
+
+        // transition through states as aircraft spools down
+        switch (motors->get_spool_state()) {
+
+        case AP_Motors::SpoolState::SHUT_DOWN:
+            return AltHoldModeState::MotorStopped;
+
+        case AP_Motors::SpoolState::GROUND_IDLE:
+            return AltHoldModeState::Landed_Ground_Idle;
+
+        default:
+            return AltHoldModeState::Landed_Pre_Takeoff;
+        }
+
+    } else if (takeoff.running() || takeoff.triggered(target_climb_rate_cms)) {
+        // the aircraft is currently landed or taking off, asking for a positive climb rate and in THROTTLE_UNLIMITED
+        // the aircraft should progress through the take off procedure
+        return AltHoldModeState::Takeoff;
+
+    } else if (!copter.ap.auto_armed || copter.ap.land_complete) {
+        // the aircraft is armed and landed
+        if (target_climb_rate_cms < 0.0f && !copter.ap.using_interlock) {
+            // the aircraft should move to a ground idle state
+            motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::GROUND_IDLE);
+
+        } else {
+            // the aircraft should prepare for imminent take off
+            motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+        }
+
+        if (motors->get_spool_state() == AP_Motors::SpoolState::GROUND_IDLE) {
+            // the aircraft is waiting in ground idle
+            return AltHoldModeState::Landed_Ground_Idle;
+
+        } else {
+            // the aircraft can leave the ground at any time
+            return AltHoldModeState::Landed_Pre_Takeoff;
+        }
+
+    } else {
+        // the aircraft is in a flying state
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+        return AltHoldModeState::Flying;
+    }
+}
+
+// transform pilot's yaw input into a desired yaw rate
+// returns desired yaw rate in centi-degrees per second
+float Mode::get_pilot_desired_yaw_rate(float yaw_in)
+{
+    // throttle failsafe check
+    if (copter.failsafe.radio || !rc().has_ever_seen_rc_input()) {
+        return 0.0f;
+    }
+
+    // convert pilot input to the desired yaw rate
+    return g2.command_model_pilot.get_rate() * 100.0 * input_expo(yaw_in, g2.command_model_pilot.get_expo());
+}
+
+// pass-through functions to reduce code churn on conversion;
+// these are candidates for moving into the Mode base
+// class.
+float Mode::get_pilot_desired_climb_rate(float throttle_control)
+{
+    return copter.get_pilot_desired_climb_rate(throttle_control);
+}
+
+float Mode::get_non_takeoff_throttle()
+{
+    return copter.get_non_takeoff_throttle();
+}
+
+void Mode::update_simple_mode(void) {
+    copter.update_simple_mode();
+}
+
+bool Mode::set_mode(Mode::Number mode, ModeReason reason)
+{
+    return copter.set_mode(mode, reason);
+}
+
+void Mode::set_land_complete(bool b)
+{
+    return copter.set_land_complete(b);
+}
+
+GCS_Copter &Mode::gcs()
+{
+    return copter.gcs();
+}
+
+uint16_t Mode::get_pilot_speed_dn()
+{
+    return copter.get_pilot_speed_dn();
+}
+
+// Return stopping point as a location with above origin alt frame
+Location Mode::get_stopping_point() const
+{
+    Vector3p stopping_point_NEU;
+    copter.pos_control->get_stopping_point_xy_cm(stopping_point_NEU.xy());
+    copter.pos_control->get_stopping_point_z_cm(stopping_point_NEU.z);
+    return Location { stopping_point_NEU.tofloat(), Location::AltFrame::ABOVE_ORIGIN };
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include "Copter.h"
+#include <AP_Math/chirp.h>
+#include <AP_ExternalControl/AP_ExternalControl_config.h> // TODO why is this needed if Copter.h includes this
+
+class Parameters;
+class ParametersG2;
+
+class GCS_Copter;
+
+// object shared by both Guided and Auto for takeoff.
+// position controller controls vehicle but the user can control the yaw.
+class _AutoTakeoff {
+public:
+    void run();
+    void start(float complete_alt_cm, bool terrain_alt);
+    bool get_position(Vector3p& completion_pos);
+
+    bool complete;          // true when takeoff is complete
+
+private:
+    // altitude above-ekf-origin below which auto takeoff does not control horizontal position
+    bool no_nav_active;
+    float no_nav_alt_cm;
+
+    // auto takeoff variables
+    float complete_alt_cm;  // completion altitude expressed in cm above ekf origin or above terrain (depending upon auto_takeoff_terrain_alt)
+    bool terrain_alt;       // true if altitudes are above terrain
+    Vector3p complete_pos;  // target takeoff position as offset from ekf origin in cm
+};
+
+#if AC_PAYLOAD_PLACE_ENABLED
+class PayloadPlace {
+public:
+    void run();
+    void start_descent();
+    bool verify();
+
+    enum class State : uint8_t {
+        FlyToLocation,
+        Descent_Start,
+        Descent,
+        Release,
+        Releasing,
+        Delay,
+        Ascent_Start,
+        Ascent,
+        Done,
+    };
+
+    // these are set by the Mission code:
+    State state = State::Descent_Start; // records state of payload place
+    float descent_max_cm;
+
+private:
+
+    uint32_t descent_established_time_ms; // milliseconds
+    uint32_t place_start_time_ms; // milliseconds
+    float descent_thrust_level;
+    float descent_start_altitude_cm;
+    float descent_speed_cms;
+};
+#endif
+
+class Mode {
+    friend class PayloadPlace;
+
+public:
+
+    // Auto Pilot Modes enumeration
+    enum class Number : uint8_t {
+        STABILIZE =     0,  // manual airframe angle with manual throttle
+        ACRO =          1,  // manual body-frame angular rate with manual throttle
+        ALT_HOLD =      2,  // manual airframe angle with automatic throttle
+        AUTO =          3,  // fully automatic waypoint control using mission commands
+        GUIDED =        4,  // fully automatic fly to coordinate or fly at velocity/direction using GCS immediate commands
+        LOITER =        5,  // automatic horizontal acceleration with automatic throttle
+        RTL =           6,  // automatic return to launching point
+        CIRCLE =        7,  // automatic circular flight with automatic throttle
+        LAND =          9,  // automatic landing with horizontal position control
+        DRIFT =        11,  // semi-autonomous position, yaw and throttle control
+        SPORT =        13,  // manual earth-frame angular rate control with manual throttle
+        FLIP =         14,  // automatically flip the vehicle on the roll axis
+        AUTOTUNE =     15,  // automatically tune the vehicle's roll and pitch gains
+        POSHOLD =      16,  // automatic position hold with manual override, with automatic throttle
+        BRAKE =        17,  // full-brake using inertial/GPS system, no pilot input
+        THROW =        18,  // throw to launch mode using inertial/GPS system, no pilot input
+        AVOID_ADSB =   19,  // automatic avoidance of obstacles in the macro scale - e.g. full-sized aircraft
+        GUIDED_NOGPS = 20,  // guided mode but only accepts attitude and altitude
+        SMART_RTL =    21,  // SMART_RTL returns to home by retracing its steps
+        FLOWHOLD  =    22,  // FLOWHOLD holds position with optical flow without rangefinder
+        FOLLOW    =    23,  // follow attempts to follow another vehicle or ground station
+        ZIGZAG    =    24,  // ZIGZAG mode is able to fly in a zigzag manner with predefined point A and point B
+        SYSTEMID  =    25,  // System ID mode produces automated system identification signals in the controllers
+        AUTOROTATE =   26,  // Autonomous autorotation
+        AUTO_RTL =     27,  // Auto RTL, this is not a true mode, AUTO will report as this mode if entered to perform a DO_LAND_START Landing sequence
+        TURTLE =       28,  // Flip over after crash
+
+        // Mode number 127 reserved for the "drone show mode" in the Skybrush
+        // fork at https://github.com/skybrush-io/ardupilot
+    };
+
+    // constructor
+    Mode(void);
+
+    // do not allow copying
+    CLASS_NO_COPY(Mode);
+
+    friend class _AutoTakeoff;
+
+    // returns a unique number specific to this mode
+    virtual Number mode_number() const = 0;
+
+    // child classes should override these methods
+    virtual bool init(bool ignore_checks) {
+        return true;
+    }
+    virtual void exit() {};
+    virtual void run() = 0;
+    virtual bool requires_GPS() const = 0;
+    virtual bool has_manual_throttle() const = 0;
+    virtual bool allows_arming(AP_Arming::Method method) const = 0;
+    virtual bool is_autopilot() const { return false; }
+    virtual bool has_user_takeoff(bool must_navigate) const { return false; }
+    virtual bool in_guided_mode() const { return false; }
+    virtual bool logs_attitude() const { return false; }
+    virtual bool allows_save_trim() const { return false; }
+    virtual bool allows_autotune() const { return false; }
+    virtual bool allows_flip() const { return false; }
+    virtual bool crash_check_enabled() const { return true; }
+
+#if FRAME_CONFIG == HELI_FRAME
+    virtual bool allows_inverted() const { return false; };
+#endif
+
+    // return a string for this flightmode
+    virtual const char *name() const = 0;
+    virtual const char *name4() const = 0;
+
+    bool do_user_takeoff(float takeoff_alt_cm, bool must_navigate);
+    virtual bool is_taking_off() const;
+    static void takeoff_stop() { takeoff.stop(); }
+
+    virtual bool is_landing() const { return false; }
+
+    // mode requires terrain to be present to be functional
+    virtual bool requires_terrain_failsafe() const { return false; }
+
+    // functions for reporting to GCS
+    virtual bool get_wp(Location &loc) const { return false; };
+    virtual int32_t wp_bearing() const { return 0; }
+    virtual uint32_t wp_distance() const { return 0; }
+    virtual float crosstrack_error() const { return 0.0f;}
+
+    // functions to support MAV_CMD_DO_CHANGE_SPEED
+    virtual bool set_speed_xy(float speed_xy_cms) {return false;}
+    virtual bool set_speed_up(float speed_xy_cms) {return false;}
+    virtual bool set_speed_down(float speed_xy_cms) {return false;}
+
+    int32_t get_alt_above_ground_cm(void);
+
+    // pilot input processing
+    void get_pilot_desired_lean_angles(float &roll_out_cd, float &pitch_out_cd, float angle_max_cd, float angle_limit_cd) const;
+    Vector2f get_pilot_desired_velocity(float vel_max) const;
+    float get_pilot_desired_yaw_rate(float yaw_in);
+    float get_pilot_desired_throttle() const;
+
+    // returns climb target_rate reduced to avoid obstacles and
+    // altitude fence
+    float get_avoidance_adjusted_climbrate(float target_rate);
+
+    const Vector3f& get_vel_desired_cms() {
+        // note that position control isn't used in every mode, so
+        // this may return bogus data:
+        return pos_control->get_vel_desired_cms();
+    }
+
+    // send output to the motors, can be overridden by subclasses
+    virtual void output_to_motors();
+
+    // returns true if pilot's yaw input should be used to adjust vehicle's heading
+    virtual bool use_pilot_yaw() const {return true; }
+
+    // pause and resume a mode
+    virtual bool pause() { return false; };
+    virtual bool resume() { return false; };
+
+    // handle situations where the vehicle is on the ground waiting for takeoff
+    void make_safe_ground_handling(bool force_throttle_unlimited = false);
+
+    // true if weathervaning is allowed in the current mode
+#if WEATHERVANE_ENABLED == ENABLED
+    virtual bool allows_weathervaning() const { return false; }
+#endif
+
+protected:
+
+    // helper functions
+    bool is_disarmed_or_landed() const;
+    void zero_throttle_and_relax_ac(bool spool_up = false);
+    void zero_throttle_and_hold_attitude();
+
+    // Return stopping point as a location with above origin alt frame
+    Location get_stopping_point() const;
+
+    // functions to control normal landing.  pause_descent is true if vehicle should not descend
+    void land_run_horizontal_control();
+    void land_run_vertical_control(bool pause_descent = false);
+    void land_run_horiz_and_vert_control(bool pause_descent = false) {
+        land_run_horizontal_control();
+        land_run_vertical_control(pause_descent);
+    }
+
+#if AC_PAYLOAD_PLACE_ENABLED
+    // payload place flight behaviour:
+    static PayloadPlace payload_place;
+#endif
+
+    // run normal or precision landing (if enabled)
+    // pause_descent is true if vehicle should not descend
+    void land_run_normal_or_precland(bool pause_descent = false);
+
+#if AC_PRECLAND_ENABLED
+    // Go towards a position commanded by prec land state machine in order to retry landing
+    // The passed in location is expected to be NED and in meters
+    void precland_retry_position(const Vector3f &retry_pos);
+
+    // Run precland statemachine. This function should be called from any mode that wants to do precision landing.
+    // This handles everything from prec landing, to prec landing failures, to retries and failsafe measures
+    void precland_run();
+#endif
+
+    // return expected input throttle setting to hover:
+    virtual float throttle_hover() const;
+
+    // Alt_Hold based flight mode states used in Alt_Hold, Loiter, and Sport
+    enum class AltHoldModeState {
+        MotorStopped,
+        Takeoff,
+        Landed_Ground_Idle,
+        Landed_Pre_Takeoff,
+        Flying
+    };
+    AltHoldModeState get_alt_hold_state(float target_climb_rate_cms);
+
+    // convenience references to avoid code churn in conversion:
+    Parameters &g;
+    ParametersG2 &g2;
+    AC_WPNav *&wp_nav;
+    AC_Loiter *&loiter_nav;
+    AC_PosControl *&pos_control;
+    AP_InertialNav &inertial_nav;
+    AP_AHRS &ahrs;
+    AC_AttitudeControl *&attitude_control;
+    MOTOR_CLASS *&motors;
+    RC_Channel *&channel_roll;
+    RC_Channel *&channel_pitch;
+    RC_Channel *&channel_throttle;
+    RC_Channel *&channel_yaw;
+    float &G_Dt;
+
+    // note that we support two entirely different automatic takeoffs:
+
+    // "user-takeoff", which is available in modes such as ALT_HOLD
+    // (see has_user_takeoff method).  "user-takeoff" is a simple
+    // reach-altitude-based-on-pilot-input-or-parameter routine.
+
+    // "auto-takeoff" is used by both Guided and Auto, and is
+    // basically waypoint navigation with pilot yaw permitted.
+
+    // user-takeoff support; takeoff state is shared across all mode instances
+    class _TakeOff {
+    public:
+        void start(float alt_cm);
+        void stop();
+        void do_pilot_takeoff(float& pilot_climb_rate);
+        bool triggered(float target_climb_rate) const;
+
+        bool running() const { return _running; }
+    private:
+        bool _running;
+        float take_off_start_alt;
+        float take_off_complete_alt;
+    };
+
+    static _TakeOff takeoff;
+
+    virtual bool do_user_takeoff_start(float takeoff_alt_cm);
+
+    static _AutoTakeoff auto_takeoff;
+
+public:
+    // Navigation Yaw control
+    class AutoYaw {
+
+    public:
+
+        // Autopilot Yaw Mode enumeration
+        enum class Mode {
+            HOLD =             0,  // hold zero yaw rate
+            LOOK_AT_NEXT_WP =  1,  // point towards next waypoint (no pilot input accepted)
+            ROI =              2,  // point towards a location held in roi (no pilot input accepted)
+            FIXED =            3,  // point towards a particular angle (no pilot input accepted)
+            LOOK_AHEAD =       4,  // point in the direction the copter is moving
+            RESETTOARMEDYAW =  5,  // point towards heading at time motors were armed
+            ANGLE_RATE =       6,  // turn at a specified rate from a starting angle
+            RATE =             7,  // turn at a specified rate (held in auto_yaw_rate)
+            CIRCLE =           8,  // use AC_Circle's provided yaw (used during Loiter-Turns commands)
+            PILOT_RATE =       9,  // target rate from pilot stick
+            WEATHERVANE =     10,  // yaw into wind
+        };
+
+        // mode(): current method of determining desired yaw:
+        Mode mode() const { return _mode; }
+        void set_mode_to_default(bool rtl);
+        void set_mode(Mode new_mode);
+        Mode default_mode(bool rtl) const;
+
+        void set_rate(float new_rate_cds);
+
+        // set_roi(...): set a "look at" location:
+        void set_roi(const Location &roi_location);
+
+        void set_fixed_yaw(float angle_deg,
+                           float turn_rate_dps,
+                           int8_t direction,
+                           bool relative_angle);
+
+        void set_yaw_angle_rate(float yaw_angle_d, float yaw_rate_ds);
+
+        bool reached_fixed_yaw_target();
+
+#if WEATHERVANE_ENABLED == ENABLED
+        void update_weathervane(const int16_t pilot_yaw_cds);
+#endif
+
+        AC_AttitudeControl::HeadingCommand get_heading();
+
+    private:
+
+        // yaw_cd(): main product of AutoYaw; the heading:
+        float yaw_cd();
+
+        // rate_cds(): desired yaw rate in centidegrees/second:
+        float rate_cds();
+
+        // returns a yaw in degrees, direction of vehicle travel:
+        float look_ahead_yaw();
+
+        float roi_yaw() const;
+
+        // auto flight mode's yaw mode
+        Mode _mode = Mode::LOOK_AT_NEXT_WP;
+        Mode _last_mode;
+
+        // Yaw will point at this location if mode is set to Mode::ROI
+        Vector3f roi;
+
+        // yaw used for YAW_FIXED yaw_mode
+        float _fixed_yaw_offset_cd;
+
+        // Deg/s we should turn
+        float _fixed_yaw_slewrate_cds;
+
+        // time of the last yaw update
+        uint32_t _last_update_ms;
+
+        // heading when in yaw_look_ahead_yaw
+        float _look_ahead_yaw;
+
+        // turn rate (in cds) when auto_yaw_mode is set to AUTO_YAW_RATE
+        float _yaw_angle_cd;
+        float _yaw_rate_cds;
+        float _pilot_yaw_rate_cds;
+    };
+    static AutoYaw auto_yaw;
+
+    // pass-through functions to reduce code churn on conversion;
+    // these are candidates for moving into the Mode base
+    // class.
+    float get_pilot_desired_climb_rate(float throttle_control);
+    float get_non_takeoff_throttle(void);
+    void update_simple_mode(void);
+    bool set_mode(Mode::Number mode, ModeReason reason);
+    void set_land_complete(bool b);
+    GCS_Copter &gcs();
+    uint16_t get_pilot_speed_dn(void);
+    // end pass-through functions
+};
+
+
+#if MODE_ACRO_ENABLED == ENABLED
+class ModeAcro : public Mode {
+
+public:
+    // inherit constructor
+    using Mode::Mode;
+    Number mode_number() const override { return Number::ACRO; }
+
+    enum class Trainer {
+        OFF = 0,
+        LEVELING = 1,
+        LIMITED = 2,
+    };
+
+    enum class AcroOptions {
+        AIR_MODE = 1 << 0,
+        RATE_LOOP_ONLY = 1 << 1,
+    };
+
+    virtual void run() override;
+
+    bool requires_GPS() const override { return false; }
+    bool has_manual_throttle() const override { return true; }
+    bool allows_arming(AP_Arming::Method method) const override { return true; };
+    bool is_autopilot() const override { return false; }
+    bool init(bool ignore_checks) override;
+    void exit() override;
+    // whether an air-mode aux switch has been toggled
+    void air_mode_aux_changed();
+    bool allows_save_trim() const override { return true; }
+    bool allows_flip() const override { return true; }
+    bool crash_check_enabled() const override { return false; }
+
+protected:
+
+    const char *name() const override { return "ACRO"; }
+    const char *name4() const override { return "ACRO"; }
+
+    // get_pilot_desired_angle_rates - transform pilot's normalised roll pitch and yaw input into a desired lean angle rates
+    // inputs are -1 to 1 and the function returns desired angle rates in centi-degrees-per-second
+    void get_pilot_desired_angle_rates(float roll_in, float pitch_in, float yaw_in, float &roll_out, float &pitch_out, float &yaw_out);
+
+    float throttle_hover() const override;
+
+private:
+    bool disable_air_mode_reset;
+};
+#endif
+
+#if FRAME_CONFIG == HELI_FRAME
+class ModeAcro_Heli : public ModeAcro {
+
+public:
+    // inherit constructor
+    using ModeAcro::Mode;
+
+    bool init(bool ignore_checks) override;
+    void run() ov#include "Copter.h"
+
+Mode::_TakeOff Mode::takeoff;
+_AutoTakeoff Mode::auto_takeoff;
+
+// This file contains the high-level takeoff logic for Loiter, PosHold, AltHold, Sport modes.
+//   The take-off can be initiated from a GCS NAV_TAKEOFF command which includes a takeoff altitude
+//   A safe takeoff speed is calculated and used to calculate a time_ms
+//   the pos_control target is then slowly increased until time_ms expires
+
+bool Mode::do_user_takeoff_start(float takeoff_alt_cm)
+{
+    copter.flightmode->takeoff.start(takeoff_alt_cm);
+    return true;
+}
+
+// initiate user takeoff - called when MAVLink TAKEOFF command is received
+bool Mode::do_user_takeoff(float takeoff_alt_cm, bool must_navigate)
+{
+    if (!copter.motors->armed()) {
+        return false;
+    }
+    if (!copter.ap.land_complete) {
+        // can't takeoff again!
+        return false;
+    }
+    if (!has_user_takeoff(must_navigate)) {
+        // this mode doesn't support user takeoff
+        return false;
+    }
+    if (takeoff_alt_cm <= copter.current_loc.alt) {
+        // can't takeoff downwards...
+        return false;
+    }
+
+    // Vehicles using motor interlock should return false if motor interlock is disabled.
+    // Interlock must be enabled to allow the controller to spool up the motor(s) for takeoff.
+    if (!motors->get_interlock() && copter.ap.using_interlock) {
+        return false;
+    }
+
+    if (!do_user_takeoff_start(takeoff_alt_cm)) {
+        return false;
+    }
+
+    copter.set_auto_armed(true);
+    return true;
+}
+
+// start takeoff to specified altitude above home in centimeters
+void Mode::_TakeOff::start(float alt_cm)
+{
+    // initialise takeoff state
+    _running = true;
+    take_off_start_alt = copter.pos_control->get_pos_target_z_cm();
+    take_off_complete_alt  = take_off_start_alt + alt_cm;
+}
+
+// stop takeoff
+void Mode::_TakeOff::stop()
+{
+    _running = false;
+    // Check if we have progressed far enough through the takeoff process that the
+    // aircraft may have left the ground but not yet detected the climb.
+    if (copter.attitude_control->get_throttle_in() > copter.get_non_takeoff_throttle()) {
+        copter.set_land_complete(false);
+    }
+}
+
+// do_pilot_takeoff - controls the vertical position controller during the process of taking off
+//  take off is complete when the vertical target reaches the take off altitude.
+//  climb is cancelled if pilot_climb_rate_cm becomes negative
+//  sets take off to complete when target altitude is within 1% of the take off altitude
+void Mode::_TakeOff::do_pilot_takeoff(float& pilot_climb_rate_cm)
+{
+    // return pilot_climb_rate if take-off inactive
+    if (!_running) {
+        return;
+    }
+
+    if (copter.ap.land_complete) {
+        // send throttle to attitude controller with angle boost
+        float throttle = constrain_float(copter.attitude_control->get_throttle_in() + copter.G_Dt / copter.g2.takeoff_throttle_slew_time, 0.0, 1.0);
+        copter.attitude_control->set_throttle_out(throttle, true, 0.0);
+        // tell position controller to reset alt target and reset I terms
+        copter.pos_control->init_z_controller();
+        if (throttle >= MIN(copter.g2.takeoff_throttle_max, 0.9) || 
+            (copter.pos_control->get_z_accel_cmss() >= 0.5 * copter.pos_control->get_max_accel_z_cmss()) ||
+            (copter.pos_control->get_vel_desired_cms().z >= constrain_float(pilot_climb_rate_cm, copter.pos_control->get_max_speed_up_cms() * 0.1, copter.pos_control->get_max_speed_up_cms() * 0.5)) || 
+            (is_positive(take_off_complete_alt - take_off_start_alt) && copter.pos_control->get_pos_target_z_cm() - take_off_start_alt > 0.5 * (take_off_complete_alt - take_off_start_alt))) {
+            // throttle > 90%
+            // acceleration > 50% maximum acceleration
+            // velocity > 10% maximum velocity && commanded climb rate
+            // velocity > 50% maximum velocity
+            // altitude change greater than half complete alt from start off alt
+            copter.set_land_complete(false);
+        }
+    } else {
+        float pos_z = take_off_complete_alt;
+        float vel_z = pilot_climb_rate_cm;
+
+        // command the aircraft to the take off altitude and current pilot climb rate
+        copter.pos_control->input_pos_vel_accel_z(pos_z, vel_z, 0);
+
+        // stop take off early and return if negative climb rate is commanded or we are within 0.1% of our take off altitude
+        if (is_negative(pilot_climb_rate_cm) ||
+            (take_off_complete_alt  - take_off_start_alt) * 0.999f < copter.pos_control->get_pos_target_z_cm() - take_off_start_alt) {
+            stop();
+        }
+    }
+}
+
+// auto_takeoff_run - controls the vertical position controller during the process of taking off in auto modes
+// auto_takeoff_complete set to true when target altitude is within 10% of the take off altitude and less than 50% max climb rate
+void _AutoTakeoff::run()
+{
+    const auto &g2 = copter.g2;
+    const auto &inertial_nav = copter.inertial_nav;
+    const auto &wp_nav = copter.wp_nav;
+    auto *motors = copter.motors;
+    auto *pos_control = copter.pos_control;
+    auto *attitude_control = copter.attitude_control;
+
+    // if not armed set throttle to zero and exit immediately
+    if (!motors->armed() || !copter.ap.auto_armed) {
+        // do not spool down tradheli when on the ground with motor interlock enabled
+        copter.flightmode->make_safe_ground_handling(copter.is_tradheli() && motors->get_interlock());
+        // update auto_takeoff_no_nav_alt_cm
+        no_nav_alt_cm = inertial_nav.get_position_z_up_cm() + g2.wp_navalt_min * 100;
+        return;
+    }
+
+    // get terrain offset
+    float terr_offset = 0.0f;
+    if (terrain_alt && !wp_nav->get_terrain_offset(terr_offset)) {
+        // trigger terrain failsafe
+        copter.failsafe_terrain_on_event();
+        return;
+    }
+
+    // set motors to full range
+    motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+
+    // aircraft stays in landed state until rotor speed run up has finished
+    if (motors->get_spool_state() != AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
+        // motors have not completed spool up yet so relax navigation and position controllers
+        pos_control->relax_velocity_controller_xy();
+        pos_control->update_xy_controller();
+        pos_control->relax_z_controller(0.0f);   // forces throttle output to decay to zero
+        pos_control->update_z_controller();
+        attitude_control->reset_yaw_target_and_rate();
+        attitude_control->reset_rate_controller_I_terms();
+        attitude_control->input_thrust_vector_rate_heading(pos_control->get_thrust_vector(), 0.0);
+        // update auto_takeoff_no_nav_alt_cm
+        no_nav_alt_cm = inertial_nav.get_position_z_up_cm() + g2.wp_navalt_min * 100;
+        return;
+    }
+    
+    // aircraft stays in landed state until vertical movement is detected or 90% throttle is reached
+    if (copter.ap.land_complete) {
+        // send throttle to attitude controller with angle boost
+        float throttle = constrain_float(copter.attitude_control->get_throttle_in() + copter.G_Dt / copter.g2.takeoff_throttle_slew_time, 0.0, 1.0);
+        copter.attitude_control->set_throttle_out(throttle, true, 0.0);
+        // tell position controller to reset alt target and reset I terms
+        copter.pos_control->init_z_controller();
+        pos_control->relax_velocity_controller_xy();
+        pos_control->update_xy_controller();
+        attitude_control->reset_rate_controller_I_terms();
+        attitude_control->input_thrust_vector_rate_heading(pos_control->get_thrust_vector(), 0.0);
+        if (throttle >= MIN(copter.g2.takeoff_throttle_max, 0.9) || 
+            (copter.pos_control->get_z_accel_cmss() >= 0.5 * copter.pos_control->get_max_accel_z_cmss()) ||
+            (copter.pos_control->get_vel_desired_cms().z >= 0.1 * copter.pos_control->get_max_speed_up_cms()) || 
+            ( no_nav_active && (inertial_nav.get_position_z_up_cm() >= no_nav_alt_cm))) {
+            // throttle > 90%
+            // acceleration > 50% maximum acceleration
+            // velocity > 10% maximum velocity
+            // altitude change greater than half auto_takeoff_no_nav_alt_cm
+            copter.set_land_complete(false);
+        }
+        return;
+    }
+
+    // check if we are not navigating because of low altitude
+    if (no_nav_active) {
+        // check if vehicle has reached no_nav_alt threshold
+        if (inertial_nav.get_position_z_up_cm() >= no_nav_alt_cm) {
+            no_nav_active = false;
+        }
+        pos_control->relax_velocity_controller_xy();
+    } else {
+        Vector2f vel;
+        Vector2f accel;
+        pos_control->input_vel_accel_xy(vel, accel);
+    }
+    pos_control->update_xy_controller();
+
+    // command the aircraft to the take off altitude
+    float pos_z = complete_alt_cm + terr_offset;
+    float vel_z = 0.0;
+    copter.pos_control->input_pos_vel_accel_z(pos_z, vel_z, 0.0);
+    
+    // run the vertical position controller and set output throttle
+    pos_control->update_z_controller();
+
+    // call attitude controller with auto yaw
+    attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), copter.flightmode->auto_yaw.get_heading());
+
+    // takeoff complete when we are less than 1% of the stopping distance from the target altitude
+    // and 10% our maximum climb rate
+    const float vel_threshold_fraction = 0.1;
+    // stopping distance from vel_threshold_fraction * max velocity
+    const float stop_distance = 0.5 * sq(vel_threshold_fraction * copter.pos_control->get_max_speed_up_cms()) / copter.pos_control->get_max_accel_z_cmss();
+    bool reached_altitude = copter.pos_control->get_pos_target_z_cm() >= pos_z - stop_distance;
+    bool reached_climb_rate = copter.pos_control->get_vel_desired_cms().z < copter.pos_control->get_max_speed_up_cms() * vel_threshold_fraction;
+    complete = reached_altitude && reached_climb_rate;
+
+    // calculate completion for location in case it is needed for a smooth transition to wp_nav
+    if (complete) {
+        const Vector3p& _complete_pos = copter.pos_control->get_pos_target_cm();
+        complete_pos = Vector3p{_complete_pos.x, _complete_pos.y, pos_z};
+    }
+}
+
+void _AutoTakeoff::start(float _complete_alt_cm, bool _terrain_alt)
+{
+    // auto_takeoff_complete_alt_cm is a problem if equal to auto_takeoff_start_alt_cm
+    complete_alt_cm = _complete_alt_cm;
+    terrain_alt = _terrain_alt;
+    complete = false;
+    // initialise auto_takeoff_no_nav_alt_cm
+    const auto &g2 = copter.g2;
+    const auto &inertial_nav = copter.inertial_nav;
+    no_nav_alt_cm = inertial_nav.get_position_z_up_cm() + g2.wp_navalt_min * 100;
+    if ((g2.wp_navalt_min > 0) && (copter.flightmode->is_disarmed_or_landed() || !copter.motors->get_interlock())) {
+        // we are not flying, climb with no navigation to current alt-above-ekf-origin + wp_navalt_min
+        no_nav_active = true;
+    } else {
+        no_nav_active = false;
+    }
+}
+
+// return takeoff final position if takeoff has completed successfully
+bool _AutoTakeoff::get_position(Vector3p& _complete_pos)
+{
+    // only provide location if takeoff has completed
+    if (!complete) {
+        return false;
+    }
+
+    complete_pos = _complete_pos;
+    return true;
+}
+
+bool Mode::is_taking_off() const
+{
+    if (!has_user_takeoff(false)) {
+        return false;
+    }
+    return takeoff.running();
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          T
+// @Description: Tiltrotor tilt values
+// @Field: TimeUS: Time since system startup
+// @Field: Tilt: Current tilt angle, 0 deg vertical, 90 deg horizontal
+// @Field: FL: Front left tilt angle, 0 deg vertical, 90 deg horizontal
+// @Field: FR: Front right tilt angle, 0 deg vertical, 90 deg horizontal
+#if HAL_QUADPLANE_ENABLED
+    { LOG_TILT_MSG, sizeof(Tiltrotor::log_tiltrotor),
+      "TILT", "Qfff",  "TimeUS,Tilt,FL,FR", "sddd", "F---" , true },
+#endif
+
+// @LoggerMessage: PIDG
+// @Description: Plane Proportional/Integral/Derivative gain values for Heading when using COMMAND_INT control.
+// @Field: TimeUS: Time since system startup
+// @Field: Tar: desired value
+// @Field: Act: achieved value
+// @Field: Err: error between target and achieved
+// @Field: P: proportional part of PID
+// @Field: I: integral part of PID
+// @Field: D: derivative part of PID
+// @Field: FF: controller feed-forward portion of response
+// @Field: DFF: controller derivative feed-forward portion of response
+// @Field: Dmod: scaler applied to D gain to reduce limit cycling
+// @Field: SRate: slew rate
+// @Field: Flags: bitmask of PID state flags
+// @FieldBitmaskEnum: Flags: log_PID_Flags
+    { LOG_PIDG_MSG, sizeof(log_PID),
+      "PIDG", PID_FMT,  PID_LABELS, PID_UNITS, PID_MULTS , true },
+
+// @LoggerMessage: AETR
+// @Description: Normalised pre-mixer control surface outputs
+// @Field: TimeUS: Time since system startup
+// @Field: Ail: Pre-mixer value for aileron output (between -4500 and 4500)
+// @Field: Elev: Pre-mixer value for elevator output (between -4500 and 4500)
+// @Field: Thr: Pre-mixer value for throttle output (between -100 and 100)
+// @Field: Rudd: Pre-mixer value for rudder output (between -4500 and 4500)
+// @Field: Flap: Pre-mixer value for flaps output (between 0 and 100)
+// @Field: Steer: Pre-mixer value for steering output (between -4500 and 4500)
+// @Field: SS: Surface movement / airspeed scaling value
+    { LOG_AETR_MSG, sizeof(log_AETR),
+      "AETR", "Qfffffff",  "TimeUS,Ail,Elev,Thr,Rudd,Flap,Steer,SS", "s-------", "F-------" , true },
+
+#if AP_PLANE_OFFBOARD_GUIDED_SLEW_ENABLED
+// @LoggerMessage: OFG
+// @Description: OFfboard-Guided - an advanced version of GUIDED for companion computers that includes rate/s.  
+// @Field: TimeUS: Time since system startup
+// @Field: Arsp:  target airspeed cm
+// @Field: ArspA:  target airspeed accel
+// @Field: Alt:  target alt
+// @Field: AltA: target alt accel
+// @Field: AltF: target alt frame
+// @Field: Hdg:  target heading
+// @Field: HdgA: target heading lim
+    { LOG_OFG_MSG, sizeof(log_OFG_Guided),     
+      "OFG", "QffffBff",    "TimeUS,Arsp,ArspA,Alt,AltA,AltF,Hdg,HdgA", "s-------", "F-------" , true }, 
+#endif
+};
+
+uint8_t Plane::get_num_log_structures() const
+{
+    return ARRAY_SIZE(log_structure);
+}
+
+void Plane::Log_Write_Vehicle_Startup_Messages()
+{
+    // only 200(?) bytes are guaranteed by AP_Logger
+#if HAL_QUADPLANE_ENABLED
+    if (quadplane.initialised) {
+        char frame_and_type_string[30];
+        quadplane.motors->get_frame_and_type_string(frame_and_type_string, ARRAY_SIZE(frame_and_type_string));
+        logger.Write_MessageF("QuadPlane %s", frame_and_type_string);
+    }
+#endif
+    logger.Write_Mode(control_mode->mode_number(), control_mode_reason);
+    ahrs.Log_Write_Home_And_Origin();
+    gps.Write_AP_Logger_Log_Startup_messages();
+}
+
+#endif // HAL_LOGGING_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      all:
+	@$(MAKE) -C ../  -f Makefile.waf plane
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include "Plane.h"
+
+#include <AP_Gripper/AP_Gripper.h>
+
+/*
+ *  ArduPlane parameter definitions
+ *
+ */
+
+const AP_Param::Info Plane::var_info[] = {
+    // @Param: FORMAT_VERSION
+    // @DisplayName: Eeprom format version number
+    // @Description: This value is incremented when changes are made to the eeprom format
+    // @User: Advanced
+    GSCALAR(format_version,         "FORMAT_VERSION", 0),
+
+    // @Param: SYSID_THISMAV
+    // @DisplayName: MAVLink system ID of this vehicle
+    // @Description: Allows setting an individual MAVLink system id for this vehicle to distinguish it from others on the same network
+    // @Range: 1 255
+    // @User: Advanced
+    GSCALAR(sysid_this_mav,         "SYSID_THISMAV",  MAV_SYSTEM_ID),
+
+    // @Param: SYSID_MYGCS
+    // @DisplayName: Ground station MAVLink system ID
+    // @Description: The identifier of the ground station in the MAVLink protocol. Don't change this unless you also modify the ground station to match.
+    // @Range: 1 255
+    // @Increment: 1
+    // @User: Advanced
+    GSCALAR(sysid_my_gcs,           "SYSID_MYGCS",    255),
+
+    // AP_SerialManager was here
+
+    // @Param: AUTOTUNE_LEVEL
+    // @DisplayName: Autotune level
+    // @Description: Level of aggressiveness of pitch and roll PID gains. Lower values result in a 'softer' tune. Level 6 recommended for most planes. A value of 0 means to keep the current values of RMAX and TCONST for the controllers, tuning only the PID values
+    // @Range: 0 10
+    // @Increment: 1
+    // @User: Standard
+    ASCALAR(autotune_level, "AUTOTUNE_LEVEL",  6),
+
+    // @Param: AUTOTUNE_OPTIONS
+    // @DisplayName: Autotune options bitmask
+    // @Description: Fixed Wing Autotune specific options. Useful on QuadPlanes with higher INS_GYRO_FILTER settings to prevent these filter values from being set too agressively during Fixed Wing Autotune.
+    // @Bitmask: 0: Disable FLTD update by Autotune
+    // @Bitmask: 1: Disable FLTT update by Autotune
+    // @User: Advanced
+    ASCALAR(autotune_options, "AUTOTUNE_OPTIONS",  0),
+
+    // @Param: TELEM_DELAY
+    // @DisplayName: Telemetry startup delay 
+    // @Description: The amount of time (in seconds) to delay radio telemetry to prevent an Xbee bricking on power up
+    // @User: Standard
+    // @Units: s
+    // @Range: 0 30
+    // @Increment: 1
+    GSCALAR(telem_delay,            "TELEM_DELAY",     0),
+
+    // @Param: GCS_PID_MASK
+    // @DisplayName: GCS PID tuning mask
+    // @Description: bitmask of PIDs to send MAVLink PID_TUNING messages for
+    // @User: Advanced
+    // @Bitmask: 0:Roll,1:Pitch,2:Yaw,3:Steering,4:Landing
+    GSCALAR(gcs_pid_mask,           "GCS_PID_MASK",     0),
+
+    // @Param: KFF_RDDRMIX
+    // @DisplayName: Rudder Mix
+    // @Description: Amount of rudder to add during aileron movement. Increase if nose initially yaws away from roll. Reduces adverse yaw.
+    // @Range: 0 1
+    // @Increment: 0.01
+    // @User: Standard
+    GSCALAR(kff_rudder_mix,         "KFF_RDDRMIX",    RUDDER_MIX),
+
+    // @Param: KFF_THR2PTCH
+    // @DisplayName: Throttle to Pitch Mix
+    // @Description: Pitch up to add in proportion to throttle. 100% throttle will add this number of degrees to the pitch target.
+    // @Range: -5 5
+    // @Increment: 0.01
+    // @User: Advanced
+    GSCALAR(kff_throttle_to_pitch,  "KFF_THR2PTCH",   0),
+
+    // @Param: STAB_PITCH_DOWN
+    // @DisplayName: Low throttle pitch down trim 
+    // @Description: Degrees of down pitch added when throttle is below TRIM_THROTTLE in FBWA and AUTOTUNE modes. Scales linearly so full value is added when THR_MIN is reached. Helps to keep airspeed higher in glides or landing approaches and prevents accidental stalls. 2 degrees recommended for most planes.
+    // @Range: 0 15
+    // @Increment: 0.1
+    // @Units: deg
+    // @User: Advanced
+    GSCALAR(stab_pitch_down, "STAB_PITCH_DOWN",   2.0f),
+
+    // @Param: GLIDE_SLOPE_MIN
+    // @DisplayName: Glide slope minimum
+    // @Description: This controls the minimum altitude change for a waypoint before a glide slope will be used instead of an immediate altitude change. The default value is 15 meters, which helps to smooth out waypoint missions where small altitude changes happen near waypoints. If you don't want glide slopes to be used in missions then you can set this to zero, which will disable glide slope calculations. Otherwise you can set it to a minimum number of meters of altitude error to the destination waypoint before a glide slope will be used to change altitude.
+    // @Range: 0 1000
+    // @Increment: 1
+    // @Units: m
+    // @User: Advanced
+    GSCALAR(glide_slope_min, "GLIDE_SLOPE_MIN", 15),
+
+    // @Param: GLIDE_SLOPE_THR
+    // @DisplayName: Glide slope threshold
+    // @Description: This controls the height above the glide slope the plane may be before rebuilding a glide slope. This is useful for smoothing out an autotakeoff
+    // @Range: 0 100
+    // @Increment: 1
+    // @Units: m
+    // @User: Advanced
+    GSCALAR(glide_slope_threshold, "GLIDE_SLOPE_THR", 5.0),
+
+    // @Param: STICK_MIXING
+    // @DisplayName: Stick Mixing
+    // @Description: When enabled, this adds user stick input to the control surfaces in auto modes, allowing the user to have some degree of flight control without changing modes.  There are two types of stick mixing available. If you set STICK_MIXING to 1 then it will use "fly by wire" mixing, which controls the roll and pitch in the same way that the FBWA mode does. This is the safest option if you usually fly ArduPlane in FBWA or FBWB mode. If you set STICK_MIXING to 3 then it will apply to the yaw while in quadplane modes only, such as while doing an automatic VTOL takeoff or landing.
+    // @Values: 0:Disabled,1:FBWMixing,3:VTOL Yaw only
+    // @User: Advanced
+    GSCALAR(stick_mixing,           "STICK_MIXING",   uint8_t(StickMixing::FBW)),
+
+    // @Param: TKOFF_THR_MINSPD
+    // @DisplayName: Takeoff throttle min speed
+    // @Description: Minimum GPS ground speed in m/s used by the speed check that un-suppresses throttle in auto-takeoff. This can be be used for catapult launches where you want the motor to engage only after the plane leaves the catapult, but it is preferable to use the TKOFF_THR_MINACC and TKOFF_THR_DELAY parameters for catapult launches due to the errors associated with GPS measurements. For hand launches with a pusher prop it is strongly advised that this parameter be set to a value no less than 4 m/s to provide additional protection against premature motor start. Note that the GPS velocity will lag the real velocity by about 0.5 seconds. The ground speed check is delayed by the TKOFF_THR_DELAY parameter.
+    // @Units: m/s
+    // @Range: 0 30
+    // @Increment: 0.1
+    // @User: Standard
+    GSCALAR(takeoff_throttle_min_speed,     "TKOFF_THR_MINSPD",  0),
+
+    // @Param: TKOFF_THR_MINACC
+    // @DisplayName: Takeoff throttle min acceleration
+    // @Description: Minimum forward acceleration in m/s/s before arming the ground speed check in auto-takeoff. This is meant to be used for hand launches. Setting this value to 0 disables the acceleration test which means the ground speed check will always be armed which could allow GPS velocity jumps to start the engine. For hand launches and bungee launches this should be set to around 15. Also see TKOFF_ACCEL_CNT paramter for control of full "shake to arm".
+    // @Units: m/s/s
+    // @Range: 0 30
+    // @Increment: 0.1
+    // @User: Standard
+    GSCALAR(takeoff_throttle_min_accel,     "TKOFF_THR_MINACC",  0),
+
+    // @Param: TKOFF_THR_DELAY
+    // @DisplayName: Takeoff throttle delay
+    // @Description: This parameter sets the time delay (in 1/10ths of a second) that the ground speed check is delayed after the forward acceleration check controlled by TKOFF_THR_MINACC has passed. For hand launches with pusher propellers it is essential that this is set to a value of no less than 2 (0.2 seconds) to ensure that the aircraft is safely clear of the throwers arm before the motor can start. For bungee launches a larger value can be used (such as 30) to give time for the bungee to release from the aircraft before the motor is started.
+    // @Units: ds
+    // @Range: 0 127
+    // @Increment: 1
+    // @User: Standard
+    GSCALAR(takeoff_throttle_delay,     "TKOFF_THR_DELAY",  2),
+
+    // @Param: TKOFF_THR_MAX_T
+    // @DisplayName: Takeoff throttle maximum time
+    // @Description: This sets the time that maximum throttle will be forced during a fixed wing takeoff.
+    // @Units: s
+    // @Range: 0 10
+    // @Increment: 0.5
+    // @User: Standard
+    ASCALAR(takeoff_throttle_max_t,     "TKOFF_THR_MAX_T",  4),
+
+    // @Param: TKOFF_THR_MIN
+    // @DisplayName: Takeoff minimum throttle
+    // @Description: The minimum throttle to use in takeoffs in AUTO and TAKEOFF flight modes, when TKOFF_OPTIONS bit 0 is set. Also, the minimum throttle to use in a quadpane forward transition. This can be useful to ensure faster takeoffs or transitions on aircraft where the normal throttle control leads to a slow takeoff or transition. It is used when it is larger than THR_MIN, otherwise THR_MIN is used instead.
+    // @Units: %
+    // @Range: 0 100
+    // @Increment: 1
+    // @User: Standard
+    ASCALAR(takeoff_throttle_min,       "TKOFF_THR_MIN",    60),
+
+    // @Param: TKOFF_OPTIONS
+    // @DisplayName: Takeoff options
+    // @Description: This selects the mode of the takeoff in AUTO and TAKEOFF flight modes. 
+    // @Bitmask: 0: When unset the maximum allowed throttle is always used (THR_MAX or TKOFF_THR_MAX) during takeoff. When set TECS is allowed to operate between a minimum (THR_MIN or TKOFF_THR_MIN) and a maximum (THR_MAX or TKOFF_THR_MAX) limit. Applicable only when using an airspeed sensor.
+    // @User: Advanced
+    ASCALAR(takeoff_options,               "TKOFF_OPTIONS",       0),
+    
+    // @Param: TKOFF_TDRAG_ELEV
+    // @DisplayName: Takeoff tail dragger elevator
+    // @Description: This parameter sets the amount of elevator to apply during the initial stage of a takeoff. It is used to hold the tail wheel of a taildragger on the ground during the initial takeoff stage to give maximum steering. This option should be combined with the TKOFF_TDRAG_SPD1 option and the GROUND_STEER_ALT option along with tuning of the ground steering controller. A value of zero means to bypass the initial "tail hold" stage of takeoff. Set to zero for hand and catapult launch. For tail-draggers you should normally set this to 100, meaning full up elevator during the initial stage of takeoff. For most tricycle undercarriage aircraft a value of zero will work well, but for some tricycle aircraft a small negative value (say around -20 to -30) will apply down elevator which will hold the nose wheel firmly on the ground during initial acceleration. Only use a negative value if you find that the nosewheel doesn't grip well during takeoff. Too much down elevator on a tricycle undercarriage may cause instability in steering as the plane pivots around the nosewheel. Add down elevator 10 percent at a time.
+    // @Units: %
+    // @Range: -100 100
+    // @Increment: 1
+    // @User: Standard
+    GSCALAR(takeoff_tdrag_elevator,     "TKOFF_TDRAG_ELEV",  0),
+
+    // @Param: TKOFF_TDRAG_SPD1
+    // @DisplayName: Takeoff tail dragger speed1
+    // @Description: This parameter sets the airspeed at which to stop holding the tail down and transition to rudder control of steering on the ground. When TKOFF_TDRAG_SPD1 is reached the pitch of the aircraft will be held level until TKOFF_ROTATE_SPD is reached, at which point the takeoff pitch specified in the mission will be used to "rotate" the pitch for takeoff climb. Set TKOFF_TDRAG_SPD1 to zero to go straight to rotation. This should be set to zero for hand launch and catapult launch. It should also be set to zero for tricycle undercarriages unless you are using the method above to gently hold the nose wheel down. For tail dragger aircraft it should be set just below the stall speed.
+    // @Units: m/s
+    // @Range: 0 30
+    // @Increment: 0.1
+    // @User: Standard
+    GSCALAR(takeoff_tdrag_speed1,     "TKOFF_TDRAG_SPD1",  0),
+
+    // @Param: TKOFF_ROTATE_SPD
+    // @DisplayName: Takeoff rotate speed
+    // @Description: This parameter sets the airspeed at which the aircraft will "rotate", setting climb pitch specified in the mission. If TKOFF_ROTATE_SPD is zero then the climb pitch will be used as soon as takeoff is started. For hand launch and catapult launches a TKOFF_ROTATE_SPD of zero should be set. For all ground launches TKOFF_ROTATE_SPD should be set above the stall speed, usually by about 10 to 30 percent. During the run, use TKOFF_GND_PITCH to keep the aircraft on the runway while below this airspeed.
+    // @Units: m/s
+    // @Range: 0 30
+    // @Increment: 0.1
+    // @User: Standard
+    GSCALAR(takeoff_rotate_speed,     "TKOFF_ROTATE_SPD",  0),
+
+    // @Param: TKOFF_THR_SLEW
+    // @DisplayName: Takeoff throttle slew rate
+    // @Description: This parameter sets the slew rate for the throttle during auto takeoff. When this is zero the THR_SLEWRATE parameter is used during takeoff. For rolling takeoffs it can be a good idea to set a lower slewrate for takeoff to give a slower acceleration which can improve ground steering control. The value is a percentage throttle change per second, so a value of 20 means to advance the throttle over 5 seconds on takeoff. Values below 20 are not recommended as they may cause the plane to try to climb out with too little throttle. A value of -1 means no limit on slew rate in takeoff.
+    // @Units: %/s
+    // @Range: -1 127
+    // @Increment: 1
+    // @User: Standard
+    GSCALAR(takeoff_throttle_slewrate, "TKOFF_THR_SLEW",  0),
+
+    // @Param: TKOFF_PLIM_SEC
+    // @DisplayName: Takeoff pitch limit reduction
+    // @Description: This parameter reduces the pitch minimum limit of an auto-takeoff just a few seconds before it reaches the target altitude. This reduces overshoot by allowing the flight controller to start leveling off a few seconds before reaching the target height. When set to zero, the mission pitch min is enforced all the way to and through the target altitude, otherwise the pitch min slowly reduces to zero in the final segment. This is the pitch_min, not the demand. The flight controller should still be commanding to gain altitude to finish the takeoff but with this param it is not forcing it higher than it wants to be.
+    // @Units: s
+    // @Range: 0 10
+    // @Increment: 0.5
+    // @User: Advanced
+    GSCALAR(takeoff_pitch_limit_reduction_sec, "TKOFF_PLIM_SEC",  2),
+
+    // @Param: TKOFF_FLAP_PCNT
+    // @DisplayName: Takeoff flap percentage
+    // @Description: The amount of flaps (as a percentage) to apply in automatic takeoff
+    // @Range: 0 100
+    // @Units: %
+    // @Increment: 1
+    // @User: Advanced
+    GSCALAR(takeoff_flap_percent,     "TKOFF_FLAP_PCNT", 0),
+
+    // @Param: LEVEL_ROLL_LIMIT
+    // @DisplayName: Level flight roll limit
+    // @Description: This controls the maximum bank angle in degrees during flight modes where level flight is desired, such as in the final stages of landing, and during auto takeoff. This should be a small angle (such as 5 degrees) to prevent a wing hitting the runway during takeoff or landing. Setting this to zero will completely disable heading hold on auto takeoff while below 5 meters and during the flare portion of a final landing approach.
+    // @Units: deg
+    // @Range: 0 45
+    // @Increment: 1
+    // @User: Standard
+    GSCALAR(level_roll_limit,              "LEVEL_ROLL_LIMIT",   5),
+
+    // @Param: USE_REV_THRUST
+    // @DisplayName: Bitmask for when to allow negative reverse thrust
+    // @Description: This controls when to use reverse thrust. If set to zero then reverse thrust is never used. If set to a non-zero value then the bits correspond to flight stages where reverse thrust may be used. The most commonly used value for USE_REV_THRUST is 2, which means AUTO_LAND only. That enables reverse thrust in the landing stage of AUTO mode. Another common choice is 1, which means to use reverse thrust in all auto flight stages. Reverse thrust is always used in MANUAL mode if enabled with THR_MIN < 0. In non-autothrottle controlled modes, if reverse thrust is not used, then THR_MIN is effectively set to 0 for that mode.
+    // @Bitmask: 0:AUTO_ALWAYS,1:AUTO_LAND,2:AUTO_LOITER_TO_ALT,3:AUTO_LOITER_ALL,4:AUTO_WAYcription: X-Axis deceleration threshold to notify the crash detector that there was a possible impact which helps disarm the motor quickly after a crash. This value should be much higher than normal negative x-axis forces during normal flight, check flight log files to determine the average IMU.x values for your aircraft and motor type. Higher value means less sensative (triggers on higher impact). For electric planes that don't vibrate much during fight a value of 25 is good (that's about 2.5G). For petrol/nitro planes you'll want a higher value. Set to 0 to disable the collision detector.
+    // @Units: m/s/s
+    // @Range: 10 127
+    // @Increment: 1
+    // @User: Advanced
+    GSCALAR(crash_accel_threshold,          "CRASH_ACC_THRESH",   0),
+
+    // @Param: CRASH_DETECT
+    // @DisplayName: Crash Detection
+    // @Description: Automatically detect a crash during AUTO flight and perform the bitmask selected action(s). Disarm will turn off motor for safety and to help against burning out ESC and motor. Set to 0 to disable crash detection.
+    // @Bitmask: 0:Disarm
+    // @User: Advanced
+    ASCALAR(crash_detection_enable,         "CRASH_DETECT",   0),
+
+    // @Group: BARO
+    // @Path: ../libraries/AP_Baro/AP_Baro.cpp
+    GOBJECT(barometer, "BARO", AP_Baro),
+
+    // GPS driver
+    // @Group: GPS
+    // @Path: ../libraries/AP_GPS/AP_GPS.cpp
+    GOBJECT(gps, "GPS", AP_GPS),
+
+#if AP_CAMERA_ENABLED
+    // @Group: CAM
+    // @Path: ../libraries/AP_Camera/AP_Camera.cpp
+    GOBJECT(camera, "CAM", AP_Camera),
+#endif
+
+    // @Group: ARMING_
+    // @Path: AP_Arming.cpp,../libraries/AP_Arming/AP_Arming.cpp
+    GOBJECT(arming,                 "ARMING_", AP_Arming_Plane),
+
+#if AP_RELAY_ENABLED
+    // @Group: RELAY
+    // @Path: ../libraries/AP_Relay/AP_Relay.cpp
+    GOBJECT(relay,                  "RELAY", AP_Relay),
+#endif
+
+#if HAL_PARACHUTE_ENABLED
+	// @Group: CHUTE_
+    // @Path: ../libraries/AP_Parachute/AP_Parachute.cpp
+    GOBJECT(parachute,		"CHUTE_", AP_Parachute),
+#endif
+
+#if AP_RANGEFINDER_ENABLED
+    // @Group: RNGFND
+    // @Path: ../libraries/AP_RangeFinder/AP_RangeFinder.cpp
+    GOBJECT(rangefinder,            "RNGFND", RangeFinder),
+
+    // @Param: RNGFND_LANDING
+    // @DisplayName: Enable rangefinder for landing
+    // @Description: This enables the use of a rangefinder for automatic landing. The rangefinder will be used both on the landing approach and for final flare
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Standard
+    GSCALAR(rangefinder_landing,    "RNGFND_LANDING",   0),
+#endif
+
+#if AP_TERRAIN_AVAILABLE
+    // @Group: TERRAIN_
+    // @Path: ../libraries/AP_Terrain/AP_Terrain.cpp
+    GOBJECT(terrain,                "TERRAIN_", AP_Terrain),
+#endif
+
+#if HAL_ADSB_ENABLED
+    // @Group: ADSB_
+    // @Path: ../libraries/AP_ADSB/AP_ADSB.cpp
+    GOBJECT(adsb,                "ADSB_", AP_ADSB),
+
+    // @Group: AVD_
+    // @Path: ../libraries/AP_Avoidance/AP_Avoidance.cpp
+    GOBJECT(avoidance_adsb, "AVD_", AP_Avoidance_Plane),
+#endif
+
+#if HAL_QUADPLANE_ENABLED
+    // @Group: Q_
+    // @Path: quadplane.cpp
+    GOBJECT(quadplane,           "Q_", QuadPlane),
+#endif
+
+#if AP_TUNING_ENABLED
+    // @Group: TUNE_
+    // @Path: tuning.cpp,../libraries/AP_Tuning/AP_Tuning.cpp
+    GOBJECT(tuning,           "TUNE_", AP_Tuning_Plane),
+#endif
+
+#if HAL_QUADPLANE_ENABLED
+    // @Group: Q_A_
+    // @Path: ../libraries/AC_AttitudeControl/AC_AttitudeControl.cpp,../libraries/AC_AttitudeControl/AC_AttitudeControl_Multi.cpp
+    { "Q_A_", (const void *)&plane.quadplane.attitude_control,
+      {group_info : AC_AttitudeControl_Multi::var_info}, AP_PARAM_FLAG_POINTER,
+      Parameters::k_param_q_attitude_control, AP_PARAM_GROUP },
+#endif
+
+    // @Group: RLL
+    // @Path: ../libraries/APM_Control/AP_RollController.cpp
+    GOBJECT(rollController,         "RLL",   AP_RollController),
+
+    // @Group: PTCH
+    // @Path: ../libraries/APM_Control/AP_PitchController.cpp
+    GOBJECT(pitchController,        "PTCH",  AP_PitchController),
+
+    // @Group: YAW
+    // @Path: ../libraries/APM_Control/AP_YawController.cpp
+    GOBJECT(yawController,          "YAW",   AP_YawController),
+
+    // @Group: STEER2SRV_
+    // @Path: ../libraries/APM_Control/AP_SteerController.cpp
+	GOBJECT(steerController,        "STEER2SRV_",   AP_SteerController),
+
+	// variables not in the g class which contain EEPROM saved variables
+
+    // @Group: COMPASS_
+    // @Path: ../libraries/AP_Compass/AP_Compass.cpp
+    GOBJECT(compass,                "COMPASS_",     Compass),
+
+    // @Group: SCHED_
+    // @Path: ../libraries/AP_Scheduler/AP_Scheduler.cpp
+    GOBJECT(scheduler, "SCHED_", AP_Scheduler),
+
+    // @Group: RCMAP_
+    // @Path: ../libraries/AP_RCMapper/AP_RCMapper.cpp
+    GOBJECT(rcmap,                "RCMAP_",         RCMapper),
+
+    // @Group: SR0_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[0], gcs0,        "SR0_",     GCS_MAVLINK_Parameters),
+
+#if MAVLINK_COMM_NUM_BUFFERS >= 2
+    // @Group: SR1_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[1],  gcs1,       "SR1_",     GCS_MAVLINK_Parameters),
+#endif
+
+#if MAVLINK_COMM_NUM_BUFFERS >= 3
+    // @Group: SR2_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[2],  gcs2,       "SR2_",     GCS_MAVLINK_Parameters),
+#endif
+
+#if MAVLINK_COMM_NUM_BUFFERS >= 4
+    // @Group: SR3_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[3],  gcs3,       "SR3_",     GCS_MAVLINK_Parameters),
+#endif
+
+#if MAVLINK_COMM_NUM_BUFFERS >= 5
+    // @Group: SR4_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[4],  gcs4,       "SR4_",     GCS_MAVLINK_Parameters),
+#endif
+
+#if MAVLINK_COMM_NUM_BUFFERS >= 6
+    // @Group: SR5_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[5],  gcs5,       "SR5_",     GCS_MAVLINK_Parameters),
+#endif
+
+#if MAVLINK_COMM_NUM_BUFFERS >= 7
+    // @Group: SR6_
+    // @Path: GCS_Mavlink.cpp
+    GOBJECTN(_gcs.chan_parameters[6],  gcs6,       "SR6_",     GCS_MAVLINK_Parameters),
+#endif
+
+    // @Group: INS
+    // @Path: ../libraries/AP_InertialSensor/AP_InertialSensor.cpp
+    GOBJECT(ins,                    "INS", AP_InertialSensor),
+
+    // @Group: AHRS_
+    // @Path: ../libraries/AP_AHRS/AP_AHRS.cpp
+    GOBJECT(ahrs,                   "AHRS_",    AP_AHRS),
+
+    // Airspeed was here
+
+    // @Group: NAVL1_
+    // @Path: ../libraries/AP_L1_Control/AP_L1_Control.cpp
+    GOBJECT(L1_controller,         "NAVL1_",   AP_L1_Control),
+
+    // @Group: TECS_
+    // @Path: ../libraries/AP_TECS/AP_TECS.cpp
+    GOBJECT(TECS_controller,         "TECS_",   AP_TECS),
+
+#if HAL_MOUNT_ENABLED
+    // @Group: MNT
+    // @Path: ../libraries/AP_Mount/AP_Mount.cpp
+    GOBJECT(camera_mount,           "MNT",  AP_Mount),
+#endif
+
+    // @Group: BATT
+    // @Path: ../libraries/AP_BattMonitor/AP_BattMonitor.cpp
+    GOBJECT(battery,                "BATT", AP_BattMonitor),
+
+    // @Group: BRD_
+    // @Path: ../libraries/AP_BoardConfig/AP_BoardConfig.cpp
+    GOBJECT(BoardConfig,            "BRD_",       AP_BoardConfig),
+
+#if HAL_MAX_CAN_PROTOCOL_DRIVERS
+    // @Group: CAN_
+    // @Path: ../libraries/AP_CANManager/AP_CANManager.cpp
+    GOBJECT(can_mgr,        "CAN_",       AP_CANManager),
+#endif
+
+#if AP_SIM_ENABLED
+    // @Group: SIM_
+    // @Path: ../libraries/SITL/SITL.cpp
+    GOBJECT(sitl, "SIM_", SITL::SIM),
+#endif
+
+#if AP_ADVANCEDFAILSAFE_ENABLED
+    // @Group: AFS_
+    // @Path: ../libraries/AP_AdvancedFailsafe/AP_AdvancedFailsafe.cpp
+    GOBJECT(afs,  "AFS_", AP_AdvancedFailsafe),
+#endif
+
+#if AP_OPTICALFLOW_ENABLED
+    // @Group: FLOW
+    // @Path: ../libraries/AP_OpticalFlow/AP_OpticalFlow.cpp
+    GOBJECT(optflow,   "FLOW", AP_OpticalFlow),
+#endif
+
+    // @Group: MIS_
+    // @Path: ../libraries/AP_Mission/AP_Mission.cpp
+    GOBJECT(mission, "MIS_",       AP_Mission),
+
+#if HAL_RALLY_ENABLED
+    // @Group: RALLY_
+    // @Path: ../libraries/AP_Rally/AP_Rally.cpp
+    GOBJECT(rally,  "RALLY_",       AP_Rally),
+#endif
+
+#if HAL_NAVEKF2_AVAILABLE
+    // @Group: EK2_
+    // @Path: ../libraries/AP_NavEKF2/AP_NavEKF2.cpp
+    GOBJECTN(ahrs.EKF2, NavEKF2, "EK2_", NavEKF2),
+#endif
+
+#if HAL_NAVEKF3_AVAILABLE
+    // @Group: EK3_
+    // @Path: ../libraries/AP_NavEKF3/AP_NavEKF3.cpp
+    GOBJECTN(ahrs.EKF3, NavEKF3, "EK3_", NavEKF3),
+#endif
+
+#if AP_RPM_ENABLED
+    // @Group: RPM
+    // @Path: ../libraries/AP_RPM/AP_RPM.cpp
+    GOBJECT(rpm_sensor, "RPM", AP_RPM),
+#endif
+
+#if AP_RSSI_ENABLED
+    // @Group: RSSI_
+    // @Path: ../libraries/AP_RSSI/AP_RSSI.cpp
+    GOBJECT(rssi, "RSSI_",  AP_RSSI),
+#endif
+
+    // @Group: NTF_
+    // @Path: ../libraries/AP_Notify/AP_Notify.cpp
+    GOBJECT(notify, "NTF_",  AP_Notify),
+
+    // @Group: 
+    // @Path: Parameters.cpp
+    GOBJECT(g2, "",  ParametersG2),
+    
+    // @Group: LAND_
+    // @Path: ../libraries/AP_Landing/AP_Landing.cpp
+    GOBJECT(landing, "LAND_", AP_Landing),
+
+#if OSD_ENABLED || OSD_PARAM_ENABLED
+    // @Group: OSD
+    // @Path: ../libraries/AP_OSD/AP_OSD.cpp
+    GOBJECT(osd, "OSD", AP_OSD),
+#endif
+
+    // @Group: TKOFF_
+    // @Path: mode_takeoff.cpp
+    GOBJECT(mode_takeoff, "TKOFF_", ModeTakeoff),
+
+    // @Group:
+    // @Path: ../libraries/AP_Vehicle/AP_Vehicle.cpp
+    PARAM_VEHICLE_INFO,
+
+    AP_VAREND
+};
+
+/*
+  2nd group of parameters
+ */
+const AP_Param::GroupInfo ParametersG2::var_info[] = {
+
+#if HAL_BUTTON_ENABLED
+    // @Group: BTN_
+    // @Path: ../libraries/AP_Button/AP_Button.cpp
+    AP_SUBGROUPPTR(button_ptr, "BTN_", 1, ParametersG2, AP_Button),
+#endif
+
+#if AP_ICENGINE_ENABLED
+    // @Group: ICE_
+    // @Path: ../libraries/AP_ICEngine/AP_ICEngine.cpp
+    AP_SUBGROUPINFO(ice_control, "ICE_", 2, ParametersG2, AP_ICEngine),
+#endif
+
+    // 3 was used by prototype for servo_channels
+    
+    // @Param: SYSID_ENFORCE
+    // @DisplayName: GCS sysid enforcement
+    // @Description: This controls whether packets from other than the expected GCS system ID will be accepted
+    // @Values: 0:NotEnforced,1:Enforced
+    // @User: Advanced
+    AP_GROUPINFO("SYSID_ENFORCE", 4, ParametersG2, sysid_enforce, 0),
+
+    // AP_Stats was 5
+
+    // @Group: SERVO
+    // @Path: ../libraries/SRV_Channel/SRV_Channels.cpp
+    AP_SUBGROUPINFO(servo_channels, "SERVO", 6, ParametersG2, SRV_Channels),
+
+    // @Group: RC
+    // @Path: ../libraries/RC_Channel/RC_Channels_VarInfo.h
+    AP_SUBGROUPINFO(rc_channels, "RC", 7, ParametersG2, RC_Channels_Plane),
+    
+#if HAL_SOARING_ENABLED
+    // @Group: SOAR_
+    // @Path: ../libraries/AP_Soaring/AP_Soaring.cpp
+    AP_SUBGROUPINFO(soaring_controller, "SOAR_", 8, ParametersG2, SoaringController),
+#endif
+  
+    // @Param: RUDD_DT_GAIN
+    // @DisplayName: rudder differential thrust gain
+    // @Description: gain control from rudder to differential thrust
+    // @Range: 0 100
+    // @Units: %
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("RUDD_DT_GAIN", 9, ParametersG2, rudd_dt_gain, 10),
+
+    // @Param: MANUAL_RCMASK
+    // @DisplayName: Manual R/C pass-through mask
+    // @Description: Mask of R/C channels to pass directly to corresponding output channel when in MANUAL mode. When in any mode except MANUAL the channels selected with this option behave normally. This parameter is designed to allow for complex mixing strategies to be used for MANUAL flight using transmitter based mixing. Note that when this option is used you need to be very careful with pre-flight checks to ensure that the output is correct both in MANUAL and non-MANUAL modes.
+    // @Bitmask: 0:Chan1,1:Chan2,2:Chan3,3:Chan4,4:Chan5,5:Chan6,6:Chan7,7:Chan8,8:Chan9,9:Chan10,10:Chan11,11:Chan12,12:Chan13,13:Chan14,14:Chan15,15:Chan16
+    // @User: Advanced
+    AP_GROUPINFO("MANUAL_RCMASK", 10, ParametersG2, manual_rc_mask, 0),
+    
+    // @Param: HOME_RESET_ALT
+    // @DisplayName: Home reset altitude threshold
+    // @Description: When the aircraft is within this altitude of the home waypoint, while disarmed it will automatically update the home position. Set to 0 to continously reset it.
+    // @Values: -1:Never reset,0:Always reset
+    // @Range: -1 127
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("HOME_RESET_ALT", 11, ParametersG2, home_reset_threshold, 0),
+
+    // 12 was AP_Gripper
+
+    // @Param: FLIGHT_OPTIONS
+    // @DisplayName: Flight mode options
+    // @Description: Flight mode specific options
+    // @Bitmask: 0: Rudder mixing in direct flight modes only (Manual/Stabilize/Acro)
+    // @Bitmask: 1: Use centered throttle in Cruise or FBWB to indicate trim airspeed
+    // @Bitmask: 2: Disable attitude check for takeoff arming
+    // @Bitmask: 3: Force target airspeed to trim airspeed in Cruise or FBWB
+    // @Bitmask: 4: Climb to RTL_ALTITUDE before turning for RTL
+    // @Bitmask: 5: Enable yaw damper in acro mode
+    // @Bitmask: 6: Supress speed scaling during auto takeoffs to be 1 or less to prevent oscillations without airspeed sensor.
+    // @Bitmask: 7: EnableDefaultAirspeed for takeoff
+    // @Bitmask: 8: Remove the PTCH_TRIM_DEG on the GCS horizon
+    // @Bitmask: 9: Remove the PTCH_TRIM_DEG on the OSD horizon
+    // @Bitmask: 10: Adjust mid-throttle to be TRIM_THROTTLE in non-auto throttle modes except MANUAL
+    // @Bitmask: 11: Disable suppression of fixed wing rate gains in ground mode
+    // @Bitmask: 12: Enable FBWB style loiter altitude control
+    // @Bitmask: 13: Indicate takeoff waiting for neutral rudder with flight control surfaces
+    // @Bitmask: 14: In AUTO - climb to next waypoint altitude immediately instead of linear climb
+    // @User: Advanced
+    AP_GROUPINFO("FLIGHT_OPTIONS", 13, ParametersG2, flight_options, 0),
+
+    // 14 was AP_Scripting
+
+    // @Param: TKOFF_ACCEL_CNT
+    // @DisplayName: Takeoff throttle acceleration count
+    // @Description: This is the number of acceleration events to require for arming with TKOFF_THR_MINACC. The default is 1, which means a single forward acceleration above TKOFF_THR_MINACC will arm. By setting this higher than 1 you can require more forward/backward movements to arm.
+    // @Range: 1 10
+    // @User: Standard
+    AP_GROUPINFO("TKOFF_ACCEL_CNT", 15, ParametersG2, takeoff_throttle_accel_count, 1),
+
+#if AP_LANDINGGEAR_ENABLED
+    // @Group: LGR_
+    // @Path: ../libraries/AP_LandingGear/AP_LandingGear.cpp
+    AP_SUBGROUPINFO(landing_gear, "LGR_", 16, ParametersG2, AP_LandingGear),
+#endif
+
+    // @Param: DSPOILER_CROW_W1
+    // @DisplayName: Differential spoiler crow flaps outer weight
+    // @Description: This is amount of deflection applied to the two outer surfaces for differential spoilers for flaps to give crow flaps. It is a number from 0 to 100. At zero no crow flaps are applied. A recommended starting value is 25.
+    // @Range: 0 100
+    // @Units: %
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("DSPOILER_CROW_W1", 17, ParametersG2, crow_flap_weight_outer, 0),
+
+    // @Param: DSPOILER_CROW_W2
+    // @DisplayName: Differential spoiler crow flaps inner weight
+    // @Description: This is amount of deflection applied to the two inner surfaces for differential spoilers for flaps to give crow flaps. It is a number from 0 to 100. At zero no crow flaps are applied. A recommended starting value is 45.
+    // @Range: 0 100
+    // @Units: %
+    // @Increment: 1
+    // @User: Advanced
+    AP_GROUPINFO("DSPOILER_CROW_W2", 18, ParametersG2, crow_flap_weight_inner, 0),
+
+    // @Param: TKOFF_TIMEOUT
+    // @DisplayName: Takeoff timeout
+    // @Description: This is the timeout for an automatic takeoff. If this is non-zero and the aircraft does not reach a ground speed of at least 4 m/s within this number of seconds then the takeoff is aborted and the vehicle disarmed. If the value is zero then no timeout applies.
+    // @Range: 0 120
+    // @Increment: 1
+    // @Units: s
+    // @User: Standard
+    AP_GROUPINFO("TKOFF_TIMEOUT", 19, ParametersG2, takeoff_timeout, 0),
+
+    // @Param: DSPOILER_OPTS
+    // @DisplayName: Differential spoiler and crow flaps options
+    // @Description: Differential spoiler and crow flaps options.  Progressive crow flaps only first (0-50% flap in) then crow flaps (50 - 100% flap in).
+    // @Bitmask: 0:Pitch input, 1:use both control surfaces on each wing for roll, 2:Progressive crow flaps
+    // @User: Advanced
+    AP_GROUPINFO("DSPOILER_OPTS", 20, ParametersG2, crow_flap_options, 3),
+
+    // @Param: DSPOILER_AILMTCH
+    // @DisplayName: Differential spoiler aileron matching
+    // @Description: This scales down the inner flaps so less than full downw#pragma once
+
+#define AP_PARAM_VEHICLE_NAME plane
+
+#include <AP_Common/AP_Common.h>
+
+// Global parameter class.
+//
+class Parameters {
+public:
+
+    /*
+     *  The value of k_format_version determines whether the existing
+     *  eeprom data is considered valid. You should only change this
+     *  value under the following circumstances:
+     *
+     *  1) the meaning of an existing eeprom parameter changes
+     *
+     *  2) the value of an existing k_param_* enum value changes
+     *
+     *  Adding a new parameter should _not_ require a change to
+     *  k_format_version except under special circumstances. If you
+     *  change it anyway then all ArduPlane users will need to reload all
+     *  their parameters. We want that to be an extremely rare
+     *  thing. Please do not just change it "just in case".
+     *
+     *  To determine if a k_param_* value has changed, use the rules of
+     *  C++ enums to work out the value of the neighboring enum
+     *  values. If you don't know the C++ enum rules then please ask for
+     *  help.
+     */
+
+    //////////////////////////////////////////////////////////////////
+    // STOP!!! DO NOT CHANGE THIS VALUE UNTIL YOU FULLY UNDERSTAND THE
+    // COMMENTS ABOVE. IF UNSURE, ASK ANOTHER DEVELOPER!!!
+    static const uint16_t k_format_version = 13;
+    //////////////////////////////////////////////////////////////////
+
+
+    enum {
+        // Layout version number, always key zero.
+        //
+        k_param_format_version = 0,
+        k_param_software_type, // unused;
+        k_param_num_resets, // unused
+        k_param_NavEKF2,
+        k_param_g2,
+        k_param_avoidance_adsb,
+        k_param_landing,
+        k_param_NavEKF3,
+        k_param_can_mgr,
+        k_param_osd,
+
+        // Misc
+        //
+        k_param_auto_trim      = 10, // unused
+        k_param_log_bitmask_old,  // unused
+        k_param_pitch_trim,
+        k_param_mix_mode,
+        k_param_reverse_elevons, // unused
+        k_param_reverse_ch1_elevon, // unused
+        k_param_reverse_ch2_elevon, // unused
+        k_param_flap_1_percent,
+        k_param_flap_1_speed,
+        k_param_flap_2_percent,
+        k_param_flap_2_speed,
+        k_param_reset_switch_chan, // unused - moved to RC option
+        k_param_manual_level, // unused
+        k_param_land_pitch_cd,  // unused - moved to AP_Landing
+        k_param_ins_old,            // *** Deprecated, remove with next eeprom number change
+        k_param_stick_mixing,
+        k_param_reset_mission_chan, // unused - moved to RC option
+        k_param_land_flare_alt, // unused - moved to AP_Landing
+        k_param_land_flare_sec, // unused - moved to AP_Landing
+        k_param_crosstrack_min_distance, // unused
+        k_param_rudder_steer, // unused
+        k_param_throttle_nudge,
+        k_param_alt_offset,
+        k_param_ins,                // libraries/AP_InertialSensor variables
+        k_param_takeoff_throttle_min_speed,
+        k_param_takeoff_throttle_min_accel,
+        k_param_takeoff_heading_hold, // unused
+        k_param_level_roll_limit,
+        k_param_hil_servos_unused,  // unused
+        k_param_vtail_output, // unused
+        k_param_nav_controller, // unused
+        k_param_elevon_output, // unused
+        k_param_att_controller, // unused
+        k_param_mixing_gain,
+        k_param_scheduler,
+        k_param_relay,
+        k_param_takeoff_throttle_delay,
+        k_param_mode_takeoff, // was skip_gyro_cal
+        k_param_auto_fbw_steer, // unused
+        k_param_waypoint_max_radius,
+        k_param_ground_steer_alt,        
+        k_param_ground_steer_dps,
+        k_param_rally_limit_km_old, //unused anymore -- just holding this index
+        k_param_hil_err_limit_unused,  // unused
+        k_param_sonar_old, // unused
+        k_param_log_bitmask,
+        k_param_BoardConfig,
+        k_param_rssi_range,     // unused, replaced by rssi_ library parameters
+        k_param_flapin_channel_old,  // unused, moved to RC_OPTION
+        k_param_flaperon_output, // unused
+        k_param_gps,
+        k_param_autotune_level,
+        k_param_rally,
+        k_param_serial0_baud,           // deprecated
+        k_param_serial1_baud,           // deprecated
+        k_param_serial2_baud,           // deprecated
+        k_param_takeoff_tdrag_elevator,
+        k_param_takeoff_tdrag_speed1,
+        k_param_takeoff_rotate_speed,
+        k_param_takeoff_throttle_slewrate,
+        k_param_takeoff_throttle_max,
+        k_param_rangefinder,
+        k_param_terrain,
+        k_param_terrain_follow,
+        k_param_stab_pitch_down_cd_old, // deprecated
+        k_param_glide_slope_min,
+        k_param_stab_pitch_down,
+        k_param_terrain_lookahead,
+        k_param_fbwa_tdrag_chan, // unused - moved to RC option
+        k_param_rangefinder_landing,
+        k_param_land_flap_percent,  // unused - moved to AP_Landing
+        k_param_takeoff_flap_percent,
+        k_param_flap_slewrate,
+        k_param_rtl_autoland,
+        k_param_override_channel,
+        k_param_stall_prevention,
+        k_param_optflow,
+        k_param_cli_enabled_old, // unused - CLI removed
+        k_param_trim_rc_at_start, // unused
+        k_param_hil_mode_unused,  // unused
+        k_param_land_disarm_delay,  // unused - moved to AP_Landing
+        k_param_glide_slope_threshold,
+        k_param_rudder_only,
+        k_param_gcs3,            // 93
+        k_param_gcs_pid_mask,
+        k_param_crash_detection_enable,
+        k_param_land_abort_throttle_enable, // unused - moved to AP_Landing
+        k_param_rssi = 97,
+        k_param_rpm_sensor,
+        k_param_parachute,
+        k_param_arming = 100,
+        k_param_parachute_channel, // unused - moved to RC option
+        k_param_crash_accel_threshold,
+        k_param_override_safety, // unused
+        k_param_land_throttle_slewrate, // 104 unused - moved to AP_Landing
+
+        // 105: Extra parameters
+        k_param_fence_retalt = 105,
+        k_param_fence_autoenable,
+        k_param_fence_ret_rally,
+        k_param_q_attitude_control,
+        k_param_takeoff_pitch_limit_reduction_sec,
+
+        // 110: Telemetry control
+        //
+        k_param_gcs0 = 110,         // stream rates for SERIAL0
+        k_param_gcs1,               // stream rates for SERIAL1
+        k_param_sysid_this_mav,
+        k_param_sysid_my_gcs,
+        k_param_serial1_baud_old,   // deprecated
+        k_param_telem_delay,
+        k_param_serial0_baud_old,   // deprecated
+        k_param_gcs2,               // stream rates for SERIAL2
+        k_param_serial2_baud_old,   // deprecated
+        k_param_serial2_protocol,   // deprecated
+
+        // 120: Fly-by-wire control
+        //
+        k_param_airspeed_min = 120,
+        k_param_airspeed_max,
+        k_param_cruise_alt_floor,
+        k_param_flybywire_elev_reverse,
+        k_param_alt_control_algorithm, // unused
+        k_param_flybywire_climb_rate,
+        k_param_acro_roll_rate,
+        k_param_acro_pitch_rate,
+        k_param_acro_locking,
+        k_param_use_reverse_thrust = 129,
+
+        //
+        // 130: Sensor parameters
+        //
+        k_param_imu = 130,  // unused
+        k_param_altitude_mix, // deprecated
+
+        k_param_compass_enabled_deprecated,
+        k_param_compass,
+        k_param_battery_monitoring, // unused
+        k_param_volt_div_ratio,     // unused
+        k_param_curr_amp_per_volt,  // unused
+        k_param_input_voltage, // deprecated, can be deleted
+        k_param_pack_capacity,      // unused
+        k_param_sonar_enabled_old,  // unused
+        k_param_ahrs,  // AHRS group
+        k_param_barometer,   // barometer ground calibration
+        k_param_airspeed,           // only used for parameter conversion; AP_Airspeed parameters moved to AP_Vehicle
+        k_param_curr_amp_offset,
+        k_param_NavEKF,  // deprecated - remove
+        k_param_mission, // mission library
+        k_param_serial_manager_old, // serial manager library
+        k_param_NavEKF2_old,  // deprecated - remove
+        k_param_land_pre_flare_alt, // unused - moved to AP_Landing
+        k_param_land_pre_flare_airspeed = 149,  // unused - moved to AP_Landing
+
+        //
+        // 150: Navigation parameters
+        //
+        k_param_crosstrack_gain = 150, // unused
+        k_param_crosstrack_entry_angle, // unused
+        k_param_roll_limit,
+        k_param_pitch_limit_max,
+        k_param_pitch_limit_min,
+        k_param_airspeed_cruise,
+        k_param_RTL_altitude,
+        k_param_inverted_flight_ch_unused, // unused
+        k_param_min_groundspeed,
+        k_param_crosstrack_use_wind, // unused
+
+
+        //
+        // Camera and mount parameters
+        //
+        k_param_camera = 160,
+        k_param_camera_mount,
+        k_param_camera_mount2,      // unused
+        k_param_adsb,
+        k_param_notify,
+        k_param_land_pre_flare_sec = 165,   // unused - moved to AP_Landing
+
+        //
+        // Battery monitoring parameters
+        //
+        k_param_battery = 166,
+        k_param_rssi_pin,               // unused, replaced by rssi_ library parameters - 167
+        k_param_battery_volt_pin,       // unused - 168
+        k_param_battery_curr_pin,       // unused - 169
+
+        //
+        // 170: Radio settings - all unused now
+        //
+        k_param_rc_1_old = 170,
+        k_param_rc_2_old,
+        k_param_rc_3_old,
+        k_param_rc_4_old,
+        k_param_rc_5_old,
+        k_param_rc_6_old,
+        k_param_rc_7_old,
+        k_param_rc_8_old,
+        k_param_rc_9_old,
+        k_param_rc_10_old,
+        k_param_rc_11_old,
+
+        k_param_throttle_min,
+        k_param_throttle_max,
+        k_param_throttle_fs_enabled,
+        k_param_throttle_fs_value,
+        k_param_throttle_cruise,
+
+        k_param_fs_action_short,
+        k_param_fs_action_long,
+        k_param_gcs_heartbeat_fs_enabled,
+        k_param_throttle_slewrate,
+        k_param_throttle_suppress_manual,
+        k_param_throttle_passthru_stabilize,
+        k_param_rc_12_old,
+        k_param_fs_batt_voltage, // unused - moved to AP_BattMonitor
+        k_param_fs_batt_mah,     // unused - moved to AP_BattMonitor
+        k_param_fs_timeout_short,
+        k_param_fs_timeout_long,
+        k_param_rc_13_old,
+        k_param_rc_14_old,
+        k_param_tuning,
+
+        //
+        // 200: Feed-forward gains
+        //
+        k_param_kff_pitch_compensation = 200, // unused
+        k_param_kff_rudder_mix,
+        k_param_kff_pitch_to_throttle, // unused
+        k_param_kff_throttle_to_pitch,
+        k_param_scaling_speed,
+        k_param_quadplane,
+        k_param_rtl_radius,
+        k_param_land_then_servos_neutral,   // unused - moved to AP_Landing
+        k_param_rc_15_old,
+        k_param_rc_16_old,
+
+        //
+        // 210: flight modes
+        //
+        k_param_flight_mode_channel = 210,
+        k_param_flight_mode1,
+        k_param_flight_mode2,
+        k_param_flight_mode3,
+        k_param_flight_mode4,
+        k_param_flight_mode5,
+        k_param_flight_mode6,
+        k_param_initial_mode,
+        k_param_land_slope_recalc_shallow_threshold,    // unused - moved to AP_Landing
+        k_param_land_slope_recalc_steep_threshold_to_abort, // unused - moved to AP_Landing
+
+        //
+        // 220: Waypoint data
+        //
+        k_param_waypoint_mode = 220, // unused
+        k_param_command_total,  // unused
+        k_param_command_index,  // unused
+        k_param_waypoint_radius,
+        k_param_loiter_radius,
+        k_param_fence_action,
+        k_param_fence_total,
+        k_param_fence_channel, // unused - moved to RC option
+        k_param_fence_minalt,
+        k_param_fence_maxalt,
+
+        // other objects
+        k_param_sitl = 230,
+        k_param_afs,
+        k_param_rollController,
+        k_param_pitchController,
+        k_param_yawController,
+        k_param_L1_controller,
+        k_param_rcmap,
+        k_param_TECS_controller,
+        k_param_rally_total_old,  //unused
+        k_param_steerController,
+
+        //
+        // 240: PID Controllers
+        k_param_pidNavRoll = 240, // unused
+        k_param_pidServoRoll, // unused
+        k_param_pidServoPitch, // unused
+        k_param_pidNavPitchAirspeed, // unused
+        k_param_pidServoRudder, // unused
+        k_param_pidTeThrottle, // unused
+        k_param_pidNavPitchAltitude, // unused
+        k_param

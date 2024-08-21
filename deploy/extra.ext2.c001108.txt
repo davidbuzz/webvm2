@@ -1,0 +1,2710 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AC_Avoidance_config.h"
+
+#if AP_OAPATHPLANNER_ENABLED
+
+#include "AP_OAPathPlanner.h"
+#include <AP_Math/AP_Math.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AC_Fence/AC_Fence.h>
+#include <AP_Logger/AP_Logger.h>
+#include "AP_OABendyRuler.h"
+#include "AP_OADijkstra.h"
+
+extern const AP_HAL::HAL &hal;
+
+// parameter defaults
+static constexpr float OA_MARGIN_MAX_DEFAULT = 5;
+static constexpr int16_t OA_OPTIONS_DEFAULT = 1;
+
+static constexpr int16_t OA_UPDATE_MS = 1000;      // path planning updates run at 1hz
+static constexpr int16_t OA_TIMEOUT_MS = 3000;     // results over 3 seconds old are ignored
+
+const AP_Param::GroupInfo AP_OAPathPlanner::var_info[] = {
+
+    // @Param: TYPE
+    // @DisplayName: Object Avoidance Path Planning algorithm to use
+    // @Description: Enabled/disable path planning around obstacles
+    // @Values: 0:Disabled,1:BendyRuler,2:Dijkstra,3:Dijkstra with BendyRuler
+    // @User: Standard
+    AP_GROUPINFO_FLAGS("TYPE", 1,  AP_OAPathPlanner, _type, OA_PATHPLAN_DISABLED, AP_PARAM_FLAG_ENABLE),
+
+    // Note: Do not use Index "2" for any new parameter
+    //       It was being used by _LOOKAHEAD which was later moved to AP_OABendyRuler 
+
+    // @Param: MARGIN_MAX
+    // @DisplayName: Object Avoidance wide margin distance
+    // @Description: Object Avoidance will ignore objects more than this many meters from vehicle
+    // @Units: m
+    // @Range: 0.1 100
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("MARGIN_MAX", 3, AP_OAPathPlanner, _margin_max, OA_MARGIN_MAX_DEFAULT),
+
+    // @Group: DB_
+    // @Path: AP_OADatabase.cpp
+    AP_SUBGROUPINFO(_oadatabase, "DB_", 4, AP_OAPathPlanner, AP_OADatabase),
+
+    // @Param: OPTIONS
+    // @DisplayName: Options while recovering from Object Avoidance
+    // @Description: Bitmask which will govern vehicles behaviour while recovering from Obstacle Avoidance (i.e Avoidance is turned off after the path ahead is clear).   
+    // @Bitmask{Rover}: 0: Reset the origin of the waypoint to the present location, 1: log Dijkstra points
+    // @Bitmask{Copter}: 1:log Dijkstra points, 2:Allow fast waypoints (Dijkastras only)
+    // @User: Standard
+    AP_GROUPINFO("OPTIONS", 5, AP_OAPathPlanner, _options, OA_OPTIONS_DEFAULT),
+
+    // @Group: BR_
+    // @Path: AP_OABendyRuler.cpp
+    AP_SUBGROUPPTR(_oabendyruler, "BR_", 6, AP_OAPathPlanner, AP_OABendyRuler),
+
+    AP_GROUPEND
+};
+
+/// Constructor
+AP_OAPathPlanner::AP_OAPathPlanner()
+{
+    _singleton = this;
+
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+// perform any required initialisation
+void AP_OAPathPlanner::init()
+{
+    // run background task looking for best alternative destination
+    switch (_type) {
+    case OA_PATHPLAN_DISABLED:
+        // do nothing
+        return;
+    case OA_PATHPLAN_BENDYRULER:
+        if (_oabendyruler == nullptr) {
+            _oabendyruler = NEW_NOTHROW AP_OABendyRuler();
+            AP_Param::load_object_from_eeprom(_oabendyruler, AP_OABendyRuler::var_info);
+        }
+        break;
+    case OA_PATHPLAN_DIJKSTRA:
+#if AP_FENCE_ENABLED
+        if (_oadijkstra == nullptr) {
+            _oadijkstra = NEW_NOTHROW AP_OADijkstra(_options);
+        }
+#endif
+        break;
+    case OA_PATHPLAN_DJIKSTRA_BENDYRULER:
+#if AP_FENCE_ENABLED
+        if (_oadijkstra == nullptr) {
+            _oadijkstra = NEW_NOTHROW AP_OADijkstra(_options);
+        }
+#endif
+        if (_oabendyruler == nullptr) {
+            _oabendyruler = NEW_NOTHROW AP_OABendyRuler();
+            AP_Param::load_object_from_eeprom(_oabendyruler, AP_OABendyRuler::var_info);
+        }
+        break;
+    }
+
+    _oadatabase.init();
+    start_thread();
+}
+
+// pre-arm checks that algorithms have been initialised successfully
+bool AP_OAPathPlanner::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const
+{
+    // check if initialisation has succeeded
+    switch (_type) {
+    case OA_PATHPLAN_DISABLED:
+        // do nothing
+        break;
+    case OA_PATHPLAN_BENDYRULER:
+        if (_oabendyruler == nullptr) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "BendyRuler OA requires reboot");
+            return false;
+        }
+        break;
+    case OA_PATHPLAN_DIJKSTRA:
+        if (_oadijkstra == nullptr) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "Dijkstra OA requires reboot");
+            return false;
+        }
+        break;
+    case OA_PATHPLAN_DJIKSTRA_BENDYRULER:
+        if(_oadijkstra == nullptr || _oabendyruler == nullptr) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "OA requires reboot");
+            return false;
+        }
+        break;
+    }
+    return true;
+}
+
+bool AP_OAPathPlanner::start_thread()
+{
+    WITH_SEMAPHORE(_rsem);
+
+    if (_thread_created) {
+        return true;
+    }
+    if (_type == OA_PATHPLAN_DISABLED) {
+        return false;
+    }
+
+    // create the avoidance thread as low priority. It should soak
+    // up spare CPU cycles to fill in the avoidance_result structure based
+    // on requests in avoidance_request
+    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_OAPathPlanner::avoidance_thread, void),
+                                      "avoidance",
+                                      8192, AP_HAL::Scheduler::PRIORITY_IO, -1)) {
+        return false;
+    }
+    _thread_created = true;
+    return true;
+}
+
+// helper function to map OABendyType to OAPathPlannerUsed
+AP_OAPathPlanner::OAPathPlannerUsed AP_OAPathPlanner::map_bendytype_to_pathplannerused(AP_OABendyRuler::OABendyType bendy_type)
+{
+    switch (bendy_type) {
+    case AP_OABendyRuler::OABendyType::OA_BENDY_HORIZONTAL:
+        return OAPathPlannerUsed::BendyRulerHorizontal;
+
+    case AP_OABendyRuler::OABendyType::OA_BENDY_VERTICAL:
+        return OAPathPlannerUsed::BendyRulerVertical;
+
+    default:
+    case AP_OABendyRuler::OABendyType::OA_BENDY_DISABLED:
+        return OAPathPlannerUsed::None;
+    }
+}
+
+// provides an alternative target location if path planning around obstacles is required
+// returns true and updates result_origin, result_destination, result_next_destination with an intermediate path
+// result_dest_to_next_dest_clear is set to true if the path from result_destination to result_next_destination is clear (only supported by Dijkstras)
+// path_planner_used updated with which path planner produced the result
+AP_OAPathPlanner::OA_RetState AP_OAPathPlanner::mission_avoidance(const Location &current_loc,
+                                         const Location &origin,
+                                         const Location &destination,
+                                         const Location &next_destination,
+                                         Location &result_origin,
+                                         Location &result_destination,
+                                         Location &result_next_destination,
+                                         bool &result_dest_to_next_dest_clear,
+                                         OAPathPlannerUsed &path_planner_used)
+{
+    // exit immediately if disabled or thread is not running from a failed init
+    if (_type == OA_PATHPLAN_DISABLED || !_thread_created) {
+        return OA_NOT_REQUIRED;
+    }
+
+    // check if just activated to avoid initial timeout error
+    const uint32_t now = AP_HAL::millis();
+    if (now - _last_update_ms > 200) {
+        _activated_ms = now;
+    }
+    _last_update_ms = now;
+
+    WITH_SEMAPHORE(_rsem);
+
+    // place new request for the thread to work on
+    avoidance_request.current_loc = current_loc;
+    avoidance_request.origin = origin;
+    avoidance_request.destination = destination;
+    avoidance_request.next_destination = next_destination;
+    avoidance_request.ground_speed_vec = AP::ahrs().groundspeed_vector();
+    avoidance_request.request_time_ms = now;
+
+    // check result's destination and next_destination matches our request
+    // e.g. check this result was using our current inputs and not from an old request
+    const bool destination_matches = destination.same_latlon_as(avoidance_result.destination);
+    const bool next_destination_matches = next_destination.same_latlon_as(avoidance_result.next_destination);
+
+    // check results have not timed out
+    const bool timed_out = (now - avoidance_result.result_time_ms > OA_TIMEOUT_MS) && (now - _activated_ms > OA_TIMEOUT_MS);
+
+    // return results from background thread's latest checks
+    if (destination_matches && next_destination_matches && !timed_out) {
+        // we have a result from the thread
+        result_origin = avoidance_result.origin_new;
+        result_destination = avoidance_result.destination_new;
+        result_next_destination = avoidance_result.next_destination_new;
+        result_dest_to_next_dest_clear = avoidance_result.dest_to_next_dest_clear;
+        path_planner_used = avoidance_result.path_planner_used;
+        return avoidance_result.ret_state;
+    }
+
+    // if timeout then path planner is taking too long to respond
+    if (timed_out) {
+        return OA_ERROR;
+    }
+
+    // background thread is working on a new destination
+    return OA_PROCESSING;
+}
+
+// avoidance thread that continually updates the avoidance_result structure based on avoidance_request
+void AP_OAPathPlanner::avoidance_thread()
+{
+    // require ekf origin to have been set
+    bool origin_set = false;
+    while (!origin_set) {
+        hal.scheduler->delay(500);
+        Location ekf_origin {};
+        {
+            WITH_SEMAPHORE(AP::ahrs().get_semaphore());
+            origin_set = AP::ahrs().get_origin(ekf_origin);    
+        }
+    }
+
+    while (true) {
+
+        // if database queue needs attention, service it faster
+        if (_oadatabase.process_queue()) {
+            hal.scheduler->delay(1);
+        } else {
+            hal.scheduler->delay(20);
+        }
+
+        const uint32_t now = AP_HAL::millis();
+        if (now - avoidance_latest_ms < OA_UPDATE_MS) {
+            continue;
+        }
+        avoidance_latest_ms = now;
+
+        _oadatabase.update();
+
+        // values returned by path planners
+        Location origin_new;
+        Location destination_new;
+        Location next_destination_new;
+        bool dest_to_next_dest_clear = false;
+        {
+            WITH_SEMAPHORE(_rsem);
+            if (now - avoidance_request.request_time_ms > OA_TIMEOUT_MS) {
+                // this is a very old request, don't process it
+                continue;
+            }
+
+            // copy request to avoid conflict with main thread
+            avoidance_request2 = avoidance_request;
+
+            // store passed in origin, destination and next_destination so we can return it if object avoidance is not required
+            origin_new = avoidance_request.origin;
+            destination_new = avoidance_request.destination;
+            next_destination_new = avoidance_request.next_destination;
+        }
+
+        // run background task looking for best alternative destination
+        OA_RetState res = OA_NOT_REQUIRED;
+        OAPathPlannerUsed path_planner_used = OAPathPlannerUsed::None;
+        switch (_type) {
+        case OA_PATHPLAN_DISABLED:
+            continue;
+        case OA_PATHPLAN_BENDYRULER: {
+            if (_oabendyruler == nullptr) {
+                continue;
+            }
+            _oabendyruler->set_config(_margin_max);
+
+            AP_OABendyRuler::OABendyType bendy_type;
+            if (_oabendyruler->update(avoidance_request2.current_loc, avoidance_request2.destination, avoidance_request2.ground_speed_vec, origin_new, destination_new, bendy_type, false)) {
+                res = OA_SUCCESS;
+            }
+            path_planner_used = map_bendytype_to_pathplannerused(bendy_type);
+            break;
+        }
+
+        case OA_PATHPLAN_DIJKSTRA: {
+#if AP_FENCE_ENABLED
+            if (_oadijkstra == nullptr) {
+                continue;
+            }
+            _oadijkstra->set_fence_margin(_margin_max);
+            const AP_OADijkstra::AP_OADijkstra_State dijkstra_state = _oadijkstra->update(avoidance_request2.current_loc,
+                                                                                          avoidance_request2.destination,
+                                                                                          avoidance_request2.next_destination,
+                                                                                          origin_new,
+                                                                                          destination_new,
+                                                                                          next_destination_new,
+                                                                                          dest_to_next_dest_clear);
+            switch (dijkstra_state) {
+            case AP_OADijkstra::DIJKSTRA_STATE_NOT_REQUIRED:
+                res = OA_NOT_REQUIRED;
+                break;
+            case AP_OADijkstra::DIJKSTRA_STATE_ERROR:
+                res = OA_ERROR;
+                break;
+            case AP_OADijkstra::DIJKSTRA_STATE_SUCCESS:
+                res = OA_SUCCESS;
+                break;
+            }
+            path_planner_used = OAPathPlannerUsed::Dijkstras;
+#endif
+            break;
+        }
+
+        case OA_PATHPLAN_DJIKSTRA_BENDYRULER: {
+            if ((_oabendyruler == nullptr) || _oadijkstra == nullptr) {
+                continue;
+            } 
+            _oabendyruler->set_config(_margin_max);
+            AP_OABendyRuler::OABendyType bendy_type;
+            if (_oabendyruler->update(avoidance_request2.current_loc, avoidance_request2.destination, avoidance_request2.ground_speed_vec, origin_new, destination_new, bendy_type, proximity_only)) {
+                // detected a obstacle by vehicle's proximity sensor. Switch avoidance to BendyRuler till obstacle is out of the way
+                proximity_only = false;
+                res = OA_SUCCESS;
+                path_planner_used = map_bendytype_to_pathplannerused(bendy_type);
+                break;
+            } else {
+                // cleared all obstacles, trigger Dijkstra's to calculate path based on current deviated position  
+#if AP_FENCE_ENABLED
+                if (proximity_only == false) {
+                    _oadijkstra->recalculate_path();
+                }
+#endif
+                // only use proximity avoidance now for BendyRuler
+                proximity_only = true;
+            }
+#if AP_FENCE_ENABLED
+            _oadijkstra->set_fence_margin(_margin_max);
+            const AP_OADijkstra::AP_OADijkstra_State dijkstra_state = _oadijkstra->update(avoidance_request2.current_loc,
+                                                                                          avoidance_request2.destination,
+                                                                                          avoidance_request2.next_destination,
+                                                                                          origin_new,
+                                                                                          destination_new,
+                                                                                          next_destination_new,
+                                                                                          dest_to_next_dest_clear);
+            switch (dijkstra_state) {
+            case AP_OADijkstra::DIJKSTRA_STATE_NOT_REQUIRED:
+                res = OA_NOT_REQUIRED;
+                break;
+            case AP_OADijkstra::DIJKSTRA_STATE_ERROR:
+                res = OA_ERROR;
+                break;
+            case AP_OADijkstra::DIJKSTRA_STATE_SUCCESS:
+                res = OA_SUCCESS;
+                break;
+            }
+            path_planner_used = OAPathPlannerUsed::Dijkstras;
+#endif
+            break;
+        }
+
+        } // switch
+
+        {
+            // give the main thread the avoidance result
+            WITH_SEMAPHORE(_rsem);
+
+            // place the destination and next destination used into the result (used by the caller to verify the result matches their request)
+            avoidance_result.destination = avoidance_request2.destination;
+            avoidance_result.next_destination = avoidance_request2.next_destination;
+            avoidance_result.dest_to_next_dest_clear = dest_to_next_dest_clear;
+
+            // fill the result structure with the intermediate path
+            avoidance_result.origin_new = (res == OA_SUCCESS) ? origin_new : avoidance_result.origin_new;
+            avoidance_result.destination_new = (res == OA_SUCCESS) ? destination_new : avoidance_result.destination;
+            avoidance_result.next_destination_new = (res == OA_SUCCESS) ? next_destination_new : avoidance_result.next_destination;
+
+            // create new avoidance result.dest_to_next_dest_clear field.  fill in with results from dijkstras or leave as unknown
+            avoidance_result.result_time_ms = AP_HAL::millis();
+            avoidance_result.path_planner_used = path_planner_used;
+            avoidance_result.ret_state = res;
+        }
+    }
+}
+
+// singleton instance
+AP_OAPathPlanner *AP_OAPathPlanner::_singleton;
+
+namespace AP {
+
+AP_OAPathPlanner *ap_oapathplanner()
+{
+    return AP_OAPathPlanner::get_singleton();
+}
+
+}
+
+#endif  // AP_OAPATHPLANNER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #pragma once
+
+#include "AC_Avoidance_config.h"
+
+#if AP_OAPATHPLANNER_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_Common/Location.h>
+#include <AP_Param/AP_Param.h>
+#include <AP_HAL/Semaphores.h>
+
+#include "AP_OABendyRuler.h"
+#include "AP_OADijkstra.h"
+#include "AP_OADatabase.h"
+
+/*
+ * This class provides path planning around fence, stay-out zones and moving obstacles
+ */
+class AP_OAPathPlanner {
+
+public:
+    AP_OAPathPlanner();
+
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_OAPathPlanner);
+
+    // get singleton instance
+    static AP_OAPathPlanner *get_singleton() {
+        return _singleton;
+    }
+
+    // perform any required initialisation
+    void init();
+
+    /// returns true if all pre-takeoff checks have completed successfully
+    bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const;
+
+    // object avoidance processing return status enum
+    enum OA_RetState : uint8_t {
+        OA_NOT_REQUIRED = 0,            // object avoidance is not required
+        OA_PROCESSING,                  // still calculating alternative path
+        OA_ERROR,                       // error during calculation
+        OA_SUCCESS                      // success
+    };
+
+    // path planner responsible for a particular result
+    enum OAPathPlannerUsed : uint8_t {
+        None = 0,
+        BendyRulerHorizontal,
+        BendyRulerVertical,
+        Dijkstras
+    };
+
+    // provides an alternative target location if path planning around obstacles is required
+    // returns true and updates result_origin, result_destination and result_next_destination with an intermediate path
+    // result_dest_to_next_dest_clear is set to true if the path from result_destination to result_next_destination is clear  (only supported by Dijkstras)
+    // path_planner_used updated with which path planner produced the result
+    OA_RetState mission_avoidance(const Location &current_loc,
+                           const Location &origin,
+                           const Location &destination,
+                           const Location &next_destination,
+                           Location &result_origin,
+                           Location &result_destination,
+                           Location &result_next_destination,
+                           bool &result_dest_to_next_dest_clear,
+                           OAPathPlannerUsed &path_planner_used) WARN_IF_UNUSED;
+
+    // enumerations for _TYPE parameter
+    enum OAPathPlanTypes {
+        OA_PATHPLAN_DISABLED = 0,
+        OA_PATHPLAN_BENDYRULER = 1,
+        OA_PATHPLAN_DIJKSTRA = 2,
+        OA_PATHPLAN_DJIKSTRA_BENDYRULER = 3,
+    };
+
+    // enumeration for _OPTION parameter
+    enum OARecoveryOptions {
+        OA_OPTION_DISABLED = 0,
+        OA_OPTION_WP_RESET = (1 << 0),
+        OA_OPTION_LOG_DIJKSTRA_POINTS = (1 << 1),
+        OA_OPTION_FAST_WAYPOINTS = (1 << 2),
+    };
+
+    uint16_t get_options() const { return _options;}
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+private:
+
+    // avoidance thread that continually updates the avoidance_result structure based on avoidance_request
+    void avoidance_thread();
+    bool start_thread();
+
+    // helper function to map OABendyType to OAPathPlannerUsed
+    OAPathPlannerUsed map_bendytype_to_pathplannerused(AP_OABendyRuler::OABendyType bendy_type);
+
+    // an avoidance request from the navigation code
+    struct avoidance_info {
+        Location current_loc;
+        Location origin;
+        Location destination;
+        Location next_destination;
+        Vector2f ground_speed_vec;
+        uint32_t request_time_ms;
+    } avoidance_request, avoidance_request2;
+
+    // an avoidance result from the avoidance thread
+    struct {
+        Location destination;       // destination vehicle is trying to get to (also used to verify the result matches a recent request)
+        Location next_destination;  // next destination vehicle is trying to get to (also used to verify the result matches a recent request)
+        Location origin_new;        // intermediate origin.  The start of line segment that vehicle should follow
+        Location destination_new;   // intermediate destination vehicle should move towards
+        Location next_destination_new; // intermediate next destination vehicle should move towards
+        bool dest_to_next_dest_clear; // true if the path from destination_new to next_destination_new is clear and does not require path planning  (only supported by Dijkstras)
+        uint32_t result_time_ms;    // system time the result was calculated (used to verify the result is recent)
+        OAPathPlannerUsed path_planner_used;    // path planner that produced the result
+        OA_RetState ret_state;      // OA_SUCCESS if the vehicle should move along the path from origin_new to destination_new
+    } avoidance_result;
+
+    // parameters
+    AP_Int8 _type;                  // avoidance algorithm to be used
+    AP_Float _margin_max;           // object avoidance will ignore objects more than this many meters from vehicle
+    AP_Int16 _options;              // Bitmask for options while recovering from Object Avoidance
+    
+    // internal variables used by front end
+    HAL_Semaphore _rsem;            // semaphore for multi-thread use of avoidance_request and avoidance_result
+    bool _thread_created;           // true once background thread has been created
+    AP_OABendyRuler *_oabendyruler; // Bendy Ruler algorithm
+    AP_OADijkstra *_oadijkstra;     // Dijkstra's algorithm
+    AP_OADatabase _oadatabase;      // Database of dynamic objects to avoid
+    uint32_t avoidance_latest_ms;   // last time Dijkstra's or BendyRuler algorithms ran (in the avoidance thread)
+    uint32_t _last_update_ms;       // system time that mission_avoidance was called in main thread
+    uint32_t _activated_ms;         // system time that object avoidance was most recently activated (used to avoid timeout error on first run)
+
+    bool proximity_only = true;
+    static AP_OAPathPlanner *_singleton;
+};
+
+namespace AP {
+    AP_OAPathPlanner *ap_oapathplanner();
+};
+
+#endif  // AP_OAPATHPLANNER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AC_Avoidance_config.h"
+
+#if AP_OAPATHPLANNER_ENABLED
+
+#include "AP_OAVisGraph.h"
+
+// constructor initialises expanding array to use 20 elements per chunk
+AP_OAVisGraph::AP_OAVisGraph() :
+    _items(20)
+{
+}
+
+// add item to visiblity graph, returns true on success, false if graph is full
+bool AP_OAVisGraph::add_item(const OAItemID &id1, const OAItemID &id2, float distance_cm)
+{
+    // no more than 65k items
+    if (_num_items == UINT16_MAX) {
+        return false;
+    }
+
+    // ensure there is space in the array
+    if (!_items.expand_to_hold(_num_items+1)) {
+        return false;
+    }
+
+    // add item
+    _items[_num_items] = {id1, id2, distance_cm};
+    _num_items++;
+    return true;
+}
+
+#endif  // AP_OAPATHPLANNER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #pragma once
+
+#include "AC_Avoidance_config.h"
+
+#if AP_OAPATHPLANNER_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_Common/AP_ExpandingArray.h>
+
+/*
+ * Visibility graph used by Dijkstra's algorithm for path planning around fence, stay-out zones and moving obstacles
+ */
+class AP_OAVisGraph {
+public:
+    AP_OAVisGraph();
+
+    CLASS_NO_COPY(AP_OAVisGraph);  /* Do not allow copies */
+
+    // types of items held in graph
+    enum OAType : uint8_t {
+        OATYPE_SOURCE = 0,
+        OATYPE_DESTINATION,
+        OATYPE_INTERMEDIATE_POINT,
+    };
+
+    // support up to 255 items of each type
+    typedef uint8_t oaid_num;
+
+    // id for uniquely identifying objects held in visibility graphs and paths
+    class OAItemID {
+    public:
+        OAType id_type;
+        oaid_num id_num;
+        bool operator ==(const OAItemID &i) const { return ((id_type == i.id_type) && (id_num == i.id_num)); }
+    };
+
+    struct VisGraphItem {
+        OAItemID id1;       // first item's id
+        OAItemID id2;       // second item's id
+        float distance_cm;  // distance between the items
+    };
+
+    // clear all elements from graph
+    void clear() { _num_items = 0; }
+
+    // get number of items in visibility graph table
+    uint16_t num_items() const { return _num_items; }
+
+    // add item to visiblity graph, returns true on success, false if graph is full
+    bool add_item(const OAItemID &id1, const OAItemID &id2, float distance_cm);
+
+    // allow accessing graph as an array, 0 indexed
+    // Note: no protection against out-of-bounds accesses so use with num_items()
+    const VisGraphItem& operator[](uint16_t i) const { return _items[i]; }
+
+private:
+
+    AP_ExpandingArray<VisGraphItem> _items;
+    uint16_t _num_items;
+};
+
+#endif  // AP_OAPATHPLANNER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #pragma once
+
+#include <AP_Logger/LogStructure.h>
+
+#define LOG_IDS_FROM_AHRS \
+    LOG_AHR2_MSG, \
+    LOG_AOA_SSA_MSG, \
+    LOG_ATTITUDE_MSG, \
+    LOG_ORGN_MSG, \
+    LOG_POS_MSG, \
+    LOG_RATE_MSG, \
+    LOG_ATSC_MSG
+
+// @LoggerMessage: AHR2
+// @Description: Backup AHRS data
+// @Field: TimeUS: Time since system startup
+// @Field: Roll: Estimated roll
+// @Field: Pitch: Estimated pitch
+// @Field: Yaw: Estimated yaw
+// @Field: Alt: Estimated altitude
+// @Field: Lat: Estimated latitude
+// @Field: Lng: Estimated longitude
+// @Field: Q1: Estimated attitude quaternion component 1
+// @Field: Q2: Estimated attitude quaternion component 2
+// @Field: Q3: Estimated attitude quaternion component 3
+// @Field: Q4: Estimated attitude quaternion component 4
+struct PACKED log_AHRS {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    int16_t roll;
+    int16_t pitch;
+    uint16_t yaw;
+    float alt;
+    int32_t lat;
+    int32_t lng;
+    float q1, q2, q3, q4;
+};
+
+// @LoggerMessage: AOA
+// @Description: Angle of attack and Side Slip Angle values
+// @Field: TimeUS: Time since system startup
+// @Field: AOA: Angle of Attack calculated from airspeed, wind vector,velocity vector 
+// @Field: SSA: Side Slip Angle calculated from airspeed, wind vector,velocity vector
+struct PACKED log_AOA_SSA {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    float AOA;
+    float SSA;
+};
+
+// @LoggerMessage: ATT
+// @Description: Canonical vehicle attitude
+// @Field: TimeUS: Time since system startup
+// @Field: DesRoll: vehicle desired roll
+// @Field: Roll: achieved vehicle roll
+// @Field: DesPitch: vehicle desired pitch
+// @Field: Pitch: achieved vehicle pitch
+// @Field: DesYaw: vehicle desired yaw
+// @Field: Yaw: achieved vehicle yaw
+// @Field: ErrRP: lowest estimated gyro drift error
+// @Field: ErrYaw: difference between measured yaw and DCM yaw estimate
+// @Field: AEKF: active EKF type
+struct PACKED log_Attitude {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    int16_t  control_roll;
+    int16_t  roll;
+    int16_t  control_pitch;
+    int16_t  pitch;
+    uint16_t control_yaw;
+    uint16_t yaw;
+    uint16_t error_rp;
+    uint16_t error_yaw;
+    uint8_t  active;
+};
+
+// @LoggerMessage: ORGN
+// @Description: Vehicle navigation origin or other notable position
+// @Field: TimeUS: Time since system startup
+// @Field: Type: Position type
+// @FieldValueEnum: Type: AP_AHRS::LogOriginType
+// @Field: Lat: Position latitude
+// @Field: Lng: Position longitude
+// @Field: Alt: Position altitude
+struct PACKED log_ORGN {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t origin_type;
+    int32_t latitude;
+    int32_t longitude;
+    int32_t altitude;
+};
+
+// @LoggerMessage: POS
+// @Description: Canonical vehicle position
+// @Field: TimeUS: Time since system startup
+// @Field: Lat: Canonical vehicle latitude
+// @Field: Lng: Canonical vehicle longitude
+// @Field: Alt: Canonical vehicle altitude
+// @Field: RelHomeAlt: Canonical vehicle altitude relative to home
+// @Field: RelOriginAlt: Canonical vehicle altitude relative to navigation origin
+struct PACKED log_POS {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    int32_t lat;
+    int32_t lng;
+    float alt;
+    float rel_home_alt;
+    float rel_origin_alt;
+};
+
+// @LoggerMessage: RATE
+// @Description: Desired and achieved vehicle attitude rates. Not logged in Fixed Wing Plane modes.
+// @Field: TimeUS: Time since system startup
+// @Field: RDes: vehicle desired roll rate
+// @Field: R: achieved vehicle roll rate
+// @Field: ROut: normalized output for Roll
+// @Field: PDes: vehicle desired pitch rate
+// @Field: P: vehicle pitch rate
+// @Field: POut: normalized output for Pitch
+// @Field: Y: achieved vehicle yaw rate
+// @Field: YOut: normalized output for Yaw
+// @Field: YDes: vehicle desired yaw rate
+// @Field: ADes: desired vehicle vertical acceleration
+// @Field: A: achieved vehicle vertical acceleration
+// @Field: AOut: percentage of vertical thrust output current being used
+// @Field: AOutSlew: vertical thrust output slew rate
+struct PACKED log_Rate {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    float   control_roll;
+    float   roll;
+    float   roll_out;
+    float   control_pitch;
+    float   pitch;
+    float   pitch_out;
+    float   control_yaw;
+    float   yaw;
+    float   yaw_out;
+    float   control_accel;
+    float   accel;
+    float   accel_out;
+    float   throttle_slew;
+};
+
+// @LoggerMessage: VSTB
+// @Description: Log message for video stabilisation software such as Gyroflow
+// @Field: TimeUS: Time since system startup
+// @Field: GyrX: measured rotation rate about X axis
+// @Field: GyrY: measured rotation rate about Y axis
+// @Field: GyrZ: measured rotation rate about Z axis
+// @Field: AccX: acceleration along X axis
+// @Field: AccY: acceleration along Y axis
+// @Field: AccZ: acceleration along Z axis
+// @Field: Q1: Estimated attitude quaternion component 1
+// @Field: Q2: Estimated attitude quaternion component 2
+// @Field: Q3: Estimated attitude quaternion component 3
+// @Field: Q4: Estimated attitude quaternion component 4
+
+struct PACKED log_Video_Stabilisation {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    float gyro_x;
+    float gyro_y;
+    float gyro_z;
+    float accel_x;
+    float accel_y;
+    float accel_z;
+    float Q1;
+    float Q2;
+    float Q3;
+    float Q4;
+};
+
+// @LoggerMessage: ATSC
+// @Description: Scale factors for attitude controller
+// @Field: TimeUS: Time since system startup
+// @Field: AngPScX: Angle P scale X
+// @Field: AngPScY: Angle P scale Y
+// @Field: AngPScZ: Angle P scale Z
+// @Field: PDScX: PD scale X
+// @Field: PDScY: PD scale Y
+// @Field: PDScZ: PD scale Z
+struct PACKED log_ATSC {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    float scaleP_x;
+    float scaleP_y;
+    float scaleP_z;
+    float scalePD_x;
+    float scalePD_y;
+    float scalePD_z;
+};
+
+
+#define LOG_STRUCTURE_FROM_AHRS \
+    { LOG_AHR2_MSG, sizeof(log_AHRS), \
+        "AHR2","QccCfLLffff","TimeUS,Roll,Pitch,Yaw,Alt,Lat,Lng,Q1,Q2,Q3,Q4","sddhmDU----", "FBBB0GG----" , true }, \
+    { LOG_AOA_SSA_MSG, sizeof(log_AOA_SSA), \
+        "AOA", "Qff", "TimeUS,AOA,SSA", "sdd", "F00" , true }, \
+    { LOG_ATTITUDE_MSG, sizeof(log_Attitude),\
+        "ATT", "QccccCCCCB", "TimeUS,DesRoll,Roll,DesPitch,Pitch,DesYaw,Yaw,ErrRP,ErrYaw,AEKF", "sddddhhdh-", "FBBBBBBBB-" , true }, \
+    { LOG_ORGN_MSG, sizeof(log_ORGN), \
+        "ORGN","QBLLe","TimeUS,Type,Lat,Lng,Alt", "s#DUm", "F-GGB" }, \
+    { LOG_POS_MSG, sizeof(log_POS), \
+        "POS","QLLfff","TimeUS,Lat,Lng,Alt,RelHomeAlt,RelOriginAlt", "sDUmmm", "FGG000" , true }, \
+    { LOG_RATE_MSG, sizeof(log_Rate), \
+        "RATE", "Qfffffffffffff",  "TimeUS,RDes,R,ROut,PDes,P,POut,YDes,Y,YOut,ADes,A,AOut,AOutSlew", "skk-kk-kk-oo--", "F?????????BB--" , true }, \
+    { LOG_ATSC_MSG, sizeof(log_ATSC), \
+        "ATSC", "Qffffff",  "TimeUS,AngPScX,AngPScY,AngPScZ,PDScX,PDScY,PDScZ", "s------", "F000000" , true }, \
+    { LOG_VIDEO_STABILISATION_MSG, sizeof(log_Video_Stabilisation), \
+        "VSTB", "Qffffffffff",  "TimeUS,GyrX,GyrY,GyrZ,AccX,AccY,AccZ,Q1,Q2,Q3,Q4", "sEEEooo----", "F0000000000" },
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #pragma once
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_ENABLED
+
+#include <AP_Param/AP_Param.h>
+#include <AP_Math/AP_Math.h>
+
+#if AP_AIRSPEED_MSP_ENABLED
+#include <AP_MSP/msp.h>
+#endif
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+#endif
+
+class AP_Airspeed_Backend;
+
+class AP_Airspeed_Params {
+public:
+    // Constructor
+    AP_Airspeed_Params(void);
+
+    // parameters for each instance
+    AP_Int32 bus_id;
+#ifndef HAL_BUILD_AP_PERIPH
+    AP_Float offset;
+    AP_Float ratio;
+#endif
+    AP_Float psi_range;
+#ifndef HAL_BUILD_AP_PERIPH
+    AP_Int8  use;
+    AP_Int8  pin;
+    AP_Int8  skip_cal;
+    AP_Int8  tube_order;
+#endif
+    AP_Int8  type;
+    AP_Int8  bus;
+#if AP_AIRSPEED_AUTOCAL_ENABLE
+    AP_Int8  autocal;
+#endif
+
+    static const struct AP_Param::GroupInfo var_info[];
+};
+
+
+class Airspeed_Calibration {
+public:
+    friend class AP_Airspeed;
+    // constructor
+    Airspeed_Calibration();
+
+    // initialise the calibration
+    void init(float initial_ratio);
+
+    // take current airspeed in m/s and ground speed vector and return
+    // new scaling factor
+    float update(float airspeed, const Vector3f &vg, int16_t max_airspeed_allowed_during_cal);
+
+private:
+    // state of kalman filter for airspeed ratio estimation
+    Matrix3f P; // covariance matrix
+    const float Q0; // process noise matrix top left and middle element
+    const float Q1; // process noise matrix bottom right element
+    Vector3f state; // state vector
+    const float DT; // time delta
+};
+
+class AP_Airspeed
+{
+public:
+    friend class AP_Airspeed_Backend;
+    
+    // constructor
+    AP_Airspeed();
+
+    void set_fixedwing_parameters(const class AP_FixedWing *_fixed_wing_parameters);
+
+    void init(void);
+    void allocate();
+
+
+    // indicate which bit in LOG_BITMASK indicates we should log airspeed readings
+    void set_log_bit(uint32_t log_bit) { _log_bit = log_bit; }
+
+#if AP_AIRSPEED_AUTOCAL_ENABLE
+    // inflight ratio calibration
+    void set_calibration_enabled(bool enable) {calibration_enabled = enable;}
+#endif //AP_AIRSPEED_AUTOCAL_ENABLE
+
+    // read the analog source and update airspeed
+    void update(void);
+
+    // calibrate the airspeed. This must be called on startup if the
+    // altitude/climb_rate/acceleration interfaces are ever used
+    void calibrate(bool in_startup);
+
+    // return the current airspeed in m/s
+    float get_airspeed(uint8_t i) const;
+    float get_airspeed(void) const { return get_airspeed(primary); }
+
+    // return the unfiltered airspeed in m/s
+    float get_raw_airspeed(uint8_t i) const;
+    float get_raw_airspeed(void) const { return get_raw_airspeed(primary); }
+
+    // return the current airspeed ratio (dimensionless)
+    float get_airspeed_ratio(uint8_t i) const {
+#ifndef HAL_BUILD_AP_PERIPH
+        return param[i].ratio;
+#else
+        return 0.0;
+#endif
+    }
+    float get_airspeed_ratio(void) const { return get_airspeed_ratio(primary); }
+
+    // get temperature if available
+    bool get_temperature(uint8_t i, float &temperature);
+    bool get_temperature(float &temperature) { return get_temperature(primary, temperature); }
+
+    // set the airspeed ratio (dimensionless)
+#ifndef HAL_BUILD_AP_PERIPH
+    void set_airspeed_ratio(uint8_t i, float ratio) {
+        param[i].ratio.set(ratio);
+    }
+    void set_airspeed_ratio(float ratio) { set_airspeed_ratio(primary, ratio); }
+#endif
+
+    // return true if airspeed is enabled, and airspeed use is set
+    bool use(uint8_t i) const;
+    bool use(void) const { return use(primary); }
+
+    // force disabling of all airspeed sensors
+    void force_disable_use(bool value) {
+        _force_disable_use = value;
+    }
+
+    // return true if airspeed is enabled
+    bool enabled(uint8_t i) const;
+    bool enabled(void) const { return enabled(primary); }
+
+    // return the differential pressure in Pascal for the last airspeed reading
+    float get_differential_pressure(uint8_t i) const;
+    float get_differential_pressure(void) const { return get_differential_pressure(primary); }
+
+    // update airspeed ratio calibration
+    void update_calibration(const Vector3f &vground, int16_t max_airspeed_allowed_during_cal);
+
+    // return health status of sensor
+    bool healthy(uint8_t i) const;
+    bool healthy(void) const { return healthy(primary); }
+
+    // return true if all enabled sensors are healthy
+    bool all_healthy(void) const;
+    
+    // return time in ms of last update
+    uint32_t last_update_ms(uint8_t i) const { return state[i].last_update_ms; }
+    uint32_t last_update_ms(void) const { return last_update_ms(primary); }
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+    bool get_hygrometer(uint8_t i, uint32_t &last_sample_ms, float &temperature, float &humidity) const;
+#endif
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    enum pitot_tube_order { PITOT_TUBE_ORDER_POSITIVE = 0,
+                            PITOT_TUBE_ORDER_NEGATIVE = 1,
+                            PITOT_TUBE_ORDER_AUTO     = 2 };
+
+    enum OptionsMask {
+        ON_FAILURE_AHRS_WIND_MAX_DO_DISABLE                   = (1<<0),   // If set then use airspeed failure check
+        ON_FAILURE_AHRS_WIND_MAX_RECOVERY_DO_REENABLE         = (1<<1),   // If set then automatically enable the airspeed sensor use when healthy again.
+        DISABLE_VOLTAGE_CORRECTION                            = (1<<2),
+        USE_EKF_CONSISTENCY                                   = (1<<3),
+        REPORT_OFFSET                                         = (1<<4),   // report offset cal to GCS
+    };
+
+    enum airspeed_type {
+        TYPE_NONE=0,
+        TYPE_I2C_MS4525=1,
+        TYPE_ANALOG=2,
+        TYPE_I2C_MS5525=3,
+        TYPE_I2C_MS5525_ADDRESS_1=4,
+        TYPE_I2C_MS5525_ADDRESS_2=5,
+        TYPE_I2C_SDP3X=6,
+        TYPE_I2C_DLVR_5IN=7,
+        TYPE_UAVCAN=8,
+        TYPE_I2C_DLVR_10IN=9,
+        TYPE_I2C_DLVR_20IN=10,
+        TYPE_I2C_DLVR_30IN=11,
+        TYPE_I2C_DLVR_60IN=12,
+        TYPE_NMEA_WATER=13,
+        TYPE_MSP=14,
+        TYPE_I2C_ASP5033=15,
+        TYPE_EXTERNAL=16,
+        TYPE_SITL=100,
+    };
+
+    // get current primary sensor
+    uint8_t get_primary(void) const { return primary; }
+
+    // get number of sensors
+    uint8_t get_num_sensors(void) const { return num_sensors; }
+    
+    static AP_Airspeed *get_singleton() { return _singleton; }
+
+    // return the current corrected pressure, public for AP_Periph
+    float get_corrected_pressure(uint8_t i) const;
+    float get_corrected_pressure(void) const {
+        return get_corrected_pressure(primary);
+    }
+
+#if AP_AIRSPEED_MSP_ENABLED
+    void handle_msp(const MSP::msp_airspeed_data_message_t &pkt);
+#endif
+
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+    void handle_external(const AP_ExternalAHRS::airspeed_data_message_t &pkt);
+#endif
+    
+    enum class CalibrationState {
+        NOT_STARTED,
+        IN_PROGRESS,
+        SUCCESS,
+        FAILED
+    };
+    // get aggregate calibration state for the Airspeed library:
+    CalibrationState get_calibration_state() const;
+
+private:
+    static AP_Airspeed *_singleton;
+
+    AP_Int8 _enable;
+    bool lib_enabled() const;
+
+    AP_Int8 primary_sensor;
+    AP_Int8 max_speed_pcnt;
+    AP_Int32 _options;    // bitmask options for airspeed
+    AP_Float _wind_max;
+    AP_Float _wind_warn;
+    AP_Float _wind_gate;
+
+    AP_Airspeed_Params param[AIRSPEED_MAX_SENSORS];
+
+    CalibrationState calibration_state[AIRSPEED_MAX_SENSORS];
+
+    struct airspeed_state {
+        float   raw_airspeed;
+        float   airspeed;
+        float	last_pressure;
+        float   filtered_pressure;
+        float	corrected_pressure;
+        uint32_t last_update_ms;
+        bool use_zero_offset;
+        bool	healthy;
+
+        // state of runtime calibration
+        struct {
+            uint32_t start_ms;
+            float    sum;
+            uint16_t count;
+            uint16_t read_count;
+        } cal;
+
+#if AP_AIRSPEED_AUTOCAL_ENABLE
+        Airspeed_Calibration calibration;
+        float last_saved_ratio;
+        uint8_t counter;
+#endif // AP_AIRSPEED_AUTOCAL_ENABLE
+
+        struct {
+            uint32_t last_check_ms;
+            float health_probability;
+            float test_ratio;
+            int8_t param_use_backup;
+            uint32_t last_warn_ms;
+        } failures;
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+        uint32_t last_hygrometer_log_ms;
+#endif
+    } state[AIRSPEED_MAX_SENSORS];
+
+    bool calibration_enabled;
+
+    // can be set to true to disable the use of the airspeed sensor
+    bool _force_disable_use;
+
+    // current primary sensor
+    uint8_t primary;
+    uint8_t num_sensors;
+
+    uint32_t _log_bit = -1;     // stores which bit in LOG_BITMASK is used to indicate we should log airspeed readings
+
+    void read(uint8_t i);
+    // return the differential pressure in Pascal for the last airspeed reading for the requested instance
+    // returns 0 if the sensor is not enabled
+    float get_pressure(uint8_t i);
+
+    // get the health probability
+    float get_health_probability(uint8_t i) const {
+        return state[i].failures.health_probability;
+    }
+    float get_health_probability(void) const {
+        return get_health_probability(primary);
+    }
+
+    // get the consistency test ratio
+    float get_test_ratio(uint8_t i) const {
+        return state[i].failures.test_ratio;
+    }
+    float get_test_ratio(void) const {
+        return get_test_ratio(primary);
+    }
+
+    void update_calibration(uint8_t i, float raw_pressure);
+    void update_calibration(uint8_t i, const Vector3f &vground, int16_t max_airspeed_allowed_during_cal);
+    void send_airspeed_calibration(const Vector3f &vg);
+    // return the current calibration offset
+    float get_offset(uint8_t i) const {
+#ifndef HAL_BUILD_AP_PERIPH
+        return param[i].offset;
+#else
+        return 0.0;
+#endif
+    }
+    float get_offset(void) const { return get_offset(primary); }
+
+    void check_sensor_failures();
+    void check_sensor_ahrs_wind_max_failures(uint8_t i);
+
+    AP_Airspeed_Backend *sensor[AIRSPEED_MAX_SENSORS];
+
+    void Log_Airspeed();
+
+    bool add_backend(AP_Airspeed_Backend *backend);
+    
+    const AP_FixedWing *fixed_wing_parameters;
+
+    void convert_per_instance();
+
+};
+
+namespace AP {
+    AP_Airspeed *airspeed();
+};
+
+#endif  // AP_AIRSPEED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  backend driver for airspeed sensor from www.qio-tek.com
+  I2C ASP5033 sensor
+ */
+
+#include "AP_Airspeed_ASP5033.h"
+
+#if AP_AIRSPEED_ASP5033_ENABLED
+
+#include <AP_HAL/I2CDevice.h>
+
+extern const AP_HAL::HAL &hal;
+
+#define ASP5033_I2C_ADDR_1     0x6C
+#define ASP5033_I2C_ADDR_2     0x6D
+#define REG_CMD                0x30
+#define REG_PRESS_DATA         0x06
+#define REG_TEMP_DATA          0x09
+#define REG_PART_ID            0x01
+#define REG_PART_ID_SET        0xa4
+#define REG_SENSOR_READY       0x08
+#define REG_WHOAMI_DEFAULT_ID  0X00
+#define REG_WHOAMI_RECHECK_ID  0X66
+#define CMD_MEASURE            0x0A
+
+
+bool AP_Airspeed_ASP5033::init()
+{
+    // probe the sensor, supporting multiple possible I2C addresses
+    const uint8_t addresses[] = { ASP5033_I2C_ADDR_1, ASP5033_I2C_ADDR_2 };
+    for (uint8_t address : addresses) {
+        dev = hal.i2c_mgr->get_device(get_bus(), address);
+        if (!dev) {
+            continue;
+        }
+
+        WITH_SEMAPHORE(dev->get_semaphore());
+        dev->set_speed(AP_HAL::Device::SPEED_HIGH);
+        dev->set_retries(2);
+
+        if (!confirm_sensor_id()) {
+            continue;
+        }
+
+        dev->set_device_type(uint8_t(DevType::ASP5033));
+        set_bus_id(dev->get_bus_id());
+
+        dev->register_periodic_callback(1000000UL/80U,
+                                        FUNCTOR_BIND_MEMBER(&AP_Airspeed_ASP5033::timer, void));
+        return true;
+    }
+
+    // not found
+    return false;
+}
+
+/*
+  this sensor has an unusual whoami scheme. The part_id is changeable
+  via another register. We check the sensor by looking for the
+  expected behaviour
+*/
+bool AP_Airspeed_ASP5033::confirm_sensor_id(void)
+{
+    uint8_t part_id;
+    if (!dev->read_registers(REG_PART_ID_SET, &part_id, 1) ||
+        part_id != REG_WHOAMI_DEFAULT_ID) {
+        return false;
+    }
+    if (!dev->write_register(REG_PART_ID_SET, REG_WHOAMI_RECHECK_ID)) {
+        return false;
+    }
+    if (!dev->read_registers(REG_PART_ID, &part_id, 1) ||
+        part_id != REG_WHOAMI_RECHECK_ID) {
+        return false;
+    }
+    return true;
+}
+
+
+// read the data from the sensor
+void AP_Airspeed_ASP5033::timer()
+{
+    // request a new measurement cycle begin
+    dev->write_register(REG_CMD, CMD_MEASURE);
+
+    uint8_t status;
+    if (!dev->read_registers(REG_CMD, &status, 1) ||
+        (status & REG_SENSOR_READY) == 0) {
+        // no data ready
+        return;
+    }
+
+    // read pressure and temperature as one block
+    uint8_t data[5];
+    if (!dev->read_registers(REG_PRESS_DATA, data, sizeof(data))) {
+        return;
+    }
+
+    // ADC pressure is signed 24 bit
+    int32_t press = (data[0]<<24) | (data[1]<<16) | (data[2]<<8);
+
+    // convert back to 24 bit
+    press >>= 8;
+
+    // k is a shift based on the pressure range of the device. See
+    // table in the datasheet
+    constexpr uint8_t k = 7;
+    constexpr float press_scale = 1.0 / (1U<<k);
+
+    // temperature is 16 bit signed in units of 1/256 C
+    const int16_t temp = (data[3]<<8) | data[4];
+    constexpr float temp_scale = 1.0 / 256;
+
+    WITH_SEMAPHORE(sem);
+    press_sum += press * press_scale;
+    temp_sum += temp * temp_scale;
+    press_count++;
+    temp_count++;
+
+    last_sample_ms = AP_HAL::millis();
+}
+
+
+// return the current differential_pressure in Pascal
+bool AP_Airspeed_ASP5033::get_differential_pressure(float &pressure)
+{
+    WITH_SEMAPHORE(sem);
+
+    if (AP_HAL::millis() - last_sample_ms > 100) {
+        return false;
+    }
+
+    if (press_count == 0) {
+        pressure = last_pressure;
+        return true;
+    }
+
+    last_pressure = pressure = press_sum / press_count;
+
+    press_count = 0;
+    press_sum = 0;
+
+    return true;
+}
+
+// return the current temperature in degrees C, if available
+bool AP_Airspeed_ASP5033::get_temperature(float &temperature)
+{
+    WITH_SEMAPHORE(sem);
+
+    if (AP_HAL::millis() - last_sample_ms > 100) {
+        return false;
+    }
+    if (temp_count == 0) {
+        temperature = last_temperature;
+        return true;
+    }
+
+    last_temperature = temperature = temp_sum / temp_count;
+    temp_count = 0;
+    temp_sum = 0;
+
+    return true;
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_ASP5033_ENABLED
+
+/*
+  backend driver for airspeed from I2C
+ */
+#include "AP_Airspeed_Backend.h"
+
+class AP_Airspeed_ASP5033 : public AP_Airspeed_Backend
+{
+public:
+    using AP_Airspeed_Backend::AP_Airspeed_Backend;
+    bool init() override;
+
+    // return the current differential_pressure in Pascal
+    bool get_differential_pressure(float &_pressure) override;
+
+    // return the current temperature in degrees C, if available
+    bool get_temperature(float &_temperature) override;
+
+private:
+    void timer();
+    bool confirm_sensor_id(void);
+    float temp_sum;
+    float press_sum;
+    float last_pressure;
+    float last_temperature;
+    uint32_t press_count;
+    uint32_t temp_count;
+    uint32_t last_sample_ms;
+
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev;
+};
+
+#endif  // AP_AIRSPEED_ASP5033_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  backend driver class for airspeed
+ */
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include "AP_Airspeed.h"
+#include "AP_Airspeed_Backend.h"
+
+extern const AP_HAL::HAL &hal;
+
+AP_Airspeed_Backend::AP_Airspeed_Backend(AP_Airspeed &_frontend, uint8_t _instance) :
+    frontend(_frontend),
+    instance(_instance)
+{
+}
+
+AP_Airspeed_Backend::~AP_Airspeed_Backend(void)
+{
+}
+ 
+
+int8_t AP_Airspeed_Backend::get_pin(void) const
+{
+#ifndef HAL_BUILD_AP_PERIPH
+    return frontend.param[instance].pin;
+#else
+    return 0;
+#endif
+}
+
+float AP_Airspeed_Backend::get_psi_range(void) const
+{
+    return frontend.param[instance].psi_range;
+}
+
+uint8_t AP_Airspeed_Backend::get_bus(void) const
+{
+    return frontend.param[instance].bus;
+}
+
+bool AP_Airspeed_Backend::bus_is_configured(void) const
+{
+    return frontend.param[instance].bus.configured();
+}
+
+void AP_Airspeed_Backend::set_bus_id(uint32_t id)
+{
+    frontend.param[instance].bus_id.set_and_save(int32_t(id));
+}
+
+#endif  // AP_AIRSPEED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+/*
+  backend driver class for airspeed
+ */
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL_Boards.h>
+#include <AP_HAL/Semaphores.h>
+#include "AP_Airspeed.h"
+#include <AP_MSP/msp_sensors.h>
+
+class AP_Airspeed_Backend {
+public:
+    AP_Airspeed_Backend(AP_Airspeed &frontend, uint8_t instance);
+    virtual ~AP_Airspeed_Backend();
+    
+    // probe and initialise the sensor
+    virtual bool init(void) = 0;
+
+    // return the current differential_pressure in Pascal
+    virtual bool get_differential_pressure(float &pressure) {return false;}
+
+    // return the current temperature in degrees C, if available
+    virtual bool get_temperature(float &temperature) = 0;
+
+    // true if sensor reads airspeed directly, not via pressure
+    virtual bool has_airspeed() {return false;}
+
+    // return airspeed in m/s if available
+    virtual bool get_airspeed(float& airspeed) {return false;}
+
+    virtual void handle_msp(const MSP::msp_airspeed_data_message_t &pkt) {}
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+    virtual void handle_external(const AP_ExternalAHRS::airspeed_data_message_t &pkt) {}
+#endif
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+    // optional hygrometer support
+    virtual bool get_hygrometer(uint32_t &last_sample_ms, float &temperature, float &humidity) { return false; }
+#endif
+
+protected:
+    int8_t get_pin(void) const;
+    float get_psi_range(void) const;
+    uint8_t get_bus(void) const;
+    bool bus_is_configured(void) const;
+    uint8_t get_instance(void) const {
+        return instance;
+    }
+
+    // see if voltage correction should be disabled
+    bool disable_voltage_correction(void) const {
+        return (frontend._options.get() & AP_Airspeed::OptionsMask::DISABLE_VOLTAGE_CORRECTION) != 0;
+    }
+
+    AP_Airspeed::pitot_tube_order get_tube_order(void) const {
+#ifndef HAL_BUILD_AP_PERIPH
+        return AP_Airspeed::pitot_tube_order(frontend.param[instance].tube_order.get());
+#else
+        return AP_Airspeed::pitot_tube_order::PITOT_TUBE_ORDER_AUTO;
+#endif
+    }
+
+    // semaphore for access to shared frontend data
+    HAL_Semaphore sem;
+
+    float get_airspeed_ratio(void) const {
+        return frontend.get_airspeed_ratio(instance);
+    }
+
+    // some sensors use zero offsets
+    void set_use_zero_offset(void) {
+        frontend.state[instance].use_zero_offset = true;
+    }
+
+    // set to no zero cal, which makes sense for some sensors
+    void set_skip_cal(void) {
+#ifndef HAL_BUILD_AP_PERIPH
+        frontend.param[instance].skip_cal.set(1);
+#endif
+    }
+
+    // set zero offset
+    void set_offset(float ofs) {
+#ifndef HAL_BUILD_AP_PERIPH
+        frontend.param[instance].offset.set(ofs);
+#endif
+    }
+
+    // set use
+    void set_use(int8_t use) {
+#ifndef HAL_BUILD_AP_PERIPH
+        frontend.param[instance].use.set(use);
+#endif
+    }
+
+    // set bus ID of this instance, for ARSPD_DEVID parameters
+    void set_bus_id(uint32_t id);
+
+    enum class DevType {
+        SITL     = 0x01,
+        MS4525   = 0x02,
+        MS5525   = 0x03,
+        DLVR     = 0x04,
+        MSP      = 0x05,
+        SDP3X    = 0x06,
+        UAVCAN   = 0x07,
+        ANALOG   = 0x08,
+        NMEA     = 0x09,
+        ASP5033  = 0x0A,
+    };
+    
+private:
+    AP_Airspeed &frontend;
+    uint8_t instance;
+};
+
+#endif  // AP_AIRSPEED_ENABLED
+                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  driver for DLVR differential airspeed sensor
+  https://www.allsensors.com/products/DLVR-L01D
+ */
+
+#include "AP_Airspeed_DLVR.h"
+
+#if AP_AIRSPEED_DLVR_ENABLED
+
+#include <AP_Math/AP_Math.h>
+
+extern const AP_HAL::HAL &hal;
+
+#define DLVR_I2C_ADDR 0x28
+
+#ifdef DLVR_DEBUGGING
+ # define Debug(fmt, args ...)  do {hal.console->printf("%s:%d: " fmt "\n", __FUNCTION__, __LINE__, ## args); hal.scheduler->delay(1); } while(0)
+#else
+ # define Debug(fmt, args ...)
+#endif
+
+
+AP_Airspeed_DLVR::AP_Airspeed_DLVR(AP_Airspeed &_frontend, uint8_t _instance, const float _range_inH2O) :
+    AP_Airspeed_Backend(_frontend, _instance),
+    range_inH2O(_range_inH2O)
+{}
+
+/*
+  probe for a sensor on a given i2c address
+ */
+AP_Airspeed_Backend *AP_Airspeed_DLVR::probe(AP_Airspeed &_frontend,
+                                             uint8_t _instance,
+                                             AP_HAL::OwnPtr<AP_HAL::I2CDevice> _dev,
+                                             const float _range_inH2O)
+{
+    if (!_dev) {
+        return nullptr;
+    }
+    AP_Airspeed_DLVR *sensor = NEW_NOTHROW AP_Airspeed_DLVR(_frontend, _instance, _range_inH2O);
+    if (!sensor) {
+        return nullptr;
+    }
+    sensor->dev = std::move(_dev);
+    sensor->setup();
+    return sensor;
+}
+
+// initialise the sensor
+void AP_Airspeed_DLVR::setup()
+{
+    WITH_SEMAPHORE(dev->get_semaphore());
+    dev->set_speed(AP_HAL::Device::SPEED_LOW);
+    dev->set_retries(2);
+    dev->set_device_type(uint8_t(DevType::DLVR));
+    set_bus_id(dev->get_bus_id());
+
+    dev->register_periodic_callback(1000000UL/50U,
+                                    FUNCTOR_BIND_MEMBER(&AP_Airspeed_DLVR::timer, void));
+}
+
+// probe and initialise the sensor
+bool AP_Airspeed_DLVR::init()
+{
+    dev = hal.i2c_mgr->get_device(get_bus(), DLVR_I2C_ADDR);
+    if (!dev) {
+        return false;
+    }
+    setup();
+    return true;
+}
+
+#define STATUS_SHIFT 30
+#define TEMPERATURE_SHIFT 5
+#define TEMPERATURE_MASK ((1 << 11) - 1)
+#define PRESSURE_SHIFT 16
+#define PRESSURE_MASK ((1 << 14) - 1)
+
+#define DLVR_OFFSET 8192.0f
+#define DLVR_SCALE 16384.0f
+
+// 50Hz timer
+void AP_Airspeed_DLVR::timer()
+{
+    uint8_t raw_bytes[4];
+    if (!dev->read((uint8_t *)&raw_bytes, sizeof(raw_bytes))) {
+        return;
+    }
+
+    uint32_t data = (raw_bytes[0] << 24) |
+                    (raw_bytes[1] << 16) |
+                    (raw_bytes[2] << 8)  |
+                    raw_bytes[3];
+
+    if ((data >> STATUS_SHIFT)) {
+        // anything other then 00 in the status bits is an error
+        Debug("DLVR: Bad status read %u", (unsigned int)(data >> STATUS_SHIFT));
+        return;
+    }
+
+    uint32_t pres_raw = (data >> PRESSURE_SHIFT)    & PRESSURE_MASK;
+    uint32_t temp_raw = (data >> TEMPERATURE_SHIFT) & TEMPERATURE_MASK;
+
+    float press_h2o = 1.25f * 2.0f * range_inH2O * ((pres_raw - DLVR_OFFSET) / DLVR_SCALE);
+
+    if ((press_h2o > range_inH2O) || (press_h2o < -range_inH2O)) {
+        Debug("DLVR: Out of range pressure %f", press_h2o);
+        return;
+    }
+
+    float temp = temp_raw * (200.0f / 2047.0f) - 50.0f;
+
+    WITH_SEMAPHORE(sem);
+
+    const uint32_t now = AP_HAL::millis();
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-equal" // suppress -Wfloat-equal as we are only worried about the case where we had never read
+    if ((temperature != 0) && (fabsf(temperature - temp) > 10) && ((now - last_sample_time_ms) < 2000)) {
+        Debug("DLVR: Temperature swing %f", temp);
+        return;
+    }
+#pragma GCC diagnostic pop
+
+    pressure_sum += INCH_OF_H2O_TO_PASCAL * press_h2o;
+    temperature_sum += temp;
+    press_count++;
+    temp_count++;
+    last_sample_time_ms = now;
+}
+
+// return the current differential_pressure in Pascal
+bool AP_Airspeed_DLVR::get_differential_pressure(float &_pressure)
+{
+    WITH_SEMAPHORE(sem);
+
+    if ((AP_HAL::millis() - last_sample_time_ms) > 100) {
+        return false;
+    }
+
+    if (press_count > 0) {
+        pressure = pressure_sum / press_count;
+        press_count = 0;
+        pressure_sum = 0;
+    }
+
+    _pressure = pressure;
+    return true;
+}
+
+// return the current temperature in degrees C, if available
+bool AP_Airspeed_DLVR::get_temperature(float &_temperature)
+{
+    WITH_SEMAPHORE(sem);
+
+    if ((AP_HAL::millis() - last_sample_time_ms) > 100) {
+        return false;
+    }
+
+    if (temp_count > 0) {
+        temperature = temperature_sum / temp_count;
+        temp_count = 0;
+        temperature_sum = 0;
+    }
+
+    _temperature = temperature;
+    return true;
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+// backend driver for AllSensors DLVR differential airspeed sensor
+// currently assumes a 5" of water, noise reduced, sensor
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_DLVR_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/utility/OwnPtr.h>
+#include <AP_HAL/I2CDevice.h>
+#include <utility>
+
+#include "AP_Airspeed_Backend.h"
+
+class AP_Airspeed_DLVR : public AP_Airspeed_Backend
+{
+public:
+
+    AP_Airspeed_DLVR(AP_Airspeed &frontend, uint8_t _instance, const float _range_inH2O);
+    static AP_Airspeed_Backend *probe(AP_Airspeed &frontend, uint8_t _instance, AP_HAL::OwnPtr<AP_HAL::I2CDevice> _dev, const float _range_inH2O);
+
+    ~AP_Airspeed_DLVR(void) {}
+    
+    // probe and initialise the sensor
+    bool init() override;
+
+    // return the current differential_pressure in Pascal
+    bool get_differential_pressure(float &pressure) override;
+
+    // return the current temperature in degrees C, if available
+    bool get_temperature(float &temperature) override;
+
+private:
+    void timer();
+
+    float pressure;
+    float temperature;
+    float temperature_sum;
+    float pressure_sum;
+    uint32_t temp_count;
+    uint32_t press_count;
+    
+    uint32_t last_sample_time_ms;
+    const float range_inH2O;
+
+    // initialise the sensor
+    void setup();
+    
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev;
+};
+
+#endif  // AP_AIRSPEED_DLVR_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #include "AP_Airspeed_DroneCAN.h"
+
+#if AP_AIRSPEED_DRONECAN_ENABLED
+
+#include <AP_CANManager/AP_CANManager.h>
+#include <AP_DroneCAN/AP_DroneCAN.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define LOG_TAG "AirSpeed"
+
+AP_Airspeed_DroneCAN::DetectedModules AP_Airspeed_DroneCAN::_detected_modules[];
+HAL_Semaphore AP_Airspeed_DroneCAN::_sem_registry;
+
+void AP_Airspeed_DroneCAN::subscribe_msgs(AP_DroneCAN* ap_dronecan)
+{
+    if (ap_dronecan == nullptr) {
+        return;
+    }
+
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_airspeed, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("airspeed_sub");
+    }
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_hygrometer, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("hygrometer_sub");
+    }
+#endif
+}
+
+AP_Airspeed_Backend* AP_Airspeed_DroneCAN::probe(AP_Airspeed &_frontend, uint8_t _instance, uint32_t previous_devid)
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    AP_Airspeed_DroneCAN* backend = nullptr;
+
+    for (uint8_t i = 0; i < AIRSPEED_MAX_SENSORS; i++) {
+        if (_detected_modules[i].driver == nullptr && _detected_modules[i].ap_dronecan != nullptr) {
+            const auto bus_id = AP_HAL::Device::make_bus_id(AP_HAL::Device::BUS_TYPE_UAVCAN,
+                                                            _detected_modules[i].ap_dronecan->get_driver_index(),
+                                                            _detected_modules[i].node_id, 0);
+            if (previous_devid != 0 && previous_devid != bus_id) {
+                // match with previous ID only
+                continue;
+            }
+            backend = NEW_NOTHROW AP_Airspeed_DroneCAN(_frontend, _instance);
+            if (backend == nullptr) {
+                AP::can().log_text(AP_CANManager::LOG_INFO,
+                                   LOG_TAG,
+                                   "Failed register DroneCAN Airspeed Node %d on Bus %d\n",
+                                   _detected_modules[i].node_id,
+                                   _detected_modules[i].ap_dronecan->get_driver_index());
+            } else {
+                _detected_modules[i].driver = backend;
+                AP::can().log_text(AP_CANManager::LOG_INFO,
+                                   LOG_TAG,
+                                   "Registered DroneCAN Airspeed Node %d on Bus %d\n",
+                                   _detected_modules[i].node_id,
+                                   _detected_modules[i].ap_dronecan->get_driver_index());
+                backend->set_bus_id(bus_id);
+            }
+            break;
+        }
+    }
+
+    return backend;
+}
+
+AP_Airspeed_DroneCAN* AP_Airspeed_DroneCAN::get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id)
+{
+    if (ap_dronecan == nullptr) {
+        return nullptr;
+    }
+
+    for (uint8_t i = 0; i < AIRSPEED_MAX_SENSORS; i++) {
+        if (_detected_modules[i].driver != nullptr &&
+            _detected_modules[i].ap_dronecan == ap_dronecan &&
+            _detected_modules[i].node_id == node_id ) {
+            return _detected_modules[i].driver;
+        }
+    }
+
+    bool detected = false;
+    for (uint8_t i = 0; i < AIRSPEED_MAX_SENSORS; i++) {
+        if (_detected_modules[i].ap_dronecan == ap_dronecan && _detected_modules[i].node_id == node_id) {
+            // detected
+            detected = true;
+            break;
+        }
+    }
+
+    if (!detected) {
+        for (uint8_t i = 0; i < AIRSPEED_MAX_SENSORS; i++) {
+            if (_detected_modules[i].ap_dronecan == nullptr) {
+                _detected_modules[i].ap_dronecan = ap_dronecan;
+                _detected_modules[i].node_id = node_id;
+                break;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+void AP_Airspeed_DroneCAN::handle_airspeed(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const uavcan_equipment_air_data_RawAirData &msg)
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    AP_Airspeed_DroneCAN* driver = get_dronecan_backend(ap_dronecan, transfer.source_node_id);
+
+    if (driver != nullptr) {
+        WITH_SEMAPHORE(driver->_sem_airspeed);
+        driver->_pressure = msg.differential_pressure;
+        if (!isnan(msg.static_air_temperature) &&
+            msg.static_air_temperature > 0) {
+            driver->_temperature = KELVIN_TO_C(msg.static_air_temperature);
+            driver->_have_temperature = true;
+        }
+        driver->_last_sample_time_ms = AP_HAL::millis();
+    }
+}
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+void AP_Airspeed_DroneCAN::handle_hygrometer(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const dronecan_sensors_hygrometer_Hygrometer &msg)
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    AP_Airspeed_DroneCAN* driver = get_dronecan_backend(ap_dronecan, transfer.source_node_id);
+
+    if (driver != nullptr) {
+        WITH_SEMAPHORE(driver->_sem_airspeed);
+        driver->_hygrometer.temperature = KELVIN_TO_C(msg.temperature);
+        driver->_hygrometer.humidity = msg.humidity;
+        driver->_hygrometer.last_sample_ms = AP_HAL::millis();
+    }
+}
+#endif // AP_AIRSPEED_HYGROMETER_ENABLE
+
+bool AP_Airspeed_DroneCAN::init()
+{
+    // always returns true
+    return true;
+}
+
+bool AP_Airspeed_DroneCAN::get_differential_pressure(float &pressure)
+{
+    WITH_SEMAPHORE(_sem_airspeed);
+
+    if ((AP_HAL::millis() - _last_sample_time_ms) > 250) {
+        return false;
+    }
+
+    pressure = _pressure;
+
+    return true;
+}
+
+bool AP_Airspeed_DroneCAN::get_temperature(float &temperature)
+{
+    if (!_have_temperature) {
+        return false;
+    }
+    WITH_SEMAPHORE(_sem_airspeed);
+
+    if ((AP_HAL::millis() - _last_sample_time_ms) > 100) {
+        return false;
+    }
+
+    temperature = _temperature;
+
+    return true;
+}
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+/*
+  return hygrometer data if available
+ */
+bool AP_Airspeed_DroneCAN::get_hygrometer(uint32_t &last_sample_ms, float &temperature, float &humidity)
+{
+    if (_hygrometer.last_sample_ms == 0) {
+        return false;
+    }
+    WITH_SEMAPHORE(_sem_airspeed);
+    last_sample_ms = _hygrometer.last_sample_ms;
+    temperature = _hygrometer.temperature;
+    humidity = _hygrometer.humidity;
+    return true;
+}
+#endif // AP_AIRSPEED_HYGROMETER_ENABLE
+#endif // AP_AIRSPEED_DRONECAN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #pragma once
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_DRONECAN_ENABLED
+
+#include "AP_Airspeed_Backend.h"
+
+#include <AP_DroneCAN/AP_DroneCAN.h>
+
+class AP_Airspeed_DroneCAN : public AP_Airspeed_Backend {
+public:
+
+    using AP_Airspeed_Backend::AP_Airspeed_Backend;
+
+    bool init(void) override;
+
+    // return the current differential_pressure in Pascal
+    bool get_differential_pressure(float &pressure) override;
+
+    // temperature not available via analog backend
+    bool get_temperature(float &temperature) override;
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+    // get hygrometer data
+    bool get_hygrometer(uint32_t &last_sample_ms, float &temperature, float &humidity) override;
+#endif
+
+    static void subscribe_msgs(AP_DroneCAN* ap_dronecan);
+
+    static AP_Airspeed_Backend* probe(AP_Airspeed &_frontend, uint8_t _instance, uint32_t previous_devid);
+
+private:
+
+    static void handle_airspeed(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const uavcan_equipment_air_data_RawAirData &msg);
+    static void handle_hygrometer(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const dronecan_sensors_hygrometer_Hygrometer &msg);
+
+    static AP_Airspeed_DroneCAN* get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id);
+
+    float _pressure; // Pascal
+    float _temperature; // Celcius
+    uint32_t _last_sample_time_ms;
+
+    // hygrometer data
+    struct {
+        float temperature;
+        float humidity;
+        uint32_t last_sample_ms;
+    } _hygrometer;
+
+    HAL_Semaphore _sem_airspeed;
+
+    // Module Detection Registry
+    static struct DetectedModules {
+        AP_DroneCAN* ap_dronecan;
+        uint8_t node_id;
+        AP_Airspeed_DroneCAN *driver;
+    } _detected_modules[AIRSPEED_MAX_SENSORS];
+
+    static HAL_Semaphore _sem_registry;
+    bool _have_temperature;
+};
+
+
+#endif  // AP_AIRSPEED_DRONECAN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "AP_Airspeed_External.h"
+
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+
+AP_Airspeed_External::AP_Airspeed_External(AP_Airspeed &_frontend, uint8_t _instance) :
+    AP_Airspeed_Backend(_frontend, _instance)
+{
+    set_bus_id(AP_HAL::Device::make_bus_id(AP_HAL::Device::BUS_TYPE_SERIAL,0,_instance,0));
+}
+
+// return the current differential_pressure in Pascal
+bool AP_Airspeed_External::get_differential_pressure(float &pressure)
+{
+    WITH_SEMAPHORE(sem);
+    if (press_count == 0) {
+        return false;
+    }
+    pressure = sum_pressure/press_count;
+    press_count = 0;
+    sum_pressure = 0;
+    return true;
+}
+
+// get last temperature
+bool AP_Airspeed_External::get_temperature(float &temperature)
+{
+    WITH_SEMAPHORE(sem);
+    if (temperature_count == 0) {
+        return false;
+    }
+    temperature = sum_temperature/temperature_count;
+    temperature_count = 0;
+    sum_temperature = 0;
+    return true;
+}
+
+void AP_Airspeed_External::handle_external(const AP_ExternalAHRS::airspeed_data_message_t &pkt)
+{
+    WITH_SEMAPHORE(sem);
+
+    sum_pressure += pkt.differential_pressure;
+    press_count++;
+    if (press_count > 100) {
+        // prevent overflow
+        sum_pressure /= 2;
+        press_count /= 2;
+    }
+
+    sum_temperature += pkt.temperature;
+    temperature_count++;
+    if (temperature_count > 100) {
+        // prevent overflow
+        sum_temperature /= 2;
+        temperature_count /= 2;
+    }
+}
+
+#endif // AP_AIRSPEED_EXTERNAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+  external AHRS airspeed backend
+ */
+#pragma once
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+
+#include "AP_Airspeed_Backend.h"
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+
+class AP_Airspeed_External : public AP_Airspeed_Backend
+{
+public:
+    AP_Airspeed_External(AP_Airspeed &airspeed, uint8_t instance);
+
+    bool init(void) override {
+        return true;
+    }
+
+    void handle_external(const AP_ExternalAHRS::airspeed_data_message_t &pkt) override;
+
+    // return the current differential_pressure in Pascal
+    bool get_differential_pressure(float &pressure) override;
+
+    // temperature not available via analog backend
+    bool get_temperature(float &temperature) override;
+    
+private:
+    float sum_pressure;
+    uint8_t press_count;
+    float sum_temperature;
+    uint8_t temperature_count;
+};
+
+#endif // AP_AIRSPEED_EXTERNAL_ENABLED
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  backend driver for airspeed from a I2C MS5525D0 sensor
+ */
+#include "AP_Airspeed_MS5525.h"
+
+#if AP_AIRSPEED_MS5525_ENABLED
+
+#include <stdio.h>
+#include <utility>
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/I2CDevice.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL &hal;
+
+#define MS5525D0_I2C_ADDR_1 0x76
+#define MS5525D0_I2C_ADDR_2 0x77
+
+#define REG_RESET               0x1E
+#define REG_CONVERT_D1_OSR_256  0x40
+#define REG_CONVERT_D1_OSR_512  0x42
+#define REG_CONVERT_D1_OSR_1024 0x44
+#define REG_CONVERT_D1_OSR_2048 0x46
+#define REG_CONVERT_D1_OSR_4096 0x48
+#define REG_CONVERT_D2_OSR_256  0x50
+#define REG_CONVERT_D2_OSR_512  0x52
+#define REG_CONVERT_D2_OSR_1024 0x54
+#define REG_CONVERT_D2_OSR_2048 0x56
+#define REG_CONVERT_D2_OSR_4096 0x58
+#define REG_ADC_READ            0x00
+#define REG_PROM_BASE           0xA0
+
+// go for 1024 oversampling. This should be fast enough to reduce
+// noise but low enough to keep self-heating small
+#define REG_CONVERT_PRESSURE    REG_CONVERT_D1_OSR_1024
+#define REG_CONVERT_TEMPERATURE REG_CONVERT_D2_OSR_1024
+
+AP_Airspeed_MS5525::AP_Airspeed_MS5525(AP_Airspeed &_frontend, uint8_t _instance, MS5525_ADDR address) :
+    AP_Airspeed_Backend(_frontend, _instance)
+{
+    _address = address;
+}
+
+// probe and initialise the sensor
+bool AP_Airspeed_MS5525::init()
+{
+    const uint8_t addresses[] = { MS5525D0_I2C_ADDR_1, MS5525D0_I2C_ADDR_2 };
+    bool found = false;
+    for (uint8_t i=0; i<ARRAY_SIZE(addresses); i++) {
+        if (_address != MS5525_ADDR_AUTO && i != (uint8_t)_address) {
+            continue;
+        }
+        dev = hal.i2c_mgr->get_device(get_bus(), addresses[i]);
+        if (!dev) {
+            continue;
+        }
+        WITH_SEMAPHORE(dev->get_semaphore());
+
+        // lots of retries during probe
+        dev->set_retries(5);
+
+        found = read_prom();
+        
+        if (found) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MS5525[%u]: Found on bus %u addr 0x%02x", get_instance(), get_bus(), addresses[i]);
+            break;
+        }
+    }
+    if (!found) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "MS5525[%u]: no sensor found", get_instance());
+        return false;
+    }
+
+    // Send a command to read temperature first
+    WITH_SEMAPHORE(dev->get_semaphore());
+    uint8_t reg = REG_CONVERT_TEMPERATURE;
+    dev->transfer(&reg, 1, nullptr, 0);
+    state = 0;
+    command_send_us = AP_HAL::micros();
+
+    dev->set_device_type(uint8_t(DevType::MS5525));
+    set_bus_id(dev->get_bus_id());
+
+    // drop to 2 retries for runtime
+    dev->set_retries(2);
+
+    // read at 80Hz
+    dev->register_periodic_callback(1000000UL/80U,
+                                    FUNCTOR_BIND_MEMBER(&AP_Airspeed_MS5525::timer, void));
+    return true;
+}
+
+
+/**
+ * CRC used by MS pressure devices
+ */
+uint16_t AP_Airspeed_MS5525::crc4_prom(void)
+{
+    return crc_crc4(prom);
+}
+
+bool AP_Airspeed_MS5525::read_prom(void)
+{
+    // reset the chip to ensure it has correct prom values loaded
+    uint8_t reg = REG_RESET;
+    if (!dev->transfer(&reg, 1, nullptr, 0)) {
+        return false;
+    }
+    hal.scheduler->delay(5);
+
+    bool all_zero = true;
+    for (uint8_t i = 0; i < 8; i++) {
+        be16_t val;
+        if (!dev->read_registers(REG_PROM_BASE+i*2, (uint8_t *) &val,
+                                 sizeof(uint16_t))) {
+            return false;
+        }
+        prom[i] = be16toh(val);
+        if (prom[i] != 0) {
+            all_zero = false;
+        }
+    }
+
+    if (all_zero) {
+        return false;
+    }
+
+    /* save the read crc */
+    const uint16_t crc_read = prom[7] & 0xf;
+
+    /* remove CRC byte */
+    prom[7] &= 0xff00;
+
+    uint16_t crc_calc = crc4_prom();
+    if (crc_read != crc_calc) {
+        printf("MS5525: CRC mismatch 0x%04x 0x%04x\n", crc_read, crc_calc);
+    }
+    return crc_read == crc_calc;
+}
+
+
+/*
+  read from the ADC
+ */
+int32_t AP_Airspeed_MS5525::read_adc()
+{
+    uint8_t val[3];
+    if (!dev->read_registers(REG_ADC_READ, val, 3)) {
+        return 0;
+    }
+    return (val[0] << 16) | (val[1] << 8) | val[2];
+}
+
+/*
+  calculate pressure and temperature
+ */
+void AP_Airspeed_MS5525::calculate(void)
+{
+    // table for the 001DS part, 1PSI range
+    const uint8_t Q1 = 15;
+    const uint8_t Q2 = 17;
+    const uint8_t Q3 = 7;
+    const uint8_t Q4 = 5;
+    const uint8_t Q5 = 7;
+    const uint8_t Q6 = 21;
+
+    float dT = float(D2) - int64_t(prom[5]) * (1L<<Q5);
+    float TEMP = 2000 + (dT*int64_t(prom[6]))/(1L<<Q6);
+    float OFF  = int64_t(prom[2])*(1L<<Q2) + (int64_t(prom[4])*dT)/(1L<<Q4);
+    float SENS = int64_t(prom[1])*(1L<<Q1) + (int64_t(prom[3])*dT)/(1L<<Q3);
+    float P = (float(D1)*SENS/(1L<<21)-OFF)/(1L<<15);
+    const float PSI_to_Pa = 6894.757f;
+    float P_Pa = PSI_to_Pa * 1.0e-4 * P;
+    float Temp_C = TEMP * 0.01;
+
+#if 0
+    static uint16_t counter;
+    if (counter++ == 100) {
+        printf("P=%.6f T=%.2f D1=%d D2=%d\n", P_Pa, Temp_C, D1, D2);
+        counter=0;
+    }
+#endif
+    
+    WITH_SEMAPHORE(sem);
+
+    pressure_sum += P_Pa;
+    temperature_sum += Temp_C;
+    press_count++;
+    temp_count++;
+    last_sample_time_ms = AP_HAL::millis();
+}
+
+// 80Hz timer
+void AP_Airspeed_MS5525::timer()
+{
+    if (AP_HAL::micros() - command_send_us < 10000) {
+        // we should avoid trying to read the ADC too soon after
+        // sending the command
+        return;
+    }
+    
+    uint32_t adc_val = read_adc();
+
+    if (adc_val == 0) {
+        // we have either done a read too soon after sending the
+        // request or we have tried to read the same sample twice. We
+        // re-send the command now as we don't know what state the
+        // sensor is in, and we do want to trigger it sending a value,
+        // which we will discard
+        if (dev->transfer(&cmd_sent, 1, nullptr, 0)) {
+            command_send_us = AP_HAL::micros();
+        }
+        // when we get adc_val == 0 then then both the current value and
+        // the next value we read from the sensor are invalid
+        ignore_next = true;
+        return;
+    }
+    
+    /*
+     * If read fails, re-initiate a read command for current state or we are
+     * stuck
+     */
+    if (!ignore_next) {
+        if (cmd_sent == REG_CONVERT_TEMPERATURE) {
+            D2 = adc_val;
+        } else if (cmd_sent == REG_CONVERT_PRESSURE) {
+            D1 = adc_val;
+            calculate();
+        }
+    }
+
+    ignore_next = false;
+    
+    cmd_sent = (state == 0) ? REG_CONVERT_TEMPERATURE : REG_CONVERT_PRESSURE;
+    if (!dev->transfer(&cmd_sent, 1, nullptr, 0)) {
+        // we don't know for sure what state the sensor is in when we
+        // fail to send the command, so ignore the next response
+        ignore_next = true;
+        return;
+    }
+    command_send_us = AP_HAL::micros();
+
+    state = (state + 1) % 5;
+}
+
+// return the current differential_pressure in Pascal
+bool AP_Airspeed_MS5525::get_differential_pressure(float &_pressure)
+{
+    WITH_SEMAPHORE(sem);
+
+    if ((AP_HAL::millis() - last_sample_time_ms) > 100) {
+        return false;
+    }
+
+    if (press_count > 0) {
+        pressure = pressure_sum / press_count;
+        press_count = 0;
+        pressure_sum = 0;
+    }
+    _pressure = pressure;
+
+    return true;
+}
+
+// return the current temperature in degrees C, if available
+bool AP_Airspeed_MS5525::get_temperature(float &_temperature)
+{
+    WITH_SEMAPHORE(sem);
+
+    if ((AP_HAL::millis() - last_sample_time_ms) > 100) {
+        return false;
+    }
+
+    if (temp_count > 0) {
+        temperature = temperature_sum / temp_count;
+        temp_count = 0;
+        temperature_sum = 0;
+    }
+
+    _temperature = temperature;
+    return true;
+}
+
+#endif  // AP_AIRSPEED_MS5525_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include "AP_Airspeed_MSP.h"
+
+#if AP_AIRSPEED_MSP_ENABLED
+
+AP_Airspeed_MSP::AP_Airspeed_MSP(AP_Airspeed &_frontend, uint8_t _instance, uint8_t _msp_instance) :
+    AP_Airspeed_Backend(_frontend, _instance),
+    msp_instance(_msp_instance)
+{
+    set_bus_id(AP_HAL::Device::make_bus_id(AP_HAL::Device::BUS_TYPE_MSP,0,msp_instance,0));
+}
+
+// return the current differential_pressure in Pascal
+bool AP_Airspeed_MSP::get_differential_pressure(float &pressure)
+{
+    WITH_SEMAPHORE(sem);
+    if (press_count == 0) {
+        return false;
+    }
+    pressure = sum_pressure/press_count;
+    press_count = 0;
+    sum_pressure = 0;
+    return true;
+}
+
+// get last temperature
+bool AP_Airspeed_MSP::get_temperature(float &temperature)
+{
+    WITH_SEMAPHORE(sem);
+    if (temp_count == 0) {
+        return false;
+    }
+    temperature = sum_temp/temp_count;
+    temp_count = 0;
+    sum_temp = 0;
+    return true;
+}
+
+void AP_Airspeed_MSP::handle_msp(const MSP::msp_airspeed_data_message_t &pkt)
+{
+    if (pkt.instance != msp_instance) {
+        // not for us
+        return;
+    }
+    WITH_SEMAPHORE(sem);
+
+    sum_pressure += pkt.pressure;
+    press_count++;
+    if (press_count > 100) {
+        // prevent overflow
+        sum_pressure /= 2;
+        press_count /= 2;
+    }
+
+    if (pkt.temp == INT16_MIN) {
+        // invalid temperature
+        return;
+    }
+
+    sum_temp += pkt.temp*0.01;
+    temp_count++;
+    if (temp_count > 100) {
+        // prevent overflow
+        sum_temp /= 2;
+        temp_count /= 2;
+    }
+    
+}
+
+#endif // AP_AIRSPEED_MSP_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+  MSP airspeed backend
+ */
+#pragma once
+
+#include "AP_Airspeed_config.h"
+
+#if AP_AIRSPEED_MSP_ENABLED
+
+#include "AP_Airspeed_Backend.h"
+
+#include <AP_MSP/msp.h>
+
+class AP_Airspeed_MSP : public AP_Airspeed_Backend
+{
+public:
+    AP_Airspeed_MSP(AP_Airspeed &airspeed, uint8_t instance, uint8_t msp_instance);
+
+    bool init(void) override {
+        return true;
+    }
+
+    void handle_msp(const MSP::msp_airspeed_data_message_t &pkt) override;
+
+    // return the current differential_pressure in Pascal
+    bool get_differential_pressure(float &pressure) override;
+
+    // temperature not available via analog backend
+    bool get_temperature(float &temperature) override;
+    
+private:
+    const uint8_t msp_instance;
+    float sum_pressure;
+    uint8_t press_count;
+    float sum_temp;
+    uint8_t temp_count;
+};
+
+#endif // AP_AIRSPEED_MSP_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             

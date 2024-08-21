@@ -1,0 +1,3727 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+   i-BUS telemetry for FlySky/Turnigy receivers and other peripherals
+   (eg iA6B, iA10) by Nicole Ashley <nicole@ashley.kiwi>.
+
+   Originally based on work by Jan Verhulst:
+     https://github.com/ArduPilot/ardupilot/pull/16545
+
+   Libraries used for reference and inspiration:
+
+   * iBUStelemetry
+     https://github.com/Hrastovc/iBUStelemetry
+
+   * IBusBM
+     https://github.com/bmellink/IBusBM
+
+   * BetaFlight
+     https://github.com/betaflight/betaflight/blob/master/src/main/telemetry/ibus_shared.c
+ */
+
+#include <AP_IBus_Telem/AP_IBus_Telem.h>
+
+#if AP_IBUS_TELEM_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Vehicle/AP_Vehicle.h>
+#include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_Arming/AP_Arming.h>
+#include <AP_GPS/AP_GPS.h>
+#include <AP_RPM/AP_RPM.h>
+
+// 2-byte values
+#define IBUS_SENSOR_TYPE_TEMPERATURE          0x01 // Temperature (in 0.1 degrees, where 0=-40'C)
+#define IBUS_SENSOR_TYPE_RPM_FLYSKY           0x02 // FlySky-specific throttle value
+#define IBUS_SENSOR_TYPE_EXTERNAL_VOLTAGE     0x03 // External voltage (in centivolts, so 1450 is 14.50V)
+#define IBUS_SENSOR_TYPE_AVERAGE_CELL_VOLTAGE 0x04 // Avg cell voltage (in centivolts, so 1450 is 14.50V)
+#define IBUS_SENSOR_TYPE_BATTERY_CURRENT      0x05 // Battery current (centi-amps)
+#define IBUS_SENSOR_TYPE_FUEL                 0x06 // Remaining battery percentage
+#define IBUS_SENSOR_TYPE_RPM                  0x07 // Throttle value (in 0.01, so 1200 is 12.00%)
+#define IBUS_SENSOR_TYPE_COMPASS_HEADING      0x08 // Heading (0-360 degrees)
+#define IBUS_SENSOR_TYPE_CLIMB_RATE           0x09 // Climb rate (cm/s)
+#define IBUS_SENSOR_TYPE_COG                  0x0a // Course over ground (centidegrees, so 27015 is 270.15 degrees)
+#define IBUS_SENSOR_TYPE_GPS_STATUS           0x0b // GPS status (2 values: fix type, and number of satellites)
+#define IBUS_SENSOR_TYPE_ACC_X                0x0c // Acc X (cm/s)
+#define IBUS_SENSOR_TYPE_ACC_Y                0x0d // Acc Y (cm/s)
+#define IBUS_SENSOR_TYPE_ACC_Z                0x0e // Acc Z (cm/s)
+#define IBUS_SENSOR_TYPE_ROLL                 0x0f // Roll (centidegrees)
+#define IBUS_SENSOR_TYPE_PITCH                0x10 // Pitch (centidegrees)
+#define IBUS_SENSOR_TYPE_YAW                  0x11 // Yaw (centidegrees)
+#define IBUS_SENSOR_TYPE_VERTICAL_SPEED       0x12 // Vertical speed (cm/s)
+#define IBUS_SENSOR_TYPE_GROUND_SPEED         0x13 // Speed (cm/s)
+#define IBUS_SENSOR_TYPE_GPS_DIST             0x14 // Distance from home (m)
+#define IBUS_SENSOR_TYPE_ARMED                0x15 // Armed / unarmed (1 = armed, 0 = unarmed)
+#define IBUS_SENSOR_TYPE_FLIGHT_MODE          0x16 // Flight mode
+#define IBUS_SENSOR_TYPE_ODO1                 0x7c // Odometer1
+#define IBUS_SENSOR_TYPE_ODO2                 0x7d // Odometer2
+#define IBUS_SENSOR_TYPE_SPEED                0x7e // Speed km/h
+#define IBUS_SENSOR_TYPE_ALT_FLYSKY           0xf9 // FlySky-specific altitude (metres)
+
+// 4-byte values
+#define IBUS_SENSOR_TYPE_TEMPERATURE_PRESSURE 0x41 // Combined temperature & pressure value
+#define IBUS_SENSOR_TYPE_GPS_LAT              0x80 // WGS84 in degrees * 1E7
+#define IBUS_SENSOR_TYPE_GPS_LNG              0x81 // WGS84 in degrees * 1E7
+#define IBUS_SENSOR_TYPE_GPS_ALT              0x82 // GPS (cm)
+#define IBUS_SENSOR_TYPE_ALT                  0x83 // Alt (cm)
+#define IBUS_SENSOR_TYPE_ALT_MAX              0x84 // MaxAlt (cm)
+
+// i-BUS vehicle modes
+#define IBUS_VEHICLE_MODE_STAB    0
+#define IBUS_VEHICLE_MODE_ACRO    1
+#define IBUS_VEHICLE_MODE_AHOLD   2
+#define IBUS_VEHICLE_MODE_AUTO    3
+#define IBUS_VEHICLE_MODE_GUIDED  4
+#define IBUS_VEHICLE_MODE_LOITER  5
+#define IBUS_VEHICLE_MODE_RTL     6
+#define IBUS_VEHICLE_MODE_CIRCLE  7
+#define IBUS_VEHICLE_MODE_PHOLD   8
+#define IBUS_VEHICLE_MODE_LAND    9
+#define IBUS_VEHICLE_MODE_UNKNOWN 255 // Must be positive and 0 is already used; out of range blanks the value
+
+// All the sensors we can accurately provide are listed here.
+// i-BUS will generally only query up to 15 sensors, so subjectively
+// higher-value sensors are sorted to the top to make the most of a
+// small telemetry window. In the future these could be configurable.
+static const AP_IBus_Telem::SensorDefinition sensors[] {
+#if AP_ARMING_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_ARMED, .sensor_length = 2},
+#endif
+    {.sensor_type = IBUS_SENSOR_TYPE_FLIGHT_MODE, .sensor_length = 2},
+#if AP_GPS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_GPS_STATUS, .sensor_length = 2},
+#endif
+#if AP_BATTERY_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_FUEL, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_EXTERNAL_VOLTAGE, .sensor_length = 2},
+#endif
+#if AP_BARO_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_ALT, .sensor_length = 4},
+#endif
+#if AP_AHRS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_GPS_DIST, .sensor_length = 2},
+#endif
+#if AP_BARO_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_CLIMB_RATE, .sensor_length = 2},
+#endif
+#if AP_GPS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_GROUND_SPEED, .sensor_length = 2},
+#endif
+#if AP_AHRS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_ROLL, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_PITCH, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_YAW, .sensor_length = 2},
+#endif
+#if AP_AIRSPEED_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_SPEED, .sensor_length = 2},
+#endif
+#if AP_BARO_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_TEMPERATURE_PRESSURE, .sensor_length = 4},
+#endif
+#if AP_RPM_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_RPM, .sensor_length = 2},
+#endif
+#if AP_BATTERY_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_BATTERY_CURRENT, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_AVERAGE_CELL_VOLTAGE, .sensor_length = 2},
+#endif
+#if AP_AHRS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_COMPASS_HEADING, .sensor_length = 2},
+#endif
+#if AP_GPS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_COG, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_GPS_LAT, .sensor_length = 4},
+    {.sensor_type = IBUS_SENSOR_TYPE_GPS_LNG, .sensor_length = 4},
+    {.sensor_type = IBUS_SENSOR_TYPE_GPS_ALT, .sensor_length = 4},
+#endif
+#if AP_AHRS_ENABLED
+    {.sensor_type = IBUS_SENSOR_TYPE_ACC_X, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_ACC_Y, .sensor_length = 2},
+    {.sensor_type = IBUS_SENSOR_TYPE_ACC_Z, .sensor_length = 2},
+#endif
+};
+
+#if APM_BUILD_TYPE(APM_BUILD_Rover)
+
+/* Rover modes:
+    MANUAL       = 0
+    ACRO         = 1
+    STEERING     = 3
+    HOLD         = 4
+    LOITER       = 5
+    FOLLOW       = 6
+    SIMPLE       = 7
+    DOCK         = 8
+    CIRCLE       = 9
+    AUTO         = 10
+    RTL          = 11
+    SMART_RTL    = 12
+    GUIDED       = 15
+    INITIALISING = 16
+*/
+static const AP_IBus_Telem::ModeMap mode_map[] {
+    {.ap_mode = 1, .ibus_mode = IBUS_VEHICLE_MODE_ACRO},
+    {.ap_mode = 4, .ibus_mode = IBUS_VEHICLE_MODE_PHOLD},
+    {.ap_mode = 5, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+    {.ap_mode = 9, .ibus_mode = IBUS_VEHICLE_MODE_CIRCLE},
+    {.ap_mode = 10, .ibus_mode = IBUS_VEHICLE_MODE_AUTO},
+    {.ap_mode = 11, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 12, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 15, .ibus_mode = IBUS_VEHICLE_MODE_GUIDED},
+};
+
+#elif APM_BUILD_COPTER_OR_HELI
+
+/* Copter modes:
+    STABILIZE    =  0
+    ACRO         =  1
+    ALT_HOLD     =  2
+    AUTO         =  3
+    GUIDED       =  4
+    LOITER       =  5
+    RTL          =  6
+    CIRCLE       =  7
+    LAND         =  9
+    DRIFT        = 11
+    SPORT        = 13
+    FLIP         = 14
+    AUTOTUNE     = 15
+    POSHOLD      = 16
+    BRAKE        = 17
+    THROW        = 18
+    AVOID_ADSB   = 19
+    GUIDED_NOGPS = 20
+    SMART_RTL    = 21
+    FLOWHOLD     = 22
+    FOLLOW       = 23
+    ZIGZAG       = 24
+    SYSTEMID     = 25
+    AUTOROTATE   = 26
+    AUTO_RTL     = 27
+    TURTLE       = 28
+*/
+static const AP_IBus_Telem::ModeMap mode_map[] {
+    {.ap_mode = 0, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 1, .ibus_mode = IBUS_VEHICLE_MODE_ACRO},
+    {.ap_mode = 2, .ibus_mode = IBUS_VEHICLE_MODE_AHOLD},
+    {.ap_mode = 3, .ibus_mode = IBUS_VEHICLE_MODE_AUTO},
+    {.ap_mode = 4, .ibus_mode = IBUS_VEHICLE_MODE_GUIDED},
+    {.ap_mode = 5, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+    {.ap_mode = 6, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 7, .ibus_mode = IBUS_VEHICLE_MODE_CIRCLE},
+    {.ap_mode = 9, .ibus_mode = IBUS_VEHICLE_MODE_LAND},
+    {.ap_mode = 16, .ibus_mode = IBUS_VEHICLE_MODE_PHOLD},
+    {.ap_mode = 21, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 22, .ibus_mode = IBUS_VEHICLE_MODE_PHOLD},
+    {.ap_mode = 27, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+};
+
+#elif APM_BUILD_TYPE(APM_BUILD_ArduPlane)
+
+/* Plane modes:
+    MANUAL        = 0
+    CIRCLE        = 1
+    STABILIZE     = 2
+    TRAINING      = 3
+    ACRO          = 4
+    FLY_BY_WIRE_A = 5
+    FLY_BY_WIRE_B = 6
+    CRUISE        = 7
+    AUTOTUNE      = 8
+    AUTO          = 10
+    RTL           = 11
+    LOITER        = 12
+    TAKEOFF       = 13
+    AVOID_ADSB    = 14
+    GUIDED        = 15
+    INITIALISING  = 16
+    QSTABILIZE    = 17
+    QHOVER        = 18
+    QLOITER       = 19
+    QLAND         = 20
+    QRTL          = 21
+    QAUTOTUNE     = 22
+    QACRO         = 23
+    THERMAL       = 24
+    LOITER_ALT_QLAND = 25
+*/
+static const AP_IBus_Telem::ModeMap mode_map[] {
+    {.ap_mode = 1, .ibus_mode = IBUS_VEHICLE_MODE_CIRCLE},
+    {.ap_mode = 2, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 4, .ibus_mode = IBUS_VEHICLE_MODE_ACRO},
+    {.ap_mode = 5, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 6, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 7, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 10, .ibus_mode = IBUS_VEHICLE_MODE_AUTO},
+    {.ap_mode = 11, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 12, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+    {.ap_mode = 13, .ibus_mode = IBUS_VEHICLE_MODE_AUTO},
+    {.ap_mode = 15, .ibus_mode = IBUS_VEHICLE_MODE_GUIDED},
+    {.ap_mode = 17, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 18, .ibus_mode = IBUS_VEHICLE_MODE_PHOLD},
+    {.ap_mode = 19, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+    {.ap_mode = 20, .ibus_mode = IBUS_VEHICLE_MODE_LAND},
+    {.ap_mode = 21, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 23, .ibus_mode = IBUS_VEHICLE_MODE_ACRO},
+    {.ap_mode = 25, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+};
+
+#elif APM_BUILD_TYPE(APM_BUILD_ArduSub)
+
+/* Submarine modes:
+    STABILIZE    = 0
+    ACRO         = 1
+    ALT_HOLD     = 2
+    AUTO         = 3
+    GUIDED       = 4
+    CIRCLE       = 7
+    SURFACE      = 9
+    POSHOLD      = 16
+    MANUAL       = 19
+    MOTOR_DETECT = 20
+*/
+static const AP_IBus_Telem::ModeMap mode_map[] {
+    {.ap_mode = 0, .ibus_mode = IBUS_VEHICLE_MODE_STAB},
+    {.ap_mode = 1, .ibus_mode = IBUS_VEHICLE_MODE_ACRO},
+    {.ap_mode = 2, .ibus_mode = IBUS_VEHICLE_MODE_AHOLD},
+    {.ap_mode = 3, .ibus_mode = IBUS_VEHICLE_MODE_AUTO},
+    {.ap_mode = 4, .ibus_mode = IBUS_VEHICLE_MODE_GUIDED},
+    {.ap_mode = 5, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+    {.ap_mode = 6, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+    {.ap_mode = 7, .ibus_mode = IBUS_VEHICLE_MODE_CIRCLE},
+    {.ap_mode = 8, .ibus_mode = IBUS_VEHICLE_MODE_PHOLD},
+    {.ap_mode = 9, .ibus_mode = IBUS_VEHICLE_MODE_LAND},
+    {.ap_mode = 16, .ibus_mode = IBUS_VEHICLE_MODE_PHOLD},
+};
+
+#elif APM_BUILD_TYPE(APM_BUILD_Blimp)
+
+/* Blimp modes:
+    LAND     = 0
+    MANUAL   = 1
+    VELOCITY = 2
+    LOITER   = 3
+    RTL      = 4
+*/
+static const AP_IBus_Telem::ModeMap mode_map[] {
+    {.ap_mode = 0, .ibus_mode = IBUS_VEHICLE_MODE_LAND},
+    {.ap_mode = 3, .ibus_mode = IBUS_VEHICLE_MODE_LOITER},
+    {.ap_mode = 4, .ibus_mode = IBUS_VEHICLE_MODE_RTL},
+};
+
+#else
+
+static const AP_IBus_Telem::ModeMap mode_map[] {};
+
+#endif
+
+void AP_IBus_Telem::init()
+{
+    const AP_SerialManager &serial_manager = AP::serialmanager();
+    if ((port = serial_manager.find_serial(AP_SerialManager::SerialProtocol_IBUS_Telem, 0))) {
+        port->set_options(port->OPTION_HDPLEX);
+        hal.scheduler->register_timer_process(FUNCTOR_BIND_MEMBER(&AP_IBus_Telem::tick, void));
+    }
+}
+
+void AP_IBus_Telem::tick(void)
+{
+    if (!initialized) {
+        port->begin(115200);
+        initialized = true;
+    }
+
+    const uint16_t available = MIN(port->available(), 1024U);
+    if (available == 0) {
+        return;
+    }
+
+    const uint32_t now = AP_HAL::millis();
+    if ((now - last_received_message_time_ms) < PROTOCOL_TIMEGAP) {
+        // Any bytes that arrive too soon since the last message should be discarded
+        port->discard_input();
+        return;
+    }
+
+    union {
+        CommandPacket incoming_message;
+        uint8_t buffer[sizeof(CommandPacket)];
+    } u;
+
+    if (available < sizeof(u.incoming_message)) {
+        // We've got here mid-message; come back in the next loop when it might be complete
+        return;
+    }
+
+    last_received_message_time_ms = now;
+
+    if (available > sizeof(u.incoming_message)) {
+        // We've received too many bytes, so probably a malformed message
+        port->discard_input();
+        return;
+    }
+
+    if (port->read(u.buffer, sizeof(u.buffer)) != sizeof(u.buffer)) {
+        // Despite all our checks this is still the wrong size; safest to wait until the next message
+        port->discard_input();
+        return;
+    }
+
+    if (u.incoming_message.message_length != PROTOCOL_INCOMING_MESSAGE_LENGTH) {
+        // Every message starts with this fixed message length; if not then it's not valid
+        return;
+    }
+
+    uint16_t calculated_checksum = 0xFFFF;
+    for (uint8_t i = 0; i < sizeof(u.buffer) - 2; i++) {
+        calculated_checksum -= u.buffer[i];
+    }
+
+    if (u.incoming_message.checksum != calculated_checksum) {
+        return;
+    }
+
+    handle_incoming_message(u.incoming_message);
+}
+
+void AP_IBus_Telem::handle_incoming_message(const CommandPacket &incoming)
+{
+    // Sensor 0 is reserved for the transmitter, so if for some reason it's requested we should ignore it
+    if (incoming.sensor_id == 0) {
+        return;
+    }
+
+    // If we've reached the end of our sensor list, we shouldn't respond; this tells the receiver that there
+    // are no more sensors to discover.
+    if (incoming.sensor_id > ARRAY_SIZE(sensors)) {
+        return;
+    }
+
+    const auto &sensor_definition = sensors[incoming.sensor_id - 1];
+
+    switch (incoming.command << 4) {
+    case PROTOCOL_COMMAND_DISCOVER:
+        handle_discover_command(incoming);
+        break;
+
+    case PROTOCOL_COMMAND_TYPE:
+        handle_type_command(incoming, sensor_definition);
+        break;
+
+    case PROTOCOL_COMMAND_VALUE:
+        handle_value_command(incoming, sensor_definition);
+        break;
+    }
+}
+
+/* A discovery query has the following format:
+   * 0x04: Message length
+   * 0x81: 0x80 for discovery + 0x01 for sensor ID 1
+   * 0x7A: Checksum low byte
+   * 0xFF: Checksum high byte
+   Checksums are 0xFFFF minus the sum of the previous bytes
+
+   To acknowledge a discovery query, we echo the command back.
+ */
+void AP_IBus_Telem::handle_discover_command(const CommandPacket &incoming)
+{
+    struct protocol_command_discover_response_t {
+        uint8_t command_length;
+        uint8_t address;
+        uint16_t checksum;
+    } packet {
+        PROTOCOL_FOUR_LENGTH,
+        (uint8_t)(PROTOCOL_COMMAND_DISCOVER | incoming.sensor_id)
+    };
+    populate_checksum((uint8_t*)&packet, sizeof(packet));
+    port->write((uint8_t*)&packet, sizeof(packet));
+}
+
+/* A type query has the following format:
+   * 0x04: Message length
+   * 0x91: 0x90 for type + 0x01 for sensor ID 1
+   * 0x6A: Checksum low byte
+   * 0xFF: Checksum high byte
+   Checksums are 0xFFFF minus the sum of the previous bytes
+
+   To respond to a type query, we send:
+   * 0x06: Message length
+   * 0x91: 0x9;
+    }
+
+#if AP_RPM_ENABLED
+    if (redline.flag && !option_set(Options::DISABLE_REDLINE_GOVERNOR)) {
+        // limit the throttle from increasing above what the current output is
+        if (redline.throttle_percentage < 1.0f) {
+            redline.throttle_percentage = percentage;
+        }
+        if (percentage < redline.throttle_percentage - redline.governor_integrator) {
+            // the throttle before the override is much lower than what the integrator is at
+            // reset the integrator
+            redline.governor_integrator = 0;
+            redline.throttle_percentage = percentage;
+        } else if (percentage < redline.throttle_percentage) {
+            // the throttle is below the integrator set point
+            // remove the difference from the integrator
+            redline.governor_integrator -= redline.throttle_percentage - percentage;
+            redline.throttle_percentage = percentage;
+        } else if (filtered_rpm_value > redline_rpm) {
+            // reduce the throttle if still over the redline RPM
+            const float redline_setpoint_step = idle_slew * AP::scheduler().get_loop_period_s();
+            redline.governor_integrator += redline_setpoint_step;
+        }
+        percentage = redline.throttle_percentage - redline.governor_integrator;
+        return true;
+    }
+#endif // AP_RPM_ENABLED
+
+    // if THROTTLE_WHILE_DISARMED is set then we use the base_throttle, allowing the pilot to control throttle while disarmed
+    if (option_set(Options::THROTTLE_WHILE_DISARMED) && !hal.util->get_soft_armed() &&
+        base_throttle > percentage) {
+        percentage = base_throttle;
+        return true;
+    }
+
+    return false;
+}
+
+/*
+  handle DO_ENGINE_CONTROL messages via MAVLink or mission
+*/
+bool AP_ICEngine::engine_control(float start_control, float cold_start, float height_delay, uint32_t flags)
+{
+    if (!enable) {
+        return false;
+    }
+
+    // always update the start while disarmed flag
+    allow_single_start_while_disarmed = (flags & ENGINE_CONTROL_OPTIONS_ALLOW_START_WHILE_DISARMED) != 0;
+
+    if (start_control <= 0) {
+        state = ICE_OFF;
+        return true;
+    }
+    if (state == ICE_RUNNING || state == ICE_START_DELAY || state == ICE_STARTING) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Engine: already running");
+        return false;
+    }
+    RC_Channel *c = rc().channel(start_chan-1);
+    if (c != nullptr && rc().has_valid_input()) {
+        // get starter control channel
+        uint16_t cvalue = c->get_radio_in();
+        if (cvalue >= start_chan_min_pwm && cvalue <= RC_Channel::AUX_PWM_TRIGGER_LOW) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Engine: start control disabled");
+            return false;
+        }
+    }
+    if (height_delay > 0) {
+        height_pending = true;
+        initial_height = 0;
+        height_required = height_delay;
+        state = ICE_START_HEIGHT_DELAY;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Takeoff height set to %.1fm", (double)height_delay);
+        return true;
+    }
+    state = ICE_STARTING;
+    return true;
+}
+
+/*
+  Update low throttle limit to ensure steady idle for IC Engines
+  return a new min_throttle value
+*/
+void AP_ICEngine::update_idle_governor(int8_t &min_throttle)
+{
+    if (!enable) {
+        return;
+    }
+#if AP_RPM_ENABLED
+    const int8_t min_throttle_base = min_throttle;
+
+    // Initialize idle point to min_throttle on the first run
+    static bool idle_point_initialized = false;
+    if (!idle_point_initialized) {
+        idle_governor_integrator = min_throttle;
+        idle_point_initialized = true;
+    }
+    AP_RPM *ap_rpm = AP::rpm();
+    if (!ap_rpm || rpm_instance == 0 || !ap_rpm->healthy(rpm_instance-1)) {
+        return;
+    }
+
+    // Check to make sure we have an enabled IC Engine, EFI Instance and that the idle governor is enabled
+    if (get_state() != AP_ICEngine::ICE_RUNNING || idle_rpm < 0) {
+        return;
+    }
+
+    // get current RPM feedback
+    float rpmv;
+
+    // Double Check to make sure engine is really running
+    if (!ap_rpm->get_rpm(rpm_instance-1, rpmv) || rpmv < 1) {
+        // Reset idle point to the default value when the engine is stopped
+        idle_governor_integrator = min_throttle;
+        return;
+    }
+
+    // Override
+    min_throttle = roundf(idle_governor_integrator);
+
+    // Calculate Error in system
+    int32_t error = idle_rpm - rpmv;
+
+    bool underspeed = error > 0;
+
+    // Don't adjust idle point when we're within the deadband
+    if (abs(error) < idle_db) {
+        return;
+    }
+
+    // Don't adjust idle point if the commanded throttle is above the
+    // current idle throttle setpoint and the RPM is above the idle
+    // RPM setpoint (Normal flight)
+    if (SRV_Channels::get_output_scaled(SRV_Channel::k_throttle) > min_throttle && !underspeed) {
+        return;
+    }
+
+    // Calculate the change per loop to achieve the desired slew rate of 1 percent per second
+    static const float idle_setpoint_step = idle_slew * AP::scheduler().get_loop_period_s();
+
+    // Update Integrator
+    if (underspeed) {
+        idle_governor_integrator += idle_setpoint_step;
+    } else {
+        idle_governor_integrator -= idle_setpoint_step;
+    }
+
+    idle_governor_integrator = constrain_float(idle_governor_integrator, min_throttle_base, 40.0f);
+
+    min_throttle = roundf(idle_governor_integrator);
+#endif // AP_RPM_ENABLED
+}
+
+/*
+  set ignition state
+ */
+void AP_ICEngine::set_ignition(bool on)
+{
+    SRV_Channels::set_output_pwm(SRV_Channel::k_ignition, on? pwm_ignition_on : pwm_ignition_off);
+
+#if AP_RELAY_ENABLED
+    AP_Relay *relay = AP::relay();
+    if (relay != nullptr) {
+        relay->set(AP_Relay_Params::FUNCTION::IGNITION, on);
+    }
+#endif // AP_RELAY_ENABLED
+
+}
+
+/*
+  set starter state
+ */
+void AP_ICEngine::set_starter(bool on)
+{
+    SRV_Channels::set_output_pwm(SRV_Channel::k_starter, on? pwm_starter_on : pwm_starter_off);
+
+#if AP_ICENGINE_TCA9554_STARTER_ENABLED
+    tca9554_starter.set_starter(on, option_set(Options::CRANK_DIR_REVERSE));
+#endif
+
+#if AP_RELAY_ENABLED
+    AP_Relay *relay = AP::relay();
+    if (relay != nullptr) {
+        relay->set(AP_Relay_Params::FUNCTION::ICE_STARTER, on);
+    }
+#endif // AP_RELAY_ENABLED
+}
+
+
+bool AP_ICEngine::allow_throttle_while_disarmed() const
+{
+    return option_set(Options::THROTTLE_WHILE_DISARMED) &&
+        hal.util->safety_switch_state() != AP_HAL::Util::SAFETY_DISARMED;
+}
+
+#if AP_RELAY_ENABLED
+bool AP_ICEngine::get_legacy_ignition_relay_index(int8_t &num) 
+{
+    // PARAMETER_CONVERSION - Added: Dec-2023
+    if (!enable || !AP_Param::get_param_by_index(this, 18, AP_PARAM_INT8, &num)) {
+        return false;
+    }
+    // convert to zero indexed
+    num -= 1;
+    return true;
+}
+#endif
+
+// singleton instance. Should only ever be set in the constructor.
+AP_ICEngine *AP_ICEngine::_singleton;
+namespace AP {
+AP_ICEngine *ice() {
+        return AP_ICEngine::get_singleton();
+    }
+}
+
+#endif  // AP_ICENGINE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  control of internal combustion engines (starter, ignition and choke)
+ */
+#pragma once
+
+#include "AP_ICEngine_config.h"
+
+#if AP_ICENGINE_ENABLED
+
+#include <AP_Param/AP_Param.h>
+#include <Filter/LowPassFilter.h>
+#include <AP_RPM/AP_RPM_config.h>
+#include <AP_HAL/I2CDevice.h>
+#include <AP_Relay/AP_Relay_config.h>
+
+#if AP_ICENGINE_TCA9554_STARTER_ENABLED
+#include "AP_ICEngine_TCA9554.h"
+#endif
+
+class AP_ICEngine {
+public:
+    // constructor
+    AP_ICEngine();
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // update engine state. Should be called at 10Hz or more
+    void update(void);
+
+    // check for throttle override
+    bool throttle_override(float &percent, const float base_throttle);
+
+    enum ICE_State {
+        ICE_DISABLED = -1,
+        ICE_OFF=0,
+        ICE_START_HEIGHT_DELAY=1,
+        ICE_START_DELAY=2,
+        ICE_STARTING=3,
+        ICE_RUNNING=4
+    };
+
+    // get current engine control state
+    ICE_State get_state(void) const { return !enable?ICE_DISABLED:state; }
+
+    // handle DO_ENGINE_CONTROL messages via MAVLink or mission
+    bool engine_control(float start_control, float cold_start, float height_delay, uint32_t flags);
+
+    // update min throttle for idle governor
+    void update_idle_governor(int8_t &min_throttle);
+
+    // do we have throttle while disarmed enabled?
+    bool allow_throttle_while_disarmed(void) const;
+
+#if AP_RELAY_ENABLED
+    // Needed for param conversion from relay numbers to functions
+    bool get_legacy_ignition_relay_index(int8_t &num);
+#endif
+
+    static AP_ICEngine *get_singleton() { return _singleton; }
+
+private:
+    static AP_ICEngine *_singleton;
+
+    void set_ignition(bool on);
+    void set_starter(bool on);
+
+    enum ICE_State state;
+
+#if AP_RPM_ENABLED
+    // filter for RPM value
+    LowPassFilterConstDtFloat _rpm_filter;
+    float filtered_rpm_value;
+#endif
+
+    // enable library
+    AP_Int8 enable;
+
+    // channel for pilot to command engine start, 0 for none
+    AP_Int8 start_chan;
+
+    // min pwm on start channel for engine stop
+    AP_Int16 start_chan_min_pwm;
+    
+#if AP_RPM_ENABLED
+    // which RPM instance to use
+    AP_Int8 rpm_instance;
+#endif
+    
+    // time to run starter for (seconds)
+    AP_Float starter_time;
+
+    // delay between start attempts (seconds)
+    AP_Float starter_delay;
+    
+    // pwm values 
+    AP_Int16 pwm_ignition_on;
+    AP_Int16 pwm_ignition_off;
+    AP_Int16 pwm_starter_on;
+    AP_Int16 pwm_starter_off;
+    
+#if AP_RPM_ENABLED
+    // RPM above which engine is considered to be running
+    AP_Int32 rpm_threshold;
+#endif
+
+    // time when we started the starter
+    uint32_t starter_start_time_ms;
+
+    // time when we last ran the starter
+    uint32_t starter_last_run_ms;
+
+    // throttle percentage for engine start
+    AP_Int8 start_percent;
+
+    // throttle percentage for engine idle
+    AP_Int8 idle_percent;
+
+#if AP_RPM_ENABLED
+    // Idle Controller RPM setpoint
+    AP_Int16 idle_rpm;
+
+    // Idle Controller RPM deadband
+    AP_Int16 idle_db;
+
+    // Idle Controller Slew Rate
+    AP_Float idle_slew;
+#endif
+
+    // height when we enter ICE_START_HEIGHT_DELAY
+    float initial_height;
+
+    // height change required to start engine
+    float height_required;
+
+    // we are waiting for valid height data
+    bool height_pending:1;
+
+    bool allow_single_start_while_disarmed;
+
+    // idle governor
+    float idle_governor_integrator;
+
+    enum class Options : uint16_t {
+        DISABLE_IGNITION_RC_FAILSAFE = (1U << 0),
+        DISABLE_REDLINE_GOVERNOR     = (1U << 1),
+        THROTTLE_WHILE_DISARMED      = (1U << 2),
+        NO_RUNNING_WHILE_DISARMED    = (1U << 3),
+        CRANK_DIR_REVERSE            = (1U << 4),
+    };
+    AP_Int16 options;
+
+    bool option_set(Options option) const {
+        return (options & uint16_t(option)) != 0;
+    }
+
+    // start_chan debounce
+    uint16_t start_chan_last_value = 1500;
+    uint32_t start_chan_last_ms;
+
+#if AP_ICENGINE_TCA9554_STARTER_ENABLED
+    AP_ICEngine_TCA9554 tca9554_starter;
+#endif
+
+#if AP_RPM_ENABLED
+    // redline rpm
+    AP_Int32 redline_rpm;
+    struct {
+        bool flag;
+        float governor_integrator;
+        float throttle_percentage;
+    } redline;
+#endif
+};
+
+
+namespace AP {
+    AP_ICEngine *ice();
+};
+
+#endif  // AP_ICENGINE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "AP_ICEngine_config.h"
+
+/*
+  support for TCA9554 for starter control on I2C
+ */
+
+#if AP_ICENGINE_TCA9554_STARTER_ENABLED
+#include "AP_ICEngine.h"
+
+extern const AP_HAL::HAL& hal;
+
+/*
+ * TCA9554 output register mapping for PMB Rev E
+ * P0 = PMU_EN - PMU output ON/OFF  (CN6 pin 2)
+ * P1 = ECU_EN - Unused (previously Engine Kill Switch)
+ * P2 = I2C_P2 - Unused
+ * P3 = LED (active low)
+ * P4 = PMU_START - Crank Direction (CN6 pin 5)
+ * P5 = PMU_ARM  - Crank Signal (CN6 pin 6)
+ * P6 = PMU_STAT_IN - Unused
+ * P7 = PMU_STAT - Unused
+ */
+#define TCA9554_I2C_BUS      1
+#define TCA9554_I2C_ADDR     0x20
+#define TCA9554_OUTPUT       0x01  // Output Port register address. Outgoing logic levels
+#define TCA9554_OUT_DEFAULT  0x30  // 0011 0000
+#define TCA9554_CONF         0x03  // Configuration Port register address [0 = Output]
+#define TCA9554_PINS         0xC2  // Set all used ports to outputs = 1100 0010
+
+/*
+  initialise TCA9554
+ */
+bool AP_ICEngine_TCA9554::TCA9554_init()
+{
+    dev_TCA9554 = std::move(hal.i2c_mgr->get_device(TCA9554_I2C_BUS, TCA9554_I2C_ADDR));
+    if (!dev_TCA9554) {
+        return false;
+    }
+    WITH_SEMAPHORE(dev_TCA9554->get_semaphore());
+
+    // setup 1 checked registers
+    dev_TCA9554->setup_checked_registers(1);
+
+    dev_TCA9554->set_retries(10);
+
+    // set outputs
+    bool ret = dev_TCA9554->write_register(TCA9554_OUTPUT, TCA9554_OUT_DEFAULT);
+    if (!ret) {
+        return false;
+    }
+    ret = dev_TCA9554->write_register(TCA9554_CONF, TCA9554_PINS, true);
+    if (!ret) {
+        return false;
+    }
+
+    dev_TCA9554->set_retries(1);
+    return true;
+}
+
+/*
+  set the state of the i2c controller
+ */
+void AP_ICEngine_TCA9554::TCA9554_set(TCA9554_state_t value)
+{
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - last_reg_check_ms > 100) {
+        /*
+          register checking at 10Hz allows us to cope with the i2c
+          device being power cycled after boot
+         */
+        last_reg_check_ms = now_ms;
+        WITH_SEMAPHORE(dev_TCA9554->get_semaphore());
+        dev_TCA9554->check_next_register();
+    }
+
+    if (value != last_state) {
+        WITH_SEMAPHORE(dev_TCA9554->get_semaphore());
+        // set outputs and status leds
+        if (dev_TCA9554->write_register(TCA9554_OUTPUT, (~(value<<2) & 0x0C) | value)) {
+            last_state = value;
+        }
+    }
+}
+
+void AP_ICEngine_TCA9554::set_starter(bool on, bool crank_dir_reverse)
+{
+    if (!initialised) {
+        initialised = TCA9554_init();
+        if (!initialised) {
+            // waiting for power to PMU
+            return;
+        }
+    }
+    if (!crank_dir_reverse) {
+        TCA9554_set(on? STARTER_FORWARD : STARTER_OFF);
+    } else {
+        TCA9554_set(on? STARTER_REVERSE : STARTER_OFF);
+    }
+}
+
+#endif // AP_ICENGINE_TCA9554_STARTER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+  optional control of starter via a TCA9554 I2C
+ */
+
+#include "AP_ICEngine_config.h"
+
+#if AP_ICENGINE_TCA9554_STARTER_ENABLED
+#include "AP_ICEngine.h"
+
+class AP_ICEngine_TCA9554 {
+public:
+    void set_starter(bool on, bool crank_dir_reverse);
+
+private:
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev_TCA9554;
+
+    enum TCA9554_state_t {
+        STARTER_OFF = 0x30, // output register - 0011 0000
+        STARTER_FORWARD = 0x11, // output register - 0001 0001 - Forward direction
+        STARTER_REVERSE = 0x01, // output register - 0000 0001 - Reverse direction
+    };
+    TCA9554_state_t last_state;
+
+    bool initialised;
+
+    bool TCA9554_init();
+    void TCA9554_set(TCA9554_state_t value);
+    uint32_t last_reg_check_ms;
+};
+
+#endif // AP_ICENGINE_TCA9554_STARTER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_ICENGINE_ENABLED
+#define AP_ICENGINE_ENABLED 1
+#endif
+
+/*
+  optional TCA9554 I2C for starter control
+ */
+#ifndef AP_ICENGINE_TCA9554_STARTER_ENABLED
+// enable on SITL by default to ensure code is built
+#define AP_ICENGINE_TCA9554_STARTER_ENABLED AP_ICENGINE_ENABLED && (CONFIG_HAL_BOARD == HAL_BOARD_SITL)
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+  implement protocol for controlling an IO microcontroller
+
+  For bootstrapping this will initially implement the px4io protocol,
+  but will later move to an ArduPilot specific protocol
+ */
+
+#include "AP_IOMCU.h"
+
+#if HAL_WITH_IO_MCU
+
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_ROMFS/AP_ROMFS.h>
+#include <SRV_Channel/SRV_Channel.h>
+#include <RC_Channel/RC_Channel.h>
+#include <AP_RCProtocol/AP_RCProtocol.h>
+#include <AP_InternalError/AP_InternalError.h>
+#include <AP_Logger/AP_Logger.h>
+#include <AP_Arming/AP_Arming.h>
+#include <AP_BLHeli/AP_BLHeli.h>
+#include <ch.h>
+
+extern const AP_HAL::HAL &hal;
+
+// pending IO events to send, used as an event mask
+enum ioevents {
+    IOEVENT_INIT=1,
+    IOEVENT_SEND_PWM_OUT,
+    IOEVENT_FORCE_SAFETY_OFF,
+    IOEVENT_FORCE_SAFETY_ON,
+    IOEVENT_SET_ONESHOT_ON,
+    IOEVENT_SET_BRUSHED_ON,
+    IOEVENT_SET_RATES,
+    IOEVENT_ENABLE_SBUS,
+    IOEVENT_SET_HEATER_TARGET,
+    IOEVENT_SET_DEFAULT_RATE,
+    IOEVENT_SET_SAFETY_MASK,
+    IOEVENT_MIXING,
+    IOEVENT_GPIO,
+    IOEVENT_SET_OUTPUT_MODE,
+    IOEVENT_SET_DSHOT_PERIOD,
+    IOEVENT_SET_CHANNEL_MASK,
+    IOEVENT_DSHOT,
+};
+
+// max number of consecutve protocol failures we accept before raising
+// an error
+#define IOMCU_MAX_REPEATED_FAILURES 20
+
+#ifndef AP_IOMCU_FORCE_ENABLE_HEATER
+#define AP_IOMCU_FORCE_ENABLE_HEATER 0
+#endif
+
+AP_IOMCU::AP_IOMCU(AP_HAL::UARTDriver &_uart) :
+    uart(_uart)
+{
+    singleton = this;
+}
+
+#define IOMCU_DEBUG_ENABLE 0
+
+#if IOMCU_DEBUG_ENABLE
+#include <stdio.h>
+#define debug(fmt, args ...)  do {printf("%s:%d: " fmt "\n", __FUNCTION__, __LINE__, ## args); } while(0)
+#else
+#define debug(fmt, args ...)
+#endif
+
+AP_IOMCU *AP_IOMCU::singleton;
+
+/*
+  initialise library, starting thread
+ */
+void AP_IOMCU::init(void)
+{
+    // uart runs at 1.5MBit
+    uart.begin(1500*1000, 128, 128);
+    uart.set_unbuffered_writes(true);
+
+#if IOMCU_DEBUG_ENABLE
+    crc_is_ok = true;
+#else
+    AP_BoardConfig *boardconfig = AP_BoardConfig::get_singleton();
+    if ((!boardconfig || boardconfig->io_enabled() == 1) && !hal.util->was_watchdog_reset()) {
+        check_crc();
+    } else {
+        crc_is_ok = true;
+    }
+#endif
+
+    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_IOMCU::thread_main, void), "IOMCU",
+                                      1024, AP_HAL::Scheduler::PRIORITY_BOOST, 1)) {
+        AP_HAL::panic("Unable to allocate IOMCU thread");
+    }
+    initialised = true;
+}
+
+/*
+  handle event failure
+ */
+void AP_IOMCU::event_failed(uint32_t event_mask)
+{
+    // wait 0.5ms then retry
+    hal.scheduler->delay_microseconds(500);
+    chEvtSignal(thread_ctx, event_mask);
+}
+
+/*
+  main IO thread loop
+ */
+void AP_IOMCU::thread_main(void)
+{
+    thread_ctx = chThdGetSelfX();
+    chEvtSignal(thread_ctx, initial_event_mask);
+
+    uart.begin(1500*1000, 128, 128);
+    uart.set_unbuffered_writes(true);
+
+#if HAL_WITH_IO_MCU_BIDIR_DSHOT
+    uint16_t erpm_period_ms = 10; // default 100Hz
+#if HAVE_AP_BLHELI_SUPPORT
+    AP_BLHeli* blh = AP_BLHeli::get_singleton();
+    if (blh && blh->get_telemetry_rate() > 0) {
+        erpm_period_ms = constrain_int16(1000 / blh->get_telemetry_rate(), 1, 1000);
+    }
+#endif
+#endif
+    trigger_event(IOEVENT_INIT);
+
+    while (!do_shutdown) {
+        // check if we have lost contact with the IOMCU
+        const uint32_t now_ms = AP_HAL::millis();
+        if (last_reg_access_ms != 0 && now_ms - last_reg_access_ms > 1000) {
+            INTERNAL_ERROR(AP_InternalError::error_t::iomcu_reset);
+            last_reg_access_ms = 0;
+        }
+
+        eventmask_t mask = chEvtWaitAnyTimeout(~0, chTimeMS2I(10));
+
+        // check for pending IO events
+        if (mask & EVENT_MASK(IOEVENT_SEND_PWM_OUT)) {
+            send_servo_out();
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SEND_PWM_OUT);
+
+        if (mask & EVENT_MASK(IOEVENT_INIT)) {
+            // get protocol version
+            if (!read_registers(PAGE_CONFIG, 0, sizeof(config)/2, (uint16_t *)&config)) {
+                event_failed(mask);
+                continue;
+            }
+            is_chibios_backend = (config.protocol_version == IOMCU_PROTOCOL_VERSION &&
+                                  config.protocol_version2 == IOMCU_PROTOCOL_VERSION2);
+
+            DEV_PRINTF("IOMCU: 0x%lx\n", config.mcuid);
+
+            // set IO_ARM_OK and FMU_ARMED
+            if (!modify_register(PAGE_SETUP, PAGE_REG_SETUP_ARMING, 0,
+                                 P_SETUP_ARMING_IO_ARM_OK |
+                                 P_SETUP_ARMING_FMU_ARMED |
+                                 P_SETUP_ARMING_RC_HANDLING_DISABLED)) {
+                event_failed(mask);
+                continue;
+            }
+
+#if AP_IOMCU_FORCE_ENABLE_HEATER
+            if (!modify_register(PAGE_SETUP, PAGE_REG_SETUP_FEATURES, 0,
+                                 P_SETUP_FEATURES_HEATER)) {
+                event_failed(mask);
+                continue;
+            }
+#endif
+        }
+        mask &= ~EVENT_MASK(IOEVENT_INIT);
+
+        if (mask & EVENT_MASK(IOEVENT_MIXING)) {
+            if (!write_registers(PAGE_MIXING, 0, sizeof(mixing)/2, (const uint16_t *)&mixing)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_MIXING);
+
+        if (mask & EVENT_MASK(IOEVENT_FORCE_SAFETY_OFF)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_FORCE_SAFETY_OFF, FORCE_SAFETY_MAGIC)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_FORCE_SAFETY_OFF);
+
+        if (mask & EVENT_MASK(IOEVENT_FORCE_SAFETY_ON)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_FORCE_SAFETY_ON, FORCE_SAFETY_MAGIC)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_FORCE_SAFETY_ON);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_RATES)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_ALTRATE, rate.freq) ||
+                !write_register(PAGE_SETUP, PAGE_REG_SETUP_PWM_RATE_MASK, rate.chmask)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_RATES);
+
+        if (mask & EVENT_MASK(IOEVENT_ENABLE_SBUS)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_SBUS_RATE, rate.sbus_rate_hz) ||
+                !modify_register(PAGE_SETUP, PAGE_REG_SETUP_FEATURES, 0,
+                                 P_SETUP_FEATURES_SBUS1_OUT)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_ENABLE_SBUS);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_HEATER_TARGET)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_HEATER_DUTY_CYCLE, heater_duty_cycle)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_HEATER_TARGET);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_DEFAULT_RATE)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_DEFAULTRATE, rate.default_freq)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_DEFAULT_RATE);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_DSHOT_PERIOD)) {
+            if (!write_registers(PAGE_SETUP, PAGE_REG_SETUP_DSHOT_PERIOD, sizeof(dshot_rate)/2, (const uint16_t *)&dshot_rate)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_DSHOT_PERIOD);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_ONESHOT_ON)) {
+            if (!modify_register(PAGE_SETUP, PAGE_REG_SETUP_FEATURES, 0, P_SETUP_FEATURES_ONESHOT)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_ONESHOT_ON);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_BRUSHED_ON)) {
+            if (!modify_register(PAGE_SETUP, PAGE_REG_SETUP_FEATURES, 0, P_SETUP_FEATURES_BRUSHED)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_BRUSHED_ON);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_OUTPUT_MODE)) {
+            if (!write_registers(PAGE_SETUP, PAGE_REG_SETUP_OUTPUT_MODE, sizeof(mode_out)/2, (const uint16_t *)&mode_out)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_OUTPUT_MODE);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_CHANNEL_MASK)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_CHANNEL_MASK, pwm_out.channel_mask)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_CHANNEL_MASK);
+
+        if (mask & EVENT_MASK(IOEVENT_SET_SAFETY_MASK)) {
+            if (!write_register(PAGE_SETUP, PAGE_REG_SETUP_IGNORE_SAFETY, pwm_out.safety_mask)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_SET_SAFETY_MASK);
+
+        if (is_chibios_backend) {
+            if (mask & EVENT_MASK(IOEVENT_GPIO)) {
+                if (!write_registers(PAGE_GPIO, 0, sizeof(GPIO)/sizeof(uint16_t), (const uint16_t*)&GPIO)) {
+                    event_failed(mask);
+                    continue;
+                }
+            }
+            mask &= ~EVENT_MASK(IOEVENT_GPIO);
+        }
+
+        if (mask & EVENT_MASK(IOEVENT_DSHOT)) {
+            page_dshot dshot;
+            if (!dshot_command_queue.pop(dshot) || !write_registers(PAGE_DSHOT, 0, sizeof(dshot)/sizeof(uint16_t), (const uint16_t*)&dshot)) {
+                event_failed(mask);
+                continue;
+            }
+        }
+        mask &= ~EVENT_MASK(IOEVENT_DSHOT);
+
+        // check for regular timed events
+        uint32_t now = AP_HAL::millis();
+        if (now - last_rc_read_ms > 20) {
+            // read RC input at 50Hz
+            read_rc_input();
+            last_rc_read_ms = AP_HAL::millis();
+        }
+
+        if (now - last_status_read_ms > 50) {
+            // read status at 20Hz
+            read_status();
+            last_status_read_ms = AP_HAL::millis();
+            write_log();
+        }
+
+        if (now - last_servo_read_ms > 50) {
+            // read servo out at 20Hz
+            read_servo();
+            last_servo_read_ms = AP_HAL::millis();
+        }
+#if HAL_WITH_IO_MCU_BIDIR_DSHOT
+        if (AP_BoardConfig::io_dshot() && now - last_erpm_read_ms > erpm_period_ms) {
+            // read erpm at configured rate. A more efficient scheme might be to 
+            // send erpm info back with the response from a PWM send, but that would
+            // require a reworking of the registers model
+            read_erpm();
+            last_erpm_read_ms = AP_HAL::millis();
+        }
+
+        if (AP_BoardConfig::io_dshot() && now - last_telem_read_ms > 100) {
+            // read dshot telemetry at 10Hz
+            // needs to be at least 4Hz since each ESC updates at ~1Hz and we
+            // are reading 4 at a time
+            read_telem();
+            last_telem_read_ms = AP_HAL::millis();
+        }
+#endif
+        if (now - last_safety_option_check_ms > 1000) {
+            update_safety_options();
+            last_safety_option_check_ms = now;
+        }
+
+        // update failsafe pwm
+        if (pwm_out.failsafe_pwm_set != pwm_out.failsafe_pwm_sent) {
+            uint8_t set = pwm_out.failsafe_pwm_set;
+            if (write_registers(PAGE_FAILSAFE_PWM, 0, IOMCU_MAX_RC_CHANNELS, pwm_out.failsafe_pwm)) {
+                pwm_out.failsafe_pwm_sent = set;
+            }
+        }
+
+        send_rc_protocols();
+    }
+    done_shutdown = true;
+}
+
+/*
+  send servo output data
+ */
+void AP_IOMCU::send_servo_out()
+{
+#if 0
+    // simple method to test IO failsafe
+    if (AP_HAL::millis() > 30000) {
+        return;
+    }
+#endif
+    if (pwm_out.num_channels > 0) {
+        uint8_t n = pwm_out.num_channels;
+        if (rate.sbus_rate_hz == 0) {
+            n = MIN(n, 8);
+        } else {
+            n = MIN(n, IOMCU_MAX_RC_CHANNELS);
+        }
+        uint32_t now = AP_HAL::micros();
+        if (now - last_servo_out_us >= 2000 || AP_BoardConfig::io_dshot()) {
+            // don't send data at more than 500Hz except when using dshot which is more timing sensitive
+            if (write_registers(PAGE_DIRECT_PWM, 0, n, pwm_out.pwm)) {
+                last_servo_out_us = now;
+            }
+        }
+    }
+}
+
+/*
+  read RC input
+ */
+void AP_IOMCU::read_rc_input()
+{
+    uint16_t *r = (uint16_t *)&rc_input;
+    if (!read_registers(PAGE_RAW_RCIN, 0, sizeof(rc_input)/2, r)) {
+        return;
+    }
+    if (rc_input.flags_failsafe && rc().option_is_enabled(RC_Channels::Option::IGNORE_FAILSAFE)) {
+        rc_input.flags_failsafe = false;
+    }
+    if (rc_input.flags_rc_ok && !rc_input.flags_failsafe) {
+        rc_last_input_ms = AP_HAL::millis();
+    }
+}
+
+#if HAL_WITH_IO_MCU_BIDIR_DSHOT
+/*
+  read dshot erpm
+ */
+void AP_IOMCU::read_erpm()
+{
+    uint16_t *r = (uint16_t *)&dshot_erpm;
+    if (!read_registers(PAGE_RAW_DSHOT_ERPM, 0, sizeof(dshot_erpm)/2, r)) {
+        return;
+    }
+    uint8_t motor_poles = 14;
+#if HAVE_AP_BLHELI_SUPPORT
+    AP_BLHeli* blh = AP_BLHeli::get_singleton();
+    if (blh) {
+        motor_poles = blh->get_motor_poles();
+    }
+#endif
+    for (uint8_t i = 0; i < IOMCU_MAX_TELEM_CHANNELS/4; i++) {
+        for (uint8_t j = 0; j < 4; j++) {
+            const uint8_t esc_id = (i * 4 + j);
+            if (dshot_erpm.update_mask & 1U<<esc_id) {
+                update_rpm(esc_id, dshot_erpm.erpm[esc_id] * 200U / motor_poles, dshot_telem[i].error_rate[j] / 100.0);
+            }
+        }
+    }
+}
+
+/*
+  read dshot telemetry
+ */
+void AP_IOMCU::read_telem()
+{
+    struct page_dshot_telem* telem = &dshot_telem[esc_group];
+    uint16_t *r = (uint16_t *)telem;
+    iopage page = PAGE_RAW_DSHOT_TELEM_1_4;
+    switch (esc_group) {
+#if IOMCU_MAX_TELEM_CHANNELS > 4
+    case 1:
+        page = PAGE_RAW_DSHOT_TELEM_5_8;
+        break;
+#endif
+    default:
+        break;
+    }
+
+    if (!read_registers(page, 0, sizeof(page_dshot_telem)/2, r)) {
+        return;
+    }
+    for (uint i = 0; i<4; i++) {
+        TelemetryData t {
+            .temperature_cdeg = int16_t(telem->temperature_cdeg[i]),
+            .voltage = float(telem->voltage_cvolts[i]) * 0.01,
+            .current = float(telem->current_camps[i]) * 0.01,
+#if AP_EXTENDED_DSHOT_TELEM_V2_ENABLED
+            .edt2_status = telem->edt2_status[i],
+            .edt2_stress = telem->edt2_stress[i],
+#endif
+        };
+        update_telem_data(esc_group * 4 + i, t, telem->types[i]);
+    }
+    esc_group = (esc_group + 1) % (IOMCU_MAX_TELEM_CHANNELS / 4);
+}
+#endif
+
+/*
+  read status registers
+ */
+void AP_IOMCU::read_status()
+{
+    uint16_t *r = (uint16_t *)&reg_status;
+    if (!read_registers(PAGE_STATUS, 0, sizeof(reg_status)/2, r)) {
+        read_status_errors++;
+        if (read_status_errors == 20 && last_iocmu_timestamp_ms != 0) {
+            // the IOMCU has stopped responding to status requests
+            INTERNAL_ERROR(AP_InternalError::error_t::iomcu_reset);
+        }
+        return;
+    }
+    if (read_status_ok == 0) {
+        // reset error count on first good read
+        read_status_errors = 0;
+    }
+    read_status_ok++;
+
+    check_iomcu_reset();
+
+    if (reg_status.flag_safety_off == 0) {
+        // if the IOMCU is indicating that safety is on, then force a
+        // re-check of the safety options. This copes with a IOMCU reset
+        last_safety_options = 0xFFFF;
+
+        // also check if the safety should be definately off.
+        AP_BoardConfig *boardconfig = AP_BoardConfig::get_singleton();
+        if (!boardconfig) {
+            return;
+        }
+        uint16_t options = boardconfig->get_safety_button_options();
+        if (safety_forced_off && (options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_ON) == 0) {
+            // the safety has been forced off, and the user has asked
+            // that the button can never be used, so there should be
+            // no way for the safety to be on except a IOMCU
+            // reboot. Force safety off again
+            force_safety_off();
+        }
+    }
+}
+
+void AP_IOMCU::write_log()
+{
+    uint32_t now = AP_HAL::millis();
+    if (now - last_log_ms >= 1000U) {
+        last_log_ms = now;
+#if HAL_LOGGING_ENABLED
+        if (AP_Logger::get_singleton()) {
+// @LoggerMessage: IOMC
+// @Description: IOMCU diagnostic information
+// @Field: TimeUS: Time since system startup
+// @Field: RSErr: Status Read error count (zeroed on successful read)
+// @Field: Mem: Free memory
+// @Field: TS: IOMCU uptime
+// @Field: NPkt: Number of packets received by IOMCU
+// @Field: Nerr: Protocol failures on MCU side
+// @Field: Nerr2: Reported number of failures on IOMCU side
+// @Field: NDel: Number of delayed packets received by MCU
+            AP::logger().WriteStreaming("IOMC", "TimeUS,RSErr,Mem,TS,NPkt,Nerr,Nerr2,NDel", "QHHIIIII",
+                               AP_HAL::micros64(),
+                               read_status_errors,
+                               reg_status.freemem,
+                               reg_status.timestamp_ms,
+                               reg_status.total_pkts,
+                               total_errors,
+                               reg_status.num_errors,
+                               num_delayed);
+        }
+#endif  // HAL_LOGGING_ENABLED
+#if IOMCU_DEBUG_ENABLE
+        static uint32_t last_io_print;
+        if (now - last_io_print >= 5000) {
+            last_io_print = now;
+            debug("t=%lu num=%lu mem=%u mstack=%u pstack=%u terr=%lu nerr=%lu crc=%u opcode=%u rd=%u wr=%u ur=%u ndel=%lu\n",
+                  now,
+                  reg_status.total_pkts,
+                  reg_status.freemem,
+                  reg_status.freemstack,
+                  reg_status.freepstack,
+                  total_errors,
+                  reg_status.num_errors,
+                  reg_status.err_crc,
+                  reg_status.err_bad_opcode,
+                  reg_status.err_read,
+                  reg_status.err_write,
+                  reg_status.err_uart,
+                  num_delayed);
+        }
+#endif // IOMCU_DEBUG_ENABLE
+    }
+}
+
+
+/*
+  read servo output values
+ */
+void AP_IOMCU::read_servo()
+{
+    if (pwm_out.num_channels > 0) {
+        read_registers(PAGE_SERVOS, 0, pwm_out.num_channels, pwm_in.pwm);
+    }
+}
+
+
+/*
+  discard any pending input
+ */
+void AP_IOMCU::discard_input(void)
+{
+    uart.discard_input();
+}
+
+/*
+  write a packet, retrying as needed
+ */
+size_t AP_IOMCU::write_wait(const uint8_t *pkt, uint8_t len)
+{
+    uint8_t wait_count = 5;
+    size_t ret;
+    do {
+        ret = uart.write(pkt, len);
+        if (ret == 0) {
+            hal.scheduler->delay_microseconds(100);
+            num_delayed++;
+        }
+    } while (ret == 0 && wait_count--);
+    return ret;
+}
+
+/*
+  read count 16 bit registers
+*/
+bool AP_IOMCU::read_registers(uint8_t page, uint8_t offset, uint8_t count, uint16_t *regs)
+{
+    while (count > PKT_MAX_REGS) {
+        if (!read_registers(page, offset, PKT_MAX_REGS, regs)) {
+            return false;
+        }
+        offset += PKT_MAX_REGS;
+        count -= PKT_MAX_REGS;
+        regs += PKT_MAX_REGS;
+    }
+
+    IOPacket pkt;
+
+    discard_input();
+
+    memset(&pkt.regs[0], 0, count*2);
+
+    pkt.code = CODE_READ;
+    pkt.count = count;
+    pkt.page = page;
+    pkt.offset = offset;
+    pkt.crc = 0;
+
+    uint8_t pkt_size = pkt.get_size();
+    if (is_chibios_backend) {
+        /*
+          the original read protocol is a bit strange, as it
+          unnecessarily sends the same size packet that it expects to
+          receive. This means reading a large number of registers
+          wastes a lot of serial bandwidth. We avoid this overhead
+          when we know we are talking to a ChibiOS backend
+        */
+        pkt_size = 4;
+    }
+
+    pkt.crc = crc_crc8((const uint8_t *)&pkt, pkt_size);
+
+    size_t ret = write_wait((uint8_t *)&pkt, pkt_size);
+
+    if (ret != pkt_size) {
+        debug("write failed1 %u %u %u\n", unsigned(pkt_size), page, offset);
+        protocol_fail_count++;
+        return false;
+    }
+
+    // wait for the expected number of reply bytes or timeout
+    if (!uart.wait_timeout(count*2+4, 10)) {
+        debug("t=%lu timeout read page=%u offset=%u count=%u avail=%u\n",
+              AP_HAL::millis(), page, offset, count, uart.available());
+        protocol_fail_count++;
+        return false;
+    }
+
+    uint8_t *b = (uint8_t *)&pkt;
+    uint8_t n = uart.available();
+    if (n < offsetof(struct IOPacket, regs)) {
+        debug("t=%lu small pkt %u\n", AP_HAL::millis(), n);
+        protocol_fail_count++;
+        return false;
+    }
+    if (pkt.get_size() != n) {
+        debug("t=%lu bad len %u %u\n", AP_HAL::millis(), n, pkt.get_size());
+        protocol_fail_count++;
+        return false;
+    }
+    uart.read(b, MIN(n, sizeof(pkt)));
+
+    uint8_t got_crc = pkt.crc;
+    pkt.crc = 0;
+    uint8_t expected_crc = crc_crc8((const uint8_t *)&pkt, pkt.get_size());
+    if (got_crc != expected_crc) {
+        debug("t=%lu bad crc %02x should be %02x n=%u %u/%u/%u\n",
+              AP_HAL::millis(), got_crc, expected_crc,
+              n, page, offset, count);
+        protocol_fail_count++;
+        return false;
+    }
+
+    if (pkt.code != CODE_SUCCESS) {
+        debug("bad code %02x read %u/%u/%u\n", pkt.code, page, offset, count);
+        protocol_fail_count++;
+        return false;
+    }
+    if (pkt.count < count) {
+        debug("bad count %u read %u/%u/%u n=%u\n", pkt.count, page, offset, count, n);
+        protocol_fail_count++;
+        return false;
+    }
+    memcpy(regs, pkt.regs, count*2);
+    if (protocol_fail_count > IOMCU_MAX_REPEATED_FAILURES) {
+        handle_repeated_failures();
+    }
+    total_errors += protocol_fail_count;
+    protocol_fail_count = 0;
+    protocol_count++;
+    last_reg_access_ms = AP_HAL::millis();
+    return true;
+}
+
+/*
+  write count 16 bit registers
+*/
+bool AP_IOMCU::write_registers(uint8_t page, uint8_t offset, uint8_t count, const uint16_t *regs)
+{
+    // The use of offset is very, very evil - it can either be a command within the page
+    // or a genuine offset, offsets within PAGE_SETUP are assumed to be commands, otherwise to be an
+    // actual offset
+    while (page != PAGE_SETUP && count > PKT_MAX_REGS) {
+        if (!write_registers(page, offset, PKT_MAX_REGS, regs)) {
+            return false;
+        }
+        offset += PKT_MAX_REGS;
+        count -= PKT_MAX_REGS;
+        regs += PKT_MAX_REGS;
+    }
+    IOPacket pkt;
+
+    discard_input();
+
+    memset(&pkt.regs[0], 0, count*2);
+
+    pkt.code = CODE_WRITE;
+    pkt.count = count;
+    pkt.page = page;
+    pkt.offset = offset;
+    pkt.crc = 0;
+    memcpy(pkt.regs, regs, 2*count);
+    pkt.crc = crc_crc8((const uint8_t *)&pkt, pkt.get_size());
+
+    const uint8_t pkt_size = pkt.get_size();
+    size_t ret = write_wait((uint8_t *)&pkt, pkt_size);
+
+    if (ret != pkt_size) {
+        debug("write failed2 %u %u %u %u\n", pkt_size, page, offset, ret);
+        protocol_fail_count++;
+        return false;
+    }
+
+    // wait for the expected number of reply bytes or timeout
+    if (!uart.wait_timeout(4, 10)) {
+        debug("no reply for %u/%u/%u\n", page, offset, count);
+        protocol_fail_count++;
+        return false;
+    }
+
+    uint8_t *b = (uint8_t *)&pkt;
+    uint8_t n = uart.available();
+    for (uint8_t i=0; i<n; i++) {
+        if (i < sizeof(pkt)) {
+            b[i] = uart.read();
+        }
+    }
+
+    if (pkt.code != CODE_SUCCESS) {
+        debug("bad code %02x write %u/%u/%u %02x/%02x n=%u\n",
+              pkt.code, page, offset, count,
+              pkt.page, pkt.offset, n);
+        protocol_fail_count++;
+        return false;
+    }
+    uint8_t got_crc = pkt.crc;
+    pkt.crc = 0;
+    uint8_t expected_crc = crc_crc8((const uint8_t *)&pkt, pkt.get_size());
+    if (got_crc != expected_crc) {
+        debug("bad crc %02x should be %02x\n", got_crc, expected_crc);
+        protocol_fail_count++;
+        return false;
+    }
+    if (protocol_fail_count > IOMCU_MAX_REPEATED_FAILURES) {
+        handle_repeated_failures();
+    }
+    total_errors += protocol_fail_count;
+    protocol_fail_count = 0;
+    protocol_count++;
+
+    last_reg_access_ms = AP_HAL::millis();
+
+    return true;
+}
+
+// modify a single register
+bool AP_IOMCU::modify_register(uint8_t page, uint8_t offset, uint16_t clearbits, uint16_t setbits)
+{
+    uint16_t v = 0;
+    if (!read_registers(page, offset, 1, &v)) {
+        return false;
+    }
+    uint16_t v2 = (v & ~clearbits) | setbits;
+    if (v2 == v) {
+        return true;
+    }
+    return write_registers(page, offset, 1, &v2);
+}
+
+void AP_IOMCU::write_channel(uint8_t chan, uint16_t pwm)
+{
+    if (chan >= IOMCU_MAX_RC_CHANNELS) {    // could be SBUS out
+        return;
+    }
+    if (chan >= pwm_out.num_channels) {
+        pwm_out.num_channels = chan+1;
+    }
+    pwm_out.pwm[chan] = pwm;
+    if (!corked) {
+        push();
+    }
+}
+
+// trigger an ioevent
+void AP_IOMCU::trigger_event(uint8_t event)
+{
+    if (thread_ctx != nullptr) {
+        chEvtSignal(thread_ctx, EVENT_MASK(event));
+    } else {
+        // thread isn't started yet, trigger this event once it is started
+        initial_event_mask |= EVENT_MASK(event);
+    }
+}
+
+// get state of safety switch
+AP_HAL::Util::safety_state AP_IOMCU::get_safety_switch_state(void) const
+{
+    return reg_status.flag_safety_off?AP_HAL::Util::SAFETY_ARMED:AP_HAL::Util::SAFETY_DISARMED;
+}
+
+// force safety on
+bool AP_IOMCU::force_safety_on(void)
+{
+    trigger_event(IOEVENT_FORCE_SAFETY_ON);
+    safety_forced_off = false;
+    return true;
+}
+
+// force safety off
+void AP_IOMCU::force_safety_off(void)
+{
+    trigger_event(IOEVENT_FORCE_SAFETY_OFF);
+    safety_forced_off = true;
+}
+
+// read from one channel
+uint16_t AP_IOMCU::read_channel(uint8_t chan)
+{
+    return pwm_in.pwm[chan];
+}
+
+// cork output
+void AP_IOMCU::cork(void)
+{
+    corked = true;
+}
+
+// push output
+void AP_IOMCU::push(void)
+{
+    trigger_event(IOEVENT_SEND_PWM_OUT);
+    corked = false;
+}
+
+// set output frequency
+void AP_IOMCU::set_freq(uint16_t chmask, uint16_t freq)
+{
+    // ensure mask is legal for the timer layout
+    for (uint8_t i=0; i<ARRAY_SIZE(ch_masks); i++) {
+        if (chmask & ch_masks[i]) {
+            chmask |= ch_masks[i];
+        }
+    }
+    rate.freq = freq;
+    rate.chmask |= chmask;
+    trigger_event(IOEVENT_SET_RATES);
+}
+
+// get output frequency
+uint16_t AP_IOMCU::get_freq(uint16_t chan)
+{
+    if ((1U<<chan) & rate.chmask) {
+        return rate.freq;
+    }
+    return rate.default_freq;
+}
+
+// enable SBUS out
+bool AP_IOMCU::enable_sbus_out(uint16_t rate_hz)
+{
+    rate.sbus_rate_hz = rate_hz;
+    trigger_event(IOEVENT_ENABLE_SBUS);
+    return true;
+}
+
+/*
+  check for new RC input
+*/
+bool AP_IOMCU::check_rcinput(uint32_t &last_frame_us, uint8_t &num_channels, uint16_t *channels, uint8_t max_chan)
+{
+    if (last_frame_us != uint32_t(rc_last_input_ms * 1000U)) {
+        num_channels = MIN(MIN(rc_input.count, IOMCU_MAX_RC_CHANNELS), max_chan);
+        memcpy(channels, rc_input.pwm, num_channels*2);
+        last_frame_us = uint32_t(rc_last_input_ms * 1000U);
+        return true;
+    }
+    return false;
+}
+
+// set IMU heater target
+void AP_IOMCU::set_heater_duty_cycle(uint8_t duty_cycle)
+{
+    heater_duty_cycle = duty_cycle;
+    trigger_event(IOEVENT_SET_HEATER_TARGET);
+}
+
+// set default output rate
+void AP_IOMCU::set_default_rate(uint16_t rate_hz)
+{
+    if (rate.default_freq != rate_hz) {
+        rate.default_freq = rate_hz;
+        trigger_event(IOEVENT_SET_DEFAULT_RATE);
+    }
+}
+
+// setup for oneshot mode
+void AP_IOMCU::set_oneshot_mode(void)
+{
+    trigger_event(IOEVENT_SET_ONESHOT_ON);
+    rate.oneshot_enabled = true;
+}
+
+// setup for brushed mode
+void AP_IOMCU::set_brushed_mode(void)
+{
+    trigger_event(IOEVENT_SET_BRUSHED_ON);
+    rate.brushed_enabled = true;
+}
+
+#if HAL_DSHOT_ENABLED
+// directly set the dshot rate - period_us is the dshot tick period_us and drate is the number
+// of dshot ticks per main loop cycle. These values are calculated by RCOutput::set_dshot_rate()
+// if the backend is free running then then period_us is fixed at 1000us and drate is 0
+void AP_IOMCU::set_dshot_period(uint16_t period_us, uint8_t drate)
+{
+    dshot_rate.period_us = period_us;
+    dshot_rate.rate = drate;
+    trigger_event(IOEVENT_SET_DSHOT_PERIOD);
+}
+
+// set the dshot esc_type
+void AP_IOMCU::set_dshot_esc_type(AP_HAL::RCOutput::DshotEscType dshot_esc_type)
+{
+    mode_out.esc_type = uint16_t(dshot_esc_type);
+    trigger_event(IOEVENT_SET_OUTPUT_MODE);
+}
+
+// set output mode
+void AP_IOMCU::set_telem_request_mask(uint32_t mask)
+{
+    page_dshot dshot {
+        .telem_mask = uint16_t(mask)
+    };
+    dshot_command_queue.push(dshot);
+    trigger_event(IOEVENT_DSHOT);
+}
+
+void AP_IOMCU::send_dshot_command(uint8_t command, uint8_t chan, uint32_t command_timeout_ms, uint16_t repeat_count, bool priority)
+{
+    page_dshot dshot {
+        .command = command,
+        .chan = chan,
+        .command_timeout_ms = command_timeout_ms,
+        .repeat_count = uint8_t(repeat_count),
+        .priority = priority
+    };
+    dshot_command_queue.push(dshot);
+    trigger_event(IOEVENT_DSHOT);
+}
+#endif
+
+// set output mode
+void AP_IOMCU::set_output_mode(uint16_t mask, uint16_t mode)
+{
+    mode_out.mask = mask;
+    mode_out.mode = mode;
+    trigger_event(IOEVENT_SET_OUTPUT_MODE);
+}
+
+// set output mode
+void AP_IOMCU::set_bidir_dshot_mask(uint16_t mask)
+{
+    mode_out.bdmask = mask;
+    trigger_event(IOEVENT_SET_OUTPUT_MODE);
+}
+
+AP_HAL::RCOutput::output_mode AP_IOMCU::get_output_mode(uint8_t& mask) const
+{
+    mask = reg_status.rcout_mask;
+    return AP_HAL::RCOutput::output_mode(reg_status.rcout_mode);
+}
+
+// setup channels
+void  AP_IOMCU::enable_ch(uint8_t ch)
+{
+    if (!(pwm_out.channel_mask & (1U << ch))) {
+        pwm_out.channel_mask |= (1U << ch);
+        trigger_event(IOEVENT_SET_CHANNEL_MASK);
+    }
+}
+
+void  AP_IOMCU::disable_ch(uint8_t ch)
+{
+    if (pwm_out.channel_mask & (1U << ch)) {
+        pwm_out.channel_mask &= ~(1U << ch);
+        trigger_event(IOEVENT_SET_CHANNEL_MASK);
+    }
+}
+
+// handling of BRD_SAFETYOPTION parameter
+void AP_IOMCU::update_safety_options(void)
+{
+    AP_BoardConfig *boardconfig = AP_BoardConfig::get_singleton();
+    if (!boardconfig) {
+        return;
+    }
+    uint16_t desired_options = 0;
+    uint16_t options = boardconfig->get_safety_button_options();
+    if (!(options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_OFF)) {
+        desired_options |= P_SETUP_ARMING_SAFETY_DISABLE_OFF;
+    }
+    if (!(options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_ON)) {
+        desired_options |= P_SETUP_ARMING_SAFETY_DISABLE_ON;
+    }
+    if (!(options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_ARMED) && AP::arming().is_armed()) {
+        desired_options |= (P_SETUP_ARMING_SAFETY_DISABLE_ON | P_SETUP_ARMING_SAFETY_DISABLE_OFF);
+    }
+    if (last_safety_options != desired_options) {
+        uint16_t mask = (P_SETUP_ARMING_SAFETY_DISABLE_ON | P_SETUP_ARMING_SAFETY_DISABLE_OFF);
+        uint32_t bits_to_set = desired_options & mask;
+        uint32_t bits_to_clear = (~desired_options) & mask;
+        if (modify_register(PAGE_SETUP, PAGE_REG_SETUP_ARMING, bits_to_clear, bits_to_set)) {
+            last_safety_options = desired_options;
+        }
+    }
+}
+
+// update enabled RC protocols mask
+void AP_IOMCU::send_rc_protocols()
+{
+    const uint32_t v = rc().enabled_protocols();
+    if (last_rc_protocols == v) {
+        return;
+    }
+    if (write_registers(PAGE_SETUP, PAGE_REG_SETUP_RC_PROTOCOLS, 2, (uint16_t *)&v)) {
+        last_rc_protocols = v;
+    }
+}
+
+/*
+  check ROMFS firmware against CRC on IOMCU, and if incorrect then upload new firmware
+ */
+bool AP_IOMCU::check_crc(void)
+{
+    // flash size minus 4k bootloader
+	const uint32_t flash_size = 0x10000 - 0x1000;
+    const char *path = AP_BoardConfig::io_dshot() ? dshot_fw_name : fw_name;
+
+    fw = AP_ROMFS::find_decompress(path, fw_size);
+
+    if (!fw) {
+        DEV_PRINTF("failed to find %s\n", path);
+        return false;
+    }
+    uint32_t crc = crc32_small(0, fw, fw_size);
+
+    // pad CRC to max size
+	for (uint32_t i=0; i<flash_size-fw_size; i++) {
+		uint8_t b = 0xff;
+        crc = crc32_small(crc, &b, 1);
+	}
+
+    uint32_t io_crc = 0;
+    uint8_t tries = 32;
+    while (tries--) {
+        if (read_registers(PAGE_SETUP, PAGE_REG_SETUP_CRC, 2, (uint16_t *)&io_crc)) {
+            break;
+        }
+    }
+    if (io_crc == crc) {
+        DEV_PRINTF("IOMCU: CRC ok\n");
+        crc_is_ok = true;
+        AP_ROMFS::free(fw);
+        fw = nullptr;
+        return true;
+    } else {
+        DEV_PRINTF("IOMCU: CRC mismatch expected: 0x%X got: 0x%X\n", (unsigned)crc, (unsigned)io_crc);
+    }
+
+    const uint16_t magic = REBOOT_BL_MAGIC;
+    write_registers(PAGE_SETUP, PAGE_REG_SETUP_REBOOT_BL, 1, &magic);
+
+    // avoid internal error on fw upload delay
+    last_reg_access_ms = 0;
+
+    if (!upload_fw()) {
+        AP_ROMFS::free(fw);
+        fw = nullptr;
+        AP_BoardConfig::config_error("Failed to update IO firmware");
+    }
+
+    AP_ROMFS::free(fw);
+    fw = nullptr;
+    return false;
+}
+
+/*
+  set the pwm to use when in FMU failsafe
+ */
+void AP_IOMCU::set_failsafe_pwm(uint16_t chmask, uint16_t period_us)
+{
+    bool changed = false;
+    for (uint8_t i=0; i<IOMCU_MAX_RC_CHANNELS; i++) {
+        if (chmask & (1U<<i)) {
+            if (pwm_out.failsafe_pwm[i] != period_us) {
+                pwm_out.failsafe_pwm[i] = period_us;
+                changed = true;
+            }
+        }
+    }
+    if (changed) {
+        pwm_out.failsafe_pwm_set++;
+    }
+}
+
+
+// set mask of channels that ignore safety state
+void AP_IOMCU::set_safety_mask(uint16_t chmask)
+{
+    if (pwm_out.safety_mask != chmask) {
+        pwm_out.safety_mask = chmask;
+        trigger_event(IOEVENT_SET_SAFETY_MASK);
+    }
+}
+
+/*
+  check that IO is healthy. This should be used in arming checks
+ */
+bool AP_IOMCU::healthy(void)
+{
+    return crc_is_ok && protocol_fail_count == 0 && !detected_io_reset && read_status_errors < read_status_ok/128U;
+}
+
+/*
+  shutdown protocol, ready for reboot
+ */
+void AP_IOMCU::shutdown(void)
+{
+    do_shutdown = true;
+    while (!done_shutdown) {
+        hal.scheduler->delay(1);
+    }
+}
+
+/*
+  reboot IOMCU
+ */
+void AP_IOMCU::soft_reboot(void)
+{
+    const uint16_t magic = REBOOT_BL_MAGIC;
+    write_registers(PAGE_SETUP, PAGE_REG_SETUP_REBOOT_BL, 1, &magic);
+}
+
+
+/*
+  request bind on a DSM radio
+ */
+void AP_IOMCU::bind_dsm(uint8_t mode)
+{
+    if (!is_chibios_backend || AP::arming().is_armed()) {
+        // only with ChibiOS IO firmware, and disarmed
+        return;
+    }
+    uint16_t reg = mode;
+    write_registers(PAGE_SETUP, PAGE_REG_SETUP_DSM_BIND, 1, &reg);
+}
+
+/*
+  setup for mixing. This allows fixed wing aircraft to fly in manual
+  mode if the FMU dies
+ */
+bool AP_IOMCU::setup_mixing(RCMapper *rcmap, int8_t override_chan,
+                            float mixing_gain, uint16_t manual_rc_mask)
+{
+    if (!is_chibios_backend) {
+        return false;
+    }
+    bool changed = false;
+#define MIX_UPDATE(a,b) do { if ((a) != (b)) { a = b; changed = true; }} while (0)
+
+    // update mixing structure, checking for changes
+    for (uint8_t i=0; i<IOMCU_MAX_RC_CHANNELS; i++) {
+        const SRV_Channel *c = SRV_Channels::srv_channel(i);
+        if (!c) {
+            continue;
+        }
+        MIX_UPDATE(mixing.servo_trim[i], c->get_trim());
+        MIX_UPDATE(mixing.servo_min[i], c->get_output_min());
+        MIX_UPDATE(mixing.servo_max[i], c->get_output_max());
+        MIX_UPDATE(mixing.servo_function[i], c->get_function());
+        MIX_UPDATE(mixing.servo_reversed[i], c->get_reversed());
+    }
+    // update RCMap
+    MIX_UPDATE(mixing.rc_channel[0], rcmap->roll());
+    MIX_UPDATE(mixing.rc_channel[1], rcmap->pitch());
+    MIX_UPDATE(mixing.rc_channel[2], rcmap->throttle());
+    MIX_UPDATE(mixing.rc_channel[3], rcmap->yaw());
+    for (uint8_t i=0; i<4; i++) {
+        const RC_Channel *c = RC_Channels::rc_channel(mixing.rc_channel[i]-1);
+        if (!c) {
+            continue;
+        }
+        MIX_UPDATE(mixing.rc_min[i], c->get_radio_min());
+        MIX_UPDATE(mixing.rc_max[i], c->get_radio_max());
+        MIX_UPDATE(mixing.rc_trim[i], c->get_radio_trim());
+        MIX_UPDATE(mixing.rc_reversed[i], c->get_reverse());
+
+        // cope with reversible throttle
+        if (i == 2 && c->get_type() == RC_Channel::ControlType::ANGLE) {
+            MIX_UPDATE(mixing.throttle_is_angle, 1);
+        } else {
+            MIX_UPDATE(mixing.throttle_is_angle, 0);
+        }
+    }
+
+    MIX_UPDATE(mixing.rc_chan_override, override_chan);
+    MIX_UPDATE(mixing.mixing_gain, (uint16_t)(mixing_gain*1000));
+    MIX_UPDATE(mixing.manual_rc_mask, manual_rc_mask);
+
+    // and enable
+    MIX_UPDATE(mixing.enabled, 1);
+    if (changed) {
+        trigger_event(IOEVENT_MIXING);
+    }
+    return true;
+}
+
+/*
+  return the RC protocol name
+ */
+const char *AP_IOMCU::get_rc_protocol(void)
+{
+    if (!is_chibios_backend) {
+        return nullptr;
+    }
+    return AP_RCProtocol::protocol_name_from_protocol((AP_RCProtocol::rcprotocol_t)rc_input.rc_protocol);
+}
+
+/*
+  we have had a series of repeated protocol failures to the
+  IOMCU. This may indicate that the IOMCU has been reset (possibly due
+  to a watchdog).
+ */
+void AP_IOMCU::handle_repeated_failures(void)
+{
+    if (protocol_count < 100) {
+        // we're just starting up, ignore initial failures caused by
+        // initial sync with IOMCU
+        return;
+    }
+    INTERNAL_ERROR(AP_InternalError::error_t::iomcu_fail);
+}
+
+/*
+  check for IOMCU reset (possibly due to a watchdog).
+ */
+void AP_IOMCU::check_iomcu_reset(void)
+{
+    if (last_iocmu_timestamp_ms == 0) {
+        // initialisation
+        last_iocmu_timestamp_ms = reg_status.timestamp_ms;
+        DEV_PRINTF("IOMCU startup\n");
+        return;
+    }
+    uint32_t dt_ms = reg_status.timestamp_ms - last_iocmu_timestamp_ms;
+#if IOMCU_DEBUG_ENABLE
+    const uint32_t ts1 = last_iocmu_timestamp_ms;
+#endif
+    // when we are in an expected delay allow for a larger time
+    // delta. This copes with flash erase, such as bootloader update
+    const uint32_t max_delay = hal.scheduler->in_expected_delay()?8000:500;
+    last_iocmu_timestamp_ms = reg_status.timestamp_ms;
+
+    if (dt_ms < max_delay) {
+        // all OK
+        last_safety_off = reg_status.flag_safety_off;
+        return;
+    }
+    detected_io_reset = true;
+    INTERNAL_ERROR(AP_InternalError::error_t::iomcu_reset);
+    debug("IOMCU reset t=%u %u %u dt=%u\n",
+          unsigned(AP_HAL::millis()), unsigned(ts1), unsigned(reg_status.timestamp_ms), unsigned(dt_ms));
+
+    bool have_forced_off = false;
+    if (last_safety_off && !reg_status.flag_safety_off && AP::arming().is_armed()) {
+        AP_BoardConfig *boardconfig = AP_BoardConfig::get_singleton();
+        uint16_t options = boardconfig?boardconfig->get_safety_button_options():0;
+        if (safety_forced_off || (options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_ARMED) == 0) {
+            // IOMCU has reset while armed with safety off - force it off
+            // again so we can keep flying
+            have_forced_off = true;
+            force_safety_off();
+        }
+    }
+    if (!have_forced_off) {
+        last_safety_off = reg_status.flag_safety_off;
+    }
+
+    // we need to ensure the mixer data and the rates are sent over to
+    // the IOMCU
+    if (mixing.enabled) {
+        trigger_event(IOEVENT_MIXING);
+    }
+    trigger_event(IOEVENT_SET_RATES);
+    trigger_event(IOEVENT_SET_DEFAULT_RATE);
+    trigger_event(IOEVENT_SET_DSHOT_PERIOD);
+    trigger_event(IOEVENT_SET_OUTPUT_MODE);
+    trigger_event(IOEVENT_SET_CHANNEL_MASK);
+    if (rate.oneshot_enabled) {
+        trigger_event(IOEVENT_SET_ONESHOT_ON);
+    }
+    if (rate.brushed_enabled) {
+        trigger_event(IOEVENT_SET_BRUSHED_ON);
+    }
+    if (rate.sbus_rate_hz) {
+        trigger_event(IOEVENT_ENABLE_SBUS);
+    }
+    if (pwm_out.safety_mask) {
+        trigger_event(IOEVENT_SET_SAFETY_MASK);
+    }
+    last_rc_protocols = 0;
+}
+
+// Check if pin number is valid and configured for GPIO
+bool AP_IOMCU::valid_GPIO_pin(uint8_t pin) const
+{
+    // sanity check pin number
+    if (!convert_pin_number(pin)) {
+        return false;
+    }
+
+    // check pin is enabled as GPIO
+    return ((GPIO.channel_mask & (1U << pin)) != 0);
+}
+
+// convert external pin numbers 101 to 108 to internal 0 to 7
+bool AP_IOMCU::convert_pin_number(uint8_t& pin) const
+{
+    if (pin < 101 || pin > 108) {
+        return false;
+    }
+    pin -= 101;
+    return true;
+}
+
+// set GPIO mask of channels setup for output
+void AP_IOMCU::set_GPIO_mask(uint8_t mask)
+{
+    if (mask == GPIO.channel_mask) {
+        return;
+    }
+    GPIO.channel_mask = mask;
+    trigger_event(IOEVENT_GPIO);
+}
+
+// Get GPIO mask of channels setup for output
+uint8_t AP_IOMCU::get_GPIO_mask() const
+{
+    return GPIO.channel_mask;
+}
+
+// write to a output pin
+void AP_IOMCU::write_GPIO(uint8_t pin, bool value)
+{
+    if (!convert_pin_number(pin)) {
+        return;
+    }
+    if (value == ((GPIO.output_mask & (1U << pin)) != 0)) {
+        return;
+    }
+    if (value) {
+        GPIO.output_mask |= (1U << pin);
+    } else {
+        GPIO.output_mask &= ~(1U << pin);
+    }
+    trigger_event(IOEVENT_GPIO);
+}
+
+// Read the last output value send to the GPIO pin
+// This is not a real read of the actual pin
+// This allows callers to check for state change
+uint8_t AP_IOMCU::read_virtual_GPIO(uint8_t pin) const
+{
+    if (!convert_pin_number(pin)) {
+        return 0;
+    }
+    return (GPIO.output_mask & (1U << pin)) != 0;
+}
+
+// toggle a output pin
+void AP_IOMCU::toggle_GPIO(uint8_t pin)
+{
+    if (!convert_pin_number(pin)) {
+        return;
+    }
+    GPIO.output_mask ^= (1U << pin);
+    trigger_event(IOEVENT_GPIO);
+}
+
+
+namespace AP {
+    AP_IOMCU *iomcu(void) {
+        return AP_IOMCU::get_singleton();
+    }
+};
+
+#endif // HAL_WITH_IO_MCU
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+  implement protocol for controlling an IO microcontroller
+
+  For bootstrapping this will initially implement the px4io protocol,
+  but will later move to an ArduPilot specific protocol
+ */
+#pragma once
+
+#include <AP_HAL/AP_HAL.h>
+
+#if HAL_WITH_IO_MCU
+
+#include "iofirmware/ioprotocol.h"
+#include <AP_RCMapper/AP_RCMapper.h>
+#include <AP_HAL/RCOutput.h>
+#include <AP_ESC_Telem/AP_ESC_Telem_Backend.h>
+
+typedef uint32_t eventmask_t;
+typedef struct ch_thread thread_t;
+
+class AP_IOMCU
+#ifdef HAL_WITH_ESC_TELEM
+  : public AP_ESC_Telem_Backend
+#endif
+{
+public:
+    AP_IOMCU(AP_HAL::UARTDriver &uart);
+
+    void init(void);
+
+    // write to one channel
+    void write_channel(uint8_t chan, uint16_t pwm);
+
+    // read from one channel
+    uint16_t read_channel(uint8_t chan);
+
+    // cork output
+    void cork(void);
+
+    // push output
+    void push(void);
+
+    // set output frequency
+    void set_freq(uint16_t chmask, uint16_t freq);
+
+    // get output frequency
+    uint16_t get_freq(uint16_t chan);
+
+    // get state of safety switch
+    AP_HAL::Util::safety_state get_safety_switch_state(void) const;
+
+    // force safety on
+    bool force_safety_on(void);
+
+    // force safety off
+    void force_safety_off(void);
+
+    // set mask of channels that ignore safety state
+    void set_safety_mask(uint16_t chmask);
+
+    // set PWM of channels when in FMU failsafe
+    void set_failsafe_pwm(uint16_t chmask, uint16_t period_us);
+
+    /*
+      enable sbus output
+    */
+    bool enable_sbus_out(uint16_t rate_hz);
+
+    /*
+      check for new RC input
+     */
+    bool check_rcinput(uint32_t &last_frame_us, uint8_t &num_channels, uint16_t *channels, uint8_t max_channels);
+
+    // Do DSM receiver binding
+    void bind_dsm(uint8_t mode);
+
+    // get the name of the RC protocol
+    const char *get_rc_protocol(void);
+
+    // get receiver RSSI
+    int16_t get_RSSI(void) const {
+        return rc_input.rssi;
+    }
+    
+    /*
+      get servo rail voltage adc counts
+     */
+    uint16_t get_vservo_adc_count(void) const { return reg_status.vservo; }
+
+    /*
+      get rssi voltage adc counts
+     */
+    uint16_t get_vrssi_adc_count(void) const { return reg_status.vrssi; }
+
+    // set target for IMU heater
+    void set_heater_duty_cycle(uint8_t duty_cycle);
+
+    // set default output rate
+    void set_default_rate(uint16_t rate_hz);
+
+    // set to oneshot mode
+    void set_oneshot_mode(void);
+
+    // set to brushed mode
+    void set_brushed_mode(void);
+
+    // set output mode
+    void set_output_mode(uint16_t mask, uint16_t mode);
+
+    // set bi-directional mask
+    void set_bidir_dshot_mask(uint16_t mask);
+
+    // get output mode
+    AP_HAL::RCOutput::output_mode get_output_mode(uint8_t& mask) const;
+
+    // MCUID
+    uint32_t get_mcu_id() const { return config.mcuid; }
+
+    // CPUID
+    uint32_t get_cpu_id() const { return config.cpuid; }
+
+#if HAL_DSHOT_ENABLED
+    // set dshot output period
+    void set_dshot_period(uint16_t period_us, uint8_t drate);
+
+    // set telem request mask
+    void set_telem_request_mask(uint32_t mask);
+
+    // set the dshot esc_type
+    void set_dshot_esc_type(AP_HAL::RCOutput::DshotEscType dshot_esc_type);
+
+    // send a dshot command
+    void send_dshot_command(uint8_t command, uint8_t chan, uint32_t command_timeout_ms, uint16_t repeat_count, bool priority);
+#endif
+    // setup channels
+    void     enable_ch(uint8_t ch);
+    void     disable_ch(uint8_t ch);
+
+    // check if IO is healthy
+    bool healthy(void);
+
+    // shutdown IO protocol (for reboot)
+    void shutdown();
+
+    void soft_reboot();
+
+    // setup for FMU failsafe mixing
+    bool setup_mixing(RCMapper *rcmap, int8_t override_chan,
+                      float mixing_gain, uint16_t manual_rc_mask);
+
+    // Check if pin number is valid and configured for GPIO
+    bool valid_GPIO_pin(uint8_t pin) const;
+
+    // convert external pin numbers 101 to 108 to internal 0 to 7
+    bool convert_pin_number(uint8_t& pin) const;
+
+    // set GPIO mask of channels setup for output
+    void set_GPIO_mask(uint8_t mask);
+
+    // Get GPIO mask of channels setup for output
+    uint8_t get_GPIO_mask() const;
+
+    // write to a output pin
+    void write_GPIO(uint8_t pin, bool value);
+
+    // Read the last output value send to the GPIO pin
+    // This is not a real read of the actual pin
+    // This allows callers to check for state change
+    uint8_t read_virtual_GPIO(uint8_t pin) const;
+
+    // toggle a output pin
+    void toggle_GPIO(uint8_t pin);
+
+    // channel group masks
+    const uint8_t ch_masks[3] = { 0x03,0x0C,0xF0 };
+
+    static AP_IOMCU *get_singleton(void) {
+        return singleton;
+    }
+
+private:
+    AP_HAL::UARTDriver &uart;
+
+    void thread_main(void);
+
+    // read count 16 bit registers
+    bool read_registers(uint8_t page, uint8_t offset, uint8_t count, uint16_t *regs);
+
+    // write count 16 bit registers
+    bool write_registers(uint8_t page, uint8_t offset, uint8_t count, const uint16_t *regs);
+
+    // write a single register
+    bool write_register(uint8_t page, uint8_t offset, uint16_t v) {
+        return write_registers(page, offset, 1, &v);
+    }
+
+    // modify a single register
+    bool modify_register(uint8_t page, uint8_t offset, uint16_t clearbits, uint16_t setbits);
+
+    // trigger an ioevent
+    void trigger_event(uint8_t event);
+
+    // IOMCU thread
+    thread_t *thread_ctx;
+
+    eventmask_t initial_event_mask;
+
+    // time when we last read various pages
+    uint32_t last_status_read_ms;
+    uint32_t last_rc_read_ms;
+    uint32_t last_servo_read_ms;
+    uint32_t last_safety_option_check_ms;
+    uint32_t last_reg_access_ms;
+    uint32_t last_erpm_read_ms;
+    uint32_t last_telem_read_ms;
+
+    // last value of safety options
+    uint16_t last_safety_options = 0xFFFF;
+
+    // have we forced the safety off?
+    bool safety_forced_off;
+
+    // was safety off on last status?
+    bool last_safety_off;
+
+    void send_servo_out(void);
+    void read_rc_input(void);
+    void read_erpm(void);
+    void read_telem(void);
+    void read_servo(void);
+    void read_status(void);
+    void discard_input(void);
+    void event_failed(uint32_t event_mask);
+    void update_safety_options(void);
+    void send_rc_protocols(void);
+
+    // CONFIG page
+    struct page_config config;
+
+    // PAGE_STATUS values
+    struct page_reg_status reg_status;
+    uint32_t last_log_ms;
+
+    // PAGE_RAW_RCIN values
+    struct page_rc_input rc_input;
+    uint32_t rc_last_input_ms;
+
+    // MIXER values
+    struct page_mixing mixing;
+
+    // output pwm values
+    struct {
+        uint8_t num_channels;
+        uint16_t pwm[IOMCU_MAX_RC_CHANNELS];
+        uint16_t safety_mask;
+        uint16_t failsafe_pwm[IOMCU_MAX_RC_CHANNELS];
+        uint8_t failsafe_pwm_set;
+        uint8_t failsafe_pwm_sent;
+        uint16_t channel_mask;
+    } pwm_out;
+
+    // read back pwm values
+    struct {
+        uint16_t pwm[IOMCU_MAX_RC_CHANNELS];
+    } pwm_in;
+
+    // output rates
+    struct {
+        uint16_t freq;
+        uint16_t chmask;
+        uint16_t default_freq = 50;
+        uint16_t sbus_rate_hz;
+        bool oneshot_enabled;
+        bool brushed_enabled;
+    } rate;
+
+    struct {
+        uint16_t period_us;
+        uint16_t rate;
+    } dshot_rate;
+
+#if HAL_WITH_IO_MCU_BIDIR_DSHOT
+    // bi-directional dshot erpm values
+    struct page_dshot_erpm dshot_erpm;
+    struct page_dshot_telem dshot_telem[IOMCU_MAX_TELEM_CHANNELS/4];
+    uint8_t esc_group;
+#endif
+    // queue of dshot commands that need sending
+    ObjectBuffer<page_dshot> dshot_command_queue{8};
+
+    struct page_GPIO GPIO;
+    // output mode values
+    struct page_mode_out mode_out;
+
+    // IMU heater duty cycle
+    uint8_t heater_duty_cycle;
+
+    uint32_t last_servo_out_us;
+
+    bool corked;
+    bool do_shutdown;
+    bool done_shutdown;
+
+    bool crc_is_ok;
+    bool detected_io_reset;
+    bool initialised;
+    bool is_chibios_backend;
+
+    uint32_t protocol_fail_count;
+    uint32_t protocol_count;
+    uint32_t total_errors;
+    uint32_t num_delayed;
+    uint32_t last_iocmu_timestamp_ms;
+    uint32_t read_status_errors;
+    uint32_t read_status_ok;
+    uint32_t last_rc_protocols;
+
+    // firmware upload
+    const char *fw_name = "io_firmware.bin";
+    const char *dshot_fw_name = "io_firmware_dshot.bin";
+    const uint8_t *fw;
+    uint32_t fw_size;
+
+    size_t write_wait(const uint8_t *pkt, uint8_t len);
+    bool upload_fw(void);
+    bool recv_byte_with_timeout(uint8_t *c, uint32_t timeout_ms);
+    bool recv_bytes(uint8_t *p, uint32_t count);
+    void drain(void);
+    bool send(uint8_t c);
+    bool send(const uint8_t *p, uint32_t count);
+    bool get_sync(uint32_t timeout = 40);
+    bool sync();
+    bool get_info(uint8_t param, uint32_t &val);
+    bool erase();
+    bool program(uint32_t fw_size);
+    bool verify_rev2(uint32_t fw_size);
+    bool verify_rev3(uint32_t fw_size_local);
+    bool reboot();
+
+    bool check_crc(void);
+    void handle_repeated_failures();
+    void check_iomcu_reset();
+
+    void write_log();  // handle onboard logging
+
+    static AP_IOMCU *singleton;
+
+    enum {
+        PROTO_NOP               = 0x00,
+        PROTO_OK                = 0x10,
+        PROTO_FAILED            = 0x11,
+        PROTO_INSYNC            = 0x12,
+        PROTO_INVALID           = 0x13,
+        PROTO_BAD_SILICON_REV   = 0x14,
+        PROTO_EOC               = 0x20,
+        PROTO_GET_SYNC          = 0x21,
+        PROTO_GET_DEVICE        = 0x22,
+        PROTO_CHIP_ERASE        = 0x23,
+        PROTO_CHIP_VERIFY       = 0x24,
+        PROTO_PROG_MULTI        = 0x27,
+        PROTO_READ_MULTI        = 0x28,
+        PROTO_GET_CRC           = 0x29,
+        PROTO_GET_OTP           = 0x2a,
+        PROTO_GET_SN            = 0x2b,
+        PROTO_GET_CHIP          = 0x2c,
+        PROTO_SET_DELAY         = 0x2d,
+        PROTO_GET_CHIP_DES      = 0x2e,
+        PROTO_REBOOT            = 0x30,
+
+        INFO_BL_REV       = 1,        /**< bootloader protocol revision */
+        BL_REV            = 5,        /**< supported bootloader protocol  */
+        INFO_BOARD_ID     = 2,        /**< board type */
+        INFO_BOARD_REV    = 3,        /**< board revision */
+        INFO_FLASH_SIZE   = 4,        /**< max firmware size in bytes */
+
+        PROG_MULTI_MAX    = 248,      /**< protocol max is 255, must be multiple of 4 */
+    };
+};
+
+namespace AP {
+    AP_IOMCU *iomcu(void);
+};
+
+#endif // HAL_WITH_IO_MCU
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  uploader for IOMCU partly based on px4io_uploader.cpp from px4
+ */
+/****************************************************************************
+ *
+ *   Copyright (c) 2012-2015 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+#include <AP_HAL/AP_HAL.h>
+
+#if HAL_WITH_IO_MCU
+
+#include "AP_IOMCU.h"
+#include <AP_ROMFS/AP_ROMFS.h>
+#include <AP_Math/crc.h>
+
+#define debug(fmt, args ...)  do { hal.console->printf("IOMCU: " fmt "\n", ## args); } while(0)
+
+extern const AP_HAL::HAL &hal;
+
+/*
+  upload a firmware to the IOMCU
+ */
+bool AP_IOMCU::upload_fw(void)
+{
+    // set baudrate for bootloader
+    uart.begin(115200, 256, 256);
+
+    bool ret = false;
+
+    /* look for the bootloader for 150 ms */
+    for (uint8_t i = 0; i < 15; i++) {
+        ret = sync();
+        if (ret) {
+            break;
+        }
+        hal.scheduler->delay(10);
+    }
+
+    if (!ret) {
+        debug("IO update failed sync");
+        return false;
+    }
+
+    uint32_t bl_rev;
+    ret = get_info(INFO_BL_REV, bl_rev);
+
+    if (!ret) {
+        debug("Err: failed to contact bootloader");
+        return false;
+    }
+    if (bl_rev > BL_REV) {
+        debug("Err: unsupported bootloader revision %u", unsigned(bl_rev));
+        return false;
+    }
+    debug("found bootloader revision: %u", unsigned(bl_rev));
+
+    ret = erase();
+    if (!ret) {
+        debug("erase failed");
+        return false;
+    }
+
+    ret = program(fw_size);
+    if (!ret) {
+        debug("program failed");
+        return false;
+    }
+
+    if (bl_rev <= 2) {
+        ret = verify_rev2(fw_size);
+    } else {
+        ret = verify_rev3(fw_size);
+    }
+
+    if (!ret) {
+        debug("verify failed");
+        return false;
+    }
+
+    ret = reboot();
+
+    if (!ret) {
+        debug("reboot failed");
+        return false;
+    }
+
+    debug("update complete");
+
+    // sleep for enough time for the IO chip to boot
+    hal.scheduler->delay(100);
+
+    return true;
+}
+
+/*
+  receive a byte from the IO bootloader
+ */
+bool AP_IOMCU::recv_byte_with_timeout(uint8_t *c, uint32_t timeout_ms)
+{
+    uint32_t start = AP_HAL::millis();
+    do {
+        int16_t v = uart.read();
+        if (v >= 0) {
+            *c = uint8_t(v);
+            return true;
+        }
+        hal.scheduler->delay_microseconds(50);
+    } while (AP_HAL::millis() - start < timeout_ms);
+
+    return false;
+}
+
+/*
+  receive multiple bytes from the bootloader
+ */
+bool AP_IOMCU::recv_bytes(uint8_t *p, uint32_t count)
+{
+    bool ret = true;
+
+    while (count--) {
+        ret = recv_byte_with_timeout(p++, 5000);
+        if (!ret) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
+/*
+  discard any pending bytes
+ */
+void AP_IOMCU::drain(void)
+{
+    uint8_t c;
+    bool ret;
+
+    do {
+        ret = recv_byte_with_timeout(&c, 40);
+    } while (ret);
+}
+
+/*
+  send a byte to the bootloader
+ */
+bool AP_IOMCU::send(uint8_t c)
+{
+    if (uart.write(c) != 1) {
+        return false;
+    }
+    return true;
+}
+
+/*
+  send a buffer to the bootloader
+ */
+bool AP_IOMCU::send(const uint8_t *p, uint32_t count)
+{
+    bool ret = true;
+
+    while (count--) {
+        ret = send(*p++);
+        if (!ret) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
+/*
+  wait for bootloader protocol sync
+ */
+bool AP_IOMCU::get_sync(uint32_t timeout_ms)
+{
+    uint8_t c[2];
+    bool ret;
+
+    ret = recv_byte_with_timeout(c, timeout_ms);
+    if (!ret) {
+        return false;
+    }
+
+    ret = recv_byte_with_timeout(c + 1, timeout_ms);
+    if (!ret) {
+        return ret;
+    }
+
+    if ((c[0] != PROTO_INSYNC) || (c[1] != PROTO_OK)) {
+        debug("bad sync 0x%02x,0x%02x", c[0], c[1]);
+        return false;
+    }
+
+    return true;
+}
+
+/*
+  drain then get sync with bootloader
+ */
+bool AP_IOMCU::sync()
+{
+    drain();
+
+    /* complete any pending program operation */
+    for (uint32_t i = 0; i < (PROG_MULTI_MAX + 6); i++) {
+        send(0);
+    }
+
+    send(PROTO_GET_SYNC);
+    send(PROTO_EOC);
+    return get_sync();
+}
+
+/*
+  get bootloader version
+ */
+bool AP_IOMCU::get_info(uint8_t param, uint32_t &val)
+{
+    bool ret;
+
+    send(PROTO_GET_DEVICE);
+    send(param);
+    send(PROTO_EOC);
+
+    ret = recv_bytes((uint8_t *)&val, sizeof(val));
+    if (!ret) {
+        return ret;
+    }
+
+    return get_sync();
+}
+
+/*
+  erase IO firmware
+ */
+bool AP_IOMCU::erase()
+{
+    debug("erase...");
+    send(PROTO_CHIP_ERASE);
+    send(PROTO_EOC);
+    return get_sync(10000);
+}
+
+/*
+  send new firmware to bootloader
+ */
+bool AP_IOMCU::program(uint32_t size)
+{
+    bool ret = false;
+    uint32_t sent = 0;
+
+    if (size & 3) {
+        return false;
+    }
+
+    debug("programming %u bytes...", (unsigned)size);
+
+    while (sent < size) {
+        /* get more bytes to program */
+        uint32_t n = size - sent;
+        if (n > PROG_MULTI_MAX) {
+            n = PROG_MULTI_MAX;
+        }
+
+        send(PROTO_PROG_MULTI);
+        send(n);
+        send(&fw[sent], n);
+        send(PROTO_EOC);
+
+        ret = get_sync(1000);
+        if (!ret) {
+            debug("Failed at %u", (unsigned)sent);
+            return false;
+        }
+
+        sent += n;
+    }
+    debug("upload OK");
+    return true;
+}
+
+/*
+  verify firmware for a rev2 bootloader
+ */
+bool AP_IOMCU::verify_rev2(uint32_t size)
+{
+    bool ret;
+    size_t sent = 0;
+
+    debug("verify...");
+
+    send(PROTO_CHIP_VERIFY);
+    send(PROTO_EOC);
+    ret = get_sync();
+    if (!ret) {
+        return ret;
+    }
+
+    while (sent < size) {
+        /* get more bytes to verify */
+        uint32_t n = size - sent;
+        if (n > 4) {
+            n = 4;
+        }
+
+        send(PROTO_READ_MULTI);
+        send(n);
+        send(PROTO_EOC);
+
+
+        for (uint8_t i = 0; i<n; i++) {
+            uint8_t c;
+            ret = recv_byte_with_timeout(&c, 5000);
+            if (!ret) {
+                debug("%d: got %d waiting for bytes", sent + i, ret);
+                return ret;
+            }
+            if (c != fw[sent+i]) {
+                debug("%d: got 0x%02x expected 0x%02x", sent + i, c, fw[sent+i]);
+                return false;
+            }
+        }
+
+        sent += n;
+
+        ret = get_sync();
+        if (!ret) {
+            debug("timeout waiting for post-verify sync");
+            return ret;
+        }
+    }
+
+    return true;
+}
+
+/*
+  verify firmware for a rev3 bootloader
+ */
+bool AP_IOMCU::verify_rev3(uint32_t fw_size_local)
+{
+    bool ret;
+    uint32_t sum = 0;
+    uint32_t crc = 0;
+    uint32_t fw_size_remote;
+    const uint8_t fill_blank = 0xff;
+
+    debug("verify...");
+
+    ret = get_info(INFO_FLASH_SIZE, fw_size_remote);
+    send(PROTO_EOC);
+
+    if (!ret) {
+        debug("could not read firmware size");
+        return ret;
+    }
+
+    sum = crc32_small(0, fw, fw_size_local);
+
+    /* fill the rest of CRC with 0xff */
+    for (uint32_t i=0; i<fw_size_remote - fw_size_local; i++) {
+        sum = crc32_small(sum, &fill_blank, 1);
+    }
+
+    /* request CRC from IO */
+    send(PROTO_GET_CRC);
+    send(PROTO_EOC);
+
+    ret = recv_bytes((uint8_t *)(&crc), sizeof(crc));
+    if (!ret) {
+        debug("did not receive CRC checksum");
+        return ret;
+    }
+
+    /* compare the CRC sum from the IO with the one calculated */
+    if (sum != crc) {
+        debug("CRC wrong: received: 0x%x, expected: 0x%x", (unsigned)crc, (unsigned)sum);
+        return false;
+    }
+
+    crc_is_ok = true;
+
+    return true;
+}
+
+/*
+  reboot IO MCU
+ */
+bool AP_IOMCU::reboot()
+{
+    send(PROTO_REBOOT);
+    hal.scheduler->delay(200);
+    send(PROTO_EOC);
+    hal.scheduler->delay(200);
+    return true;
+}
+
+#endif // HAL_WITH_IO_MCU
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+   analog capture for IOMCU. This uses direct register access to avoid
+   using up a DMA channel and to minimise latency. We capture a single
+   sample at a time
+ */
+
+#include "ch.h"
+#include "hal.h"
+#include "analog.h"
+
+#if HAL_USE_ADC != TRUE
+#error "HAL_USE_ADC must be set"
+#endif
+// we build this file with optimisation to lower the interrupt
+// latency.
+#pragma GCC optimize("O2")
+
+extern "C" {
+    extern void Vector88();
+}
+
+#define STM32_ADC1_NUMBER 18
+#define STM32_ADC1_HANDLER Vector88
+
+const uint32_t VSERVO_CHANNEL = ADC_SQR3_SQ1_N(ADC_CHANNEL_IN4);
+const uint32_t VRSSI_CHANNEL = ADC_SQR3_SQ1_N(ADC_CHANNEL_IN5);
+
+static uint16_t vrssi_val = 0xFFFF;
+static uint16_t vservo_val = 0xFFFF;
+static bool sample_vrssi_enable = true;
+static bool sampling_vservo = true;
+
+/*
+  initialise ADC capture
+ */
+void adc_init(void)
+{
+    rccEnableADC1(true);
+    ADC1->CR1 = 0;
+    ADC1->CR2 = ADC_CR2_ADON;
+
+    /* Reset calibration just to be safe.*/
+    ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_RSTCAL;
+    while ((ADC1->CR2 & ADC_CR2_RSTCAL) != 0)
+      ;
+
+    /* Calibration.*/
+    ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_CAL;
+    while ((ADC1->CR2 & ADC_CR2_CAL) != 0)
+      ;
+
+    /* set channels 4 and 5 for 28.5us sample time */
+    ADC1->SMPR2 = ADC_SMPR2_SMP_AN4(ADC_SAMPLE_28P5) | ADC_SMPR2_SMP_AN5(ADC_SAMPLE_28P5);
+
+    /* capture one sample at a time */
+    ADC1->SQR1 = 0;
+    ADC1->SQR2 = 0;
+
+    ADC1->CR1 |= ADC_CR1_EOCIE;
+
+    nvicEnableVector(STM32_ADC1_NUMBER, STM32_ADC_ADC1_IRQ_PRIORITY);
+}
+
+/*
+  capture VSERVO in mV
+ */
+void adc_enable_vrssi(void)
+{
+    sample_vrssi_enable = true;
+}
+
+/*
+  don't capture VRSSI
+ */
+void adc_disable_vrssi(void)
+{
+    sample_vrssi_enable = false;
+}
+
+/*
+  capture one sample on a channel
+ */
+void adc_sample_channels()
+{
+    chSysLock();
+
+    if (ADC1->SR & ADC_SR_STRT) {
+        return; // still waiting for sample
+    }
+
+    /* capture another sample */
+    ADC1->CR2 |= ADC_CR2_ADON;
+
+    chSysUnlock();
+}
+
+/*
+  capture VSERVO in mV
+ */
+uint16_t adc_vservo(void)
+{
+    return vservo_val;
+}
+
+/*
+  capture VRSSI in mV
+ */
+uint16_t adc_vrssi(void)
+{
+    return vrssi_val;
+}
+
+static void adc_read_sample()
+{
+    if (ADC1->SR & ADC_SR_EOC) {
+
+        ADC1->SR &= ~(ADC_SR_EOC | ADC_SR_STRT);
+
+        if (sampling_vservo) {
+            vservo_val = ADC1->DR;
+            if (sample_vrssi_enable) {
+                /* capture another sample */
+                ADC1->SQR3 = VRSSI_CHANNEL;
+                ADC1->CR2 |= ADC_CR2_ADON;
+                sampling_vservo = false;
+            }
+        } else {
+            vrssi_val = ADC1->DR;
+            ADC1->SQR3 = VSERVO_CHANNEL;
+            sampling_vservo = true;
+        }
+    }
+}
+
+OSAL_IRQ_HANDLER(STM32_ADC1_HANDLER) {
+    OSAL_IRQ_PROLOGUE();
+
+    chSysLockFromISR();
+
+    adc_read_sample();
+
+    chSysUnlockFromISR();
+
+    OSAL_IRQ_EPILOGUE();
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #pragma once
+
+#include <stdint.h>
+/*
+  initialise adc
+ */
+void adc_init(void);
+
+/*
+  capture VSERVO
+ */
+uint16_t adc_vservo(void);
+
+/*
+  capture VRSSI
+ */
+uint16_t adc_vrssi(void);
+
+/* start another update */
+void adc_sample_channels(void);
+
+/* capture VRSSI */
+void adc_enable_vrssi(void);
+
+/* don't capture VRSSI */
+void adc_disable_vrssi(void);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  IOMCU main firmware
+ */
+#include <AP_HAL/AP_HAL.h>
+
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+#include "iofirmware.h"
+#include <AP_HAL_ChibiOS/RCInput.h>
+#include <AP_HAL_ChibiOS/RCOutput.h>
+#include "analog.h"
+#include "rc.h"
+#include <AP_HAL_ChibiOS/hwdef/common/watchdog.h>
+
+extern const AP_HAL::HAL &hal;
+
+// we build this file with optimisation to lower the interrupt
+// latency. This helps reduce the chance of losing an RC input byte
+// due to missing a UART interrupt
+#pragma GCC optimize("O2")
+
+static AP_IOMCU_FW iomcu;
+
+void setup();
+void loop();
+
+#undef CH_DBG_ENABLE_STACK_CHECK
+#define CH_DBG_ENABLE_STACK_CHECK FALSE
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+/*
+ enable testing of IOMCU reset using safety switch
+ a value of 0 means normal operation
+ a value of 1 means test with watchdog
+ a value of 2 means test with reboot
+*/
+#define IOMCU_ENABLE_RESET_TEST 0
+
+//#define IOMCU_LOOP_TIMING_DEBUG
+// enable timing GPIO pings
+#ifdef IOMCU_LOOP_TIMING_DEBUG
+#undef TOGGLE_PIN_DEBUG
+#define TOGGLE_PIN_DEBUG(pin) do { palToggleLine(HAL_GPIO_LINE_GPIO ## pin); } while (0)
+#endif
+
+// pending events on the main thread
+enum ioevents {
+    IOEVENT_PWM = EVENT_MASK(1),
+    IOEVENT_TX_BEGIN = EVENT_MASK(2),
+    IOEVENT_TX_END = EVENT_MASK(3),
+};
+
+// see https://github.com/MaJerle/stm32-usart-uart-dma-rx-tx for a discussion of how to run
+// separate tx and rx streams
+static void setup_rx_dma(hal_uart_driver* uart)
+{
+    uart->usart->CR3 &= ~USART_CR3_DMAR;
+    dmaStreamDisable(uart->dmarx);
+    dmaStreamSetMemory0(uart->dmarx, &iomcu.rx_io_packet);
+    dmaStreamSetTransactionSize(uart->dmarx, sizeof(iomcu.rx_io_packet));
+    dmaStreamSetPeripheral(uart->dmarx, &(uart->usart->DR));
+    dmaStreamSetMode(uart->dmarx, uart->dmarxmode    | STM32_DMA_CR_DIR_P2M |
+                     STM32_DMA_CR_MINC | STM32_DMA_CR_TCIE);
+    dmaStreamEnable(uart->dmarx);
+    uart->usart->CR3 |= USART_CR3_DMAR;
+}
+
+static void setup_tx_dma(hal_uart_driver* uart)
+{
+    uart->usart->CR3 &= ~USART_CR3_DMAT;
+    dmaStreamDisable(uart->dmatx);
+    dmaStreamSetMemory0(uart->dmatx, &iomcu.tx_io_packet);
+    dmaStreamSetTransactionSize(uart->dmatx, iomcu.tx_io_packet.get_size());
+    // starting the UART allocates the peripheral statically, so we need to reinstate it after swapping
+    dmaStreamSetPeripheral(uart->dmatx, &(uart->usart->DR));
+    dmaStreamSetMode(uart->dmatx, uart->dmatxmode    | STM32_DMA_CR_DIR_M2P |
+                     STM32_DMA_CR_MINC | STM32_DMA_CR_TCIE);
+    // enable transmission complete interrupt
+    uart->usart->SR &= ~USART_SR_TC;
+    uart->usart->CR1 |= USART_CR1_TCIE;
+
+    dmaStreamEnable(uart->dmatx);
+
+    uart->usart->CR3 |= USART_CR3_DMAT;
+}
+
+static void dma_rx_end_cb(hal_uart_driver *uart)
+{
+    chSysLockFromISR();
+    uart->usart->CR3 &= ~USART_CR3_DMAR;
+
+    dmaStreamDisable(uart->dmarx);
+
+    iomcu.process_io_packet();
+
+    setup_rx_dma(uart);
+
+#if AP_HAL_SHARED_DMA_ENABLED
+    // indicate that a response needs to be sent
+    uint32_t mask = chEvtGetAndClearEventsI(IOEVENT_TX_BEGIN);
+    if (mask) {
+        iomcu.reg_status.err_lock++;
+    }
+    // the FMU code waits 10ms for a reply so this should be easily fast enough
+    chEvtSignalI(iomcu.thread_ctx, IOEVENT_TX_BEGIN);
+#else
+    setup_tx_dma(uart);
+#endif
+    chSysUnlockFromISR();
+}
+
+static void dma_tx_end_cb(hal_uart_driver *uart)
+{
+    // DMA stream has already been disabled at this point
+    uart->usart->CR3 &= ~USART_CR3_DMAT;
+
+    (void)uart->usart->SR;
+    (void)uart->usart->DR;
+    (void)uart->usart->DR;
+
+#ifdef HAL_GPIO_LINE_GPIO108
+    TOGGLE_PIN_DEBUG(108);
+    TOGGLE_PIN_DEBUG(108);
+#endif
+#if AP_HAL_SHARED_DMA_ENABLED
+    chSysLockFromISR();
+    chEvtSignalI(iomcu.thread_ctx, IOEVENT_TX_END);
+    chSysUnlockFromISR();
+#endif
+}
+
+/* replacement for ChibiOS uart_lld_serve_interrupt() */
+static void idle_rx_handler(hal_uart_driver *uart)
+{
+    volatile uint16_t sr;
+    sr = uart->usart->SR; /* SR reset step 1.*/
+    uint32_t cr1 = uart->usart->CR1;
+
+    if (sr & (USART_SR_LBD | USART_SR_ORE |	/* overrun error - packet was too big for DMA or DMA was too slow */
+              USART_SR_NE |		/* noise error - we have lost a byte due to noise */
+              USART_SR_FE |
+              USART_SR_PE)) {		/* framing error - start/stop bit lost or line break */
+
+        (void)uart->usart->DR;  /* SR reset step 2 - clear ORE | FE.*/
+
+        /* send a line break - this will abort transmission/reception on the other end */
+        chSysLockFromISR();
+        uart->usart->SR = ~USART_SR_LBD;
+        uart->usart->CR1 = cr1 | USART_CR1_SBK;
+
+        iomcu.reg_status.num_errors++;
+        iomcu.reg_status.err_uart++;
+
+        /* disable RX DMA */
+        uart->usart->CR3 &= ~USART_CR3_DMAR;
+
+        setup_rx_dma(uart);
+
+        chSysUnlockFromISR();
+    }
+
+    if ((sr & USART_SR_TC) && (cr1 & USART_CR1_TCIE)) {
+        /* TC interrupt cleared and disabled.*/
+        uart->usart->SR &= ~USART_SR_TC;
+        uart->usart->CR1 = cr1 & ~USART_CR1_TCIE;
+#ifdef HAL_GPIO_LINE_GPIO105
+        TOGGLE_PIN_DEBUG(105);
+        TOGGLE_PIN_DEBUG(105);
+#endif
+        /* End of transmission, a callback is generated.*/
+        dma_tx_end_cb(uart);
+    }
+
+    if ((sr & USART_SR_IDLE) && (cr1 & USART_CR1_IDLEIE)) {
+        (void)uart->usart->DR;  /* SR reset step 2 - clear IDLE.*/
+
+        /* the DMA size is the maximum packet size, but smaller packets are perfectly possible leading to 
+           an IDLE ISR. The data still must be processed. */
+
+        /* End of receive, a callback is generated.*/
+        dma_rx_end_cb(uart);
+    }
+}
+
+using namespace ChibiOS;
+
+#if AP_HAL_SHARED_DMA_ENABLED
+/*
+ copy of uart_lld_serve_tx_end_irq() from ChibiOS hal_uart_lld
+ that is re-instated upon switching the DMA channel
+ */
+static void uart_lld_serve_tx_end_irq(hal_uart_driver *uart, uint32_t flags)
+{
+    dmaStreamDisable(uart->dmatx);
+
+    /* A callback is generated, if enabled, after a completed transfer.*/
+    _uart_tx1_isr_code(uart);
+}
+
+void AP_IOMCU_FW::tx_dma_allocate(Shared_DMA *ctx)
+{
+    hal_uart_driver *uart = &UARTD2;
+    chSysLock();
+    if (uart->dmatx == nullptr) {
+        uart->dmatx = dmaStreamAllocI(STM32_UART_USART2_TX_DMA_STREAM,
+                                        STM32_UART_USART2_IRQ_PRIORITY,
+                                        (stm32_dmaisr_t)uart_lld_serve_tx_end_irq,
+                                        (void *)uart);
+    }
+    chSysUnlock();
+}
+
+/*
+  deallocate DMA channel
+ */
+void AP_IOMCU_FW::tx_dma_deallocate(Shared_DMA *ctx)
+{
+    hal_uart_driver *uart = &UARTD2;
+    chSysLock();
+    if (uart->dmatx != nullptr) {
+        // defensively make sure the DMA is fully shutdown before swapping
+        uart->usart->CR3 &= ~USART_CR3_DMAT;
+        dmaStreamDisable(uart->dmatx);
+        dmaStreamSetPeripheral(uart->dmatx, nullptr);
+        dmaStreamFreeI(uart->dmatx);
+        uart->dmatx = nullptr;
+    }
+    chSysUnlock();
+}
+#endif // AP_HAL_SHARED_DMA_ENABLED
+
+/*
+ * UART driver configuration structure.
+ */
+static UARTConfig uart_cfg = {
+    nullptr,
+    dma_tx_end_cb,
+    dma_rx_end_cb,
+    nullptr,
+    nullptr,            // error
+    idle_rx_handler,    // global irq
+    nullptr,            // idle
+    1500000,      //1.5MBit
+    USART_CR1_IDLEIE,
+    0,
+    0
+};
+
+void setup(void)
+{
+    hal.rcin->init();
+    hal.rcout->init();
+    iomcu.init();
+
+    iomcu.calculate_fw_crc();
+
+    uartStart(&UARTD2, &uart_cfg);
+    uartStartReceive(&UARTD2, sizeof(iomcu.rx_io_packet), &iomcu.rx_io_packet);
+#if AP_HAL_SHARED_DMA_ENABLED
+    iomcu.tx_d

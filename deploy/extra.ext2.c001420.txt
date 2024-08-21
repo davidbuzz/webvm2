@@ -1,0 +1,3109 @@
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+
+#include "AP_Compass.h"
+#include "AP_Compass_Backend.h"
+
+#include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+extern const AP_HAL::HAL& hal;
+
+AP_Compass_Backend::AP_Compass_Backend()
+    : _compass(AP::compass())
+{
+}
+
+void AP_Compass_Backend::rotate_field(Vector3f &mag, uint8_t instance)
+{
+    Compass::mag_state &state = _compass._state[Compass::StateIndex(instance)];
+    if (MAG_BOARD_ORIENTATION != ROTATION_NONE) {
+        mag.rotate(MAG_BOARD_ORIENTATION);
+    }
+    mag.rotate(state.rotation);
+
+#ifdef HAL_HEATER_MAG_OFFSET
+    /*
+      apply compass compensations for boards that have a heater which
+      interferes with an internal compass. This needs to be applied
+      before the board orientation so it is independent of
+      AHRS_ORIENTATION
+     */
+    if (!is_external(instance)) {
+        const uint32_t dev_id = uint32_t(_compass._state[Compass::StateIndex(instance)].dev_id);
+        static const struct offset {
+            uint32_t dev_id;
+            Vector3f ofs;
+        } offsets[] = HAL_HEATER_MAG_OFFSET;
+        const auto *bc = AP::boardConfig();
+        if (bc) {
+            for (const auto &o : offsets) {
+                if (o.dev_id == dev_id) {
+                    mag += o.ofs * bc->get_heater_duty_cycle() * 0.01;
+                }
+            }
+        }
+    }
+#endif
+
+    if (!state.external) {
+        mag.rotate(_compass._board_orientation);
+    } else {
+        // add user selectable orientation
+        mag.rotate((enum Rotation)state.orientation.get());
+    }
+}
+
+void AP_Compass_Backend::publish_raw_field(const Vector3f &mag, uint8_t instance)
+{
+    // note that we do not set last_update_usec here as otherwise the
+    // EKF and DCM would end up consuming compass data at the full
+    // sensor rate. We want them to consume only the filtered fields
+#if COMPASS_CAL_ENABLED
+    auto& cal = _compass._calibrator[_compass._get_priority(Compass::StateIndex(instance))];
+    if (cal != nullptr) {
+        Compass::mag_state &state = _compass._state[Compass::StateIndex(instance)];
+        state.last_update_ms = AP_HAL::millis();
+        cal->new_sample(mag);
+    }
+#endif
+}
+
+void AP_Compass_Backend::correct_field(Vector3f &mag, uint8_t i)
+{
+    Compass::mag_state &state = _compass._state[Compass::StateIndex(i)];
+
+    const Vector3f &offsets = state.offset.get();
+#if AP_COMPASS_DIAGONALS_ENABLED
+    const Vector3f &diagonals = state.diagonals.get();
+    const Vector3f &offdiagonals = state.offdiagonals.get();
+#endif
+
+    // add in the basic offsets
+    mag += offsets;
+
+    // add in scale factor, use a wide sanity check. The calibrator
+    // uses a narrower check.
+    if (_compass.have_scale_factor(i)) {
+        mag *= state.scale_factor;
+    }
+
+#if AP_COMPASS_DIAGONALS_ENABLED
+    // apply elliptical correction
+    if (!diagonals.is_zero()) {
+        Matrix3f mat(
+            diagonals.x,    offdiagonals.x, offdiagonals.y,
+            offdiagonals.x, diagonals.y,    offdiagonals.z,
+            offdiagonals.y, offdiagonals.z, diagonals.z
+            );
+
+        mag = mat * mag;
+    }
+#endif
+
+#if COMPASS_MOT_ENABLED
+    const Vector3f &mot = state.motor_compensation.get();
+    /*
+      calculate motor-power based compensation
+      note that _motor_offset[] is kept even if compensation is not
+      being applied so it can be logged correctly
+    */    
+    state.motor_offset.zero();
+    if (_compass._per_motor.enabled() && i == 0) {
+        // per-motor correction is only valid for first compass
+        _compass._per_motor.compensate(state.motor_offset);
+    } else if (_compass._motor_comp_type == AP_COMPASS_MOT_COMP_THROTTLE) {
+        state.motor_offset = mot * _compass._thr;
+    } else if (_compass._motor_comp_type == AP_COMPASS_MOT_COMP_CURRENT) {
+        AP_BattMonitor &battery = AP::battery();
+        float current;
+        if (battery.current_amps(current)) {
+            state.motor_offset = mot * current;
+        }
+    }
+
+    /*
+      we apply the motor offsets after we apply the elliptical
+      correction. This is needed to match the way that the motor
+      compensation values are calculated, as they are calculated based
+      on final field outputs, not on the raw outputs
+    */
+    mag += state.motor_offset;
+#endif // COMPASS_MOT_ENABLED
+}
+
+void AP_Compass_Backend::accumulate_sample(Vector3f &field, uint8_t instance,
+                                           uint32_t max_samples)
+{
+    /* rotate raw_field from sensor frame to body frame */
+    rotate_field(field, instance);
+
+    /* publish raw_field (uncorrected point sample) for calibration use */
+    publish_raw_field(field, instance);
+
+    /* correct raw_field for known errors */
+    correct_field(field, instance);
+
+    if (!field_ok(field)) {
+        return;
+    }
+
+    WITH_SEMAPHORE(_sem);
+
+    Compass::mag_state &state = _compass._state[Compass::StateIndex(instance)];
+    state.accum += field;
+    state.accum_count++;
+    if (max_samples && state.accum_count >= max_samples) {
+        state.accum_count /= 2;
+        state.accum /= 2;
+    }
+}
+
+void AP_Compass_Backend::drain_accumulated_samples(uint8_t instance,
+                                                   const Vector3f *scaling)
+{
+    WITH_SEMAPHORE(_sem);
+
+    Compass::mag_state &state = _compass._state[Compass::StateIndex(instance)];
+
+    if (state.accum_count == 0) {
+        return;
+    }
+
+    if (scaling) {
+        state.accum *= *scaling;
+    }
+    state.accum /= state.accum_count;
+
+    publish_filtered_field(state.accum, instance);
+
+    state.accum.zero();
+    state.accum_count = 0;
+}
+
+/*
+  copy latest data to the frontend from a backend
+ */
+void AP_Compass_Backend::publish_filtered_field(const Vector3f &mag, uint8_t instance)
+{
+    Compass::mag_state &state = _compass._state[Compass::StateIndex(instance)];
+
+    state.field = mag;
+
+    state.last_update_ms = AP_HAL::millis();
+    state.last_update_usec = AP_HAL::micros();
+}
+
+void AP_Compass_Backend::set_last_update_usec(uint32_t last_update, uint8_t instance)
+{
+    Compass::mag_state &state = _compass._state[Compass::StateIndex(instance)];
+    state.last_update_usec = last_update;
+}
+
+/*
+  register a new backend with frontend, returning instance which
+  should be used in publish_field()
+ */
+bool AP_Compass_Backend::register_compass(int32_t dev_id, uint8_t& instance) const
+{ 
+    return _compass.register_compass(dev_id, instance);
+}
+
+
+/*
+  set dev_id for an instance
+*/
+void AP_Compass_Backend::set_dev_id(uint8_t instance, uint32_t dev_id)
+{
+    _compass._state[Compass::StateIndex(instance)].dev_id.set_and_notify(dev_id);
+    _compass._state[Compass::StateIndex(instance)].detected_dev_id = dev_id;
+}
+
+/*
+  save dev_id, used by SITL
+*/
+void AP_Compass_Backend::save_dev_id(uint8_t instance)
+{
+    _compass._state[Compass::StateIndex(instance)].dev_id.save();
+}
+
+/*
+  set external for an instance
+*/
+void AP_Compass_Backend::set_external(uint8_t instance, bool external)
+{
+    if (_compass._state[Compass::StateIndex(instance)].external != 2) {
+        _compass._state[Compass::StateIndex(instance)].external.set_and_notify(external);
+    }
+}
+
+bool AP_Compass_Backend::is_external(uint8_t instance)
+{
+    return _compass._state[Compass::StateIndex(instance)].external;
+}
+
+// set rotation of an instance
+void AP_Compass_Backend::set_rotation(uint8_t instance, enum Rotation rotation)
+{
+    _compass._state[Compass::StateIndex(instance)].rotation = rotation;
+}
+
+static constexpr float FILTER_KOEF = 0.1f;
+
+/* Check that the compass value is valid by using a mean filter. If
+ * the value is further than filter_range from mean value, it is
+ * rejected. 
+*/
+bool AP_Compass_Backend::field_ok(const Vector3f &field)
+{
+
+    
+    if (field.is_inf() || field.is_nan()) {
+        return false;
+    }
+
+    const float range = (float)_compass.get_filter_range();
+    if (range <= 0) {
+        return true;
+    }
+
+    const float length = field.length();
+
+    if (is_zero(_mean_field_length)) {
+        _mean_field_length = length;
+        return true;
+    }
+
+    bool ret = true;
+    const float d = fabsf(_mean_field_length - length) / (_mean_field_length + length);  // diff divide by mean value in percent ( with the *200.0f on later line)
+    float koeff = FILTER_KOEF;
+
+    if (d * 200.0f > range) {  // check the difference from mean value outside allowed range
+        // printf("\nCompass field length error: mean %f got %f\n", (double)_mean_field_length, (double)length );
+        ret = false;
+        koeff /= (d * 10.0f);  // 2.5 and more, so one bad sample never change mean more than 4%
+        _error_count++;
+    }
+    _mean_field_length = _mean_field_length * (1 - koeff) + length * koeff;  // complimentary filter 1/k
+
+    return ret;
+}
+
+
+enum Rotation AP_Compass_Backend::get_board_orientation(void) const
+{
+    return _compass._board_orientation;
+}
+
+#endif  // AP_COMPASS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+  Compass driver backend class. Each supported compass sensor type
+  needs to have an object derived from this class.
+ */
+#pragma once
+
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_EXTERNALAHRS_ENABLED
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+#endif
+
+#if AP_COMPASS_MSP_ENABLED
+#include <AP_MSP/msp.h>
+#endif
+
+#include <AP_Math/AP_Math.h>
+
+class Compass;  // forward declaration
+class AP_Compass_Backend
+{
+public:
+    AP_Compass_Backend();
+
+    // we declare a virtual destructor so that drivers can
+    // override with a custom destructor if need be.
+    virtual ~AP_Compass_Backend(void) {}
+
+    // read sensor data
+    virtual void read(void) = 0;
+
+    /*
+      device driver IDs. These are used to fill in the devtype field
+      of the device ID, which shows up as COMPASS*ID* parameters to
+      users. The values are chosen for compatibility with existing PX4
+      drivers.
+      If a change is made to a driver that would make existing
+      calibration values invalid then this number must be changed.
+     */
+    enum DevTypes {
+        DEVTYPE_HMC5883_OLD = 0x01,
+        DEVTYPE_HMC5883 = 0x07,
+        DEVTYPE_LSM303D = 0x02,
+        DEVTYPE_AK8963  = 0x04,
+        DEVTYPE_BMM150  = 0x05,
+        DEVTYPE_LSM9DS1 = 0x06,
+        DEVTYPE_LIS3MDL = 0x08,
+        DEVTYPE_AK09916 = 0x09,
+        DEVTYPE_IST8310 = 0x0A,
+        DEVTYPE_ICM20948 = 0x0B,
+        DEVTYPE_MMC3416 = 0x0C,
+        DEVTYPE_QMC5883L = 0x0D,
+        DEVTYPE_MAG3110  = 0x0E,
+        DEVTYPE_SITL  = 0x0F,
+        DEVTYPE_IST8308 = 0x10,
+        DEVTYPE_RM3100 = 0x11,
+        DEVTYPE_RM3100_2 = 0x12, // unused, past mistake
+        DEVTYPE_MMC5983 = 0x13,
+        DEVTYPE_AK09918 = 0x14,
+        DEVTYPE_AK09915 = 0x15,
+    	DEVTYPE_QMC5883P = 0x16,
+    };
+
+#if AP_COMPASS_MSP_ENABLED
+    virtual void handle_msp(const MSP::msp_compass_data_message_t &pkt) {}
+#endif
+
+#if AP_COMPASS_EXTERNALAHRS_ENABLED
+    virtual void handle_external(const AP_ExternalAHRS::mag_data_message_t &pkt) {}
+#endif
+    
+protected:
+
+    /*
+     * A compass measurement is expected to pass through the following functions:
+     * 1. rotate_field - this rotates the measurement in-place from sensor frame
+     *      to body frame
+     * 2. publish_raw_field - this provides an uncorrected point-sample for
+     *      calibration libraries
+     * 3. correct_field - this corrects the measurement in-place for hard iron,
+     *      soft iron, motor interference, and non-orthogonality errors
+     * 4. publish_filtered_field - legacy filtered magnetic field
+     *
+     * All those functions expect the mag field to be in milligauss.
+     */
+
+    void rotate_field(Vector3f &mag, uint8_t instance);
+    void publish_raw_field(const Vector3f &mag, uint8_t instance);
+    void correct_field(Vector3f &mag, uint8_t i);
+    void publish_filtered_field(const Vector3f &mag, uint8_t instance);
+    void set_last_update_usec(uint32_t last_update, uint8_t instance);
+
+    void accumulate_sample(Vector3f &field, uint8_t instance,
+                           uint32_t max_samples = 10);
+    void drain_accumulated_samples(uint8_t instance, const Vector3f *scale = NULL);
+
+    // register a new compass instance with the frontend
+    bool register_compass(int32_t dev_id, uint8_t& instance) const;
+
+    // set dev_id for an instance
+    void set_dev_id(uint8_t instance, uint32_t dev_id);
+
+    // save dev_id, used by SITL
+    void save_dev_id(uint8_t instance);
+
+    // set external state for an instance
+    void set_external(uint8_t instance, bool external);
+
+    // tell if instance is an external compass
+    bool is_external(uint8_t instance);
+
+    // set rotation of an instance
+    void set_rotation(uint8_t instance, enum Rotation rotation);
+
+    // get board orientation (for SITL)
+    enum Rotation get_board_orientation(void) const;
+    
+    // access to frontend
+    Compass &_compass;
+
+    // semaphore for access to shared frontend data
+    HAL_Semaphore _sem;
+
+    // Check that the compass field is valid by using a mean filter on the vector length
+    bool field_ok(const Vector3f &field);
+    
+    uint32_t get_error_count() const { return _error_count; }
+private:
+    void apply_corrections(Vector3f &mag, uint8_t i);
+    
+    // mean field length for range filter
+    float _mean_field_length;
+    // number of dropped samples. Not used for now, but can be usable to choose more reliable sensor
+    uint32_t _error_count;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include <AP_HAL/AP_HAL.h>
+#include <AP_Notify/AP_Notify.h>
+#include <AP_GPS/AP_GPS.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_InternalError/AP_InternalError.h>
+
+#include "AP_Compass.h"
+
+const extern AP_HAL::HAL& hal;
+
+#if COMPASS_CAL_ENABLED
+
+void Compass::cal_update()
+{
+    if (hal.util->get_soft_armed()) {
+        return;
+    }
+
+    bool running = false;
+
+    for (Priority i(0); i<COMPASS_MAX_INSTANCES; i++) {
+        if (_calibrator[i] == nullptr) {
+            continue;
+        }
+        if (_calibrator[i]->failed()) {
+            AP_Notify::events.compass_cal_failed = 1;
+        }
+
+        if (_calibrator[i]->running()) {
+            running = true;
+        } else if (_cal_autosave && !_cal_saved[i] && _calibrator[i]->get_state().status == CompassCalibrator::Status::SUCCESS) {
+            _accept_calibration(uint8_t(i));
+        }
+    }
+
+    AP_Notify::flags.compass_cal_running = running;
+
+    if (is_calibrating()) {
+        _cal_has_run = true;
+        return;
+    } else if (_cal_has_run && _auto_reboot()) {
+        hal.scheduler->delay(1000);
+        hal.scheduler->reboot();
+    }
+}
+
+bool Compass::_start_calibration(uint8_t i, bool retry, float delay)
+{
+    if (!healthy(i)) {
+        return false;
+    }
+    if (!use_for_yaw(i)) {
+        return false;
+    }
+    Priority prio = Priority(i);
+
+#if COMPASS_MAX_INSTANCES > 1
+    if (_priority_did_list[prio] != _priority_did_stored_list[prio]) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Compass cal requires reboot after priority change");
+        return false;
+    }
+#endif
+    
+    if (_calibrator[prio] == nullptr) {
+        _calibrator[prio] = NEW_NOTHROW CompassCalibrator();
+        if (_calibrator[prio] == nullptr) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Compass cal object not initialised");
+            return false;
+        }
+    }
+
+    if (option_set(Option::CAL_REQUIRE_GPS)) {
+        if (AP::gps().status() < AP_GPS::GPS_OK_FIX_2D) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Compass cal requires GPS lock");
+            return false;
+        }
+    }
+    if (!is_calibrating()) {
+        AP_Notify::events.initiated_compass_cal = 1;
+    }
+
+    if (_rotate_auto) {
+        enum Rotation r = _get_state(prio).external?(enum Rotation)_get_state(prio).orientation.get():ROTATION_NONE;
+        if (r < ROTATION_MAX) {
+            _calibrator[prio]->set_orientation(r, _get_state(prio).external, _rotate_auto>=2, _rotate_auto>=3);
+        }
+    }
+    _cal_saved[prio] = false;
+    if (i == 0 && _get_state(prio).external != 0) {
+        _calibrator[prio]->start(retry, delay, get_offsets_max(), i, _calibration_threshold);
+    } else {
+        // internal compasses or secondary compasses get twice the
+        // threshold. This is because internal compasses tend to be a
+        // lot noisier
+        _calibrator[prio]->start(retry, delay, get_offsets_max(), i, _calibration_threshold*2);
+    }
+    if (!_cal_thread_started) {
+        _cal_requires_reboot = true;
+        if (!hal.scheduler->thread_create(FUNCTOR_BIND(this, &Compass::_update_calibration_trampoline, void), "compasscal", 2048, AP_HAL::Scheduler::PRIORITY_IO, 0)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "CompassCalibrator: Cannot start compass thread.");
+            return false;
+        }
+        _cal_thread_started = true;
+    }
+
+    // disable compass learning both for calibration and after completion
+    _learn.set_and_save(0);
+
+    return true;
+}
+
+void Compass::_update_calibration_trampoline() {
+    while(true) {
+        for (Priority i(0); i<COMPASS_MAX_INSTANCES; i++) {
+            if (_calibrator[i] == nullptr) {
+                continue;
+            }
+            _calibrator[i]->update();
+        }
+        hal.scheduler->delay(1);
+    }
+}
+
+bool Compass::_start_calibration_mask(uint8_t mask, bool retry, bool autosave, float delay, bool autoreboot)
+{
+    _cal_autosave = autosave;
+    _compass_cal_autoreboot = autoreboot;
+
+    bool at_least_one_started = false;
+    for (uint8_t i=0; i<COMPASS_MAX_INSTANCES; i++) {
+        if ((1<<i) & mask) {
+            if (!_start_calibration(i,retry,delay)) {
+                _cancel_calibration_mask(mask);
+                return false;
+            }
+            at_least_one_started = true;
+        }
+    }
+    return at_least_one_started;
+}
+
+bool Compass::start_calibration_all(bool retry, bool autosave, float delay, bool autoreboot)
+{
+    _cal_autosave = autosave;
+    _compass_cal_autoreboot = autoreboot;
+
+    bool at_least_one_started = false;
+    for (uint8_t i=0; i<COMPASS_MAX_INSTANCES; i++) {
+        // ignore any compasses that fail to start calibrating
+        // start all should only calibrate compasses that are being used
+        if (_start_calibration(i,retry,delay)) {
+            at_least_one_started = true;
+        }
+    }
+    return at_least_one_started;
+}
+
+void Compass::_cancel_calibration(uint8_t i)
+{
+    AP_Notify::events.initiated_compass_cal = 0;
+    Priority prio = Priority(i);
+    if (_calibrator[prio] == nullptr) {
+        return;
+    }
+    if (_calibrator[prio]->running() || _calibrator[prio]->get_state().status == CompassCalibrator::Status::WAITING_TO_START) {
+        AP_Notify::events.compass_cal_canceled = 1;
+    }
+    _cal_saved[prio] = false;
+    _calibrator[prio]->stop();
+}
+
+void Compass::_cancel_calibration_mask(uint8_t mask)
+{
+    for (uint8_t i=0; i<COMPASS_MAX_INSTANCES; i++) {
+        if ((1<<i) & mask) {
+            _cancel_calibration(i);
+        }
+    }
+}
+
+void Compass::cancel_calibration_all()
+{
+    _cancel_calibration_mask(0xFF);
+}
+
+bool Compass::_accept_calibration(uint8_t i)
+{
+    Priority prio = Priority(i);
+
+    CompassCalibrator* cal = _calibrator[prio];
+    if (cal == nullptr) {
+        return false;
+    }
+    const CompassCalibrator::Report cal_report = cal->get_report();
+
+    if (_cal_saved[prio] || cal_report.status == CompassCalibrator::Status::NOT_STARTED) {
+        return true;
+    } else if (cal_report.status == CompassCalibrator::Status::SUCCESS) {
+        _cal_saved[prio] = true;
+
+        Vector3f ofs(cal_report.ofs), diag(cal_report.diag), offdiag(cal_report.offdiag);
+        float scale_factor = cal_report.scale_factor;
+
+        set_and_save_offsets(i, ofs);
+#if AP_COMPASS_DIAGONALS_ENABLED
+        set_and_save_diagonals(i,diag);
+        set_and_save_offdiagonals(i,offdiag);
+#endif
+        set_and_save_scale_factor(i,scale_factor);
+
+        if (cal_report.check_orientation && _get_state(prio).external && _rotate_auto >= 2) {
+            set_and_save_orientation(i, cal_report.orientation);
+        }
+
+        if (!is_calibrating()) {
+            AP_Notify::events.compass_cal_saved = 1;
+        }
+        return true;
+    } else {
+        return false;
+    }
+}
+
+bool Compass::_accept_calibration_mask(uint8_t mask)
+{
+    bool success = true;
+    for (Priority i(0); i<COMPASS_MAX_INSTANCES; i++) {
+        if (_calibrator[i] == nullptr) {
+            continue;
+        }
+        if ((1<<uint8_t(i)) & mask) {
+            if (!_accept_calibration(uint8_t(i))) {
+                success = false;
+            }
+            _calibrator[i]->stop();
+        }
+    }
+
+    return success;
+}
+
+#if HAL_GCS_ENABLED
+bool Compass::send_mag_cal_progress(const GCS_MAVLINK& link)
+{
+    const mavlink_channel_t chan = link.get_chan();
+
+    for (uint8_t i = 0; i < COMPASS_MAX_INSTANCES; i++) {
+        const Priority compass_id = (next_cal_progress_idx[chan] + 1) % COMPASS_MAX_INSTANCES;
+        
+        auto& calibrator = _calibrator[compass_id];
+        if (calibrator == nullptr) {
+            next_cal_progress_idx[chan] = compass_id;
+            continue;
+        }
+        const CompassCalibrator::State cal_state = calibrator->get_state();
+
+        if (cal_state.status == CompassCalibrator::Status::WAITING_TO_START  ||
+            cal_state.status == CompassCalibrator::Status::RUNNING_STEP_ONE ||
+            cal_state.status == CompassCalibrator::Status::RUNNING_STEP_TWO) {
+            // ensure we don't try to send with no space available
+            if (!HAVE_PAYLOAD_SPACE(chan, MAG_CAL_PROGRESS)) {
+                return false;
+            }
+
+            next_cal_progress_idx[chan] = compass_id;
+
+            mavlink_msg_mag_cal_progress_send(
+                link.get_chan(),
+                uint8_t(compass_id),
+                _get_cal_mask(),
+                (uint8_t)cal_state.status, cal_state.attempt, cal_state.completion_pct, cal_state.completion_mask,
+                0.0f, 0.0f, 0.0f
+            );
+        } else {
+            next_cal_progress_idx[chan] = compass_id;
+        }
+    }
+
+    return true;
+}
+
+bool Compass::send_mag_cal_report(const GCS_MAVLINK& link)
+{
+    const mavlink_channel_t chan = link.get_chan();
+
+    for (uint8_t i = 0; i < COMPASS_MAX_INSTANCES; i++) {
+        const Priority compass_id = (next_cal_report_idx[chan] + 1) % COMPASS_MAX_INSTANCES;
+
+        if (_calibrator[compass_id] == nullptr) {
+            next_cal_report_idx[chan] = compass_id;
+            continue;
+        }
+        const CompassCalibrator::Report cal_report = _calibrator[compass_id]->get_report();
+        switch (cal_report.status) {
+        case CompassCalibrator::Status::NOT_STARTED:
+        case CompassCalibrator::Status::WAITING_TO_START:
+        case CompassCalibrator::Status::RUNNING_STEP_ONE:
+        case CompassCalibrator::Status::RUNNING_STEP_TWO:
+            // calibration has not finished ergo no report
+            next_cal_report_idx[chan] = compass_id;
+            continue;
+        case CompassCalibrator::Status::SUCCESS:
+        case CompassCalibrator::Status::FAILED:
+        case CompassCalibrator::Status::BAD_ORIENTATION:
+        case CompassCalibrator::Status::BAD_RADIUS:
+            // ensure we don't try to send with no space available
+            if (!HAVE_PAYLOAD_SPACE(chan, MAG_CAL_REPORT)) {
+                return false;
+            }
+
+            next_cal_report_idx[chan] = compass_id;
+
+            mavlink_msg_mag_cal_report_send(
+                link.get_chan(),
+                uint8_t(compass_id),
+                _get_cal_mask(),
+                (uint8_t)cal_report.status,
+                _cal_saved[compass_id],
+                cal_report.fitness,
+                cal_report.ofs.x, cal_report.ofs.y, cal_report.ofs.z,
+                cal_report.diag.x, cal_report.diag.y, cal_report.diag.z,
+                cal_report.offdiag.x, cal_report.offdiag.y, cal_report.offdiag.z,
+                cal_report.orientation_confidence,
+                cal_report.original_orientation,
+                cal_report.orientation,
+                cal_report.scale_factor
+            );
+        }
+    }
+    return true;
+}
+#endif
+
+bool Compass::is_calibrating() const
+{
+    for (Priority i(0); i<COMPASS_MAX_INSTANCES; i++) {
+        if (_calibrator[i] == nullptr) {
+            continue;
+        }
+        switch(_calibrator[i]->get_state().status) {
+            case CompassCalibrator::Status::NOT_STARTED:
+            case CompassCalibrator::Status::SUCCESS:
+            case CompassCalibrator::Status::FAILED:
+            case CompassCalibrator::Status::BAD_ORIENTATION:
+            case CompassCalibrator::Status::BAD_RADIUS:
+                // this backend isn't calibrating,
+                // but maybe the next one is:
+                continue;
+            case CompassCalibrator::Status::WAITING_TO_START:
+            case CompassCalibrator::Status::RUNNING_STEP_ONE:
+            case CompassCalibrator::Status::RUNNING_STEP_TWO:
+                return true;
+        }
+    }
+    return false;
+}
+
+uint8_t Compass::_get_cal_mask()
+{
+    uint8_t cal_mask = 0;
+    for (Priority i(0); i<COMPASS_MAX_INSTANCES; i++) {
+        if (_calibrator[i] == nullptr) {
+            continue;
+        }
+        if (_calibrator[i]->get_state().status != CompassCalibrator::Status::NOT_STARTED) {
+            cal_mask |= 1 << uint8_t(i);
+        }
+    }
+    return cal_mask;
+}
+
+/*
+  handle an incoming MAG_CAL command
+ */
+MAV_RESULT Compass::handle_mag_cal_command(const mavlink_command_int_t &packet)
+{
+    MAV_RESULT result = MAV_RESULT_FAILED;
+
+    switch (packet.command) {
+    case MAV_CMD_DO_START_MAG_CAL: {
+        result = MAV_RESULT_ACCEPTED;
+        if (hal.util->get_soft_armed()) {
+            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "Disarm to allow compass calibration");
+            result = MAV_RESULT_FAILED;
+            break;
+        }
+        if (packet.param1 < 0 || packet.param1 > 255) {
+            result = MAV_RESULT_FAILED;
+            break;
+        }
+
+        uint8_t mag_mask = packet.param1;
+        bool retry = !is_zero(packet.param2);
+        bool autosave = !is_zero(packet.param3);
+        float delay = packet.param4;
+        bool autoreboot = packet.x != 0;
+
+        if (mag_mask == 0) { // 0 means all
+            _reset_compass_id();
+            if (!start_calibration_all(retry, autosave, delay, autoreboot)) {
+                result = MAV_RESULT_FAILED;
+            }
+        } else {
+            if (!_start_calibration_mask(mag_mask, retry, autosave, delay, autoreboot)) {
+                result = MAV_RESULT_FAILED;
+            }
+        }
+
+        break;
+    }
+
+    case MAV_CMD_DO_ACCEPT_MAG_CAL: {
+        result = MAV_RESULT_ACCEPTED;
+        if (packet.param1 < 0 || packet.param1 > 255) {
+            result = MAV_RESULT_FAILED;
+            break;
+        }
+
+        uint8_t mag_mask = packet.param1;
+
+        if (mag_mask == 0) { // 0 means all
+            mag_mask = 0xFF;
+        }
+
+        if (!_accept_calibration_mask(mag_mask)) {
+            result = MAV_RESULT_FAILED;
+        }
+        break;
+    }
+
+    case MAV_CMD_DO_CANCEL_MAG_CAL: {
+        result = MAV_RESULT_ACCEPTED;
+        if (packet.param1 < 0 || packet.param1 > 255) {
+            result = MAV_RESULT_FAILED;
+            break;
+        }
+        
+        uint8_t mag_mask = packet.param1;
+        
+        if (mag_mask == 0) { // 0 means all
+            cancel_calibration_all();
+            break;
+        }
+        
+        _cancel_calibration_mask(mag_mask);
+        break;
+    }
+    }
+    
+    return result;
+}
+
+#endif // COMPASS_CAL_ENABLED
+
+#if AP_COMPASS_CALIBRATION_FIXED_YAW_ENABLED
+/*
+  get mag field with the effects of offsets, diagonals and
+  off-diagonals removed
+ */
+bool Compass::get_uncorrected_field(uint8_t instance, Vector3f &field) const
+{
+    // get corrected field
+    field = get_field(instance);
+
+#if AP_COMPASS_DIAGONALS_ENABLED
+    // form elliptical correction matrix and invert it. This is
+    // needed to remove the effects of the elliptical correction
+    // when calculating new offsets
+    const Vector3f &diagonals = get_diagonals(instance);
+    if (!diagonals.is_zero()) {
+        const Vector3f &offdiagonals = get_offdiagonals(instance);
+        Matrix3f mat {
+            diagonals.x, offdiagonals.x, offdiagonals.y,
+            offdiagonals.x,    diagonals.y, offdiagonals.z,
+            offdiagonals.y, offdiagonals.z,    diagonals.z
+        };
+        if (!mat.invert()) {
+            return false;
+        }
+
+        // remove impact of diagonals and off-diagonals
+        field = mat * field;
+    }
+#endif
+
+    // remove impact of offsets
+    field -= get_offsets(instance);
+
+    return true;
+}
+
+/*
+  fast compass calibration given vehicle position and yaw. This
+  results in zero diagonal and off-diagonal elements, so is only
+  suitable for vehicles where the field is close to spherical. It is
+  useful for large vehicles where moving the vehicle to calibrate it
+  is difficult.
+
+  The offsets of the selected compasses are set to values to bring
+  them into consistency with the WMM tables at the given latitude and
+  longitude. If compass_mask is zero then all enabled compasses are
+  calibrated.
+
+  This assumes that the compass is correctly scaled in milliGauss
+*/
+bool Compass::mag_cal_fixed_yaw(float yaw_deg, uint8_t compass_mask,
+                                      float lat_deg, float lon_deg, bool force_use)
+{
+    _reset_compass_id();
+    if (is_zero(lat_deg) && is_zero(lon_deg)) {
+        Location loc;
+        // get AHRS position. If unavailable then try GPS location
+        if (!AP::ahrs().get_location(loc)) {
+            if (AP::gps().status() < AP_GPS::GPS_OK_FIX_3D) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Mag: no position available");
+                return false;
+            }
+            loc = AP::gps().location();
+        }
+        lat_deg = loc.lat * 1.0e-7;
+        lon_deg = loc.lng * 1.0e-7;
+    }
+
+    // get the magnetic field intensity and orientation
+    float intensity;
+    float declination;
+    float inclination;
+    if (!AP_Declination::get_mag_field_ef(lat_deg, lon_deg, intensity, declination, inclination)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Mag: WMM table error");
+        return false;
+    }
+
+    // create a field vector and rotate to the required orientation
+    Vector3f field(1e3f * intensity, 0.0f, 0.0f);
+    Matrix3f R;
+    R.from_euler(0.0f, -ToRad(inclination), ToRad(declination));
+    field = R * field;
+
+    Matrix3f dcm;
+    dcm.from_euler(AP::ahrs().get_roll(), AP::ahrs().get_pitch(), radians(yaw_deg));
+
+    // Rotate into body frame using provided yaw
+    field = dcm.transposed() * field;
+
+    for (uint8_t i=0; i<get_count(); i++) {
+        if (compass_mask != 0 && ((1U<<i) & compass_mask) == 0) {
+            // skip this compass
+            continue;
+        }
+        if (_use_for_yaw[Priority(i)] == 0 || (!force_use && !use_for_yaw(i))) {
+            continue;
+        }
+        if (!healthy(i)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Mag[%u]: unhealthy\n", i);
+            return false;
+        }
+
+        Vector3f measurement;
+        if (!get_uncorrected_field(i, measurement)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Mag[%u]: bad uncorrected field", i);
+            return false;
+        }
+
+        Vector3f offsets = field - measurement;
+        set_and_save_offsets(i, offsets);
+#if AP_COMPASS_DIAGONALS_ENABLED
+        Vector3f one{1,1,1};
+        set_and_save_diagonals(i, one);
+        Vector3f zero{0,0,0};
+        set_and_save_offdiagonals(i, zero);
+#endif
+    }
+
+    return true;
+}
+
+#endif  // AP_COMPASS_CALIBRATION_FIXED_YAW_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_Compass_DroneCAN.h"
+
+#if AP_COMPASS_DRONECAN_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+
+#include <AP_CANManager/AP_CANManager.h>
+#include <AP_DroneCAN/AP_DroneCAN.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_Logger/AP_Logger.h>
+#include <SITL/SITL.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define LOG_TAG "COMPASS"
+
+AP_Compass_DroneCAN::DetectedModules AP_Compass_DroneCAN::_detected_modules[];
+HAL_Semaphore AP_Compass_DroneCAN::_sem_registry;
+
+AP_Compass_DroneCAN::AP_Compass_DroneCAN(AP_DroneCAN* ap_dronecan, uint32_t devid) :
+    _devid(devid)
+{
+}
+
+void AP_Compass_DroneCAN::subscribe_msgs(AP_DroneCAN* ap_dronecan)
+{
+    if (ap_dronecan == nullptr) {
+        return;
+    }
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_magnetic_field, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("mag_sub");
+    }
+
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_magnetic_field_2, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("mag2_sub");
+    }
+
+#if AP_COMPASS_DRONECAN_HIRES_ENABLED
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_magnetic_field_hires, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("mag3_sub");
+    }
+#endif
+}
+
+AP_Compass_Backend* AP_Compass_DroneCAN::probe(uint8_t index)
+{
+    AP_Compass_DroneCAN* driver = nullptr;
+    if (!_detected_modules[index].driver && _detected_modules[index].ap_dronecan) {
+        WITH_SEMAPHORE(_sem_registry);
+        // Register new Compass mode to a backend
+        driver = NEW_NOTHROW AP_Compass_DroneCAN(_detected_modules[index].ap_dronecan, _detected_modules[index].devid);
+        if (driver) {
+            if (!driver->init()) {
+                delete driver;
+                return nullptr;
+            }
+            _detected_modules[index].driver = driver;
+            AP::can().log_text(AP_CANManager::LOG_INFO,
+                                LOG_TAG,
+                                "Found Mag Node %d on Bus %d Sensor ID %d\n",
+                                _detected_modules[index].node_id,
+                                _detected_modules[index].ap_dronecan->get_driver_index(),
+                                _detected_modules[index].sensor_id);
+#if AP_TEST_DRONECAN_DRIVERS
+            // Scroll through the registered compasses, and set the offsets
+            if (driver->_compass.get_offsets(index).is_zero()) {
+                driver->_compass.set_offsets(index, AP::sitl()->mag_ofs[index]);
+            }
+
+            // we want to simulate a calibrated compass by default, so set
+            // scale to 1
+            AP_Param::set_default_by_name("COMPASS_SCALE", 1);
+            AP_Param::set_default_by_name("COMPASS_SCALE2", 1);
+            AP_Param::set_default_by_name("COMPASS_SCALE3", 1);
+            driver->save_dev_id(index);
+            driver->set_rotation(index, ROTATION_NONE);
+
+            // make first compass external
+            driver->set_external(index, true);
+#endif
+        }
+    }
+    return driver;
+}
+
+bool AP_Compass_DroneCAN::init()
+{
+    // Adding 1 is necessary to allow backward compatibility, where this field was set as 1 by default
+    if (!register_compass(_devid, _instance)) {
+        return false;
+    }
+
+    set_dev_id(_instance, _devid);
+    set_external(_instance, true);
+
+    AP::can().log_text(AP_CANManager::LOG_INFO, LOG_TAG,  "AP_Compass_DroneCAN loaded\n\r");
+    return true;
+}
+
+AP_Compass_DroneCAN* AP_Compass_DroneCAN::get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id, uint8_t sensor_id)
+{
+    if (ap_dronecan == nullptr) {
+        return nullptr;
+    }
+    for (uint8_t i=0; i<COMPASS_MAX_BACKEND; i++) {
+        if (_detected_modules[i].driver &&
+            _detected_modules[i].ap_dronecan == ap_dronecan &&
+            _detected_modules[i].node_id == node_id &&
+            _detected_modules[i].sensor_id == sensor_id) {
+            return _detected_modules[i].driver;
+        }
+    }
+
+    bool already_detected = false;
+    // Check if there's an empty spot for possible registration
+    for (uint8_t i = 0; i < COMPASS_MAX_BACKEND; i++) {
+        if (_detected_modules[i].ap_dronecan == ap_dronecan && 
+            _detected_modules[i].node_id == node_id &&
+            _detected_modules[i].sensor_id == sensor_id) {
+            // Already Detected
+            already_detected = true;
+            break;
+        }
+    }
+    if (!already_detected) {
+        for (uint8_t i = 0; i < COMPASS_MAX_BACKEND; i++) {
+            if (nullptr == _detected_modules[i].ap_dronecan) {
+                _detected_modules[i].ap_dronecan = ap_dronecan;
+                _detected_modules[i].node_id = node_id;
+                _detected_modules[i].sensor_id = sensor_id;
+                _detected_modules[i].devid = AP_HAL::Device::make_bus_id(AP_HAL::Device::BUS_TYPE_UAVCAN,
+                                                 ap_dronecan->get_driver_index(),
+                                                 node_id,
+                                                 sensor_id + 1); // we use sensor_id as devtype
+                break;
+            }
+        }
+    }
+
+    struct DetectedModules tempslot;
+    // Sort based on the node_id, larger values first
+    // we do this, so that we have repeatable compass
+    // registration, especially in cases of extraneous
+    // CAN compass is connected.
+    for (uint8_t i = 1; i < COMPASS_MAX_BACKEND; i++) {
+        for (uint8_t j = i; j > 0; j--) {
+            if (_detected_modules[j].node_id > _detected_modules[j-1].node_id) {
+                tempslot = _detected_modules[j];
+                _detected_modules[j] = _detected_modules[j-1];
+                _detected_modules[j-1] = tempslot;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void AP_Compass_DroneCAN::handle_mag_msg(const Vector3f &mag)
+{
+    Vector3f raw_field = mag * 1000.0;
+
+    accumulate_sample(raw_field, _instance);
+}
+
+void AP_Compass_DroneCAN::handle_magnetic_field(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const uavcan_equipment_ahrs_MagneticFieldStrength& msg)
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    Vector3f mag_vector;
+    AP_Compass_DroneCAN* driver = get_dronecan_backend(ap_dronecan, transfer.source_node_id, 0);
+    if (driver != nullptr) {
+        mag_vector[0] = msg.magnetic_field_ga[0];
+        mag_vector[1] = msg.magnetic_field_ga[1];
+        mag_vector[2] = msg.magnetic_field_ga[2];
+        driver->handle_mag_msg(mag_vector);
+    }
+}
+
+void AP_Compass_DroneCAN::handle_magnetic_field_2(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const uavcan_equipment_ahrs_MagneticFieldStrength2 &msg)
+{
+    WITH_SEMAPHORE(_sem_registry);
+
+    Vector3f mag_vector;
+    uint8_t sensor_id = msg.sensor_id;
+    AP_Compass_DroneCAN* driver = get_dronecan_backend(ap_dronecan, transfer.source_node_id, sensor_id);
+    if (driver != nullptr) {
+        mag_vector[0] = msg.magnetic_field_ga[0];
+        mag_vector[1] = msg.magnetic_field_ga[1];
+        mag_vector[2] = msg.magnetic_field_ga[2];
+        driver->handle_mag_msg(mag_vector);
+    }
+}
+
+#if AP_COMPASS_DRONECAN_HIRES_ENABLED
+/*
+  just log hires magnetic field data for magnetic surveying
+ */
+void AP_Compass_DroneCAN::handle_magnetic_field_hires(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer,
+                                                      const dronecan_sensors_magnetometer_MagneticFieldStrengthHiRes &msg)
+{
+// @LoggerMessage: MAGH
+// @Description: Magnetometer high resolution data
+// @Field: TimeUS: Time since system startup
+// @Field: Node: CAN node
+// @Field: Sensor: sensor ID on node
+// @Field: Bus: CAN bus
+// @Field: Mx: X axis field
+// @Field: My: y axis field
+// @Field: Mz: z axis field
+
+#if HAL_LOGGING_ENABLED
+    // just log it for now
+    AP::logger().WriteStreaming("MAGH", "TimeUS,Node,Sensor,Bus,Mx,My,Mz", "s#-----", "F------", "QBBBfff",
+                                transfer.timestamp_usec,
+                                transfer.source_node_id,
+                                ap_dronecan->get_driver_index(),
+                                msg.sensor_id,
+                                msg.magnetic_field_ga[0]*1000,
+                                msg.magnetic_field_ga[1]*1000,
+                                msg.magnetic_field_ga[2]*1000);
+#endif  // HAL_LOGGING_ENABLED
+}
+#endif  // AP_COMPASS_DRONECAN_HIRES_ENABLED
+
+void AP_Compass_DroneCAN::read(void)
+{
+    drain_accumulated_samples(_instance);
+}
+#endif  // AP_COMPASS_DRONECAN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #pragma once
+
+#include "AP_Compass.h"
+
+#if AP_COMPASS_DRONECAN_ENABLED
+
+#include "AP_Compass_Backend.h"
+
+#include <AP_DroneCAN/AP_DroneCAN.h>
+
+class AP_Compass_DroneCAN : public AP_Compass_Backend {
+public:
+    AP_Compass_DroneCAN(AP_DroneCAN* ap_dronecan, uint32_t devid);
+
+    void        read(void) override;
+
+    static void subscribe_msgs(AP_DroneCAN* ap_dronecan);
+    static AP_Compass_Backend* probe(uint8_t index);
+    static uint32_t get_detected_devid(uint8_t index) { return _detected_modules[index].devid; }
+    static void handle_magnetic_field(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const uavcan_equipment_ahrs_MagneticFieldStrength& msg);
+    static void handle_magnetic_field_2(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const uavcan_equipment_ahrs_MagneticFieldStrength2 &msg);
+#if AP_COMPASS_DRONECAN_HIRES_ENABLED
+    static void handle_magnetic_field_hires(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const dronecan_sensors_magnetometer_MagneticFieldStrengthHiRes &msg);
+#endif
+
+private:
+    bool init();
+
+    // callback for DroneCAN messages
+    void handle_mag_msg(const Vector3f &mag);
+
+    static AP_Compass_DroneCAN* get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id, uint8_t sensor_id);
+
+    uint8_t  _instance;
+
+    uint32_t _devid;
+
+    // Module Detection Registry
+    static struct DetectedModules {
+        AP_DroneCAN* ap_dronecan;
+        uint8_t node_id;
+        uint8_t sensor_id;
+        AP_Compass_DroneCAN *driver;
+        uint32_t devid;
+    } _detected_modules[COMPASS_MAX_BACKEND];
+
+    static HAL_Semaphore _sem_registry;
+};
+
+#endif  // AP_COMPASS_DRONECAN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include "AP_Compass_ExternalAHRS.h"
+
+#if AP_COMPASS_EXTERNALAHRS_ENABLED
+
+AP_Compass_ExternalAHRS::AP_Compass_ExternalAHRS(uint8_t port)
+{
+    auto devid = AP_HAL::Device::make_bus_id(AP_HAL::Device::BUS_TYPE_SERIAL,port,0,0);
+    register_compass(devid, instance);
+
+    set_dev_id(instance, devid);
+    set_external(instance, true);
+}
+
+void AP_Compass_ExternalAHRS::handle_external(const AP_ExternalAHRS::mag_data_message_t &pkt)
+{
+    Vector3f field = pkt.field;
+    accumulate_sample(field, instance);
+}
+
+void AP_Compass_ExternalAHRS::read(void)
+{
+    drain_accumulated_samples(instance);
+}
+
+#endif // AP_COMPASS_EXTERNALAHRS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_EXTERNALAHRS_ENABLED
+
+#include "AP_Compass.h"
+#include "AP_Compass_Backend.h"
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+
+class AP_Compass_ExternalAHRS : public AP_Compass_Backend
+{
+public:
+    AP_Compass_ExternalAHRS(uint8_t instance);
+
+    void read(void) override;
+
+private:
+    void handle_external(const AP_ExternalAHRS::mag_data_message_t &pkt) override;
+    uint8_t instance;
+};
+
+#endif  // AP_COMPASS_EXTERNALAHRS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ *       AP_Compass_HMC5843.cpp - Arduino Library for HMC5843 I2C magnetometer
+ *       Code by Jordi Muñoz and Jose Julio. DIYDrones.com
+ *
+ *       Sensor is connected to I2C port
+ *       Sensor is initialized in Continuos mode (10Hz)
+ *
+ */
+#include "AP_Compass_HMC5843.h"
+
+#if AP_COMPASS_HMC5843_ENABLED
+
+#include <assert.h>
+#include <utility>
+#include <stdio.h>
+
+#include <AP_Math/AP_Math.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
+#include <AP_InertialSensor/AuxiliaryBus.h>
+
+extern const AP_HAL::HAL& hal;
+
+/*
+ * Default address: 0x1E
+ */
+
+#define HMC5843_REG_CONFIG_A 0x00
+// Valid sample averaging for 5883L
+#define HMC5843_SAMPLE_AVERAGING_1 (0x00 << 5)
+#define HMC5843_SAMPLE_AVERAGING_2 (0x01 << 5)
+#define HMC5843_SAMPLE_AVERAGING_4 (0x02 << 5)
+#define HMC5843_SAMPLE_AVERAGING_8 (0x03 << 5)
+
+#define HMC5843_CONF_TEMP_ENABLE   (0x80)
+
+// Valid data output rates for 5883L
+#define HMC5843_OSR_0_75HZ (0x00 << 2)
+#define HMC5843_OSR_1_5HZ  (0x01 << 2)
+#define HMC5843_OSR_3HZ    (0x02 << 2)
+#define HMC5843_OSR_7_5HZ  (0x03 << 2)
+#define HMC5843_OSR_15HZ   (0x04 << 2)
+#define HMC5843_OSR_30HZ   (0x05 << 2)
+#define HMC5843_OSR_75HZ   (0x06 << 2)
+// Sensor operation modes
+#define HMC5843_OPMODE_NORMAL 0x00
+#define HMC5843_OPMODE_POSITIVE_BIAS 0x01
+#define HMC5843_OPMODE_NEGATIVE_BIAS 0x02
+#define HMC5843_OPMODE_MASK 0x03
+
+#define HMC5843_REG_CONFIG_B 0x01
+#define HMC5883L_GAIN_0_88_GA (0x00 << 5)
+#define HMC5883L_GAIN_1_30_GA (0x01 << 5)
+#define HMC5883L_GAIN_1_90_GA (0x02 << 5)
+#define HMC5883L_GAIN_2_50_GA (0x03 << 5)
+#define HMC5883L_GAIN_4_00_GA (0x04 << 5)
+#define HMC5883L_GAIN_4_70_GA (0x05 << 5)
+#define HMC5883L_GAIN_5_60_GA (0x06 << 5)
+#define HMC5883L_GAIN_8_10_GA (0x07 << 5)
+
+#define HMC5843_GAIN_0_70_GA (0x00 << 5)
+#define HMC5843_GAIN_1_00_GA (0x01 << 5)
+#define HMC5843_GAIN_1_50_GA (0x02 << 5)
+#define HMC5843_GAIN_2_00_GA (0x03 << 5)
+#define HMC5843_GAIN_3_20_GA (0x04 << 5)
+#define HMC5843_GAIN_3_80_GA (0x05 << 5)
+#define HMC5843_GAIN_4_50_GA (0x06 << 5)
+#define HMC5843_GAIN_6_50_GA (0x07 << 5)
+
+#define HMC5843_REG_MODE 0x02
+#define HMC5843_MODE_CONTINUOUS 0x00
+#define HMC5843_MODE_SINGLE     0x01
+
+#define HMC5843_REG_DATA_OUTPUT_X_MSB 0x03
+
+#define HMC5843_REG_ID_A 0x0A
+
+
+AP_Compass_HMC5843::AP_Compass_HMC5843(AP_HMC5843_BusDriver *bus,
+                                       bool force_external, enum Rotation rotation)
+    : _bus(bus)
+    , _rotation(rotation)
+    , _force_external(force_external)
+{
+}
+
+AP_Compass_HMC5843::~AP_Compass_HMC5843()
+{
+    delete _bus;
+}
+
+AP_Compass_Backend *AP_Compass_HMC5843::probe(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                                              bool force_external,
+                                              enum Rotation rotation)
+{
+    if (!dev) {
+        return nullptr;
+    }
+    AP_HMC5843_BusDriver *bus = NEW_NOTHROW AP_HMC5843_BusDriver_HALDevice(std::move(dev));
+    if (!bus) {
+        return nullptr;
+    }
+
+    AP_Compass_HMC5843 *sensor = NEW_NOTHROW AP_Compass_HMC5843(bus, force_external, rotation);
+    if (!sensor || !sensor->init()) {
+        delete sensor;
+        return nullptr;
+    }
+
+    return sensor;
+}
+
+#if AP_INERTIALSENSOR_ENABLED
+AP_Compass_Backend *AP_Compass_HMC5843::probe_mpu6000(enum Rotation rotation)
+{
+    AP_InertialSensor &ins = *AP_InertialSensor::get_singleton();
+
+    AP_HMC5843_BusDriver *bus =
+        NEW_NOTHROW AP_HMC5843_BusDriver_Auxiliary(ins, HAL_INS_MPU60XX_SPI,
+                                           HAL_COMPASS_HMC5843_I2C_ADDR);
+    if (!bus) {
+        return nullptr;
+    }
+
+    AP_Compass_HMC5843 *sensor = NEW_NOTHROW AP_Compass_HMC5843(bus, false, rotation);
+    if (!sensor || !sensor->init()) {
+        delete sensor;
+        return nullptr;
+    }
+
+    return sensor;
+}
+#endif
+
+bool AP_Compass_HMC5843::init()
+{
+    AP_HAL::Semaphore *bus_sem = _bus->get_semaphore();
+
+    if (!bus_sem) {
+        DEV_PRINTF("HMC5843: Unable to get bus semaphore\n");
+        return false;
+    }
+    bus_sem->take_blocking();
+
+    // high retries for init
+    _bus->set_retries(10);
+    
+    if (!_bus->configure()) {
+        DEV_PRINTF("HMC5843: Could not configure the bus\n");
+        goto errout;
+    }
+
+    if (!_check_whoami()) {
+        goto errout;
+    }
+
+    if (!_calibrate()) {
+        DEV_PRINTF("HMC5843: Could not calibrate sensor\n");
+        goto errout;
+    }
+
+    if (!_setup_sampling_mode()) {
+        goto errout;
+    }
+
+    if (!_bus->start_measurements()) {
+        DEV_PRINTF("HMC5843: Could not start measurements on bus\n");
+        goto errout;
+    }
+
+    _initialised = true;
+
+    // lower retries for run
+    _bus->set_retries(3);
+    
+    bus_sem->give();
+
+    // perform an initial read
+    read();
+
+    //register compass instance
+    _bus->set_device_type(DEVTYPE_HMC5883);
+    if (!register_compass(_bus->get_bus_id(), _compass_instance)) {
+        return false;
+    }
+    set_dev_id(_compass_instance, _bus->get_bus_id());
+
+    set_rotation(_compass_instance, _rotation);
+    
+    if (_force_external) {
+        set_external(_compass_instance, true);
+    }
+
+    // read from sensor at 75Hz
+    _bus->register_periodic_callback(13333,
+                                     FUNCTOR_BIND_MEMBER(&AP_Compass_HMC5843::_timer, void));
+
+    DEV_PRINTF("HMC5843 found on bus 0x%x\n", (unsigned)_bus->get_bus_id());
+    
+    return true;
+
+errout:
+    bus_sem->give();
+    return false;
+}
+
+/*
+ * take a reading from the magnetometer
+ *
+ * bus semaphore has been taken already by HAL
+ */
+void AP_Compass_HMC5843::_timer()
+{
+    bool result = _read_sample();
+
+    // always ask for a new sample
+    _take_sample();
+    
+    if (!result) {
+        return;
+    }
+
+    // get raw_field - sensor frame, uncorrected
+    Vector3f raw_field = Vector3f(_mag_x, _mag_y, _mag_z);
+    raw_field *= _gain_scale;
+
+    // rotate to the desired orientation
+    if (is_external(_compass_instance)) {
+        raw_field.rotate(ROTATION_YAW_90);
+    }
+
+    // We expect to do reads at 10Hz, and  we get new data at most 75Hz, so we
+    // don't expect to accumulate more than 8 before a read; let's make it
+    // 14 to give more room for the initialization phase
+    accumulate_sample(raw_field, _compass_instance, 14);
+}
+
+/*
+ * Take accumulated reads from the magnetometer or try to read once if no
+ * valid data
+ *
+ * bus semaphore must not be locked
+ */
+void AP_Compass_HMC5843::read()
+{
+    if (!_initialised) {
+        // someone has tried to enable a compass for the first time
+        // mid-flight .... we can't do that yet (especially as we won't
+        // have the right orientation!)
+        return;
+    }
+
+    drain_accumulated_samples(_compass_instance, &_scaling);
+}
+
+bool AP_Compass_HMC5843::_setup_sampling_mode()
+{
+    _gain_scale = (1.0f / 1090) * 1000;
+    if (!_bus->register_write(HMC5843_REG_CONFIG_A,
+                              HMC5843_CONF_TEMP_ENABLE |
+                              HMC5843_OSR_75HZ |
+                              HMC5843_SAMPLE_AVERAGING_1) ||
+        !_bus->register_write(HMC5843_REG_CONFIG_B,
+                              HMC5883L_GAIN_1_30_GA) ||
+        !_bus->register_write(HMC5843_REG_MODE,
+                              HMC5843_MODE_SINGLE)) {
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Read Sensor data - bus semaphore must be taken
+ */
+bool AP_Compass_HMC5843::_read_sample()
+{
+    struct PACKED {
+        be16_t rx;
+        be16_t ry;
+        be16_t rz;
+    } val;
+    int16_t rx, ry, rz;
+
+    if (!_bus->block_read(HMC5843_REG_DATA_OUTPUT_X_MSB, (uint8_t *) &val, sizeof(val))){
+        return false;
+    }
+
+    rx = be16toh(val.rx);
+    ry = be16toh(val.rz);
+    rz = be16toh(val.ry);
+
+    if (rx == -4096 || ry == -4096 || rz == -4096) {
+        // no valid data available
+        return false;
+    }
+
+    _mag_x = -rx;
+    _mag_y =  ry;
+    _mag_z = -rz;
+
+    return true;
+}
+
+
+/*
+  ask for a new oneshot sample
+ */
+void AP_Compass_HMC5843::_take_sample()
+{
+    _bus->register_write(HMC5843_REG_MODE,
+                         HMC5843_MODE_SINGLE);
+}
+
+bool AP_Compass_HMC5843::_check_whoami()
+{
+    uint8_t id[3];
+    if (!_bus->block_read(HMC5843_REG_ID_A, id, 3)) {
+        // can't talk on bus
+        return false;        
+    }
+    if (id[0] != 'H' ||
+        id[1] != '4' ||
+        id[2] != '3') {
+        // not a HMC5x83 device
+        return false;
+    }
+
+    return true;
+}
+
+bool AP_Compass_HMC5843::_calibrate()
+{
+    uint8_t calibration_gain;
+    int numAttempts = 0, good_count = 0;
+    bool success = false;
+
+    calibration_gain = HMC5883L_GAIN_2_50_GA;
+
+    /*
+     * the expected values are based on observation of real sensors
+     */
+	float expected[3] = { 1.16*600, 1.08*600, 1.16*600 };
+
+    uint8_t base_config = HMC5843_OSR_15HZ;
+    uint8_t num_samples = 0;
+    
+    while (success == 0 && numAttempts < 25 && good_count < 5) {
+        numAttempts++;
+
+        // force positiveBias (compass should return 715 for all channels)
+        if (!_bus->register_write(HMC5843_REG_CONFIG_A,
+                                  base_config | HMC5843_OPMODE_POSITIVE_BIAS)) {
+            // compass not responding on the bus
+            continue;
+        }
+
+        hal.scheduler->delay(50);
+
+        // set gains
+        if (!_bus->register_write(HMC5843_REG_CONFIG_B, calibration_gain) ||
+            !_bus->register_write(HMC5843_REG_MODE, HMC5843_MODE_SINGLE)) {
+            continue;
+        }
+
+        // read values from the compass
+        hal.scheduler->delay(50);
+        if (!_read_sample()) {
+            // we didn't read valid values
+            continue;
+        }
+
+        num_samples++;
+
+        float cal[3];
+
+        // hal.console->printf("mag %d %d %d\n", _mag_x, _mag_y, _mag_z);
+
+        cal[0] = fabsf(expected[0] / _mag_x);
+        cal[1] = fabsf(expected[1] / _mag_y);
+        cal[2] = fabsf(expected[2] / _mag_z);
+
+        // hal.console->printf("cal=%.2f %.2f %.2f\n", cal[0], cal[1], cal[2]);
+
+        // we throw away the first two samples as the compass may
+        // still be changing its state from the application of the
+        // strap excitation. After that we accept values in a
+        // reasonable range
+        if (numAttempts <= 2) {
+            continue;
+        }
+
+#define IS_CALIBRATION_VALUE_VALID(val) (val > 0.7f && val < 1.35f)
+
+        if (IS_CALIBRATION_VALUE_VALID(cal[0]) &&
+            IS_CALIBRATION_VALUE_VALID(cal[1]) &&
+            IS_CALIBRATION_VALUE_VALID(cal[2])) {
+            // hal.console->printf("car=%.2f %.2f %.2f good\n", cal[0], cal[1], cal[2]);
+            good_count++;
+
+            _scaling[0] += cal[0];
+            _scaling[1] += cal[1];
+            _scaling[2] += cal[2];
+        }
+
+#undef IS_CALIBRATION_VALUE_VALID
+
+#if 0
+        /* useful for debugging */
+        hal.console->printf("MagX: %d MagY: %d MagZ: %d\n", (int)_mag_x, (int)_mag_y, (int)_mag_z);
+        hal.console->printf("CalX: %.2f CalY: %.2f CalZ: %.2f\n", cal[0], cal[1], cal[2]);
+#endif
+    }
+
+    _bus->register_write(HMC5843_REG_CONFIG_A, base_config);
+    
+    if (good_count >= 5) {
+        _scaling[0] = _scaling[0] / good_count;
+        _scaling[1] = _scaling[1] / good_count;
+        _scaling[2] = _scaling[2] / good_count;
+        success = true;
+    } else {
+        /* best guess */
+        _scaling[0] = 1.0;
+        _scaling[1] = 1.0;
+        _scaling[2] = 1.0;
+        if (num_samples > 5) {
+            // a sensor can be broken for calibration but still
+            // otherwise workable, accept it if we are reading samples
+            success = true;
+        }
+    }
+
+#if 0
+    printf("scaling: %.2f %.2f %.2f\n",
+           _scaling[0], _scaling[1], _scaling[2]);
+#endif
+    
+    return success;
+}
+
+/* AP_HAL::Device implementation of the HMC5843 */
+AP_HMC5843_BusDriver_HALDevice::AP_HMC5843_BusDriver_HALDevice(AP_HAL::OwnPtr<AP_HAL::Device> dev)
+    : _dev(std::move(dev))
+{
+    // set read and auto-increment flags on SPI
+    if (_dev->bus_type() == AP_HAL::Device::BUS_TYPE_SPI) {
+        _dev->set_read_flag(0xC0);
+    }
+}
+
+bool AP_HMC5843_BusDriver_HALDevice::block_read(uint8_t reg, uint8_t *buf, uint32_t size)
+{
+    return _dev->read_registers(reg, buf, size);
+}
+
+bool AP_HMC5843_BusDriver_HALDevice::register_read(uint8_t reg, uint8_t *val)
+{
+    return _dev->read_registers(reg, val, 1);
+}
+
+bool AP_HMC5843_BusDriver_HALDevice::register_write(uint8_t reg, uint8_t val)
+{
+    return _dev->write_register(reg, val);
+}
+
+AP_HAL::Semaphore *AP_HMC5843_BusDriver_HALDevice::get_semaphore()
+{
+    return _dev->get_semaphore();
+}
+
+AP_HAL::Device::PeriodicHandle AP_HMC5843_BusDriver_HALDevice::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    return _dev->register_periodic_callback(period_usec, cb);
+}
+
+
+#if AP_INERTIALSENSOR_ENABLED
+/* HMC5843 on an auxiliary bus of IMU driver */
+AP_HMC5843_BusDriver_Auxiliary::AP_HMC5843_BusDriver_Auxiliary(AP_InertialSensor &ins, uint8_t backend_id,
+                                                               uint8_t addr)
+{
+    /*
+     * Only initialize members. Fails are handled by configure or while
+     * getting the semaphore
+     */
+    _bus = ins.get_auxiliary_bus(backend_id);
+    if (!_bus) {
+        return;
+    }
+
+    _slave = _bus->request_next_slave(addr);
+}
+
+AP_HMC5843_BusDriver_Auxiliary::~AP_HMC5843_BusDriver_Auxiliary()
+{
+    /* After started it's owned by AuxiliaryBus */
+    if (!_started) {
+        delete _slave;
+    }
+}
+
+bool AP_HMC5843_BusDriver_Auxiliary::block_read(uint8_t reg, uint8_t *buf, uint32_t size)
+{
+    if (_started) {
+        /*
+         * We can only read a block when reading the block of sample values -
+         * calling with any other value is a mistake
+         */
+        if (reg != HMC5843_REG_DATA_OUTPUT_X_MSB) {
+            return false;
+        }
+
+        int n = _slave->read(buf);
+        return n == static_cast<int>(size);
+    }
+
+    int r = _slave->passthrough_read(reg, buf, size);
+
+    return r > 0 && static_cast<uint32_t>(r) == size;
+}
+
+bool AP_HMC5843_BusDriver_Auxiliary::register_read(uint8_t reg, uint8_t *val)
+{
+    return _slave->passthrough_read(reg, val, 1) == 1;
+}
+
+bool AP_HMC5843_BusDriver_Auxiliary::register_write(uint8_t reg, uint8_t val)
+{
+    return _slave->passthrough_write(reg, val) == 1;
+}
+
+AP_HAL::Semaphore *AP_HMC5843_BusDriver_Auxiliary::get_semaphore()
+{
+    return _bus->get_semaphore();
+}
+
+
+bool AP_HMC5843_BusDriver_Auxiliary::configure()
+{
+    if (!_bus || !_slave) {
+        return false;
+    }
+    return true;
+}
+
+bool AP_HMC5843_BusDriver_Auxiliary::start_measurements()
+{
+    if (_bus->register_periodic_read(_slave, HMC5843_REG_DATA_OUTPUT_X_MSB, 6) < 0) {
+        return false;
+    }
+
+    _started = true;
+
+    return true;
+}
+
+AP_HAL::Device::PeriodicHandle AP_HMC5843_BusDriver_Auxiliary::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    return _bus->register_periodic_callback(period_usec, cb);
+}
+
+// set device type within a device class
+void AP_HMC5843_BusDriver_Auxiliary::set_device_type(uint8_t devtype)
+{
+    _bus->set_device_type(devtype);
+}
+
+// return 24 bit bus identifier
+uint32_t AP_HMC5843_BusDriver_Auxiliary::get_bus_id(void) const
+{
+    return _bus->get_bus_id();
+}
+#endif  // AP_INERTIALSENSOR_ENABLED
+
+#endif  // AP_COMPASS_HMC5843_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_HMC5843_ENABLED
+
+#ifndef HAL_COMPASS_HMC5843_I2C_ADDR
+#define HAL_COMPASS_HMC5843_I2C_ADDR 0x1E
+#endif
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/Device.h>
+
+#include "AP_Compass_Backend.h"
+#include <AP_InertialSensor/AP_InertialSensor_config.h>
+
+class AuxiliaryBus;
+class AuxiliaryBusSlave;
+class AP_InertialSensor;
+class AP_HMC5843_BusDriver;
+
+class AP_Compass_HMC5843 : public AP_Compass_Backend
+{
+public:
+    static AP_Compass_Backend *probe(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                                     bool force_external,
+                                     enum Rotation rotation);
+
+#if AP_INERTIALSENSOR_ENABLED
+    static AP_Compass_Backend *probe_mpu6000(enum Rotation rotation);
+#endif
+
+    static constexpr const char *name = "HMC5843";
+
+    virtual ~AP_Compass_HMC5843();
+
+    void read() override;
+
+private:
+    AP_Compass_HMC5843(AP_HMC5843_BusDriver *bus,
+                       bool force_external, enum Rotation rotation);
+
+    bool init();
+    bool _check_whoami();
+    bool _calibrate();
+    bool _setup_sampling_mode();
+
+    void _timer();
+
+    /* Read a single sample */
+    bool _read_sample();
+
+    // ask for a new sample
+    void _take_sample();
+
+    AP_HMC5843_BusDriver *_bus;
+
+    Vector3f _scaling;
+    float _gain_scale;
+
+    int16_t _mag_x;
+    int16_t _mag_y;
+    int16_t _mag_z;
+
+    uint8_t _compass_instance;
+
+    enum Rotation _rotation;
+    
+    bool _initialised:1;
+    bool _force_external:1;
+};
+
+class AP_HMC5843_BusDriver
+{
+public:
+    virtual ~AP_HMC5843_BusDriver() { }
+
+    virtual bool block_read(uint8_t reg, uint8_t *buf, uint32_t size) = 0;
+    virtual bool register_read(uint8_t reg, uint8_t *val) = 0;
+    virtual bool register_write(uint8_t reg, uint8_t val) = 0;
+
+    virtual AP_HAL::Semaphore *get_semaphore() = 0;
+
+    virtual bool configure() { return true; }
+    virtual bool start_measurements() { return true; }
+
+    virtual AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t, AP_HAL::Device::PeriodicCb) = 0;
+
+    // set device type within a device class
+    virtual void set_device_type(uint8_t devtype) = 0;
+
+    // return 24 bit bus identifier
+    virtual uint32_t get_bus_id(void) const = 0;
+
+    virtual void set_retries(uint8_t retries) {}
+};
+
+class AP_HMC5843_BusDriver_HALDevice : public AP_HMC5843_BusDriver
+{
+public:
+    AP_HMC5843_BusDriver_HALDevice(AP_HAL::OwnPtr<AP_HAL::Device> dev);
+
+    bool block_read(uint8_t reg, uint8_t *buf, uint32_t size) override;
+    bool register_read(uint8_t reg, uint8_t *val) override;
+    bool register_write(uint8_t reg, uint8_t val) override;
+
+    AP_HAL::Semaphore *get_semaphore() override;
+
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
+
+    // set device type within a device class
+    void set_device_type(uint8_t devtype) override {
+        _dev->set_device_type(devtype);
+    }
+
+    // return 24 bit bus identifier
+    uint32_t get_bus_id(void) const override {
+        return _dev->get_bus_id();
+    }
+
+    void set_retries(uint8_t retries) override {
+        return _dev->set_retries(retries);
+    }
+    
+private:
+    AP_HAL::OwnPtr<AP_HAL::Device> _dev;
+};
+
+#if AP_INERTIALSENSOR_ENABLED
+class AP_HMC5843_BusDriver_Auxiliary : public AP_HMC5843_BusDriver
+{
+public:
+    AP_HMC5843_BusDriver_Auxiliary(AP_InertialSensor &ins, uint8_t backend_id,
+                                   uint8_t addr);
+    virtual ~AP_HMC5843_BusDriver_Auxiliary();
+
+    bool block_read(uint8_t reg, uint8_t *buf, uint32_t size) override;
+    bool register_read(uint8_t reg, uint8_t *val) override;
+    bool register_write(uint8_t reg, uint8_t val) override;
+
+    AP_HAL::Semaphore *get_semaphore() override;
+
+    bool configure() override;
+    bool start_measurements() override;
+
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
+
+    // set device type within a device class
+    void set_device_type(uint8_t devtype) override;
+
+    // return 24 bit bus identifier
+    uint32_t get_bus_id(void) const override;
+    
+private:
+    AuxiliaryBus *_bus;
+    AuxiliaryBusSlave *_slave;
+    bool _started;
+};
+#endif  // AP_INERTIALSENSOR_ENABLED
+
+#endif // AP_COMPASS_HMC5843_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * Copyright (C) 2018  Lucas De Marchi. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "AP_Compass_IST8308.h"
+
+#if AP_COMPASS_IST8308_ENABLED
+
+#include <stdio.h>
+#include <utility>
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_Math/AP_Math.h>
+
+#define WAI_REG 0x0
+#define DEVICE_ID 0x08
+
+#define STAT1_REG 0x10
+#define STAT1_VAL_DRDY 0x1
+#define STAT1_VAL_DOR 0x2
+
+#define DATAX_L_REG 0x11
+#define DATAX_H_REG 0x12
+#define DATAY_L_REG 0x13
+#define DATAY_H_REG 0x14
+#define DATAZ_L_REG 0x15
+#define DATAZ_H_REG 0x16
+
+#define CNTL1_REG 0x30
+
+#define CNTL2_REG 0x31
+#define CNTL2_VAL_STANDBY_MODE      0x0
+#define CNTL2_VAL_SINGLE_MODE       0x1
+#define CNTL2_VAL_CONT_ODR10_MODE   0x2
+#define CNTL2_VAL_CONT_ODR20_MODE   0x4
+#define CNTL2_VAL_CONT_ODR50_MODE   0x6
+#define CNTL2_VAL_CONT_ODR100_MODE  0x8
+#define CNTL2_VAL_CONT_ODR200_MODE  0xA
+#define CNTL2_VAL_CONT_ODR8_MODE    0xB
+#define CNTL2_VAL_CONT_ODR1_MODE    0xC
+#define CNTL2_VAL_CONT_ODR0P5_MODE  0xD
+#define CNTL2_VAL_SINGLE_TEST_MODE  0x10
+
+#define CNTL3_REG 0x32
+#define CNTL3_VAL_SRST 1
+#define CNTL3_VAL_DRDY_POLARITY_HIGH (1 << 2)
+#define CNTL3_VAL_DRDY_EN (1 << 3)
+
+#define CNTL4_REG 0x34
+#define CNTL4_VAL_DYNAMIC_RANGE_500 0
+#define CNTL4_VAL_DYNAMIC_RANGE_200 0x1
+
+#define OSRCNTL_REG 0x41
+#define OSRCNTL_VAL_XZ_1  (0)
+#define OSRCNTL_VAL_XZ_2  (1)
+#define OSRCNTL_VAL_XZ_4  (2)
+#define OSRCNTL_VAL_XZ_8  (3)
+#define OSRCNTL_VAL_XZ_16 (4)
+#define OSRCNTL_VAL_XZ_32 (4)
+#define OSRCNTL_VAL_Y_1  (0 << 3)
+#define OSRCNTL_VAL_Y_2  (1 << 3)
+#define OSRCNTL_VAL_Y_4  (2 << 3)
+#define OSRCNTL_VAL_Y_8  (3 << 3)
+#define OSRCNTL_VAL_Y_16 (4 << 3)
+#define OSRCNTL_VAL_Y_32 (5 << 3)
+
+#define SAMPLING_PERIOD_USEC (10 * AP_USEC_PER_MSEC)
+
+extern const AP_HAL::HAL &hal;
+
+AP_Compass_Backend *AP_Compass_IST8308::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+                                              bool force_external,
+                                              enum Rotation rotation)
+{
+    if (!dev) {
+        return nullptr;
+    }
+
+    AP_Compass_IST8308 *sensor = NEW_NOTHROW AP_Compass_IST8308(std::move(dev), force_external, rotation);
+    if (!sensor || !sensor->init()) {
+        delete sensor;
+        return nullptr;
+    }
+
+    return sensor;
+}
+
+AP_Compass_IST8308::AP_Compass_IST8308(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                                       bool force_external,
+                                       enum Rotation rotation)
+    : _dev(std::move(dev))
+    , _rotation(rotation)
+    , _force_external(force_external)
+{
+}
+
+bool AP_Compass_IST8308::init()
+{
+    uint8_t reset_count = 0;
+
+    _dev->get_semaphore()->take_blocking();
+
+    // high retries for init
+    _dev->set_retries(10);
+
+    uint8_t whoami;
+    if (!_dev->read_registers(WAI_REG, &whoami, 1) ||
+        whoami != DEVICE_ID) {
+        // not an IST8308
+        goto fail;
+    }
+
+    for (; reset_count < 5; reset_count++) {
+        if (!_dev->write_register(CNTL3_REG, CNTL3_VAL_SRST)) {
+            hal.scheduler->delay(10);
+            continue;
+        }
+
+        hal.scheduler->delay(20);
+
+        uint8_t cntl3 = 0xFF;
+        if (_dev->read_registers(CNTL3_REG, &cntl3, 1) &&
+            (cntl3 & 0x01) == 0) {
+            break;
+        }
+    }
+
+    if (reset_count == 5) {
+        printf("IST8308: failed to reset device\n");
+        goto fail;
+    }
+
+    // DRDY enabled
+    // Dynamic Range=±500 uT, Sensitivity=6.6 LSB/uT
+    // OSR 16 (max 100Hz)
+    // Start continuous mode at 100Hz
+    if (!_dev->write_register(CNTL3_REG, CNTL3_VAL_DRDY_EN) ||
+        !_dev->write_register(CNTL4_REG, CNTL4_VAL_DYNAMIC_RANGE_500) ||
+        !_dev->write_register(OSRCNTL_REG, OSRCNTL_VAL_Y_16 | OSRCNTL_VAL_XZ_16) ||
+        !_dev->write_register(CNTL2_REG, CNTL2_VAL_CONT_ODR100_MODE)) {
+        printf("IST8308: found device but could not set it up\n");
+        goto fail;
+    }
+
+    // lower retries for run
+    _dev->set_retries(3);
+
+    _dev->get_semaphore()->give();
+
+    //register compass instance
+    _dev->set_device_type(DEVTYPE_IST8308);
+    if (!register_compass(_dev->get_bus_id(), _instance)) {
+        return false;
+    }
+    set_dev_id(_instance, _dev->get_bus_id());
+
+    printf("%s found on bus %u id %u address 0x%02x\n", name,
+           _dev->bus_num(), unsigned(_dev->get_bus_id()), _dev->get_bus_address());
+
+    set_rotation(_instance, _rotation);
+
+    if (_force_external) {
+        set_external(_instance, true);
+    }
+
+    _dev->register_periodic_callback(SAMPLING_PERIOD_USEC,
+                                     FUNCTOR_BIND_MEMBER(&AP_Compass_IST8308::timer, void));
+
+    return true;
+
+fail:
+    _dev->get_semaphore()->give();
+    return false;
+}
+
+void AP_Compass_IST8308::timer()
+{
+    struct PACKED {
+        le16_t rx;
+        le16_t ry;
+        le16_t rz;
+    } buffer;
+    uint8_t stat;
+
+    if (!_dev->read_registers(STAT1_REG, &stat, 1) ||
+        !(stat & STAT1_VAL_DRDY)) {
+        return;
+    }
+
+    if (!_dev->read_registers(DATAX_L_REG, (uint8_t *) &buffer,
+                              sizeof(buffer))) {
+        return;
+    }
+
+    auto x = static_cast<int16_t>(le16toh(buffer.rx));
+    auto y = static_cast<int16_t>(le16toh(buffer.ry));
+    auto z = static_cast<int16_t>(le16toh(buffer.rz));
+
+    // flip Z to conform to right-hand rule convention
+    z = -z;
+
+    /* Resolution: 0.1515 µT/LSB - already convert to milligauss */
+    Vector3f field = Vector3f{x * 1.515f, y * 1.515f, z * 1.515f};
+
+    accumulate_sample(field, _instance);
+}
+
+void AP_Compass_IST8308::read()
+{
+    drain_accumulated_samples(_instance);
+}
+
+#endif  // AP_COMPASS_IST8308_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * Copyright (C) 2018  Lucas De Marchi. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_IST8308_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/I2CDevice.h>
+
+#include "AP_Compass_Backend.h"
+
+#ifndef HAL_COMPASS_IST8308_I2C_ADDR
+#define HAL_COMPASS_IST8308_I2C_ADDR 0x0C
+#endif
+
+class AP_Compass_IST8308 : public AP_Compass_Backend
+{
+public:
+    static AP_Compass_Backend *probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+                                     bool force_external,
+                                     enum Rotation rotation);
+
+    void read() override;
+
+    static constexpr const char *name = "IST8308";
+
+private:
+    AP_Compass_IST8308(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                       bool force_external,
+                       enum Rotation rotation);
+
+    void timer();
+    bool init();
+
+    AP_HAL::OwnPtr<AP_HAL::Device> _dev;
+
+    enum Rotation _rotation;
+    uint8_t _instance;
+    bool _force_external;
+};
+
+#endif  // AP_COMPASS_IST8308_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright (C) 2016  Emlid Ltd. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Driver by Georgii Staroselskii, Sep 2016
+ */
+#include "AP_Compass_IST8310.h"
+
+#if AP_COMPASS_IST8310_ENABLED
+
+#include <stdio.h>
+#include <utility>
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+#define WAI_REG 0x0
+#define DEVICE_ID 0x10
+
+#define OUTPUT_X_L_REG 0x3
+#define OUTPUT_X_H_REG 0x4
+#define OUTPUT_Y_L_REG 0x5
+#define OUTPUT_Y_H_REG 0x6
+#define OUTPUT_Z_L_REG 0x7
+#define OUTPUT_Z_H_REG 0x8
+
+#define CNTL1_REG 0xA
+#define CNTL1_VAL_SINGLE_MEASUREMENT_MODE 0x1
+
+#define CNTL2_REG 0xB
+#define CNTL2_VAL_SRST 1
+
+#define AVGCNTL_REG 0x41
+#define AVGCNTL_VAL_XZ_0  (0)
+#define AVGCNTL_VAL_XZ_2  (1)
+#define AVGCNTL_VAL_XZ_4  (2)
+#define AVGCNTL_VAL_XZ_8  (3)
+#define AVGCNTL_VAL_XZ_16 (4)
+#define AVGCNTL_VAL_Y_0  (0 << 3)
+#define AVGCNTL_VAL_Y_2  (1 << 3)
+#define AVGCNTL_VAL_Y_4  (2 << 3)
+#define AVGCNTL_VAL_Y_8  (3 << 3)
+#define AVGCNTL_VAL_Y_16 (4 << 3)
+
+#define PDCNTL_REG 0x42
+#define PDCNTL_VAL_PULSE_DURATION_NORMAL 0xC0
+
+#define SAMPLING_PERIOD_USEC (10 * AP_USEC_PER_MSEC)
+
+/*
+ * FSR:
+ *   x, y: +- 1600 µT
+ *   z:    +- 2500 µT
+ *
+ * Resolution according to datasheet is 0.3µT/LSB
+ */
+#define IST8310_RESOLUTION 0.3
+
+static const int16_t IST8310_MAX_VAL_XY = (1600 / IST8310_RESOLUTION) + 1;
+static const int16_t IST8310_MIN_VAL_XY = -IST8310_MAX_VAL_XY;
+static const int16_t IST8310_MAX_VAL_Z  = (2500 / IST8310_RESOLUTION) + 1;
+static const int16_t IST8310_MIN_VAL_Z  = -IST8310_MAX_VAL_Z;
+
+
+extern const AP_HAL::HAL &hal;
+
+AP_Compass_Backend *AP_Compass_IST8310::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+                                              bool force_external,
+                                              enum Rotation rotation)
+{
+    if (!dev) {
+        return nullptr;
+    }
+
+    AP_Compass_IST8310 *sensor = NEW_NOTHROW AP_Compass_IST8310(std::move(dev), force_external, rotation);
+    if (!sensor || !sensor->init()) {
+        delete sensor;
+        return nullptr;
+    }
+
+    return sensor;
+}
+
+AP_Compass_IST8310::AP_Compass_IST8310(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                                       bool force_external,
+                                       enum Rotation rotation)
+    : _dev(std::move(dev))
+    , _rotation(rotation)
+    , _force_external(force_external)
+{
+}
+
+bool AP_Compass_IST8310::init()
+{
+    uint8_t reset_count = 0;
+
+    _dev->get_semaphore()->take_blocking();
+
+    // high retries for init
+    _dev->set_retries(10);
+
+    /*
+      unfortunately the IST8310 employs the novel concept of a
+      writeable WHOAMI register. The register can become corrupt due
+      to bus noise, and what is worse it persists the corruption even
+      across a power cycle. If you power it off for 30s or more then
+      it will reset to the default of 0x10, but for less than that the
+      value of WAI is unreliable.
+
+      To avoid this issue we do a reset of the device before we probe
+      the WAI register. This is nasty as we don't yet know we've found
+      a real IST8310, but it is the best we can do given the bad
+      hardware design of the sensor
+     */
+    _dev->write_register(CNTL2_REG, CNTL2_VAL_SRST);
+    hal.scheduler->delay(10);
+
+    uint8_t whoami;
+    if (!_dev->read_registers(WAI_REG, &whoami, 1) ||
+        whoami != DEVICE_ID) {
+        // not an IST8310
+        goto fail;
+    }
+
+    for (; reset_count < 5; reset_count++) {
+        if (!_dev->write_register(CNTL2_REG, CNTL2_VAL_SRST)) {
+            hal.scheduler->delay(10);
+            continue;
+        }
+
+        hal.scheduler->delay(10);
+
+        uint8_t cntl2 = 0xFF;
+        if (_dev->read_registers(CNTL2_REG, &cntl2, 1) &&
+            (cntl2 & 0x01) == 0) {
+            break;
+        }
+    }
+
+    if (reset_count == 5) {
+        printf("IST8310: failed to reset device\n");
+        goto fail;
+    }
+
+    if (!_dev->write_register(AVGCNTL_REG, AVGCNTL_VAL_Y_16 | AVGCNTL_VAL_XZ_16) ||
+        !_dev->write_register(PDCNTL_REG, PDCNTL_VAL_PULSE_DURATION_NORMAL)) {
+        printf("IST8310: found device but could not set it up\n");
+        goto fail;
+    }
+
+    // lower retries for run
+    _dev->set_retries(3);
+
+    // start state machine: request a sample
+    start_conversion();
+
+    _dev->get_semaphore()->give();
+
+    // register compass instance
+    _dev->set_device_type(DEVTYPE_IST8310);
+    if (!register_compass(_dev->get_bus_id(), _instance)) {
+        return false;
+    }
+    set_dev_id(_instance, _dev->get_bus_id());
+
+    printf("%s found on bus %u id %u address 0x%02x\n", name,
+           _dev->bus_num(), unsigned(_dev->get_bus_id()), _dev->get_bus_address());
+
+    set_rotation(_instance, _rotation);
+
+    if (_force_external) {
+        set_external(_instance, true);
+    }
+    
+    _periodic_handle = _dev->register_periodic_callback(SAMPLING_PERIOD_USEC,
+        FUNCTOR_BIND_MEMBER(&AP_Compass_IST8310::timer, void));
+
+    return true;
+
+fail:
+    _dev->get_semaphore()->give();
+    return false;
+}
+
+void AP_Compass_IST8310::start_conversion()
+{
+    if (!_dev->write_register(CNTL1_REG, CNTL1_VAL_SINGLE_MEASUREMENT_MODE)) {
+        _ignore_next_sample = true;
+    }
+}
+
+void AP_Compass_IST8310::timer()
+{
+    if (_ignore_next_sample) {
+        _ignore_next_sample = false;
+        start_conversion();
+        return;
+    }
+
+    struct PACKED {
+        le16_t rx;
+        le16_t ry;
+        le16_t rz;
+    } buffer;
+
+    bool ret = _dev->read_registers(OUTPUT_X_L_REG, (uint8_t *) &buffer, sizeof(buffer));
+    if (!ret) {
+        return;
+    }
+
+    start_conversion();
+
+    /* same period, but start counting from now */
+    _dev->adjust_periodic_callback(_periodic_handle, SAMPLING_PERIOD_USEC);
+
+    auto x = static_cast<int16_t>(le16toh(buffer.rx));
+    auto y = static_cast<int16_t>(le16toh(buffer.ry));
+    auto z = static_cast<int16_t>(le16toh(buffer.rz));
+
+    /*
+     * Check if value makes sense according to the FSR and Resolution of
+     * this sensor, discarding outliers
+     */
+    if (x > IST8310_MAX_VAL_XY || x < IST8310_MIN_VAL_XY ||
+        y > IST8310_MAX_VAL_XY || y < IST8310_MIN_VAL_XY ||
+        z > IST8310_MAX_VAL_Z  || z < IST8310_MIN_VAL_Z) {
+        return;
+    }
+
+    // flip Z to conform to right-hand rule convention
+    z = -z;
+
+    /* Resolution: 0.3 µT/LSB - already convert to milligauss */
+    Vector3f field = Vector3f{x * 3.0f, y * 3.0f, z * 3.0f};
+
+    accumulate_sample(field, _instance);
+}
+
+void AP_Compass_IST8310::read()
+{
+    drain_accumulated_samples(_instance);
+}
+
+#endif  // AP_COMPASS_IST8310_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Copyright (C) 2016  Emlid Ltd. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_IST8310_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/I2CDevice.h>
+#include <AP_Math/AP_Math.h>
+
+#include "AP_Compass_Backend.h"
+
+#ifndef HAL_COMPASS_IST8310_I2C_ADDR
+#define HAL_COMPASS_IST8310_I2C_ADDR 0x0E
+#endif
+
+#ifndef AP_COMPASS_IST8310_DEFAULT_ROTATION
+#define AP_COMPASS_IST8310_DEFAULT_ROTATION ROTATION_PITCH_180
+#endif
+
+class AP_Compass_IST8310 : public AP_Compass_Backend
+{
+public:
+    static AP_Compass_Backend *probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+                                     bool force_external,
+                                     enum Rotation rotation);
+
+    void read() override;
+
+    static constexpr const char *name = "IST8310";
+
+private:
+    AP_Compass_IST8310(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                       bool force_external,
+                       enum Rotation rotation);
+
+    void timer();
+    bool init();
+    void start_conversion();
+
+    AP_HAL::OwnPtr<AP_HAL::Device> _dev;
+    AP_HAL::Device::PeriodicHandle _periodic_handle;
+
+    enum Rotation _rotation;
+    uint8_t _instance;
+    bool _ignore_next_sample;
+    bool _force_external;
+};
+
+#endif  // AP_COMPASS_IST8310_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Driver by Andrew Tridgell, Nov 2016
+
+  thanks to Robert Dickenson and the PX4 team for register definitions
+ */
+#include "AP_Compass_LIS3MDL.h"
+
+#if AP_COMPASS_LIS3MDL_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <utility>
+#include <AP_Math/AP_Math.h>
+#include <stdio.h>
+
+#define ADDR_CTRL_REG1      0x20
+#define ADDR_CTRL_REG2      0x21
+#define ADDR_CTRL_REG3      0x22
+#define ADDR_CTRL_REG4      0x23
+#define ADDR_CTRL_REG5      0x24
+
+#define ADDR_STATUS_REG     0x27
+#define ADDR_OUT_X_L        0x28
+#define ADDR_OUT_X_H        0x29
+#define ADDR_OUT_Y_L        0x2a
+#define ADDR_OUT_Y_H        0x2b
+#define ADDR_OUT_Z_L        0x2c
+#define ADDR_OUT_Z_H        0x2d
+#define ADDR_OUT_T_L        0x2e
+#define ADDR_OUT_T_H        0x2f
+
+#define MODE_REG_CONTINOUS_MODE     (0 << 0)
+#define MODE_REG_SINGLE_MODE        (1 << 0)
+
+#define ADDR_WHO_AM_I       0x0f
+#define ID_WHO_AM_I         0x3d
+
+extern const AP_HAL::HAL &hal;
+
+AP_Compass_Backend *AP_Compass_LIS3MDL::probe(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                                              bool force_external,
+                                              enum Rotation rotation)
+{
+    if (!dev) {
+        return nullptr;
+    }
+    AP_Compass_LIS3MDL *sensor = NEW_NOTHROW AP_Compass_LIS3MDL(std::move(dev), force_external, rotation);
+    if (!sensor || !sensor->init()) {
+        delete sensor;
+        return nullptr;
+    }
+
+    return sensor;
+}
+
+AP_Compass_LIS3MDL::AP_Compass_LIS3MDL(AP_HAL::OwnPtr<AP_HAL::Device> _dev,
+                                       bool _force_external,
+                                       enum Rotation _rotation)
+    : dev(std::move(_dev))
+    , force_external(_force_external)
+    , rotation(_rotation)
+{
+}
+
+bool AP_Compass_LIS3MDL::init()
+{
+    dev->get_semaphore()->take_blocking();
+
+    if (dev->bus_type() == AP_HAL::Device::BUS_TYPE_SPI) {
+        dev->set_read_flag(0xC0);
+    }
+
+    // high retries for init
+    dev->set_retries(10);
+    
+    uint8_t whoami;
+    if (!dev->read_registers(ADDR_WHO_AM_I, &whoami, 1) ||
+        whoami != ID_WHO_AM_I) {
+        // not a 3MDL
+        goto fail;
+    }
+
+    dev->setup_checked_registers(5);
+
+    dev->write_register(ADDR_CTRL_REG1, 0xFC, true); // 80Hz, UHP
+    dev->write_register(ADDR_CTRL_REG2, 0, true); // 4Ga range
+    dev->write_register(ADDR_CTRL_REG3, 0, true); // continuous
+    dev->write_register(ADDR_CTRL_REG4, 0x0C, true); // z-axis ultra high perf
+    dev->write_register(ADDR_CTRL_REG5, 0x40, true); // block-data-update
+
+    // lower retries for run
+    dev->set_retries(3);
+    
+    dev->get_semaphore()->give();
+
+    /* register the compass instance in the frontend */
+    dev->set_device_type(DEVTYPE_LIS3MDL);
+    if (!register_compass(dev->get_bus_id(), compass_instance)) {
+        return false;
+    }
+    set_dev_id(compass_instance, dev->get_bus_id());
+
+    printf("Found a LIS3MDL on 0x%x as compass %u\n", unsigned(dev->get_bus_id()), compass_instance);
+    
+    set_rotation(compass_instance, rotation);
+
+    if (force_external) {
+        set_external(compass_instance, true);
+    }
+    
+    // call timer() at 80Hz
+    dev->register_periodic_callback(1000000U/80U,
+                                    FUNCTOR_BIND_MEMBER(&AP_Compass_LIS3MDL::timer, void));
+
+    return true;
+
+fail:
+    dev->get_semaphore()->give();
+    return false;
+}
+
+void AP_Compass_LIS3MDL::timer()
+{
+    struct PACKED {
+        int16_t magx;
+        int16_t magy;
+        int16_t magz;
+    } data;
+    const float range_scale = 1000.0f / 6842.0f;
+
+    // check data ready
+    uint8_t status;
+    if (!dev->read_registers(ADDR_STATUS_REG, (uint8_t *)&status, 1)) {
+        goto check_registers;
+    }
+    if (!(status & 0x08)) {
+        // data not available yet
+        goto check_registers;
+    }
+
+    if (!dev->read_registers(ADDR_OUT_X_L, (uint8_t *)&data, sizeof(data))) {
+        goto check_registers;
+    }
+
+    {
+        Vector3f field{
+            data.magx * range_scale,
+            data.magy * range_scale,
+            data.magz * range_scale,
+        };
+
+        accumulate_sample(field, compass_instance);
+    }
+
+check_registers:
+    dev->check_next_register();
+}
+
+void AP_Compass_LIS3MDL::read()
+{
+    drain_accumulated_samples(compass_instance);
+}
+
+#endif  // AP_COMPASS_LIS3MDL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_Compass_config.h"
+
+#if AP_COMPASS_LIS3MDL_ENABLED
+
+#include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/Device.h>
+#include <AP_Math/AP_Math.h>
+
+#include "AP_Compass.h"
+#include "AP_Compass_Backend.h"
+
+#ifndef HAL_COMPASS_LIS3MDL_I2C_ADDR
+# define HAL_COMPASS_LIS3MDL_I2C_ADDR 0x1c
+#endif
+
+#ifndef HAL_COMPASS_LIS3MDL_I2C_ADDR2
+# define HAL_COMPASS_LIS3MDL_I2C_ADDR2 0x1e
+#endif
+
+class AP_Compass_LIS3MDL : public AP_Compass_Backend
+{
+public:
+    static AP_Compass_Backend *probe(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                                     bool force_external,
+                                     enum Rotation rotation);
+
+    void read() override;
+
+    static constexpr const char *name = "LIS3MDL";
+
+private:
+    AP_Compass_LIS3MDL(AP_HAL::OwnPtr<AP_HAL::Device> dev,
+                       bool force_external,
+                       enum Rotation rotation);
+
+    AP_HAL::OwnPtr<AP_HAL::Device> dev;
+    
+    /**
+     * Device periodic callback to read data from the sensor.
+     */
+    bool init();
+    void timer();
+
+    uint8_t compass_instance;
+    bool force_external;
+    enum Rotation rotation;
+};
+
+#endif  // AP_COMPASS_LIS3MDL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_Compass_LSM303D.h"
+
+#if AP_COMPASS_LSM303D_ENABLED
+
+#include <utility>
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+
+extern const AP_HAL::HAL &hal;
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_LINUX
+#include <AP_HAL_Linux/GPIO.h>
+#endif
+
+#ifndef LSM303D_DRDY_M_PIN
+#define LSM303D_DRDY_M_PIN -1
+#endif
+
+/* SPI protocol address bits */
+#define DIR_READ                (1<<7)
+#define DIR_WRITE               (0<<7)
+#define ADDR_INCREMENT          (1<<6)
+
+/* register addresses: A: accel, M: mag, T: temp */
+#define ADDR_WHO_AM_I           0x0F
+#define WHO_I_AM                     0x49
+
+#define ADDR_OUT_TEMP_L         0x05
+#define ADDR_OUT_TEMP_H         0x06
+#define ADDR_STATUS_M           0x07
+#define ADDR_OUT_X_L_M              0x08
+#define ADDR_OUT_X_H_M              0x09
+#define ADDR_OUT_Y_L_M              0x0A
+#define ADDR_OUT_Y_H_M          0x0B
+#define ADDR_OUT_Z_L_M          0x0C
+#define ADDR_OUT_Z_H_M          0x0D
+
+#define ADDR_INT_CTRL_M         0x12
+#define ADDR_INT_SRC_M          0x13
+#define ADDR_REFERENCE_X        0x1c
+#define ADDR_REFERENCE_Y        0x1d
+#define ADDR_REFERENCE_Z        0x1e
+
+#define ADDR_STATUS_A           0x27
+#define ADDR_OUT_X_L_A          0x28
+#define ADDR_OUT_X_H_A          0x29
+#define ADDR_OUT_Y_L_A          0x2A
+#define ADDR_OUT_Y_H_A          0x2B
+#define ADDR_OUT_Z_L_A          0x2C
+#define ADDR_OUT_Z_H_A          0x2D
+
+#define ADDR_CTRL_REG0          0x1F
+#define ADDR_CTRL_REG1          0x20
+#define ADDR_CTRL_REG2          0x21
+#define ADDR_CTRL_REG3          0x22
+#define ADDR_CTRL_REG4          0x23
+#define ADDR_CTRL_REG5          0x24
+#define ADDR_CTRL_REG6          0x25
+#define ADDR_CTRL_REG7          0x26
+
+#define ADDR_FIFO_CTRL          0x2e
+#define ADDR_FIFO_SRC           0x2f
+
+#define ADDR_IG_CFG1            0x30
+#define ADDR_IG_SRC1            0x31
+#define ADDR_IG_THS1            0x32
+#define ADDR_IG_DUR1            0x33
+#define ADDR_IG_CFG2            0x34
+#define ADDR_IG_SRC2            0x35
+#define ADDR_IG_THS2            0x36
+#define ADDR_IG_DUR2            0x37
+#define ADDR_CLICK_CFG          0x38
+#define ADDR_CLICK_SRC          0x39
+#define ADDR_CLICK_THS          0x3a
+#define ADDR_TIME_LIMIT         0x3b
+#define ADDR_TIME_LATENCY       0x3c
+#define ADDR_TIME_WINDOW        0x3d
+#define ADDR_ACT_THS            0x3e
+#define ADDR_ACT_DUR            0x3f
+
+#define REG1_RATE_BITS_A        ((1<<7) | (1<<6) | (1<<5) | (1<<4))
+#define REG1_POWERDOWN_A        ((0<<7) | (0<<6) | (0<<5) | (0<<4))
+#define REG1_RATE_3_125HZ_A     ((0<<7) | (0<<6) | (0<<5) | (1<<4))
+#define REG1_RATE_6_25HZ_A      ((0<<7) | (0<<6) | (1<<5) | (0<<4))
+#define REG1_RATE_12_5HZ_A      ((0<<7) | (0<<6) | (1<<5) | (1<<4))
+#define REG1_RATE_25HZ_A        ((0<<7) | (1<<6) | (0<<5) | (0<<4))
+#define REG1_RATE_50HZ_A        ((0<<7) | (1<<6) | (0<<5) | (1<<4))
+#define REG1_RATE_100HZ_A       ((0<<7) | (1<<6) | (1<<5) | (0<<4))
+#define REG1_RATE_200HZ_A       ((0<<7) | (1<<6) | (1<<5) | (1<<4))
+#define REG1_RATE_400HZ_A       ((1<<7) | (0<<6) | (0<<5) | (0<<4))
+#define REG1_RATE_800HZ_A       ((1<<7) | (0<<6) | (0<<5) | (1<<4))
+#define REG1_RATE_1600HZ_A      ((1<<7) | (0<<6) | (1<<5) | (0<<4))
+
+#define REG1_BDU_UPDATE         (1<<3)
+#define REG1_Z_ENABLE_A         (1<<2)
+#define REG1_Y_ENABLE_A         (1<<1)
+#define REG1_X_ENABLE_A         (1<<0)
+
+#define REG2_ANTIALIAS_FILTER_BW_BITS_A ((1<<7) | (1<<6))
+#define REG2_AA_FILTER_BW_773HZ_A       ((0<<7) | (0<<6))

@@ -1,0 +1,2583 @@
+    // @Field: VFE: Force on vehicle in East direction
+    // @Field: VFD: Force on vehicle in Down direction
+    AP::logger().WriteStreaming("SLUP",
+                                "TimeUS,Land,Tens,Len,PN,PE,PD,VN,VE,VD,AN,AE,AD,VFN,VFE,VFD",  // labels
+                                "s-%mmmmnnnooo---",  // units
+                                "F-20000000000000",  // multipliers
+                                "Qbffffffffffffff",  // format
+                                AP_HAL::micros64(),
+                                (uint8_t)landed,
+                                (float)tension_ratio,
+                                (float)payload_to_veh.length(),
+                                (double)-payload_to_veh.x,
+                                (double)-payload_to_veh.y,
+                                (double)-payload_to_veh.z,
+                                (double)velocity_NED.x,
+                                (double)velocity_NED.y,
+                                (double)velocity_NED.z,
+                                (double)accel_NED.x,
+                                (double)accel_NED.y,
+                                (double)accel_NED.z,
+                                (double)veh_forces_ef.x,
+                                (double)veh_forces_ef.y,
+                                (double)veh_forces_ef.z);
+#endif
+}
+
+// returns true on success and fills in payload_loc argument, false on failure
+bool SlungPayloadSim::get_payload_location(Location& payload_loc) const
+{
+    // get EKF origin
+    auto *sitl = AP::sitl();
+    if (sitl == nullptr) {
+        return false;
+    }
+    const Location ekf_origin = sitl->state.home;
+    if (ekf_origin.lat == 0 && ekf_origin.lng == 0) {
+        return false;
+    }
+
+    // calculate location
+    payload_loc = ekf_origin;
+    payload_loc.offset(position_NED);
+    return true;
+}
+
+// update the slung payloads position, velocity, acceleration
+// vehicle position, velocity and acceleration should be in earth-frame NED frame
+void SlungPayloadSim::update_payload(const Vector3p& veh_pos, const Vector3f& veh_vel_ef, const Vector3f& veh_accel_ef, float dt)
+{
+    // how we calculate the payload's position, velocity and acceleration
+    //   1. update the payload's position, velocity using the previous iterations acceleration
+    //   2. check that the payload does not fall below the terrain
+    //   3. check if the line is taught and that the payload does not move more than the line length from the vehicle
+    //   4. calculate gravity and drag forces on the payload
+    //   5. calculate the tension force between the payload and vehicle including force countering gravity, drag and centripetal force
+    //   6. update the payload's acceleration using the sum of the above forces
+
+    // initialise position_NED from vehicle position
+    if (position_NED.is_zero()) {
+        if (!veh_pos.is_zero()) {
+            position_NED = veh_pos;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SlungPayload: initialised at %f %f %f", position_NED.x, position_NED.y, position_NED.z);
+        }
+        return;
+    }
+
+    // integrate previous iterations acceleration into velocity and position
+    velocity_NED += accel_NED * dt;
+    position_NED += (velocity_NED * dt).todouble();
+
+    // calculate distance from payload to vehicle
+    payload_to_veh = veh_pos - position_NED;
+    float payload_to_veh_length = payload_to_veh.length();
+
+    // update landed state by checking if payload has dropped below terrain
+    Location payload_loc;
+    if (get_payload_location(payload_loc)) {
+        int32_t alt_terrain_cm;
+        bool landed_orig = landed;
+        if (payload_loc.get_alt_cm(Location::AltFrame::ABOVE_TERRAIN, alt_terrain_cm)) {
+
+            // landed if below terrain
+            if (alt_terrain_cm <= 0) {
+                landed = true;
+
+                // raise payload to match terrain
+                position_NED.z += (alt_terrain_cm * 0.01);
+
+                // zero out velocity and acceleration in horizontal and downward direction
+                velocity_NED.xy().zero();
+                velocity_NED.z = MIN(velocity_NED.z, 0);
+                accel_NED.xy().zero();
+                accel_NED.z = MIN(accel_NED.z, 0);
+
+                // zero out forces on vehicle
+                veh_forces_ef.zero();
+            }
+
+            // not landed if above terrain
+            if (landed && (alt_terrain_cm > 1)) {
+                landed = false;
+            }
+        }
+
+        // inform user if landed state has changed
+        if (landed != landed_orig) {
+            if (landed) {
+                // get payload location again in case it has moved
+                get_payload_location(payload_loc);
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SlungPayload: landed lat:%f lon:%f alt:%4.1f",
+                              (double)payload_loc.lat * 1e-7,
+                              (double)payload_loc.lng * 1e-7,
+                              (double)payload_loc.alt * 1e-2);
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SlungPayload: liftoff");
+            }
+        }
+    }
+
+    // calculate forces of gravity
+    Vector3f force_gravity_NED = Vector3f(0.0f, 0.0f, GRAVITY_MSS * weight_kg);
+
+    // tension force on payload (resists gravity, drag, centripetal force)
+    Vector3f tension_force_NED;
+
+    // tension ratio to smooth transition from line being taut to slack
+    tension_ratio = 0;
+
+    // calculate drag force (0.5 * drag_coef * air_density * velocity^2 * surface area)
+    Vector3f force_drag_NED;
+    if (drag_coef > 0 && !velocity_NED.is_zero()) {
+        const float air_density = 1.225;    // 1.225 kg/m^3 (standard sea-level density)
+        const float surface_area_m2 = 0.07; // 30cm diameter sphere
+        const float drag_force = 0.5 * drag_coef * air_density * velocity_NED.length_squared() * surface_area_m2;
+        force_drag_NED = -velocity_NED.normalized() * drag_force;
+    }
+
+    // sanity check payload distance from vehicle and calculate tension force
+    if (is_positive(payload_to_veh_length)) {
+
+        // calculate unit vector from payload to vehicle
+        const Vector3f payload_to_veh_norm = payload_to_veh.normalized().tofloat();
+
+        // ensure payload is no more than line_length from vehicle
+        if (payload_to_veh_length > line_length) {
+            payload_to_veh *= (line_length / payload_to_veh_length);
+            position_NED = veh_pos - payload_to_veh;
+        }
+
+        // calculate tension ratio as value between 0 and 1
+        // tension ratio is 0 when payload-to-vehicle distance is 10cm less than line length
+        // tension ratio is 1 when payload-to-vehicle distance is equal to line length
+        tension_ratio = constrain_float(1.0 - (line_length - payload_to_veh_length) * 10, 0, 1);
+
+        // calculate tension forces when line is taut
+        if (is_positive(tension_ratio)) {
+
+            // tension resists gravity if vehicle is above payload
+            if (is_negative(payload_to_veh_norm.z)) {
+                tension_force_NED += -force_gravity_NED.projected(payload_to_veh_norm);
+            }
+
+            // calculate tension force resulting from velocity difference between vehicle and payload
+            // use time constant to convert velocity to acceleration
+            const float velocity_to_accel_TC = 2.0;
+            Vector3f velocity_diff_NED = (veh_vel_ef - velocity_NED).projected(payload_to_veh_norm);
+
+            // add to tension force if the vehicle is moving faster than the payload
+            if (vectors_same_direction(velocity_diff_NED, payload_to_veh_norm)) {
+                tension_force_NED += velocity_diff_NED / velocity_to_accel_TC * weight_kg;
+            }
+
+            // tension force resisting payload drag
+            tension_force_NED += -force_drag_NED.projected(payload_to_veh_norm);
+
+            // calculate centripetal force
+            const Vector3f velocity_parallel = velocity_NED.projected(payload_to_veh_norm);
+            const Vector3f velocity_perpendicular = velocity_NED - velocity_parallel;
+            const float tension_force_centripetal = velocity_perpendicular.length_squared() * weight_kg / line_length;
+            const Vector3f tension_force_centripetal_NED = payload_to_veh_norm * tension_force_centripetal;
+
+            // add centripetal force to tension force
+            tension_force_NED += tension_force_centripetal_NED;
+
+            // scale tension force by tension ratio
+            tension_force_NED *= tension_ratio;
+        }
+    }
+
+    // force on vehicle is opposite to tension force on payload
+    veh_forces_ef = -tension_force_NED;
+
+    // convert force to acceleration (f=m*a => a=f/m)
+    accel_NED = (force_gravity_NED + force_drag_NED + tension_force_NED) / weight_kg;
+
+    // if slung payload is landed we zero out downward (e.g positive) acceleration
+    if (landed) {
+        accel_NED.z = MIN(accel_NED.z, 0);
+        // should probably zero out forces_ef vertical component as well?
+    }
+}
+
+// returns true if the two vectors point in the same direction, false if perpendicular or opposite
+bool SlungPayloadSim::vectors_same_direction(const Vector3f& v1, const Vector3f& v2) const
+{
+    // check both vectors are non-zero
+    if (v1.is_zero() || v2.is_zero()) {
+        return false;
+    }
+    return v1.dot(v2) > 0;
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simulate a payload slung from a line under a vehicle
+*/
+
+#pragma once
+
+#include "SIM_config.h"
+
+#if AP_SIM_SLUNGPAYLOAD_ENABLED
+
+#include <AP_HAL/utility/Socket_native.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Common/Location.h>
+#include <GCS_MAVLink/GCS_MAVLink.h>
+
+namespace SITL {
+
+// SlungPayloadSim handles interaction with main vehicle
+class SlungPayloadSim {
+public:
+    friend class SlungPayload;
+
+    // constructor
+    SlungPayloadSim();
+
+    // update the SlungPayloadSim's state using thevehicle's earth-frame position, velocity and acceleration
+    void update(const Vector3p& veh_pos, const Vector3f& veh_vel_ef, const Vector3f& veh_accel_ef);
+
+    // get earth-frame forces on the vehicle from slung payload
+    // returns true on success and fills in forces_ef argument, false on failure
+    bool get_forces_on_vehicle(Vector3f& forces_ef) const;
+
+    // parameter table
+    static const struct AP_Param::GroupInfo var_info[];
+
+private:
+
+    // parameters
+    AP_Int8 enable;         // enable parameter
+    AP_Float weight_kg;        // payload weight in kg
+    AP_Float line_length;   // line length in meters
+    AP_Int8 sys_id;         // mavlink system id for reporting to GCS
+    AP_Float drag_coef;     // drag coefficient (spheres=0.5, cubes=1.05, barrels=0.8~1.2)
+
+    // send MAVLink messages to GCS
+    void send_report();
+
+    // write onboard log
+    void write_log();
+
+    // get payload location
+    // returns true on success and fills in payload_loc argument, false on failure
+    bool get_payload_location(Location& payload_loc) const;
+
+    // update the slung payload's position, velocity, acceleration
+    // vehicle position, velocity and acceleration should be in earth-frame NED frame
+    void update_payload(const Vector3p& veh_pos, const Vector3f& veh_vel_ef, const Vector3f& veh_accel_ef, float dt);
+
+    // returns true if the two vectors point in the same direction, false if perpendicular or opposite
+    bool vectors_same_direction(const Vector3f& v1, const Vector3f& v2) const;
+
+    // socket connection variables
+    const char *target_address = "127.0.0.1";
+    const uint16_t target_port = 5763;
+    SocketAPM_native mav_socket { false };
+    bool initialised;           // true if this class has been initialised
+    uint32_t last_update_us;    // system time of last update
+
+    // mavlink reporting variables
+    const float reporting_period_ms = 200;  // reporting period in ms
+    uint32_t last_report_ms;                // system time of last MAVLink report sent to GCS
+    uint32_t last_heartbeat_ms;             // system time of last MAVLink heartbeat sent to GCS
+    bool mavlink_connected;                 // true if a mavlink connection has been established
+    mavlink_status_t mav_status;            // reported mavlink status
+
+    // payload variables
+    bool landed = true;     // true if the payload is on the ground
+    float tension_ratio;    // 0 if line is loose, 1 if completely taut
+    Vector3p payload_to_veh;// distance vector (in meters in NED frame) from payload to vehicle (used for reporting purposes)
+    Vector3p position_NED;  // payload's position (as an offset from EKF origin? offset from vehicle?) in meters
+    Vector3f velocity_NED;  // payload velocity
+    Vector3f accel_NED;     // payload's acceleration
+    Vector3f veh_forces_ef; // earth-frame forces on the vehicle caused by the payload
+};
+
+}  // namespace SITL
+
+#endif  // AP_SIM_SLUNGPAYLOAD_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  gimbal simulator class for MAVLink gimbal
+*/
+
+#include "SIM_SoloGimbal.h"
+
+#if AP_SIM_SOLOGIMBAL_ENABLED
+
+#include <stdio.h>
+
+#include "SIM_Aircraft.h"
+
+extern const AP_HAL::HAL& hal;
+
+#define GIMBAL_DEBUG 0
+
+#if GIMBAL_DEBUG
+#define debug(fmt, args...)  do { printf("GIMBAL: " fmt, ##args); } while(0)
+#else
+#define debug(fmt, args...)  do { } while(0)
+#endif
+
+namespace SITL {
+
+/*
+  update the gimbal state
+*/
+void SoloGimbal::update(const Aircraft &aircraft)
+{
+    gimbal.update(aircraft);
+
+    // see if we should do a report
+    send_report();
+}
+
+static struct gimbal_param {
+    const char *name;
+    float value;
+} gimbal_params[] = {
+    {"GMB_OFF_ACC_X", 0},
+    {"GMB_OFF_ACC_Y", 0},
+    {"GMB_OFF_ACC_Z", 0},
+    {"GMB_GN_ACC_X", 0},
+    {"GMB_GN_ACC_Y", 0},
+    {"GMB_GN_ACC_Z", 0},
+    {"GMB_OFF_GYRO_X", 0},
+    {"GMB_OFF_GYRO_Y", 0},
+    {"GMB_OFF_GYRO_Z", 0},
+    {"GMB_OFF_JNT_X", 0},
+    {"GMB_OFF_JNT_Y", 0},
+    {"GMB_OFF_JNT_Z", 0},
+    {"GMB_K_RATE", 0},
+    {"GMB_POS_HOLD", 0},
+    {"GMB_MAX_TORQUE", 0},
+    {"GMB_SND_TORQUE", 0},
+    {"GMB_SYSID", 0},
+    {"GMB_FLASH", 0},
+};
+
+/*
+  find a parameter structure
+ */
+struct gimbal_param *SoloGimbal::param_find(const char *name)
+{
+    for (uint8_t i=0; i<ARRAY_SIZE(gimbal_params); i++) {
+        if (strncmp(name, gimbal_params[i].name, 16) == 0) {
+            return &gimbal_params[i];
+        }
+    }
+    return nullptr;
+}
+    
+/*
+  send a parameter to flight board
+ */
+void SoloGimbal::param_send(const struct gimbal_param *p)
+{
+    mavlink_message_t msg;
+    mavlink_param_value_t param_value{};
+    strncpy_noterm(param_value.param_id, p->name, sizeof(param_value.param_id));
+    param_value.param_value = p->value;
+    param_value.param_count = 0;
+    param_value.param_index = 0;
+    param_value.param_type = MAV_PARAM_TYPE_REAL32;
+
+    uint16_t len = mavlink_msg_param_value_encode_status(vehicle_system_id,
+                                                         gimbal_component_id,
+                                                         &mavlink.status,
+                                                         &msg, &param_value);
+
+    uint8_t msgbuf[len];
+    len = mavlink_msg_to_send_buffer(msgbuf, &msg);
+    if (len > 0) {
+        mav_socket.send(msgbuf, len);
+    }
+}
+
+    
+/*
+  send a report to the vehicle control code over MAVLink
+*/
+void SoloGimbal::send_report(void)
+{
+    uint32_t now = AP_HAL::millis();
+    if (now < 10000) {
+        // don't send gimbal reports until 10s after startup. This
+        // avoids a windows threading issue with non-blocking sockets
+        // and the initial wait on SERIAL0
+        return;
+    }
+    if (!mavlink.connected && mav_socket.connect(target_address, target_port)) {
+        ::printf("SoloGimbal connected to %s:%u\n", target_address, (unsigned)target_port);
+        mavlink.connected = true;
+    }
+    if (!mavlink.connected) {
+        return;
+    }
+
+    if (param_send_last_ms && now - param_send_last_ms > 100) {
+        param_send(&gimbal_params[param_send_idx]);
+        if (++param_send_idx == ARRAY_SIZE(gimbal_params)) {
+            printf("Finished sending parameters\n");
+            param_send_last_ms = 0;
+        }
+    }
+
+    // check for incoming MAVLink messages
+    uint8_t buf[100];
+    ssize_t ret;
+
+    while ((ret=mav_socket.recv(buf, sizeof(buf), 0)) > 0) {
+        for (uint8_t i=0; i<ret; i++) {
+            mavlink_message_t msg;
+            mavlink_status_t status;
+            if (mavlink_frame_char_buffer(&mavlink.rxmsg, &mavlink.status,
+                                          buf[i],
+                                          &msg, &status) == MAVLINK_FRAMING_OK) {
+                switch (msg.msgid) {
+                case MAVLINK_MSG_ID_HEARTBEAT: {
+                    mavlink_heartbeat_t pkt;
+                    mavlink_msg_heartbeat_decode(&msg, &pkt);
+                    debug("got HB type=%u autopilot=%u base_mode=0x%x\n", pkt.type, pkt.autopilot, pkt.base_mode);
+                    if (!seen_heartbeat) {
+                        seen_heartbeat = true;
+                        vehicle_component_id = msg.compid;
+                        vehicle_system_id = msg.sysid;
+                        ::printf("SoloGimbal using srcSystem %u\n", (unsigned)vehicle_system_id);
+                    }
+                    break;
+                }
+                case MAVLINK_MSG_ID_GIMBAL_CONTROL: {
+                    static uint32_t counter;
+                    if (counter++ % 100 == 0) {
+                        printf("GIMBAL_CONTROL %u\n", counter);
+                    }
+                    mavlink_gimbal_control_t pkt;
+                    mavlink_msg_gimbal_control_decode(&msg, &pkt);
+                    gimbal.set_demanded_rates(Vector3f(pkt.demanded_rate_x,
+                                                       pkt.demanded_rate_y,
+                                                       pkt.demanded_rate_z));
+                    seen_gimbal_control = true;
+                    break;
+                }
+                case MAVLINK_MSG_ID_PARAM_SET: {
+                    mavlink_param_set_t pkt;
+                    mavlink_msg_param_set_decode(&msg, &pkt);
+                    printf("SoloGimbal got PARAM_SET %.16s %f\n", pkt.param_id, pkt.param_value);
+
+                    struct gimbal_param *p = param_find(pkt.param_id);
+                    if (p) {
+                        p->value = pkt.param_value;
+                        param_send(p);
+                    }
+
+                    break;
+                }
+                case MAVLINK_MSG_ID_PARAM_REQUEST_LIST: {
+                    mavlink_param_request_list_t pkt;
+                    mavlink_msg_param_request_list_decode(&msg, &pkt);
+                    if (pkt.target_system == 0 && pkt.target_component == MAV_COMP_ID_GIMBAL) {
+                        // start param send
+                        param_send_idx = 0;
+                        param_send_last_ms = AP_HAL::millis();
+                    }
+                    printf("SoloGimbal sending %u parameters\n", (unsigned)ARRAY_SIZE(gimbal_params));
+                    break;
+                }
+                default:
+                    debug("got unexpected msg %u\n", msg.msgid);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!seen_heartbeat) {
+        return;
+    }
+    mavlink_message_t msg;
+    uint16_t len;
+
+    if (now - last_heartbeat_ms >= 1000) {
+        mavlink_heartbeat_t heartbeat;
+        heartbeat.type = MAV_TYPE_GIMBAL;
+        heartbeat.autopilot = MAV_AUTOPILOT_ARDUPILOTMEGA;
+        heartbeat.base_mode = 0;
+        heartbeat.system_status = 0;
+        heartbeat.mavlink_version = 0;
+        heartbeat.custom_mode = 0;
+
+        len = mavlink_msg_heartbeat_encode_status(vehicle_system_id,
+                                                  gimbal_component_id,
+                                                  &mavlink.status,
+                                                  &msg, &heartbeat);
+
+        mav_socket.send(&msg.magic, len);
+        last_heartbeat_ms = now;
+    }
+
+    /*
+      send a GIMBAL_REPORT message
+     */
+    uint32_t now_us = AP_HAL::micros();
+    if (now_us - last_report_us > reporting_period_ms*1000UL) {
+        last_report_us = now_us;
+
+        uint32_t delta_time_us;
+        Vector3f delta_angle;
+        Vector3f delta_velocity;
+        gimbal.get_deltas(delta_angle, delta_velocity, delta_time_us);
+
+        Vector3f joint_angles;
+        gimbal.get_joint_angles(joint_angles);
+
+        mavlink_gimbal_report_t gimbal_report;
+        gimbal_report.target_system = vehicle_system_id;
+        gimbal_report.target_component = vehicle_component_id;
+        gimbal_report.delta_time = delta_time_us * 1e-6;
+        gimbal_report.delta_angle_x = delta_angle.x;
+        gimbal_report.delta_angle_y = delta_angle.y;
+        gimbal_report.delta_angle_z = delta_angle.z;
+        gimbal_report.delta_velocity_x = delta_velocity.x;
+        gimbal_report.delta_velocity_y = delta_velocity.y;
+        gimbal_report.delta_velocity_z = delta_velocity.z;
+        gimbal_report.joint_roll = joint_angles.x;
+        gimbal_report.joint_el = joint_angles.y;
+        gimbal_report.joint_az = joint_angles.z;
+
+        len = mavlink_msg_gimbal_report_encode_status(vehicle_system_id,
+                                                      gimbal_component_id,
+                                                      &mavlink.status,
+                                                      &msg, &gimbal_report);
+
+        uint8_t msgbuf[len];
+        len = mavlink_msg_to_send_buffer(msgbuf, &msg);
+        if (len > 0) {
+            mav_socket.send(msgbuf, len);
+        }
+
+        delta_velocity.zero();
+        delta_angle.zero();
+    }
+}
+
+} // namespace SITL
+
+#endif  // AP_SIM_SOLOGIMBAL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  gimbal simulator class
+
+./Tools/autotest/sim_vehicle.py -D -G -v ArduCopter --mavlink-gimbal
+param set MNT1_TYPE 2
+param set RC6_OPTION 213  # MOUNT1_PITCH
+rc 6 1818  # for neutral pitch input
+*/
+
+#pragma once
+
+#include "SIM_config.h"
+
+#if AP_SIM_SOLOGIMBAL_ENABLED
+
+#include "SIM_Gimbal.h"
+
+#include <AP_Math/AP_Math.h>
+#include <GCS_MAVLink/GCS_MAVLink.h>
+#include <AP_HAL/utility/Socket_native.h>
+
+namespace SITL {
+
+class SoloGimbal {
+public:
+
+    SoloGimbal() {}
+    void update(const Aircraft &aicraft);
+
+private:
+
+    const char *target_address = "127.0.0.1";
+    const uint16_t target_port = 5762;
+
+    // physic simulation of gimbal:
+    Gimbal gimbal;
+
+    // reporting variables. gimbal pushes these to vehicle code over
+    // MAVLink at approx 100Hz
+
+    // reporting period in ms
+    const float reporting_period_ms = 10;
+
+    uint32_t last_report_us;
+    uint32_t last_heartbeat_ms;
+    bool seen_heartbeat;
+    bool seen_gimbal_control;
+    uint8_t vehicle_system_id;
+    uint8_t vehicle_component_id;
+
+    SocketAPM_native mav_socket{false};
+    struct {
+        // socket to telem2 on aircraft
+        bool connected;
+        mavlink_message_t rxmsg;
+        mavlink_status_t status;
+        uint8_t seq;
+    } mavlink;
+
+    uint32_t param_send_last_ms;
+    uint8_t param_send_idx;
+
+    // component ID we send from:
+    const uint8_t gimbal_component_id = 154;  // MAV_COMP_ID_GIMBAL
+
+    void send_report(void);
+    void param_send(const struct gimbal_param *p);
+    struct gimbal_param *param_find(const char *name);
+};
+
+}  // namespace SITL
+
+#endif  // AP_SIM_SOLOGIMBAL_ENABLED
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simple sprayer simulator class
+*/
+
+#include "SIM_Sprayer.h"
+#include "AP_HAL/AP_HAL.h"
+#include "AP_Math/AP_Math.h"
+
+#include <stdio.h>
+
+using namespace SITL;
+
+// table of user settable parameters
+const AP_Param::GroupInfo Sprayer::var_info[] = {
+
+    // @Param: ENABLE
+    // @DisplayName: Sprayer Sim enable/disable
+    // @Description: Allows you to enable (1) or disable (0) the Sprayer simulation
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("ENABLE", 0, Sprayer, sprayer_enable, 0),
+
+    // @Param: PUMP
+    // @DisplayName: Sprayer pump pin
+    // @Description: The pin number that the Sprayer pump is connected to. (start at 1)
+    // @Range: 0 15
+    // @User: Advanced
+    AP_GROUPINFO("PUMP", 1, Sprayer, sprayer_pump_pin, -1),
+
+    // @Param: SPIN
+    // @DisplayName: Sprayer spinner servo pin
+    // @Description: The pin number that the Sprayer spinner servo is connected to. (start at 1)
+    // @Range: 0 15
+    // @User: Advanced
+    AP_GROUPINFO("SPIN", 2, Sprayer, sprayer_spin_pin, -1),
+
+    AP_GROUPEND
+};
+
+/*
+  update sprayer state
+ */
+void Sprayer::update(const struct sitl_input &input)
+{
+    const int16_t pump_pwm = sprayer_pump_pin >= 1 ? input.servos[sprayer_pump_pin-1] : -1;
+    const int16_t spinner_pwm = sprayer_spin_pin >= 1 ? input.servos[sprayer_spin_pin-1] : -1;
+    const uint64_t now = AP_HAL::micros64();
+    const float dt = (now - last_update_us) * 1.0e-6f;
+    if (pump_pwm >= 0) {
+        // update remaining payload
+        if (capacity > 0) {
+            const double delta = last_pump_output * pump_max_rate * dt;
+            capacity -= delta;
+            if (capacity < 0) {
+                capacity = 0.0f;
+            }
+        }
+
+        // update pump
+        float pump_demand = (pump_pwm - 1000) * 0.001f;
+        // ::fprintf(stderr, "pump_demand=%f\n", pump_demand);
+        if (pump_demand < 0) { // never updated
+            pump_demand = 0;
+        }
+        const float pump_max_change = pump_slew_rate / 100.0f * dt;
+        last_pump_output =
+            constrain_float(pump_demand, last_pump_output - pump_max_change, last_pump_output + pump_max_change);
+        last_pump_output = constrain_float(last_pump_output, 0, 1);
+    } else {
+        last_pump_output = 0.0f;
+    }
+    // update spinner (if any)
+    if (spinner_pwm >= 0) {
+        const float spinner_demand = (spinner_pwm - 1000) * 0.001f;
+        const float spinner_max_change = spinner_slew_rate * 0.01f * dt;
+        last_spinner_output = constrain_float(spinner_demand,
+                                              last_spinner_output - spinner_max_change,
+                                              last_spinner_output + spinner_max_change);
+        last_spinner_output = constrain_float(last_spinner_output, 0, 1);
+    }
+
+    if (should_report()) {
+        printf("Remaining: %f litres\n", capacity);
+        printf("Pump: %f l/s\n", last_pump_output * pump_max_rate);
+        if (spinner_pwm >= 0) {
+            printf("Spinner: %f rev/s\n", (last_spinner_output * spinner_max_rate) / 360.0f);
+        }
+        last_report_us = now;
+    }
+    last_update_us = now;
+}
+
+bool Sprayer::should_report()
+{
+    if (AP_HAL::micros64() - last_report_us < report_interval) {
+        return false;
+    }
+
+    if (!is_zero(last_pump_output) || !is_zero(last_spinner_output)) {
+        zero_report_done = false;
+        return true;
+    }
+
+    if (!zero_report_done) {
+        zero_report_done = true;
+        return true;
+    }
+
+    return false;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simple sprayer simulation class
+*/
+
+#pragma once
+
+#include "stdint.h"
+#include <AP_Param/AP_Param.h>
+#include "SITL_Input.h"
+
+namespace SITL {
+
+class Sprayer {
+public:
+    Sprayer() {
+        AP_Param::setup_object_defaults(this, var_info);
+    };
+
+    // update sprayer state
+    void update(const struct sitl_input &input);
+
+    float payload_mass() const { return static_cast<float>(capacity); }; // kg; water, so kg=l
+
+    static const struct AP_Param::GroupInfo var_info[];
+    bool is_enabled() const {return static_cast<bool>(sprayer_enable);}
+
+ private:
+
+    AP_Int8  sprayer_enable;  // enable sprayer sim
+    AP_Int8  sprayer_pump_pin;
+    AP_Int8  sprayer_spin_pin;
+
+    const uint32_t report_interval = 1000000; // microseconds
+    uint64_t last_report_us;
+
+    const float pump_max_rate = 0.01f; // litres/second
+    const float pump_slew_rate = 20.0f; // percent/second
+    float last_pump_output; // percentage
+
+    const float spinner_max_rate = 3600.0f; // degrees/second
+    const float spinner_slew_rate = 20.0f; // percent/second
+    float last_spinner_output; // percentage
+
+    double capacity = 0.25; // litres
+
+    uint64_t last_update_us;
+
+    bool should_report();
+    bool zero_report_done = false;
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  StratoBlimp simulator class
+*/
+
+#include "SIM_StratoBlimp.h"
+
+#if AP_SIM_STRATOBLIMP_ENABLED
+
+#include <AP_Logger/AP_Logger.h>
+#include <AP_Motors/AP_Motors.h>
+
+#include <stdio.h>
+
+using namespace SITL;
+
+extern const AP_HAL::HAL& hal;
+
+// SITL StratoBlimp parameters
+const AP_Param::GroupInfo StratoBlimp::var_info[] = {
+    // @Param: MASS
+    // @DisplayName: mass
+    // @Description: mass of blimp not including lifting gas
+    // @Units: kg
+    AP_GROUPINFO("MASS",     1, StratoBlimp,  mass, 80),
+
+    // @Param: HMASS
+    // @DisplayName: helium mass
+    // @Description: mass of lifting gas
+    // @Units: kg
+    AP_GROUPINFO("HMASS",    2, StratoBlimp,  helium_mass, 13.54),
+
+    // @Param: ARM_LEN
+    // @DisplayName: arm length
+    // @Description: distance from center of mass to one motor
+    // @Units: m
+    AP_GROUPINFO("ARM_LEN",  3, StratoBlimp,  arm_length, 3.6),
+
+    // @Param: MOT_THST
+    // @DisplayName: motor thrust
+    // @Description: thrust at max throttle for one motor
+    // @Units: N
+    AP_GROUPINFO("MOT_THST", 4, StratoBlimp,  motor_thrust, 145),
+
+    // @Param: DRAG_FWD
+    // @DisplayName: drag in forward direction
+    // @Description: drag on X axis
+    AP_GROUPINFO("DRAG_FWD", 5, StratoBlimp,  drag_fwd, 0.27),
+
+    // @Param: DRAG_SIDE
+    // @DisplayName: drag in sidewards direction
+    // @Description: drag on Y axis
+    AP_GROUPINFO("DRAG_SIDE",  16, StratoBlimp,  drag_side, 0.5),
+
+    // @Param: DRAG_UP
+    // @DisplayName: drag in upward direction
+    // @Description: drag on Z axis
+    AP_GROUPINFO("DRAG_UP",  6, StratoBlimp,  drag_up, 0.4),
+
+    // @Param: MOI_YAW
+    // @DisplayName: moment of inertia in yaw
+    // @Description: moment of inertia in yaw
+    AP_GROUPINFO("MOI_YAW",  7, StratoBlimp,  moi_yaw, 2800),
+
+    // @Param: MOI_ROLL
+    // @DisplayName: moment of inertia in roll
+    // @Description: moment of inertia in roll
+    AP_GROUPINFO("MOI_ROLL", 8, StratoBlimp,  moi_roll, 1400),
+
+    // @Param: MOI_PITCH
+    // @DisplayName: moment of inertia in pitch
+    // @Description: moment of inertia in pitch
+    AP_GROUPINFO("MOI_PITCH", 9, StratoBlimp,  moi_pitch, 3050),
+    
+    // @Param: ALT_TARG
+    // @DisplayName: altitude target
+    // @Description: altitude target
+    // @Units: m
+    AP_GROUPINFO("ALT_TARG", 10, StratoBlimp,  altitude_target, 20000),
+
+    // @Param: CLMB_RT
+    // @DisplayName: target climb rate
+    // @Description: target climb rate
+    // @Units: m/s
+    AP_GROUPINFO("CLMB_RT",  11, StratoBlimp, target_climb_rate, 5),
+
+    // @Param: YAW_RT
+    // @DisplayName: yaw rate
+    // @Description: maximum yaw rate with full left throttle at target altitude
+    // @Units: deg/s
+    AP_GROUPINFO("YAW_RT",   12, StratoBlimp, yaw_rate_max, 60),
+
+    // @Param: MOT_ANG
+    // @DisplayName: motor angle
+    // @Description: maximum motor tilt angle
+    // @Units: deg
+    AP_GROUPINFO("MOT_ANG",  13, StratoBlimp,  motor_angle, 20),
+
+    // @Param: COL
+    // @DisplayName: center of lift
+    // @Description: center of lift position above CoG
+    // @Units: m
+    AP_GROUPINFO("COL",      14, StratoBlimp,  center_of_lift, 2.54),
+
+    // @Param: WVANE
+    // @DisplayName: weathervaning offset
+    // @Description: center of drag for weathervaning
+    // @Units: m
+    AP_GROUPINFO("WVANE",    15, StratoBlimp,  center_of_drag, 0.3),
+
+    // @Param: FLR
+    // @DisplayName: free lift rate
+    // @Description: amount of additional lift generated by the helper balloon (for the purpose of ascent), as a proportion of the 'neutral buoyancy' lift
+    AP_GROUPINFO("FLR",  17, StratoBlimp,  free_lift_rate, 0.12),
+    
+    AP_GROUPEND
+};
+
+StratoBlimp::StratoBlimp(const char *frame_str) :
+    Aircraft(frame_str)
+{
+    AP::sitl()->models.stratoblimp_ptr = this;
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+/*
+  calculate coefficients to match parameters
+ */
+void StratoBlimp::calculate_coefficients(void)
+{
+    // calculate yaw drag based on turn rate at the given altitude
+    drag_yaw = 1.0;
+
+    // get full throttle rotational accel for one motor
+    Vector3f body_acc, rot_accel;
+    handle_motor(1, 0, body_acc, rot_accel, -arm_length);
+
+    // get rotational drag at target alt
+    Vector3f vel_bf, g, drag_linear, drag_rotaccel;
+    g.z = radians(yaw_rate_max);
+
+    get_drag(vel_bf, g,
+             altitude_target,
+             drag_linear, drag_rotaccel);
+
+    drag_yaw = rot_accel.z / -drag_rotaccel.z;
+}
+
+void StratoBlimp::handle_motor(float throttle, float tilt, Vector3f &body_acc, Vector3f &rot_accel, float lateral_position)
+{
+    const float angle_rad = radians(motor_angle) * tilt;
+    const float thrust_x = motor_thrust * throttle;
+    const float total_mass = mass + helium_mass;
+
+    const Vector3f thrust{cosf(angle_rad)*thrust_x, 0, -sinf(angle_rad)*thrust_x}; // assume constant with pressure alt and linear
+    Vector3f accel = thrust / total_mass;
+    Vector3f pos{0, lateral_position, 0};
+
+    Vector3f torque = (pos % thrust);
+
+    rot_accel.z += torque.z / moi_yaw;
+    body_acc += accel;
+}
+
+
+/*
+  get body frame linear and rotational drag for a given velocity and altitude
+ */
+void StratoBlimp::get_drag(const Vector3f &velocity_linear,
+                           const Vector3f &velocity_rot,
+                           float altitude,
+                           Vector3f &drag_linear, Vector3f &drag_rotaccel)
+{
+    Vector3f vel_air_bf = velocity_linear;
+    const float drag_x_sign = vel_air_bf.x>0? -1 : 1;
+    const float drag_y_sign = vel_air_bf.y>0? -1 : 1;
+    const float drag_z_sign = vel_air_bf.z>0? -1 : 1;
+    drag_linear.x = 0.5 * drag_x_sign * air_density * sq(vel_air_bf.x) * drag_fwd;
+    drag_linear.y = 0.5 * drag_y_sign * air_density * sq(vel_air_bf.y) * drag_fwd;
+    drag_linear.z = 0.5 * drag_z_sign * air_density * sq(vel_air_bf.z) * drag_up;
+
+    drag_rotaccel = -velocity_rot * drag_yaw;
+
+    /*
+      apply torque from drag
+    */
+    Vector3f drag_force = drag_linear * mass;
+    Vector3f drag_pos{-center_of_drag, 0, -center_of_lift};
+    Vector3f drag_torque = (drag_pos % drag_force);
+    drag_rotaccel += drag_torque / moi_pitch;
+}
+
+/*
+  get vertical thrust from lift in Newtons
+ */
+float StratoBlimp::get_lift(float altitude)
+{
+    // start with neutral buoyancy
+    float lift_accel = GRAVITY_MSS;
+
+    // add lift from helper balloon if still attached
+    if (helper_balloon_attached) {
+        // helper balloon additional lift amount based on Free Lift Ratio
+        lift_accel += GRAVITY_MSS*free_lift_rate;
+        // detach helper balloon if the target altitude has been reached
+        if (altitude >= altitude_target) {
+            helper_balloon_attached = false;
+        }
+    }
+    return mass * lift_accel;
+}
+
+// calculate rotational and linear accelerations in body frame
+void StratoBlimp::calculate_forces(const struct sitl_input &input, Vector3f &body_acc, Vector3f &rot_accel)
+{
+    //float delta_time = frame_time_us * 1.0e-6f;
+
+    if (!hal.scheduler->is_system_initialized()) {
+        return;
+    }
+
+    const float left_tilt = filtered_servo_angle(input, 0);
+    const float right_tilt = filtered_servo_angle(input, 1);
+
+    const float left_throttle = filtered_servo_range(input, 2);
+    const float right_throttle = filtered_servo_range(input, 3);
+    const float ground_release = filtered_servo_range(input, 4);
+
+    body_acc.zero();
+    rot_accel.zero();
+
+    handle_motor(left_throttle, left_tilt, body_acc, rot_accel, -arm_length);
+    handle_motor(right_throttle, right_tilt, body_acc, rot_accel, arm_length);
+
+    Vector3f drag_linear, drag_rotaccel;
+    get_drag(velocity_air_bf, gyro,
+             location.alt*0.01,
+             drag_linear, drag_rotaccel);
+
+    body_acc += drag_linear;
+    rot_accel += drag_rotaccel;
+
+    if (ground_release > 0.9) {
+        released = true;
+    }
+    if (released) {
+        Vector3f lift_thrust_ef{0, 0, -get_lift(location.alt*0.01)};
+        Vector3f lift_thrust_bf = dcm.transposed() * lift_thrust_ef;
+
+        body_acc += lift_thrust_bf / mass;
+
+        /*
+          apply righting moment
+         */
+        Vector3f lift_pos{0, 0, -center_of_lift};
+        Vector3f lift_torque = (lift_pos % lift_thrust_bf);
+        rot_accel += lift_torque / moi_roll;
+    }
+}
+
+/*
+  update the airship simulation by one time step
+ */
+void StratoBlimp::update(const struct sitl_input &input)
+{
+    air_density = get_air_density(location.alt*0.01);
+    EAS2TAS = sqrtf(SSL_AIR_DENSITY / air_density);
+
+    calculate_coefficients();
+
+    float delta_time = frame_time_us * 1.0e-6f;
+
+    Vector3f rot_accel = Vector3f(0,0,0);
+    calculate_forces(input, accel_body, rot_accel);
+
+    // update rotational rates in body frame
+    gyro += rot_accel * delta_time;
+
+    gyro.x = constrain_float(gyro.x, -radians(2000.0f), radians(2000.0f));
+    gyro.y = constrain_float(gyro.y, -radians(2000.0f), radians(2000.0f));
+    gyro.z = constrain_float(gyro.z, -radians(2000.0f), radians(2000.0f));
+
+    dcm.rotate(gyro * delta_time);
+    dcm.normalize();
+
+    update_dynamics(rot_accel);
+    update_external_payload(input);
+
+    // update lat/lon/altitude
+    update_position();
+    update_wind(input);
+    time_advance();
+
+    // update magnetic field
+    update_mag_field_bf();
+}
+
+#endif // AP_SIM_STRATOBLIMP_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  a stratospheric blimp simulator class
+*/
+
+#pragma once
+
+#include "SIM_config.h"
+
+#if AP_SIM_STRATOBLIMP_ENABLED
+
+#include "SIM_Aircraft.h"
+#include <AP_Param/AP_Param.h>
+
+namespace SITL {
+
+/*
+  a stratospheric blimp simulator
+ */
+
+class StratoBlimp : public Aircraft {
+public:
+    StratoBlimp(const char *frame_str);
+
+    /* update model by one time step */
+    void update(const struct sitl_input &input) override;
+
+    /* static object creator */
+    static Aircraft *create(const char *frame_str) {
+        return NEW_NOTHROW StratoBlimp(frame_str);
+    }
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+protected:
+    void calculate_forces(const struct sitl_input &input, Vector3f &rot_accel, Vector3f &body_accel);
+
+private:
+    void calculate_coefficients();
+    void handle_motor(float throttle, float tilt, Vector3f &body_acc, Vector3f &rot_accel, float lateral_position);
+    void get_drag(const Vector3f &velocity_linear,
+                  const Vector3f &velocity_rot,
+                  float altitude,
+                  Vector3f &drag_linear, Vector3f &drag_rotaccel);
+    float get_lift(float altitude);
+
+    float air_density;
+    float EAS2TAS;
+    float drag_yaw;
+    bool released;
+    bool helper_balloon_attached = true;
+
+    AP_Float mass;
+    AP_Float helium_mass;
+    AP_Float arm_length;
+    AP_Float motor_thrust;
+    AP_Float drag_fwd;
+    AP_Float drag_side;
+    AP_Float drag_up;
+    AP_Float altitude_target;
+    AP_Float target_climb_rate;
+    AP_Float turn_rate;
+    AP_Float motor_angle;
+    AP_Float yaw_rate_max;
+    AP_Float moi_roll;
+    AP_Float moi_yaw;
+    AP_Float moi_pitch;
+    AP_Float center_of_lift;
+    AP_Float center_of_drag;
+    AP_Float free_lift_rate;
+};
+
+}
+
+#endif // AP_SIM_STRATOBLIMP_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  Submarine simulator class
+*/
+
+#include "SIM_Submarine.h"
+#include <AP_Motors/AP_Motors.h>
+
+#include <stdio.h>
+
+using namespace SITL;
+
+static Thruster vectored_thrusters[] =
+{      //       Motor #     Roll Factor     Pitch Factor    Yaw Factor      Throttle Factor     Forward Factor      Lateral Factor
+       Thruster(0,          0,              0,              1.0f,           0,                  -1.0f,              1.0f),
+       Thruster(1,          0,              0,              -1.0f,          0,                  -1.0f,              -1.0f),
+       Thruster(2,          0,              0,              -1.0f,          0,                  1.0f,               1.0f),
+       Thruster(3,          0,              0,              1.0f,           0,                  1.0f,               -1.0f),
+       Thruster(4,          1.0f,           0,              0,              -1.0f,              0,                  0),
+       Thruster(5,          -1.0f,          0,              0,              -1.0f,              0,                  0)
+};
+
+
+static Thruster vectored_6dof_thrusters[] =
+{
+       //       Motor #     Roll Factor     Pitch Factor    Yaw Factor      Throttle Factor     Forward Factor      Lateral Factor
+       Thruster(0,          0,              0,              1.0f,           0,                  -1.0f,              1.0f),
+       Thruster(1,          0,              0,              -1.0f,          0,                  -1.0f,              -1.0f),
+       Thruster(2,          0,              0,              -1.0f,          0,                  1.0f,               1.0f),
+       Thruster(3,          0,              0,              1.0f,           0,                  1.0f,               -1.0f),
+       Thruster(4,          1.0f,           -1.0f,          0,              -1.0f,              0,                  0),
+       Thruster(5,          -1.0f,          -1.0f,          0,              -1.0f,              0,                  0),
+       Thruster(6,          1.0f,           1.0f,           0,              -1.0f,              0,                  0),
+       Thruster(7,          -1.0f,          1.0f,           0,              -1.0f,              0,                  0)
+};
+
+Submarine::Submarine(const char *frame_str) :
+    Aircraft(frame_str),
+    frame(NULL)
+{
+    frame_height = 0.0;
+    ground_behavior = GROUND_BEHAVIOR_NONE;
+
+    // default to vectored frame
+    thrusters = vectored_thrusters;
+    n_thrusters = 6;
+
+    if (strstr(frame_str, "vectored_6dof")) {
+        thrusters = vectored_6dof_thrusters;
+        n_thrusters = 8;
+    }
+    lock_step_scheduled = true;
+}
+
+float Submarine::perpendicular_distance_to_rangefinder_surface() const
+{
+    const float floor_depth = calculate_sea_floor_depth(position);
+    return floor_depth - position.z;
+}
+
+// calculate rotational and linear accelerations
+void Submarine::calculate_forces(const struct sitl_input &input, Vector3f &rot_accel, Vector3f &body_accel)
+{
+    rot_accel = Vector3f(0,0,0);
+
+    // slight positive buoyancy
+    body_accel = dcm.transposed() *  Vector3f(0, 0, -calculate_buoyancy_acceleration());
+
+    for (int i = 0; i < n_thrusters; i++) {
+        Thruster t = thrusters[i];
+        int16_t pwm = input.servos[t.servo];
+        float output = 0;
+        // if valid pwm and not in the esc deadzone
+        // TODO: extract deadzone from parameters/vehicle code
+        if (pwm < 2000 && pwm > 1000 && (pwm < 1475 || pwm > 1525)) {
+            output = (pwm - 1500) / 400.0; // range -1~1
+        }
+
+        float thrust = output * fabs(output) * frame_property.thrust; // approximate pwm to thrust function using a quadratic curve
+        body_accel += t.linear * thrust / frame_property.weight;
+        rot_accel += t.rotational * thrust * frame_property.thruster_mount_radius / frame_property.moment_of_inertia;
+    }
+
+    // Limit movement at the sea floor
+    const float floor_depth = calculate_sea_floor_depth(position);
+    if (position.z > floor_depth && body_accel.z > -GRAVITY_MSS) {
+    	body_accel.z = -GRAVITY_MSS;
+    }
+
+    // Calculate linear drag forces
+    Vector3f linear_drag_forces;
+    calculate_drag_force(velocity_air_bf, frame_property.linear_drag_coefficient, linear_drag_forces);
+    // Add forces in body frame accel
+    body_accel -= linear_drag_forces / frame_property.weight;
+
+    // Calculate angular drag forces
+    // TODO: This results in the wrong units. Fix the math.
+    Vector3f angular_drag_torque;
+    calculate_angular_drag_torque(gyro, frame_property.angular_drag_coefficient, angular_drag_torque);
+
+    // Calculate torque induced by buoyancy foams on the frame
+    Vector3f buoyancy_torque;
+    calculate_buoyancy_torque(buoyancy_torque);
+    // Add forces in body frame accel
+    rot_accel -= angular_drag_torque / frame_property.moment_of_inertia;
+    rot_accel += buoyancy_torque / frame_property.moment_of_inertia;
+    add_shove_forces(rot_accel, body_accel);
+}
+
+
+/**
+ * @brief Calculate the torque induced by buoyancy foam
+ *
+ * @param torque Output torques
+ */
+void Submarine::calculate_buoyancy_torque(Vector3f &torque)
+{
+    // Let's assume 2 Liters water displacement at the top, and ~ 2kg of weight at the bottom.
+    const Vector3f force_up(0,0,-40); // 40 N upwards
+    const Vector3f force_position = dcm.transposed() * Vector3f(0, 0, 0.15); // offset in meters
+    torque = force_position % force_up;
+}
+
+
+/**
+ * @brief Calculate sea floor depth from submarine position
+ *          This creates a non planar floor for rangefinder sensor test
+ *          TODO: Create a better sea floor with procedural generatation
+ *
+ * @param position
+ * @return float
+ */
+float Submarine::calculate_sea_floor_depth(const Vector3d &/*position*/) const
+{
+    return 50;
+}
+
+/**
+ * @brief Calculate drag force against body
+ *
+ * @param velocity Body frame velocity of fluid
+ * @param drag_coefficient Drag coefficient of body
+ * @param force Output forces
+ * $ F_D = rho * v^2 * A * C_D / 2 $
+ * rho = water density (kg/m^3), V = velocity (m/s), A = area (m^2), C_D = drag_coefficient
+ */
+void Submarine::calculate_drag_force(const Vector3f &velocity, const Vector3f &drag_coefficient, Vector3f &force) const
+{
+    /**
+     * @brief It's necessary to keep the velocity orientation from the body frame.
+     *     To do so, a mathematical artifice is used to do velocity square but without loosing the direction.
+     *  $(|V|/V)*V^2$ = $|V|*V$
+     */
+    const Vector3f velocity_2(
+        fabsf(velocity.x) * velocity.x,
+        fabsf(velocity.y) * velocity.y,
+        fabsf(velocity.z) * velocity.z
+    );
+
+    force = (velocity_2 * water_density) * frame_property.equivalent_sphere_area / 2.0f;
+    force *= drag_coefficient;
+}
+
+/**
+ * @brief Calculate angular drag torque using the equivalente sphere area and assuming a laminar external flow.
+ *
+ *  $F_D = C_D*A*\rho*V^2/2$
+ * where:
+ *      $F_D$ is the drag force
+ *      $C_D$ is the drag coefficient
+ *      $A$ is the surface area in contact with the fluid
+ *      $/rho$ is the fluid density (1000kg/m³ for water)
+ *      $V$ is the fluid velocity velocity relative to the surface
+ *
+ * @param angular_velocity Body frame velocity of fluid
+ * @param drag_coefficient Rotational drag coefficient of body
+ */
+void Submarine::calculate_angular_drag_torque(const Vector3f &angular_velocity, const Vector3f &drag_coefficient, Vector3f &torque) const
+{
+     /**
+     * @brief It's necessary to keep the velocity orientation from the body frame.
+     *     To do so, a mathematical artifice is used to do velocity square but without loosing the direction.
+     *  $(|V|/V)*V^2$ = $|V|*V$
+     */
+    Vector3f v_2(
+        fabsf(angular_velocity.x) * angular_velocity.x,
+        fabsf(angular_velocity.y) * angular_velocity.y,
+        fabsf(angular_velocity.z) * angular_velocity.z
+    );
+    Vector3f f_d = v_2 *= drag_coefficient * frame_property.equivalent_sphere_area * 1000 / 2;
+    torque = f_d * frame_property.equivalent_sphere_radius;
+}
+
+
+/**
+* @brief Calculate buoyancy force of the frame
+*
+* @return float
+*/
+float Submarine::calculate_buoyancy_acceleration()
+{
+    float below_water_level = position.z - frame_property.height/2;
+
+    // Completely above water level
+    if (below_water_level < 0) {
+        return 0.0f;
+    }
+
+    // Completely below water level
+    if (below_water_level > frame_property.height/2) {
+        return GRAVITY_MSS + sitl->buoyancy / frame_property.mass;
+    }
+
+    // bouyant force is proportional to fraction of height in water
+    return GRAVITY_MSS + (sitl->buoyancy * below_water_level/frame_property.height) / frame_property.mass;
+};
+
+/*
+  update the Submarine simulation by one time step
+ */
+void Submarine::update(const struct sitl_input &input)
+{
+    // get wind vector setup
+    update_wind(input);
+
+    Vector3f rot_accel;
+
+    calculate_forces(input, rot_accel, accel_body);
+
+    update_dynamics(rot_accel);
+    update_external_payload(input);
+
+    // update lat/lon/altitude
+    update_position();
+    time_advance();
+
+    // update magnetic field
+    update_mag_field_bf();
+}
+
+/*
+   return true if we are on the ground
+*/
+bool Submarine::on_ground() const
+{
+	return false;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include "SIM_I2CDevice.h"
+
+/*
+  Simulator for the MCP9600 temperature sensor
+
+  DataSheet; https://www.microchip.com/content/dam/mchp/documents/OTH/ProductDocuments/DataSheets/MCP960X-Data-Sheet-20005426.pdf
+
+*/
+
+namespace SITL {
+
+class MCP9600DevReg : public I2CRegEnum {
+public:
+    static constexpr uint8_t HOT_JUNC        { 0x00 };
+    static constexpr uint8_t SENSOR_CONFIG   { 0x05 };
+    static constexpr uint8_t WHOAMI          { 0x20 };
+};
+
+class MCP9600 : public I2CDevice, private I2CRegisters_ConfigurableLength
+{
+public:
+
+    void init() override;
+
+    void update(const class Aircraft &aircraft) override;
+
+    int rdwr(I2C::i2c_rdwr_ioctl_data *&data) override;
+
+private:
+
+    // should be a call on aircraft:
+    float some_temperature = 26.5;
+
+    uint32_t last_temperature_update_ms;
+};
+
+} // namespace SITL
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "SIM_Temperature_TSYS01.h"
+
+#include <stdio.h>
+
+constexpr const int32_t SITL::TSYS01::_k[5];
+
+int SITL::TSYS01::rdwr(I2C::i2c_rdwr_ioctl_data *&data)
+{
+    if (data->nmsgs == 2) {
+        // something is expecting a response....
+        if (data->msgs[0].flags != 0) {
+            AP_HAL::panic("Unexpected flags");
+        }
+        if (data->msgs[1].flags != I2C_M_RD) {
+            AP_HAL::panic("Unexpected flags");
+        }
+        const uint8_t command = data->msgs[0].buf[0];
+        switch ((Command)command) {
+        case Command::RESET:
+            AP_HAL::panic("Bad RESET");
+        case Command::READ_PROM0:
+        case Command::READ_PROM1:
+        case Command::READ_PROM2:
+        case Command::READ_PROM3:
+        case Command::READ_PROM4:
+        case Command::READ_PROM5: {
+            if (state != State::RESET) {
+                AP_HAL::panic("reading prom outside RESET state");
+            }
+            if (data->msgs[1].len != 2) {
+                AP_HAL::panic("Unexpected prom read length");
+            }
+            uint8_t offs = 5-((uint8_t(command) - uint8_t(Command::READ_PROM0))/2);
+            const uint16_t k = _k[offs];
+            data->msgs[1].buf[0] = k >> 8;
+            data->msgs[1].buf[1] = k & 0xFF;
+            break;
+        }
+        case Command::CONVERT:
+            AP_HAL::panic("Bad CONVERT");
+        case Command::READ_ADC: {
+            uint8_t registers[3] {};
+            if (data->msgs[1].len != sizeof(registers)) {
+                AP_HAL::panic("Unexpected prom read length");
+            }
+            if (state == State::CONVERTING) {
+                // we've been asked for values while still converting.
+                // Return zeroes per data sheet
+            } else if (state == State::CONVERTED) {
+                uint32_t value = adc;
+                registers[2] = value & 0xff;
+                value >>= 8;
+                registers[1] = value & 0xff;
+                value >>= 8;
+                registers[0] = value & 0xff;
+                set_state(State::IDLE);
+            } else {
+                // AP_HAL::panic("READ_ADC in bad state");
+                // this happens at startup
+                return -1;
+            }
+            for (uint8_t i=0; i<ARRAY_SIZE(registers); i++) {
+                data->msgs[1].buf[i] = registers[i];
+            }
+            break;
+        }
+        }
+        return 0;
+    }
+
+    if (data->nmsgs == 1) {
+        // incoming write-only command
+        const auto &msg = data->msgs[0];
+        const uint8_t cmd = msg.buf[0];
+
+        switch ((Command)cmd) {
+        case Command::RESET:
+            set_state(State::RESET);
+            break;
+        case Command::READ_PROM0:
+        case Command::READ_PROM1:
+        case Command::READ_PROM2:
+        case Command::READ_PROM3:
+        case Command::READ_PROM4:
+        case Command::READ_PROM5:
+            AP_HAL::panic("bad prom read");
+        case Command::CONVERT:
+            if (state != State::RESET &&
+                state != State::CONVERTING &&
+                state != State::IDLE &&
+                state != State::READ_PROM) {
+                AP_HAL::panic("Convert outside reset/idle");
+            }
+            set_state(State::CONVERTING);
+            break;
+        case Command::READ_ADC:
+            AP_HAL::panic("bad READ_ADC");
+        }
+        return 0;
+    }
+    return -1;
+}
+
+// swiped from the driver:
+float SITL::TSYS01::temperature_for_adc(uint32_t _adc) const
+{
+    const float adc16 = _adc/256.0;
+    // const uint32_t _k[] { 28446, 24926, 36016, 32791, 40781 };
+    return
+        -2   * _k[4] * powf(10, -21) * powf(adc16, 4) +
+        4    * _k[3] * powf(10, -16) * powf(adc16, 3) +
+        -2   * _k[2] * powf(10, -11) * powf(adc16, 2) +
+        1    * _k[1] * powf(10, -6)  * adc16 +
+        -1.5 * _k[0] * powf(10, -2);
+}
+
+uint32_t SITL::TSYS01::calculate_adc(float temperature) const
+{
+    // bisect to find the adc24 value:
+    uint32_t min_adc = 0;
+    uint32_t max_adc = 1<<24;
+    uint32_t current_adc = (min_adc+(uint64_t)max_adc)/2;
+    float current_error = fabsf(temperature_for_adc(current_adc) - temperature);
+    bool bisect_down = false;
+
+    // temperature_for_adc(9378708);  // should be 10.59
+
+    while (labs(int32_t(max_adc - min_adc)) > 1 && current_error > 0.05) {
+        uint32_t candidate_adc;
+        if (bisect_down) {
+            candidate_adc = (min_adc+(uint64_t)current_adc)/2;
+        } else {
+            candidate_adc = (max_adc+(uint64_t)current_adc)/2;
+        }
+        const float candidate_temp = temperature_for_adc(candidate_adc);
+        const float candidate_error = fabsf(candidate_temp - temperature);
+        if (candidate_error > current_error) {
+            // worse result
+            if (bisect_down) {
+                min_adc = candidate_adc;
+                bisect_down = false;
+            } else {
+                max_adc = candidate_adc;
+                bisect_down = true;
+            }
+        } else {
+            // better result
+            if (bisect_down) {
+                max_adc = current_adc;
+                bisect_down = false;
+            } else {
+                min_adc = current_adc;
+                bisect_down = true;
+            }
+            current_adc = candidate_adc;
+            current_error = candidate_error;
+        }
+    }
+    return current_adc;
+}
+
+void SITL::TSYS01::update(const class Aircraft &aircraft)
+{
+    switch (state) {
+    case State::UNKNOWN:
+        break;
+    case State::RESET:
+        if (time_in_state_ms() > 10) {
+            set_state(State::READ_PROM);
+        }
+        break;
+    case State::READ_PROM:
+        break;
+    case State::IDLE:
+        break;
+    case State::CONVERTING:
+        if (time_in_state_ms() > 5) {
+            const float temperature = get_sim_temperature();
+            if (!is_equal(last_temperature, temperature)) {
+                last_temperature = temperature;
+                adc = calculate_adc(temperature);
+            }
+            set_state(State::CONVERTED);
+        }
+        break;
+    case State::CONVERTED:
+        break;
+    }
+}
+
+float SITL::TSYS01::get_sim_temperature() const
+{
+    float sim_alt = AP::sitl()->state.altitude;
+    sim_alt += 2 * rand_float();
+
+    // To Do: Add a sensor board temperature offset parameter
+    return AP_Baro::get_temperatureC_for_alt_amsl(sim_alt) + 25;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #include "SIM_I2CDevice.h"
+
+/*
+  Simulator for the TSYS01 temperature sensor
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduSub -A --speedup=1
+
+*/
+
+namespace SITL {
+
+class TSYS01 : public I2CDevice
+{
+public:
+
+    void update(const class Aircraft &aircraft) override;
+
+    int rdwr(I2C::i2c_rdwr_ioctl_data *&data) override;
+
+private:
+
+    // should be a call on aircraft:
+    float last_temperature = -1000.0f;
+
+    enum class State {
+        UNKNOWN = 22,
+        RESET = 23,
+        READ_PROM = 24,
+        IDLE = 25,
+        CONVERTING = 26,
+        CONVERTED = 27,
+    } state = State::RESET;
+
+    uint32_t state_start_time_ms;
+
+    void set_state(State new_state) {
+        state = new_state;
+        state_start_time_ms = AP_HAL::millis();
+    }
+    uint32_t time_in_state_ms() const {
+        return AP_HAL::millis() - state_start_time_ms;
+    }
+
+    float get_sim_temperature() const;
+
+    float temperature_for_adc(uint32_t adc) const;
+    uint32_t calculate_adc(float temperature) const;
+    uint32_t adc;
+
+    enum class Command {
+        RESET       = 0x1E,
+        READ_PROM0  = 0xA0,
+        READ_PROM1  = 0xA2,
+        READ_PROM2  = 0xA4,
+        READ_PROM3  = 0xA6,
+        READ_PROM4  = 0xA8,
+        READ_PROM5  = 0xAA,
+        CONVERT     = 0x40,
+        READ_ADC    = 0x00,
+    };
+
+    static constexpr int32_t _k[] { 40781, 32791, 36016, 24926, 28446 };
+};
+
+} // namespace SITL
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #include "SIM_config.h"
+
+#if AP_SIM_TSYS03_ENABLED
+
+#include "SIM_Temperature_TSYS03.h"
+
+#include <stdio.h>
+
+#include <GCS_MAVLink/GCS.h>
+
+constexpr const uint8_t SITL::TSYS03::serial[3];
+
+int SITL::TSYS03::rdwr_handle_read(I2C::i2c_rdwr_ioctl_data *&data)
+{
+    // something is expecting a response....
+    if (data->msgs[0].flags != 0) {
+        AP_HAL::panic("Unexpected flags");
+    }
+    if (data->msgs[1].flags != I2C_M_RD) {
+        AP_HAL::panic("Unexpected flags");
+    }
+    const uint8_t command = data->msgs[0].buf[0];
+    switch ((Command)command) {
+    case Command::RESET:
+        AP_HAL::panic("Bad RESET");
+    case Command::READ_SERIAL: {
+        if (state != State::RESET) {
+            // not sure if this is illegal or not?
+            AP_HAL::panic("reading serial outside RESET state");
+        }
+        if (data->msgs[1].len != 4) {
+            AP_HAL::panic("Unexpected serial read length");
+        }
+        memcpy(data->msgs[1].buf, serial, 3);
+        uint8_t crc = 0;
+        for (uint8_t i=0; i<3; i++) {
+            crc = crc8_dvb(crc, serial[i], 0x31);
+        }
+        data->msgs[1].buf[3] = crc;
+        break;
+    }
+    case Command::CONVERT:
+        AP_HAL::panic("Bad CONVERT");
+    case Command::READ_ADC: {
+        if (data->msgs[1].len != 3) {
+            AP_HAL::panic("Unexpected adc read length");
+        }
+        if (state == State::CONVERTING) {
+            // we've been asked for values while still converting.
+            // Return zeroes
+        } else if (state == State::CONVERTED) {
+            data->msgs[1].buf[1] = adc & 0xff;
+            data->msgs[1].buf[0] = adc >> 8;
+
+            uint8_t crc = 0;
+            for (uint8_t i=0; i<2; i++) {
+                crc = crc8_dvb(crc, data->msgs[1].buf[i], 0x31);
+            }
+            data->msgs[1].buf[2] = crc;
+
+            set_state(State::IDLE);
+        } else {
+            // AP_HAL::panic("READ_ADC in bad state");
+            // this happens at startup
+            return -1;
+        }
+        break;
+    }
+    }
+    return 0;
+}
+
+int SITL::TSYS03::rdwr_handle_write(I2C::i2c_rdwr_ioctl_data *&data)
+{
+    // incoming write-only command
+    const auto &msg = data->msgs[0];
+    const uint8_t cmd = msg.buf[0];
+
+    switch ((Command)cmd) {
+    case Command::RESET:
+        set_state(State::RESET);
+        break;
+    case Command::READ_SERIAL:
+        AP_HAL::panic("bad serial read");
+    case Command::CONVERT:
+        if (state != State::RESET &&
+            state != State::CONVERTING &&
+            state != State::IDLE &&
+            state != State::READ_SERIAL) {
+            AP_HAL::panic("Convert outside reset/idle");
+        }
+        set_state(State::CONVERTING);
+        break;
+    case Command::READ_ADC:
+        AP_HAL::panic("bad READ_ADC");
+    }
+    return 0;
+}
+
+int SITL::TSYS03::rdwr(I2C::i2c_rdwr_ioctl_data *&data)
+{
+    if (data->nmsgs == 2) {
+        return rdwr_handle_read(data);
+    }
+
+    if (data->nmsgs == 1) {
+        return rdwr_handle_write(data);
+    }
+    return -1;
+}
+
+// swiped from the driver:
+float SITL::TSYS03::temperature_for_adc(const uint16_t _adc) const
+{
+    const float temperature = -40.0 + _adc * 165 / (powf(2, 16) - 1.0);
+
+    return temperature;
+}
+
+uint16_t SITL::TSYS03::calculate_adc(float temperature) const
+{
+    // bisect to find the adc24 value:
+    uint16_t min_adc = 0;
+    uint16_t max_adc = 0xffff;
+    uint16_t current_adc = (min_adc+(uint64_t)max_adc)/2;
+    float current_error = fabsf(temperature_for_adc(current_adc) - temperature);
+    bool bisect_down = false;
+
+    // temperature_for_adc(9378708);  // should be 10.59
+
+    while (labs(int32_t(max_adc - min_adc)) > 1 && current_error > 0.05) {
+        uint16_t candidate_adc;
+        if (bisect_down) {
+            candidate_adc = (min_adc+(uint64_t)current_adc)/2;
+        } else {
+            candidate_adc = (max_adc+(uint64_t)current_adc)/2;
+        }
+        const float candidate_temp = temperature_for_adc(candidate_adc);
+        const float candidate_error = fabsf(candidate_temp - temperature);
+        if (candidate_error > current_error) {
+            // worse result
+            if (bisect_down) {
+                min_adc = candidate_adc;
+                bisect_down = false;
+            } else {
+                max_adc = candidate_adc;
+                bisect_down = true;
+            }
+        } else {
+            // better result
+            if (bisect_down) {
+                max_adc = current_adc;
+                bisect_down = false;
+            } else {
+                min_adc = current_adc;
+                bisect_down = true;
+            }
+            current_adc = candidate_adc;
+            current_error = candidate_error;
+        }
+    }
+    return current_adc;
+}
+
+void SITL::TSYS03::update(const class Aircraft &aircraft)
+{
+    switch (state) {
+    case State::UNKNOWN:
+        break;
+    case State::RESET:
+        if (time_in_state_ms() > 2) {
+            set_state(State::IDLE);
+        }
+        break;
+    case State::READ_SERIAL:
+        break;
+    case State::IDLE:
+        break;
+    case State::CONVERTING:
+        if (time_in_state_ms() > 5) {
+            const float temperature = get_sim_temperature(aircraft);
+            if (!is_equal(last_temperature, temperature)) {
+                last_temperature = temperature;
+                adc = calculate_adc(KELVIN_TO_C(temperature));
+            }
+            set_state(State::CONVERTED);
+        }
+        break;
+    case State::CONVERTED:
+        break;
+    }
+}
+
+float SITL::TSYS03::get_sim_temperature(const Aircraft &aircraft) const
+{
+    return aircraft.get_battery_temperature();
+}
+
+#endif  // AP_SIM_TSYS03_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #include "SIM_config.h"
+
+#if AP_SIM_TSYS03_ENABLED
+
+#include "SIM_I2CDevice.h"
+
+/*
+  Simulator for the TSYS03 temperature sensor
+
+./Tools/autotest/sim_vehicle.py --gdb --debug -v ArduCopter -f Callisto -A --speedup=1
+param set TEMP1_TYPE 4
+param fetch
+param set TEMP1_BUS 2
+param set TEMP1_SRC 3
+param set TEMP1_SRC_ID 1
+graph BATTERY_STATUS.temperature*0.01
+reboot
+
+arm throttle
+rc 3 2000
+
+fly around, check BAT[0].temperature
+
+*/
+
+namespace SITL {
+
+class TSYS03 : public I2CDevice
+{
+public:
+
+    void update(const class Aircraft &aircraft) override;
+
+    int rdwr(I2C::i2c_rdwr_ioctl_data *&data) override;
+
+private:
+
+    int rdwr_handle_read(I2C::i2c_rdwr_ioctl_data *&data);
+    int rdwr_handle_write(I2C::i2c_rdwr_ioctl_data *&data);
+
+    // should be a call on aircraft:
+    float last_temperature = -1000.0f;
+
+    enum class State {
+        UNKNOWN = 22,
+        RESET = 23,
+        READ_SERIAL = 24,
+        IDLE = 25,
+        CONVERTING = 26,
+        CONVERTED = 27,
+    } state = State::RESET;
+
+    uint32_t state_start_time_ms;
+
+    void set_state(State new_state) {
+        state = new_state;
+        state_start_time_ms = AP_HAL::millis();
+    }
+    uint32_t time_in_state_ms() const {
+        return AP_HAL::millis() - state_start_time_ms;
+    }
+
+    float get_sim_temperature(const class Aircraft &aircraft) const;
+
+    float temperature_for_adc(uint16_t adc) const;
+    uint16_t calculate_adc(float temperature) const;
+    uint32_t adc;
+
+    enum class Command {
+        RESET       = 0x1E,
+        READ_SERIAL = 0x0A,
+        CONVERT     = 0x46,
+        READ_ADC    = 0x00,
+    };
+
+    static constexpr uint8_t serial[] { 0xAB, 0xCD, 0xEF };
+};
+
+} // namespace SITL
+
+#endif  // AP_SIM_TSYS03_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simple tonealarm simulator class
+*/
+
+#include <GCS_MAVLink/GCS.h>
+#include <SITL/SITL.h>
+
+#include "SIM_ToneAlarm.h"
+
+using namespace SITL;
+
+// table of user settable parameters
+const AP_Param::GroupInfo ToneAlarm::var_info[] = {
+
+    // @Param: ENABLE
+    // @DisplayName: ToneAlarm enable/disable
+    // @Description: Allows you to enable (1) or disable (0) the simulated tonealarm
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("ENABLE", 0, ToneAlarm, _enable, 1),
+
+    AP_GROUPEND
+};
+
+/*
+  update tonealarm state
+ */
+void ToneAlarm::update(const struct sitl_input &input)
+{
+    // currently all of the simulated buzzer logic is within AP_HAL_SITL
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simple tonealarm simulation class; note that the bulk of this is
+  actuall in AP_HAL_SITL at the moment in ToneAlarm_SF.h and
+  ToneAlarm_SF.cpp
+*/
+
+#pragma once
+
+#include <AP_Param/AP_Param.h>
+#include "SITL_Input.h"
+
+#include "stdint.h"
+
+namespace SITL {
+
+class ToneAlarm {
+public:
+    ToneAlarm() {
+        AP_Param::setup_object_defaults(this, var_info);
+    };
+
+    void update(const struct sitl_input &input);
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    bool is_enabled() const {return static_cast<bool>(_enable);}
+
+ private:
+
+    AP_Int8  _enable;  // enable buzzer sim
+
+};
+
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #include "SIM_ToshibaLED.h"
+
+#if AP_SIM_TOSHIBALED_ENABLED
+
+#include <stdio.h>
+
+void SITL::ToshibaLED::update(const class Aircraft &aircraft)
+{
+    if (last_print_pwm0 == get_register(ToshibaLEDDevReg::PWM0) &&
+        last_print_pwm1 == get_register(ToshibaLEDDevReg::PWM1) &&
+        last_print_pwm2 == get_register(ToshibaLEDDevReg::PWM2) &&
+        last_print_enable == get_register(ToshibaLEDDevReg::ENABLE)) {
+        return;
+    }
+
+    last_print_pwm0 = get_register(ToshibaLEDDevReg::PWM0);
+    last_print_pwm1 = get_register(ToshibaLEDDevReg::PWM1);
+    last_print_pwm2 = get_register(ToshibaLEDDevReg::PWM2);
+    last_print_enable = get_register(ToshibaLEDDevReg::ENABLE);
+    // GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SIM_ToshibaLED: PWM0=%u PWM1=%u PWM2=%u ENABLE=%u", last_print_pwm0, last_print_pwm1, last_print_pwm2, last_print_enable);
+
+    if (get_register(ToshibaLEDDevReg::ENABLE)) {
+        // here we convert from 0-15 BGR (the PWM values from the i2c bus)
+        // to 0-255 RGB (what SIM_RGBLED wants):
+        rgbled.set_colours(
+            get_register(ToshibaLEDDevReg::PWM2) * 17,
+            get_register(ToshibaLEDDevReg::PWM1) * 17,
+            get_register(ToshibaLEDDevReg::PWM0) * 17
+            );
+    } else {
+        rgbled.set_colours(0, 0, 0);
+    }
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #include "SIM_I2CDevice.h"
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifndef AP_SIM_TOSHIBALED_ENABLED
+#define AP_SIM_TOSHIBALED_ENABLED (CONFIG_HAL_BOARD == HAL_BOARD_SITL)
+#endif
+
+#if AP_SIM_TOSHIBALED_ENABLED
+
+#include "SIM_RGBLED.h"
+
+namespace SITL {
+
+class ToshibaLEDDevReg : public I2CRegEnum {
+public:
+    static constexpr uint8_t PWM0 = 0x01;
+    static constexpr uint8_t PWM1 = 0x02;
+    static constexpr uint8_t PWM2 = 0x03;
+    static constexpr uint8_t ENABLE = 0x04;
+};
+
+class ToshibaLED : public I2CDevice, protected I2CRegisters_8Bit
+{
+public:
+    void init() override {
+        rgbled.init();
+
+        add_register("PWM0", ToshibaLEDDevReg::PWM0, I2CRegisters::RegMode::WRONLY);
+        add_register("PWM1", ToshibaLEDDevReg::PWM1, I2CRegisters::RegMode::WRONLY);
+        add_register("PWM2", ToshibaLEDDevReg::PWM2, I2CRegisters::RegMode::WRONLY);
+        add_register("ENABLE", ToshibaLEDDevReg::ENABLE, I2CRegisters::RegMode::WRONLY);
+    }
+
+    void update(const class Aircraft &aircraft) override;
+
+    int rdwr(I2C::i2c_rdwr_ioctl_data *&data) override {
+        return I2CRegisters_8Bit::rdwr(data);
+    }
+
+private:
+    uint8_t last_print_pwm0;
+    uint8_t last_print_pwm1;
+    uint8_t last_print_pwm2;
+    uint8_t last_print_enable;
+
+    SIM_RGBLED rgbled{"ToshibaLED"};
+};
+
+} // namespace SITL
+
+#endif  // AP_SIM_TOSHIBALED_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  simulate VectorNav serial AHRS
+*/
+
+#include "SIM_VectorNav.h"
+#include <stdio.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <AP_Common/NMEA.h>
+
+using namespace SITL;
+
+VectorNav::VectorNav() :
+    SerialDevice::SerialDevice()
+{
+}
+
+
+struct PACKED VN_IMU_packet_sim {
+    static constexpr uint8_t header[]{0x01, 0x21, 0x07};
+    uint64_t timeStartup;
+    float gyro[3];
+    float accel[3];
+    float uncompAccel[3];
+    float uncompAngRate[3];
+    float mag[3];
+    float temp;
+    float pressure;
+};
+constexpr uint8_t VN_IMU_packet_sim::header[];
+
+struct PACKED VN_INS_ekf_packet_sim {
+    static constexpr uint8_t header[]{0x31, 0x01, 0x00, 0x06, 0x01, 0x13, 0x06};
+    uint64_t timeStartup;
+    float ypr[3];
+    float quaternion[4];
+    float yprU[3];
+    uint16_t insStatus;
+    double posLla[3];
+    float velNed[3];
+    float posU;
+    float velU;
+};
+constexpr uint8_t VN_INS_ekf_packet_sim::header[];
+
+struct PACKED VN_INS_gnss_packet_sim {
+    static constexpr uint8_t header[]{0x49, 0x03, 0x00, 0xB8, 0x26, 0x18, 0x00};
+    uint64_t timeStartup;
+    uint64_t timeGps;
+    uint8_t numSats1;
+    uint8_t fix1;
+    double posLla1[3];
+    float velNed1[3];
+    float posU1[3];
+    float velU1;
+    float dop1[7];
+    uint8_t numSats2;
+    uint8_t fix2;
+};
+constexpr uint8_t VN_INS_gnss_packet_sim::header[];
+
+/*
+  get timeval using simulation time
+ */
+static void simulation_timeval(struct timeval *tv)
+{
+    uint64_t now = AP_HAL::micros64();
+    static uint64_t first_usec;
+    static struct timeval first_tv;
+    if (first_usec == 0) {
+        first_usec = now;
+        first_tv.tv_sec = AP::sitl()->start_time_UTC;
+    }
+    *tv = first_tv;
+    tv->tv_sec += now / 1000000ULL;
+    uint64_t new_usec = tv->tv_usec + (now % 1000000ULL);
+    tv->tv_sec += new_usec / 1000000ULL;
+    tv->tv_usec = new_usec % 1000000ULL;
+}
+
+void VectorNav::send_imu_packet(void)
+{
+    const auto &fdm = _sitl->state;
+
+    struct VN_IMU_packet_sim pkt {};
+
+    pkt.timeStartup = AP_HAL::micros() * 1e3;
+    
+    
+    const float gyro_noise = 0.05;
+
+    pkt.gyro[0] = radians(fdm.rollRate + rand_float() * gyro_noise);
+    pkt.gyro[1] = radians(fdm.pitchRate + rand_float() * gyro_noise);
+    pkt.gyro[2] = radians(fdm.yawRate + rand_float() * gyro_noise);
+    
+    pkt.accel[0] = fdm.xAccel;
+    pkt.accel[1] = fdm.yAccel;
+    pkt.accel[2] = fdm.zAccel;
+
+    pkt.uncompAccel[0] = fdm.xAccel;
+    pkt.uncompAccel[1] = fdm.yAccel;
+    pkt.uncompAccel[2] = fdm.zAccel;
+    
+    pkt.uncompAngRate[0] = radians(fdm.rollRate + gyro_noise * rand_float());
+    pkt.uncompAngRate[1] = radians(fdm.pitchRate + gyro_noise * rand_float());
+    pkt.uncompAngRate[2] = radians(fdm.yawRate + gyro_noise * rand_float());
+
+    pkt.mag[0] = fdm.bodyMagField.x*0.001;
+    pkt.mag[1] = fdm.bodyMagField.y*0.001;
+    pkt.mag[2] = fdm.bodyMagField.z*0.001;
+
+    pkt.temp = AP_Baro::get_temperatureC_for_alt_amsl(fdm.altitude);
+
+    const float pressure_Pa = AP_Baro::get_pressure_for_alt_amsl(fdm.altitude);
+    pkt.pressure = pressure_Pa*0.001 + rand_float() * 0.01;
+
+    const uint8_t sync_byte = 0xFA;
+    write_to_autopilot((const char *)&sync_byte, 1);
+    write_to_autopilot((const char *)&VN_IMU_packet_sim::header, sizeof(VN_IMU_packet_sim::header));
+    write_to_autopilot((const char *)&pkt, sizeof(pkt));
+
+    uint16_t crc = crc16_ccitt(&VN_IMU_packet_sim::header[0], sizeof(VN_IMU_packet_sim::header), 0);
+    crc = crc16_ccitt((const uint8_t *)&pkt, sizeof(pkt), crc);
+    uint16_t crc2;
+    swab(&crc, &crc2, 2);
+
+    write_to_autopilot((const char *)&crc2, sizeof(crc2));
+}
+
+void VectorNav::send_ins_ekf_packet(void)
+{
+    const auto &fdm = _sitl->state;
+
+    struct VN_INS_ekf_packet_sim pkt {};
+
+    pkt.timeStartup = AP_HAL::micros() * 1e3;
+
+    pkt.ypr[0] = fdm.yawDeg;
+    pkt.ypr[1] = fdm.pitchDeg;
+    pkt.ypr[2] = fdm.rollDeg;
+
+    pkt.quaternion[0] = fdm.quaternion.q2;
+    pkt.quaternion[1] = fdm.quaternion.q3;
+    pkt.quaternion[2] = fdm.quaternion.q4;
+    pkt.quaternion[3] = fdm.quaternion.q1;
+
+    pkt.yprU[0] = 0.03;
+    pkt.yprU[1] = 0.03;
+    pkt.yprU[2] = 0.15;
+
+    pkt.insStatus = 0x0306;
+
+    pkt.posLla[0] = fdm.latitude;
+    pkt.posLla[1] = fdm.longitude;
+    pkt.posLla[2] = fdm.altitude;
+    pkt.velNed[0] = fdm.speedN;
+    pkt.velNed[1] = fdm.speedE;
+    pkt.velNed[2] = fdm.speedD;
+    pkt.posU = 0.5;
+    pkt.velU = 0.25;
+
+    const uint8_t sync_byte = 0xFA;
+    write_to_autopilot((const char *)&sync_byte, 1);
+    write_to_autopilot((const char *)&VN_INS_ekf_packet_sim::header, sizeof(VN_INS_ekf_packet_sim::header));
+    write_to_autopilot((const char *)&pkt, sizeof(pkt));
+
+    uint16_t crc = crc16_ccitt(&VN_INS_ekf_packet_sim::header[0], sizeof(VN_INS_ekf_packet_sim::header), 0);
+    crc = crc16_ccitt((const uint8_t *)&pkt, sizeof(pkt), crc);
+
+    uint16_t crc2;
+    swab(&crc, &crc2, 2);
+
+    write_to_autopilot((const char *)&crc2, sizeof(crc2));
+}
+
+void VectorNav::send_ins_gnss_packet(void)
+{
+    const auto &fdm = _sitl->state;
+
+    struct VN_INS_gnss_packet_sim pkt {};
+
+    pkt.timeStartup = AP_HAL::micros() * 1e3;
+
+    struct timeval tv;
+    simulation_timeval(&tv);
+
+    pkt.timeGps = tv.tv_usec * 1000ULL;
+
+    pkt.numSats1 = 19;
+    pkt.fix1 = 3;
+    pkt.posLla1[0] = fdm.latitude;
+    pkt.posLla1[1] = fdm.longitude;
+    pkt.posLla1[2] = fdm.altitude;
+    pkt.velNed1[0] = fdm.speedN;
+    pkt.velNed1[1] = fdm.speedE;
+    pkt.velNed1[2] = fdm.speedD;
+
+    pkt.posU1[0] = 1;
+    pkt.posU1[0] = 1;
+    pkt.posU1[0] = 1.5;
+
+    pkt.velNed1[0] = 0.05;
+    pkt.velNed1[0] = 0.05;
+    pkt.velNed1[0] = 0.05;
+    // pkt.dop1 =
+    pkt.numSats2 = 18;
+    pkt.fix2 = 3;
+
+    const uint8_t sync_byte = 0xFA;
+    write_to_autopilot((const char *)&sync_byte, 1);
+    write_to_autopilot((const char *)&VN_INS_gnss_packet_sim::header, sizeof(VN_INS_gnss_packet_sim::header));
+    write_to_autopilot((const char *)&pkt, sizeof(pkt));
+
+    uint16_t crc = crc16_ccitt(&VN_INS_gnss_packet_sim::header[0], sizeof(VN_INS_gnss_packet_sim::header), 0);
+    crc = crc16_ccitt((const uint8_t *)&pkt, sizeof(pkt), crc);
+
+    uint16_t crc2;
+    swab(&crc, &crc2, 2);
+
+    write_to_autopilot((const char *)&crc2, sizeof(crc2));
+}
+
+void VectorNav::nmea_printf(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    char *s = nmea_vaprintf(fmt, ap);
+    va_end(ap);
+    if (s != nullptr) {
+        write_to_autopilot((const char*)s, strlen(s));
+        free(s);
+    }
+}
+
+/*
+  send VectorNav data
+ */
+void VectorNav::update(void)
+{
+    if (!init_sitl_pointer()) {
+        return;
+    }
+
+    uint32_t now = AP_HAL::micros();
+    if (now - last_imu_pkt_us >= 20000) {
+        last_imu_pkt_us = now;
+        send_imu_packet();
+    }
+    
+    if (now - last_ekf_pkt_us >= 20000) {
+        last_ekf_pkt_us = now;
+        send_ins_ekf_packet();
+    }
+    
+    if (now - last_gnss_pkt_us >= 200000) {
+        last_gnss_pkt_us = now;
+        send_ins_gnss_packet();
+    }
+
+    char receive_buf[50];
+    ssize_t n = read_from_autopilot(&receive_buf[0], ARRAY_SIZE(receive_buf));
+    if (n <= 0) {
+        return;
+    }
+
+    // avoid parsing the NMEA stream here by making assumptions about
+    // how we receive configuration strings.  Generally we can just
+    // echo back the configuration string to make the driver happy.
+    if (n >= 9) {
+        // intercept device-version query, respond with simulated version:
+        const char *ver_query_string = "$VNRRG,01";
+        if (strncmp(receive_buf, ver_query_string, strlen(ver_query_string)) == 0) {
+            nmea_printf("$VNRRG,01,VN-300-SITL");
+  

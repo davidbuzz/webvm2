@@ -1,0 +1,2987 @@
+/*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  test for RC input protocols
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_RCProtocol/AP_RCProtocol.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+#include <RC_Channel/RC_Channel.h>
+#include <AP_VideoTX/AP_VideoTX.h>
+#include <stdio.h>
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#endif
+
+void setup();
+void loop();
+
+class RC_Channel_Example : public RC_Channel {};
+
+class RC_Channels_Example : public RC_Channels
+{
+public:
+    RC_Channel_Example obj_channels[NUM_RC_CHANNELS];
+
+    RC_Channel_Example *channel(const uint8_t chan) override {
+        if (chan >= NUM_RC_CHANNELS) {
+            return nullptr;
+        }
+        return &obj_channels[chan];
+    }
+
+protected:
+    int8_t flight_mode_channel_number() const override { return 5; }
+};
+
+#define RC_CHANNELS_SUBCLASS RC_Channels_Example
+#define RC_CHANNEL_SUBCLASS RC_Channel_Example
+
+#include <RC_Channel/RC_Channels_VarInfo.h>
+
+static RC_Channels_Example rchannels;
+static AP_SerialManager serial_manager;
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+static AP_VideoTX vtx; // for set_vtx functions
+
+static AP_RCProtocol *rcprot;
+
+static uint32_t test_count;
+static uint32_t test_failures;
+
+static void delay_ms(uint32_t ms)
+{
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    hal.scheduler->stop_clock(AP_HAL::micros64()+ms*1000);
+#else
+    hal.scheduler->delay(ms);
+#endif
+}
+
+// setup routine
+void setup()
+{
+    // introduction
+    hal.console->printf("ArduPilot RC protocol test\n");
+    delay_ms(100);
+}
+
+static bool check_result(const char *name, bool bytes, const uint16_t *values, uint8_t nvalues)
+{
+    char label[20];
+    snprintf(label, 20, "%s(%s)", name, bytes?"bytes":"pulses");
+    const bool have_input = rcprot->new_input();
+    if (values == nullptr) {
+        if (have_input) {
+            printf("%s: got input, none expected\n", label);
+            return false;
+        } else {
+            printf("%s: OK (no input)\n", label);
+            return true;
+        }
+    }
+    if (!have_input) {
+        printf("%s: No new input\n", label);
+        test_failures++;
+        return false;
+    }
+    const char *pname = rcprot->protocol_name();
+    if (strncmp(pname, name, strlen(pname)) != 0) {
+        printf("%s: wrong protocol detected %s\n", label, rcprot->protocol_name());
+        test_failures++;
+        return false;
+    }
+    uint8_t n = rcprot->num_channels();
+    if (n != nvalues) {
+        printf("%s: wrong number of channels %u should be %u\n", label, n, nvalues);
+        test_failures++;
+        return false;
+    }
+    for (uint8_t i=0; i<n; i++) {
+        uint16_t v = rcprot->read(i);
+        if (values[i] != v) {
+            printf("%s: chan %u wrong value %u should be %u\n", label, i+1, v, values[i]);
+            test_failures++;
+            return false;
+        }
+    }
+    printf("%s OK\n", label);
+    return true;
+}
+
+/*
+  test a byte protocol handler
+ */
+static bool test_byte_protocol(const char *name, uint32_t baudrate,
+                               const uint8_t *bytes, uint8_t nbytes,
+                               const uint16_t *values, uint8_t nvalues,
+                               uint8_t repeats,
+                               uint8_t pause_at)
+{
+    bool ret = true;
+    for (uint8_t repeat=0; repeat<repeats+4; repeat++) {
+        for (uint8_t i=0; i<nbytes; i++) {
+            if (pause_at > 0 && i > 0 && ((i % pause_at) == 0)) {
+                delay_ms(10);
+            }
+            rcprot->process_byte(bytes[i], baudrate);
+        }
+        delay_ms(10);
+        if (repeat > repeats) {
+            ret &= check_result(name, true, values, nvalues);
+        }
+    }
+    return ret;
+}
+
+static void send_bit(uint8_t bit, uint32_t baudrate, bool inverted)
+{
+    static uint16_t bits_0, bits_1;
+    if (!inverted) {
+        // inverted serial idles low
+        bit = !bit;
+    }
+    if (bit == 0) {
+        if (bits_1 > 0) {
+            uint32_t w0=(bits_0 * (uint32_t)1000000) / baudrate;
+            uint32_t w1=(bits_1 * (uint32_t)1000000) / baudrate;
+            //printf("%u %u\n", w0, w1);
+            rcprot->process_pulse(w0, w1);
+            bits_0 = 1;
+            bits_1 = 0;
+        } else {
+            bits_0++;
+        }
+    } else {
+        bits_1++;
+    }
+}
+
+/*
+  call process_pulse() for a byte of input
+ */
+static void send_byte(uint8_t b, uint32_t baudrate, bool inverted)
+{
+    send_bit(0, baudrate, inverted); // start bit
+    uint8_t parity = 0;
+    for (uint8_t i=0; i<8; i++) {
+        uint8_t bit = (b & (1U<<i))?1:0;
+        send_bit(bit, baudrate, inverted);
+        if (bit) {
+            parity = !parity;
+        }
+    }
+    if (baudrate == 100000) {
+        // assume SBUS, send parity
+        send_bit(parity, baudrate, inverted);
+    }
+    send_bit(1, baudrate, inverted); // stop bit
+    if (baudrate == 100000) {
+        send_bit(1, baudrate, inverted); // 2nd stop bit
+    }
+}
+
+/*
+  add a gap in bits
+ */
+static void send_pause(uint8_t b, uint32_t baudrate, uint32_t pause_us, bool inverted)
+{
+    uint32_t nbits = pause_us * 1e6 / baudrate;
+    for (uint32_t i=0; i<nbits; i++) {
+        send_bit(b, baudrate, inverted);
+    }
+}
+
+/*
+  test a byte protocol handler
+ */
+static bool test_pulse_protocol(const char *name, uint32_t baudrate,
+                                const uint8_t *bytes, uint8_t nbytes,
+                                const uint16_t *values, uint8_t nvalues,
+                                uint8_t repeats, uint8_t pause_at,
+                                bool inverted)
+{
+    bool ret = true;
+    for (uint8_t repeat=0; repeat<repeats+4; repeat++) {
+        send_pause(1, baudrate, 6000, inverted);
+        for (uint8_t i=0; i<nbytes; i++) {
+            if (pause_at > 0 && i > 0 && ((i % pause_at) == 0)) {
+                send_pause(1, baudrate, 10000, inverted);
+            }
+            send_byte(bytes[i], baudrate, inverted);
+        }
+        send_pause(1, baudrate, 6000, inverted);
+        if (repeat > repeats) {
+            ret &= check_result(name, false, values, nvalues);
+        }
+    }
+    return ret;
+}
+
+/*
+  test a protocol handler
+ */
+static bool test_protocol(const char *name, uint32_t baudrate,
+                          const uint8_t *bytes, uint8_t nbytes,
+                          const uint16_t *values, uint8_t nvalues,
+                          uint8_t repeats=1,
+                          int8_t pause_at=0,
+                          bool inverted=false)
+{
+    bool ret = true;
+    rcprot = new AP_RCProtocol();
+    rcprot->init();
+
+    ret &= test_byte_protocol(name, baudrate, bytes, nbytes, values, nvalues, repeats, pause_at);
+    delete rcprot;
+
+    rcprot = new AP_RCProtocol();
+    rcprot->init();
+    ret &= test_pulse_protocol(name, baudrate, bytes, nbytes, values, nvalues, repeats, pause_at, inverted);
+    delete rcprot;
+
+    return ret;
+}
+
+/*
+  test a protocol handler where we only expected byte input to work
+ */
+static bool test_protocol_bytesonly(const char *name, uint32_t baudrate,
+                                    const uint8_t *bytes, uint8_t nbytes,
+                                    const uint16_t *values, uint8_t nvalues,
+                                    uint8_t repeats=1,
+                                    int8_t pause_at=0,
+                                    bool inverted=false)
+{
+    bool ret = true;
+    rcprot = new AP_RCProtocol();
+    rcprot->init();
+
+    ret &= test_byte_protocol(name, baudrate, bytes, nbytes, values, nvalues, repeats, pause_at);
+    delete rcprot;
+
+    rcprot = new AP_RCProtocol();
+    rcprot->init();
+    ret &= test_pulse_protocol(name, baudrate, bytes, nbytes, nullptr, 0, repeats, pause_at, inverted);
+    delete rcprot;
+
+    return ret;
+}
+
+/*
+  test with random data
+ */
+static void test_random(void)
+{
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    const uint32_t baudrates[] = { 115200, 100000, 416666, 420000 };
+    const uint32_t test_bytes = 1000000;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd == -1) {
+        printf("Can't open /dev/urandom\n");
+        return;
+    }
+    uint8_t *buf = (uint8_t *)malloc(test_bytes);
+    for (const auto b : baudrates) {
+        printf("Testing random with baud %u\n", unsigned(b));
+        rcprot = new AP_RCProtocol();
+        rcprot->init();
+        if (::read(fd, buf, test_bytes) != test_bytes) {
+            printf("Failed to read from /dev/urandom\n");
+            break;
+        }
+        for (uint32_t i=0; i<test_bytes; i++) {
+            rcprot->process_byte(buf[i], b);
+        }
+        delete rcprot;
+        rcprot = nullptr;
+    }
+    free(buf);
+    close(fd);
+#endif
+}
+
+//Main loop where the action takes place
+#pragma GCC diagnostic error "-Wframe-larger-than=2000"
+void loop()
+{
+    const uint8_t srxl_bytes[] = { 0xa5, 0x03, 0x0c, 0x04, 0x2f, 0x6c, 0x10, 0xb4, 0x26,
+                                   0x16, 0x34, 0x01, 0x04, 0x76, 0x1c, 0x40, 0xf5, 0x3b };
+    const uint16_t srxl_output[] = { 1567, 1502, 1019, 1536, 1804, 2000, 1500 };
+
+    const uint8_t sbus_bytes[] = {0x0F, 0x4C, 0x1C, 0x5F, 0x32, 0x34, 0x38, 0xDD, 0x89,
+                                  0x83, 0x0F, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    const uint16_t sbus_output[] = {1562, 1496, 1000, 1531, 1806, 2006, 1495, 1495, 875,
+                                    875, 875, 875, 875, 875, 875, 875};
+
+    const uint8_t dsm_bytes[] = {0x00, 0xab, 0x00, 0xae, 0x08, 0xbf, 0x10, 0xd0, 0x18,
+                                 0xe1, 0x20, 0xf2, 0x29, 0x03, 0x31, 0x14, 0x00, 0xab,
+                                 0x39, 0x25, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                 0xff, 0xff, 0xff, 0xff, 0xff};
+    const uint16_t dsm_output[] = {1010, 1020, 1000, 1030, 1040, 1050, 1060, 1070};
+
+    // DSMX_2048_11MS
+    const uint8_t dsm_bytes2[] = {0x00, 0xb2, 0x80, 0x94, 0x3c, 0x02, 0x1b, 0xfe,
+                                  0x44, 0x00, 0x4c, 0x00, 0x5c, 0x00, 0xff, 0xff,
+                                  0x00, 0xb2, 0x0c, 0x03, 0x2e, 0xaa, 0x14, 0x00,
+                                  0x21, 0x56, 0x34, 0x02, 0x54, 0x00, 0xff, 0xff };
+
+    const uint16_t dsm_output2[] = {1501, 1500, 985, 1499, 1099, 1901, 1501, 1501, 1500, 1500, 1500, 1500};
+
+    // DSMX_2048_11MS, from genuine spektrum satellite, 12 channels
+    const uint8_t dsm_bytes3[] = {0x00, 0x00, 0x81, 0x56, 0x39, 0x50, 0x1C, 0x06,
+                                  0x44, 0x00, 0x4c, 0x00, 0x5c, 0x00, 0xff, 0xff,
+                                  0x00, 0x00, 0x0c, 0x06, 0x2b, 0x32, 0x14, 0x06,
+                                  0x21, 0x96, 0x31, 0x50, 0x54, 0x00, 0xff, 0xff };
+
+    const uint16_t dsm_output3[] = {1503, 1503, 1099, 1503, 1137, 1379, 1096, 1096, 1500, 1500, 1500, 1500};
+
+    // DSMX_2048_22MS, from genuine spektrum satellite, 12 channels
+    const uint8_t dsm_bytes4[] = {0x00, 0x5a, 0x81, 0x7a, 0x39, 0x50, 0x1C, 0x06,
+                                  0x44, 0x00, 0x4c, 0x00, 0x5c, 0x00, 0xff, 0xff,
+                                  0x00, 0x5a, 0x0c, 0x06, 0x2b, 0x32, 0x14, 0x06,
+                                  0x21, 0x96, 0x31, 0x50, 0x54, 0x00, 0xff, 0xff };
+
+    const uint16_t dsm_output4[] = {1503, 1503, 1120, 1503, 1137, 1379, 1096, 1096, 1500, 1500, 1500, 1500};
+
+    const uint8_t dsm_bytes5[] = {0x03, 0xB2, 0x05, 0xFE, 0x17, 0x55, 0x13, 0x55,
+                                  0x09, 0xFC, 0x18, 0xAB, 0x00, 0x56, 0x0D, 0xFD};
+
+    const uint16_t dsm_output5[] = {1498, 1496, 999, 1497, 1901, 1901, 1099};
+
+    // DSMX 22ms D6G3 and SPM4648 autobound
+    const uint8_t dsmx22ms_bytes[] = {
+        0x00, 0xB2, 0x0C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x25, 0xF8, 0x34, 0x00, 0x54, 0x00, 0xFF, 0xFF,
+        0x00, 0xB2, 0x81, 0x50, 0x3C, 0x00, 0x1B, 0xFD,
+        0x44, 0x00, 0x4C, 0x00, 0x5C, 0x00, 0xFF, 0xFF
+    };
+    const uint16_t dsmx22ms_output[] = {
+        1500, 1500, 1096, 1499, 1796, 1099, 1500, 1500, 1500, 1500, 1500, 1500
+    };
+
+    // DSMX 22ms D6G3 and SPM4648 autobound VTX frame Ch1, B1, Pw25, Race
+    const uint8_t dsmx22ms_vtx_bytes[] = {
+        // two normal frames to satisfy the format guesser
+        0x00, 0xB2, 0x0C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x25, 0xF8, 0x34, 0x00, 0x54, 0x00, 0xFF, 0xFF,
+        0x00, 0xB2, 0x81, 0x50, 0x3C, 0x00, 0x1B, 0xFD,
+        0x44, 0x00, 0x4C, 0x00, 0x5C, 0x00, 0xFF, 0xFF,
+        // This is channels 1, 5, 2, 4, 6
+        0x00, 0xB2, 0x0C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x25, 0xF8, 0x34, 0x00, 0xE0, 0x00, 0xE0, 0x0A
+    };
+    const uint16_t dsmx22ms_vtx_output[] = {
+        1500, 1500, 1096, 1499, 1796, 1099, 1500, 1500, 1500, 1500, 1500, 1500
+    };
+    // DSMX 11ms D6G3 and SPM4648 autobound
+    const uint8_t dsmx11ms_bytes[] = {
+        0x01, 0xB2, 0x0C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x1B, 0xFC, 0x25, 0xF8, 0x44, 0x00, 0x4C, 0x00,
+        0x01, 0xB2, 0x8C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x1B, 0xFC, 0x01, 0x50, 0x3C, 0x00, 0x34, 0x00
+    };
+    const uint16_t dsmx11ms_output[] = {
+        1500, 1500, 1096, 1498, 1796, 1099, 1500, 1500, 1500, 1500
+    };
+
+    // DSMX 11ms D6G3 and SPM4648 autobound VTX frame Ch1, B1, Pw25, Race
+    const uint8_t dsmx11ms_vtx_bytes[] = {
+        0x01, 0xB2, 0x0C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x1B, 0xFD, 0x25, 0xF8, 0x44, 0x00, 0x4C, 0x00,
+        0x01, 0xB2, 0x8C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x1B, 0xFD, 0x01, 0x50, 0x3C, 0x00, 0x34, 0x00,
+        0x00, 0xB2, 0x0C, 0x00, 0x29, 0x56, 0x14, 0x00,
+        0x1B, 0xFD, 0x25, 0xF8, 0xE0, 0x00, 0xE0, 0x0A
+    };
+    const uint16_t dsmx11ms_vtx_output[] = {
+        1500, 1500, 1096, 1499, 1796, 1099, 1500, 1500, 1500, 1500
+    };
+
+    const uint8_t sumd_bytes[] = {0xA8, 0x01, 0x08, 0x2F, 0x50, 0x31, 0xE8, 0x21, 0xA0,
+                                  0x2F, 0x50, 0x22, 0x60, 0x22, 0x60, 0x2E, 0xE0, 0x2E,
+                                  0xE0, 0x87, 0xC6};
+
+    const uint8_t sumd_bytes2[] = {0xA8, 0x01, 0x0C, 0x22, 0x60, 0x2F, 0x60, 0x2E, 0xE0, 0x2E, 0xE0, 0x3B,
+                                  0x60, 0x3B, 0x60, 0x3B, 0x60, 0x3B, 0x60, 0x3B, 0x60, 0x3B, 0x60, 0x3B, 0x60, 0x3B,
+                                  0x60, 0x17, 0x02};
+
+    const uint8_t sumd_bytes3[] = {0xA8, 0x01, 0x10, 0x1F, 0x40, 0x2E, 0xE8, 0x2E, 0xE0, 0x2E, 0xE0, 0x2E, 0xE0,
+                                   0x2E, 0xE0, 0x2E, 0xE0, 0x22, 0x60, 0x2E, 0xE0, 0x2E, 0xE0, 0x2E, 0xE0, 0x2E,
+                                   0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3B, 0x20, 0x4F, 0x10};
+
+    const uint16_t sumd_output[] = {1597, 1076, 1514, 1514, 1100, 1100, 1500, 1500};
+    const uint16_t sumd_output2[] = {1516, 1500, 1100, 1500, 1900, 1900, 1900, 1900, 1900, 1900, 1900, 1900};
+    const uint16_t sumd_output3[] = {1501, 1500, 1000, 1500, 1500, 1500, 1500, 1100, 1500, 1500, 1500, 1500, 0, 0, 0, 1892};
+
+    const uint8_t ibus_bytes[] = {0x20, 0x40, 0xdc, 0x05, 0xdc, 0x05, 0xe8, 0x03, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0xdc, 0x05, 0x47, 0xf3};
+    const uint16_t ibus_output[] = {1500, 1500, 1000, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500};
+
+    const uint8_t fport_bytes[] = {0x7e, 0x19, 0x00, 0xe7, 0x3b, 0xdf, 0x5a, 0xce,
+                                   0x07, 0x10, 0x75, 0x49, 0x9c, 0x15, 0xe0, 0x03,
+                                   0x1f, 0xf8, 0xc0, 0x07, 0x3e, 0xf0, 0x81, 0x0f,
+                                   0x7c, 0x00, 0x38, 0xfa, 0x7e};
+
+    const uint16_t fport_output[] = {1499, 1499, 1101, 1499, 1035, 1341, 2006, 982, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495};
+
+    const uint8_t fport2_16ch_bytes[] = {0x18, 0xff, 
+                                    0xac, 0x00, 0x5f, 0xf8, 0xc0, 0x07, 0x3e, 0xf0, 0x81, 0x0f, 0x7c, // 8ch on 11 bits
+                                    0xe0, 0x03, 0x1f, 0xf8, 0xc0, 0x07, 0x3e, 0xf0, 0x81, 0x0f, 0x7c, // 8ch on 11 bits
+                                    0x00, 0x5e, 0x98};
+    const uint16_t fport2_16ch_output[] = {982, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495, 1495};
+
+    const uint8_t fport2_24ch_bytes[] = {0x23, 0xff,
+                                    0xe0, 0x03, 0xdf, 0x2c, 0xc2, 0xc7, 0x0a, 0xf0, 0xb1, 0x82, 0x15, // 8ch on 11 bits
+                                    0xe0, 0x9b, 0x38, 0x2b, 0xc0, 0x07, 0x3e, 0xf0, 0x81, 0x0f, 0x7c, // 8ch on 11 bits
+                                    0xe0, 0x03, 0x1f, 0xf8, 0xc0, 0x07, 0x3e, 0xf0, 0x81, 0x0f, 0x7c, // 8ch on 11 bits
+                                    0x00, 0x5b, 0x02 };
+
+    // we only decode up to 18ch
+    const uint16_t fport2_24ch_output[] = {1495, 1495, 986, 1495, 982, 1495, 982, 982, 1495, 2006, 982, 1495, 1495, 1495, 1495, 1495, 1495, 1495};
+
+    const uint8_t crsf_bytes[] = {0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                  0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x0F, 0x6E };
+    const uint16_t crsf_output[] = {1501, 1500, 989, 1497, 1873, 1136, 2011, 988, 988, 988, 988, 2011, 0, 0, 0, 0, 0, 0};
+    // CRSF partial frame followed by full frame
+    const uint8_t crsf_bad_bytes1[] = {0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                  0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x0F, 0x6E };
+    const uint16_t crsf_bad_output1[] = {1501, 1500, 989, 1497, 1873, 1136, 2011, 988, 988, 988, 988, 2011, 0, 0, 0, 0, 0, 0};
+    // CRSF full frame with bad CRC followed by full frame
+    const uint8_t crsf_bad_bytes2[] = {0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                  0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x0F, 0x6F,
+                                  0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                  0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x0F, 0x6E };
+    const uint16_t crsf_bad_output2[] = {1501, 1500, 989, 1497, 1873, 1136, 2011, 988, 988, 988, 988, 2011, 0, 0, 0, 0, 0, 0};
+
+    // CRSF with lots of start markers followed by full frame
+    const uint8_t crsf_bad_bytes3[] = {0xC8, 0x14, 0xC8, 0x14, 0xC8, 0x0C, 0xA0,
+                                   0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                   0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x0F, 0x6E, };
+    const uint16_t crsf_bad_output3[] = {1501, 1500, 989, 1497, 1873, 1136, 2011, 988, 988, 988, 988, 2011, 0, 0, 0, 0, 0, 0};
+
+    // CRSF with a partial frame followed by a full frame
+    const uint8_t crsf_bad_bytes4[] = {
+                                   0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                   0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE,
+                                   0xC8, 0x14, 0x17, 0x20, 0x03, 0x0C, 0xA0, 0x00, 0xF6, 0xB7, 0x6E, 0x94, 0xFC,
+                                   0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x0F, 0x6E };
+    const uint16_t crsf_bad_output4[] = {1501, 1500, 989, 1497, 1873, 1136, 2011, 988, 988, 988, 988, 2011, 0, 0, 0, 0, 0, 0};
+    
+
+    test_protocol("SRXL", 115200, srxl_bytes, sizeof(srxl_bytes), srxl_output, ARRAY_SIZE(srxl_output), 1);
+    test_protocol("SUMD", 115200, sumd_bytes, sizeof(sumd_bytes), sumd_output, ARRAY_SIZE(sumd_output), 1);
+    test_protocol("SUMD2", 115200, sumd_bytes2, sizeof(sumd_bytes2), sumd_output2, ARRAY_SIZE(sumd_output2), 1);
+    test_protocol("SUMD3", 115200, sumd_bytes3, sizeof(sumd_bytes3), sumd_output3, ARRAY_SIZE(sumd_output3), 1);
+    test_protocol("IBUS", 115200, ibus_bytes, sizeof(ibus_bytes), ibus_output, ARRAY_SIZE(ibus_output), 1);
+
+    // SBUS needs 3 repeats to pass the RCProtocol 3 frames test
+    test_protocol("SBUS", 100000, sbus_bytes, sizeof(sbus_bytes), sbus_output, ARRAY_SIZE(sbus_output), 3, 0, true);
+
+    // CRSF needs 3 repeats to pass the RCProtocol 3 frames test
+    test_protocol_bytesonly("CRSF", 416666, crsf_bytes, sizeof(crsf_bytes), crsf_output, ARRAY_SIZE(crsf_output), 3, 0, true);
+    test_protocol_bytesonly("CRSF2", 416666, crsf_bad_bytes1, sizeof(crsf_bad_bytes1), crsf_bad_output1, ARRAY_SIZE(crsf_bad_output1), 3, 0, true);
+    test_protocol_bytesonly("CRSF3", 416666, crsf_bad_bytes2, sizeof(crsf_bad_bytes2), crsf_bad_output2, ARRAY_SIZE(crsf_bad_output2), 3, 0, true);
+    test_protocol_bytesonly("CRSF4", 416666, crsf_bad_bytes3, sizeof(crsf_bad_bytes3), crsf_bad_output3, ARRAY_SIZE(crsf_bad_output3), 3, 0, true);
+    test_protocol_bytesonly("CRSF5", 416666, crsf_bad_bytes4, sizeof(crsf_bad_bytes4), crsf_bad_output4, ARRAY_SIZE(crsf_bad_output4), 3, 0, true);
+
+    // DSM needs 8 repeats, 5 to guess the format, then 3 to pass the RCProtocol 3 frames test
+    test_protocol("DSM1", 115200, dsm_bytes,  sizeof(dsm_bytes),  dsm_output,  ARRAY_SIZE(dsm_output), 9);
+    test_protocol("DSM2", 115200, dsm_bytes2, sizeof(dsm_bytes2), dsm_output2, ARRAY_SIZE(dsm_output2), 9, 16);
+    test_protocol("DSM3", 115200, dsm_bytes3, sizeof(dsm_bytes3), dsm_output3, ARRAY_SIZE(dsm_output3), 9, 16);
+    test_protocol("DSM4", 115200, dsm_bytes4, sizeof(dsm_bytes4), dsm_output4, ARRAY_SIZE(dsm_output4), 9, 16);
+    test_protocol("DSM5", 115200, dsm_bytes5, sizeof(dsm_bytes5), dsm_output5, ARRAY_SIZE(dsm_output5), 9);
+    test_protocol("DSMX22", 115200, dsmx22ms_bytes, sizeof(dsmx22ms_bytes), dsmx22ms_output, ARRAY_SIZE(dsmx22ms_output), 9, 16);
+    test_protocol("DSMX22_VTX", 115200, dsmx22ms_vtx_bytes, sizeof(dsmx22ms_vtx_bytes), dsmx22ms_vtx_output, ARRAY_SIZE(dsmx22ms_vtx_output), 9, 16);
+    test_protocol("DSMX11", 115200, dsmx11ms_bytes, sizeof(dsmx11ms_bytes), dsmx11ms_output, ARRAY_SIZE(dsmx11ms_output), 9, 16);
+    test_protocol("DSMX11_VTX", 115200, dsmx11ms_vtx_bytes, sizeof(dsmx11ms_vtx_bytes), dsmx11ms_vtx_output, ARRAY_SIZE(dsmx11ms_vtx_output), 9, 16);
+
+    test_protocol("FPORT", 115200, fport_bytes, sizeof(fport_bytes), fport_output, ARRAY_SIZE(fport_output), 3, 0, true);
+    test_protocol("FPORT2_16CH", 115200, fport2_16ch_bytes, sizeof(fport2_16ch_bytes), fport2_16ch_output, ARRAY_SIZE(fport2_16ch_output), 3, 0, true);
+    test_protocol("FPORT2_24CH", 115200, fport2_24ch_bytes, sizeof(fport2_24ch_bytes), fport2_24ch_output, ARRAY_SIZE(fport2_24ch_output), 3, 0, true);
+
+    /*
+      now test with random data to ensure we don't have any logic bugs that can cause a crash of the parser
+     */
+    test_random();
+
+    if (test_count++ == 10) {
+        if (test_failures == 0) {
+            printf("Test PASSED\n");
+            ::exit(0);
+        }
+        printf("Test FAILED - %u failures\n", unsigned(test_failures));
+        ::exit(1);
+    }
+    printf("Test count %u - %u failures\n", unsigned(test_count), unsigned(test_failures));
+}
+
+AP_HAL_MAIN();
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_example(
+        use='ap',
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+MIT License
+
+Copyright (c) 2019 Horizon Hobby, LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+#include <string.h>
+#include <stdint.h>
+
+#include "spm_srxl.h"
+
+/// LOCAL TYPES AND CONSTANTS ///
+
+#if(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_SPEED)
+const uint16_t srxlCRCTable[] =
+{
+    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
+    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
+    0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
+    0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
+    0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
+    0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
+    0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
+    0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
+
+    0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
+    0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
+    0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
+    0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
+    0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
+    0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
+    0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
+    0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
+
+    0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
+    0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
+    0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
+    0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
+    0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
+    0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
+    0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
+    0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
+
+    0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
+    0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
+    0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
+    0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
+    0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
+    0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
+    0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
+    0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
+};
+#endif
+
+#define SRXL_TELEM_SUPPRESS_MAX (100)
+
+/// PUBLIC VARIABLES ///
+
+SrxlChannelData srxlChData = {0, 0, 0, {0}};
+SrxlTelemetryData srxlTelemData = {0};
+SrxlVtxData srxlVtxData = {0, 0, 1, 0, 0, 1};
+
+/// LOCAL VARIABLES ///
+
+static SrxlDevice srxlThisDev = {0};
+static SrxlBus srxlBus[SRXL_NUM_OF_BUSES];
+static bool srxlChDataIsFailsafe = false;
+static bool srxlTelemetryPhase = false;
+#ifdef SRXL_INCLUDE_MASTER_CODE
+static uint32_t srxlFailsafeChMask = 0;  // Tracks all active channels for use during failsafe transmission
+#endif
+static SrxlBindData srxlBindInfo = {0, 0, 0, 0};
+static SrxlReceiverStats srxlRx = {0};
+static uint16_t srxlTelemSuppressCount = 0;
+
+#ifdef SRXL_INCLUDE_FWD_PGM_CODE
+static SrxlFullID srxlFwdPgmDevice = {0, 0};  // Device that should accept Forward Programming connection by default
+static uint8_t srxlFwdPgmBuffer[FWD_PGM_MAX_DATA_SIZE] = {0};
+static uint8_t srxlFwdPgmBufferLength = 0;
+#endif
+
+// Include additional header and externs if using STM32 hardware acceleration
+#if(SRXL_CRC_OPTIMIZE_MODE > SRXL_CRC_OPTIMIZE_SIZE)
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+#if(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_STM_HAL)
+#if(SRXL_STM_TARGET_FAMILY == SRXL_STM_TARGET_F7)
+#include "stm32f7xx_hal.h"
+#else
+#include "stm32f3xx_hal.h"  // Default to F3 if not given
+#endif
+    extern CRC_HandleTypeDef hcrc;
+#else
+#if(SRXL_STM_TARGET_FAMILY == SRXL_STM_TARGET_F7)
+#error "STM32F7 targets not yet supported for register-based STM HW optimization"
+#else
+#include "stm32f30x.h"  // Default to F3 if not given
+#endif
+#endif
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+/// LOCAL HELPER FUNCTIONS ///
+
+// Compute SRXL CRC over packet buffer (assumes length is correctly set)
+static uint16_t srxlCrc16(uint8_t* packet)
+{
+    uint16_t crc = 0;                // Seed with 0
+    uint8_t length = packet[2] - 2;  // Exclude 2 CRC bytes at end of packet from the length
+
+    if(length <= SRXL_MAX_BUFFER_SIZE - 2)
+    {
+#if(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_SIZE)
+        // Use bitwise method
+        for(uint8_t i = 0; i < length; ++i)
+        {
+            crc = crc ^ ((uint16_t)packet[i] << 8);
+            for(int b = 0; b < 8; b++)
+            {
+                if(crc & 0x8000)
+                    crc = (crc << 1) ^ 0x1021;
+                else
+                    crc = crc << 1;
+            }
+        }
+#elif(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_STM_HW)
+        // Use direct STM32 HW CRC register access
+        uint8_t* pEnd = &packet[length];
+        srxlEnterCriticalSection();
+#ifdef SRXL_SAVE_HW_CRC_CONTEXT
+        uint32 savedPOL = CRC->POL;
+        uint32 savedINIT = CRC->INIT;
+        uint32 savedCR = CRC->CR;
+        uint32 savedDR = CRC->DR;
+#endif
+        CRC->POL = 0x1021;
+        CRC->INIT = 0;
+        CRC->CR = 0x09;  // 16-bit polynomial, no input or output reversal, reset to init of 0
+        while(packet < pEnd)
+            *(uint8_t*)(CRC_BASE) = *(packet++);
+        crc = (uint16_t)CRC->DR;
+#ifdef SRXL_SAVE_HW_CRC_CONTEXT
+        // We have to use this convoluted method to restore things because writing INIT sets DR too
+        CRC->CR = 0;
+        CRC->POL = 0x04C11DB7;
+        CRC->INIT = savedINIT;
+        CRC->DR = savedINIT;
+        CRC->POL = savedDR;
+        CRC->DR = 1;
+        CRC->CR = savedCR;
+        CRC->POL = savedPOL;
+#endif
+        srxlExitCriticalSection();
+#elif(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_STM_HAL)
+        // STM32f3/f7 hardware optimization using the STM32Cube libraries in HAL mode requires the following
+        // configuration, set in the STM32CubeMX "Pinout & Configuration" tab under "Computing > CRC":
+        //  Basic Parameters
+        //    Default Polynomial State        = Disable
+        //    CRC Length                      = 16-bit
+        //    CRC Generating Polynomial       = X12+X5+X0
+        //    Default Init Value State        = Disable
+        //    Init Value For CRC Computation  = 0
+        //  Advanced Parameters
+        //    Input Data Inversion Mode       = None
+        //    Output Data Inversion Mode      = Disable
+        //    Input Data Format               = Bytes
+        crc = (uint16_t)HAL_CRC_Calculate(&hcrc, (uint32_t*)packet, length);
+#elif(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_EXTERNAL)
+        crc = SRXL_CRC_CALCULATE(packet, length, crc);
+#else
+        // Default to table-lookup method
+        uint8_t i;
+        for(i = 0; i < length; ++i)
+        {
+            // Get indexed position in lookup table using XOR of current CRC hi byte
+            uint8_t pos = (uint8_t)((crc >> 8) ^ packet[i]);
+            // Shift LSB up and XOR with the resulting lookup table entry
+            crc = (uint16_t)((crc << 8) ^ (uint16_t)(srxlCRCTable[pos]));
+        }
+#endif
+    }
+    return crc;
+}
+
+// Get the receiver entry for the requested bus and device ID
+static inline SrxlRcvrEntry* srxlGetReceiverEntry(uint8_t busIndex, uint8_t deviceID)
+{
+    SrxlRcvrEntry* pRcvr = 0;
+    uint8_t i;
+    for(i = 0; i < srxlRx.rcvrCount; ++i)
+    {
+        if((srxlRx.rcvr[i].busBits & (1u << busIndex)) && (srxlRx.rcvr[i].deviceID == deviceID))
+        {
+            pRcvr = &srxlRx.rcvr[i];
+            break;
+        }
+    }
+    return pRcvr;
+}
+
+// Add a new receiver entry for the given device
+static inline SrxlRcvrEntry* srxlAddReceiverEntry(SrxlBus* pBus, SrxlDevEntry devEntry)
+{
+    // Only allow receivers (or flight controllers in certain circumstances) to be added
+    if(!pBus || devEntry.deviceID < 0x10 || devEntry.deviceID >= 0x40)
+        return 0;
+
+    // If we didn't previously add this receiver, add it now if we have room
+    SrxlRcvrEntry* pRcvr = srxlGetReceiverEntry(pBus->fullID.busIndex, devEntry.deviceID);
+    if(!pRcvr)
+    {
+        if(srxlRx.rcvrCount >= SRXL_MAX_RCVRS)
+            return 0;
+
+        uint8_t i = srxlRx.rcvrCount++;
+        pRcvr = &srxlRx.rcvr[i];
+        pRcvr->deviceID = devEntry.deviceID;
+        pRcvr->busBits = (1u << pBus->fullID.busIndex);
+        pRcvr->info = devEntry.info;
+
+        // If this receiver is full-range, insert into our sorted list after the other full-range telemetry receivers
+        if(pRcvr->info & SRXL_DEVINFO_TELEM_FULL_RANGE)
+        {
+            uint8_t n;
+            for(n = i; n > srxlRx.rcvrSortInsert; --n)
+                srxlRx.rcvrSorted[n] = srxlRx.rcvrSorted[n - 1];
+            srxlRx.rcvrSorted[(srxlRx.rcvrSortInsert)++] = pRcvr;
+        }
+        // Else just tack onto the end
+        else
+        {
+            srxlRx.rcvrSorted[i] = pRcvr;
+        }
+    }
+
+    // If this new receiver is a base receiver that supports telemetry or we haven't set a default active telemetry receiver, set it
+    if(!srxlRx.pTelemRcvr || (pRcvr->deviceID >= 0x20 && pRcvr->deviceID < 0x30 && (pRcvr->info & SRXL_DEVINFO_TELEM_TX_ENABLED)))
+    {
+        srxlRx.pTelemRcvr = pRcvr;
+    }
+
+    return pRcvr;
+}
+
+// Pick the best receiver to send telemetry on
+static inline SrxlRcvrEntry* srxlChooseTelemRcvr(void)
+{
+    // If we only know about one receiver, set it to that
+    if(srxlRx.rcvrCount == 1)
+        return srxlRx.rcvrSorted[0];
+
+    // If we were previously sending telemetry
+    if(srxlRx.pTelemRcvr && srxlRx.pTelemRcvr->channelMask)
+    {
+        // If the current choice is not full-range
+        if((srxlRx.pTelemRcvr->info & SRXL_DEVINFO_TELEM_FULL_RANGE) == 0)
+        {
+            // Then see if there is a full-range choice that received channel data to switch to
+            uint8_t i;
+            for(i = 0; i < srxlRx.rcvrSortInsert; ++i)
+            {
+                if(srxlRx.rcvrSorted[i]->channelMask)
+                    return srxlRx.rcvrSorted[i];
+            }
+        }
+
+        // Else keep using the current receiver
+        return srxlRx.pTelemRcvr;
+    }
+    // Else just pick the first one that got channel data this past frame
+    else
+    {
+        uint8_t i;
+        for(i = 0; i < srxlRx.rcvrCount; ++i)
+        {
+            if(srxlRx.rcvrSorted[i]->channelMask)
+                return srxlRx.rcvrSorted[i];
+        }
+    }
+
+    return 0;
+}
+
+// Return pointer to device entry matching the given ID, or NULL if not found
+static SrxlDevEntry* srxlGetDeviceEntry(SrxlBus* pBus, uint8_t deviceID)
+{
+    if(pBus)
+    {
+        uint8_t i;
+        for(i = 0; i < pBus->rxDevCount; ++i)
+        {
+            if(pBus->rxDev[i].deviceID == deviceID)
+                return &(pBus->rxDev[i]);
+        }
+    }
+    return 0;
+}
+
+// Add an entry to our list of devices found on the SRXL bus (or update an entry if it already exists)
+static SrxlDevEntry* srxlAddDeviceEntry(SrxlBus* pBus, SrxlDevEntry devEntry)
+{
+    // Don't allow broadcast or unknown device types to be added
+    if(!pBus || devEntry.deviceID < 0x10 || devEntry.deviceID > 0xEF)
+        return 0;
+
+    // Limit device priority
+    if(devEntry.priority > 100)
+        devEntry.priority = 100;
+
+    // Update device entry if it already exists
+    SrxlDevEntry* retVal = srxlGetDeviceEntry(pBus, devEntry.deviceID);
+    if(retVal)
+    {
+        pBus->rxDevPrioritySum -= retVal->priority;
+        *retVal = devEntry;
+        pBus->rxDevPrioritySum += retVal->priority;
+    }
+    // Else add to the list if we have room
+    else if(pBus->rxDevCount < SRXL_MAX_DEVICES)
+    {
+        retVal = &(pBus->rxDev[pBus->rxDevCount++]);
+        *retVal = devEntry;
+        pBus->rxDevPrioritySum += retVal->priority;
+
+#ifdef SRXL_INCLUDE_FWD_PGM_CODE
+        // If the new device supports Forward Programming and is a base receiver or flight controller, choose as the default
+        if(devEntry.info & SRXL_DEVINFO_FWD_PROG_SUPPORT)
+        {
+            uint8_t devType = devEntry.deviceID >> 4;
+            if(devType > (srxlFwdPgmDevice.deviceID >> 4) && devType < SrxlDevType_ESC)
+            {
+                srxlFwdPgmDevice.deviceID = devEntry.deviceID;
+                srxlFwdPgmDevice.busIndex = pBus->fullID.busIndex;
+            }
+        }
+#endif
+
+        // If the new device is a receiver, add to our receiver list
+        if(retVal->deviceID < 0x30)
+        {
+            srxlAddReceiverEntry(pBus, *retVal);
+        }
+    }
+
+    return retVal;
+}
+
+/// PUBLIC FUNCTIONS ///
+
+/**
+    @brief  Initialize common SRXL info for this device
+
+    @param  deviceID:   SRXL Device ID (see section 7.1.1 of SRXL2 Spec)
+    @param  priority:   Requested telemetry priority (1-100; typical is 10 per unique message type)
+    @param  info:       Device info bits (see SRXL_DEVINFO_XXX bits in spm_srxl.h)
+    @param  uid:        Unique 32-bit id to avoid device ID collision during handshake
+    @return bool:       True if device info was successfully initialized
+*/
+bool srxlInitDevice(uint8_t deviceID, uint8_t priority, uint8_t info, uint32_t uid)
+{
+    if(deviceID < 0x10 || deviceID > 0xEF)
+        return false;
+
+    srxlThisDev.devEntry.deviceID = deviceID;
+    srxlThisDev.devEntry.info = info;
+    srxlThisDev.devEntry.priority = priority;
+    srxlThisDev.devEntry.rfu = 0;
+    srxlThisDev.uid = uid;
+    srxlThisDev.vtxProxy = false;
+
+#ifdef SRXL_INCLUDE_MASTER_CODE
+    // If this device is a receiver, add to our receiver info
+    if(deviceID < 0x30)
+    {
+        srxlInitReceiver(deviceID, info);
+    }
+#endif
+
+#ifdef SRXL_INCLUDE_FWD_PGM_CODE
+    // If this device is a receiver or flight controller that supports Forward Programming, set as default
+    if((info & SRXL_DEVINFO_FWD_PROG_SUPPORT) && deviceID < 0x40)
+    {
+        srxlFwdPgmDevice.deviceID = deviceID;
+        srxlFwdPgmDevice.busIndex = 0;
+    }
+#endif
+
+#if(SRXL_CRC_OPTIMIZE_MODE == SRXL_CRC_OPTIMIZE_STM_HW)
+    // Enable the peripheral clock for the HW CRC engine
+    RCC->AHBENR |= RCC_AHBENR_CRCEN;
+#endif
+
+    return true;
+}
+
+/**
+    @brief  Initialize bus settings for the given SRXL bus
+
+    @param  busIndex:       Index into srxlBus array of bus entries
+    @param  uart:           Number to identify UART to which this SRXL bus should be connected
+    @param  baudSupported:  0 = 115200 baud, 1 = 400000 baud
+    @return bool:           True if SRXL bus was successfully initialized
+*/
+bool srxlInitBus(uint8_t busIndex, uint8_t uart, uint8_t baudSupported)
+{
+    if(busIndex >= SRXL_NUM_OF_BUSES || !srxlThisDev.devEntry.deviceID)
+        return false;
+
+    SrxlBus* pBus = &srxlBus[busIndex];
+    pBus->state = SrxlState_ListenOnStartup;
+    pBus->fullID.deviceID = srxlThisDev.devEntry.deviceID;
+    pBus->fullID.busIndex = busIndex;
+    pBus->rxDevCount = 0;
+    pBus->rxDevPrioritySum = 0;
+    pBus->requestID = (srxlThisDev.devEntry.deviceID == 0x10) ? 0x11 : 0;
+    pBus->baudSupported = baudSupported;
+    pBus->baudRate = SRXL_BAUD_115200;
+    pBus->frameErrCount = 0;
+    pBus->uart = uart;
+    // Default remote receiver is automatically master -- everyone else figures it out during handshake
+    pBus->master = (srxlThisDev.devEntry.deviceID == 0x10);
+    pBus->pMasterRcvr = (srxlThisDev.devEntry.deviceID == 0x10) ? &srxlRx.rcvr[0] : 0;
+    pBus->initialized = true;
+
+    return true;
+}
+
+/**
+    @brief  See if this device is the bus master on the given bus
+
+    @param  busIndex:   Index into srxlBus array for the desired SRXL bus
+    @return bool:       True if this device is the bus master on the given SRXL bus
+*/
+bool srxlIsBusMaster(uint8_t busIndex)
+{
+    return (busIndex < SRXL_NUM_OF_BUSES && srxlBus[busIndex].master);
+}
+
+/**
+    @brief  Get the current SRXL state machine timeout count for the given bus
+
+    @param  busIndex:   Index into srxlBus array for the desired SRXL bus
+    @return uint16_t:    Timeout count in ms for the given SRXL bus
+*/
+uint16_t srxlGetTimeoutCount_ms(uint8_t busIndex)
+{
+    return (busIndex < SRXL_NUM_OF_BUSES) ? srxlBus[busIndex].timeoutCount_ms : 0;
+}
+
+/**
+    @brief  Get the Device ID of this device on the given bus
+
+    @param  busIndex:   Index into srxlBus array for the desired SRXL bus
+    @return uint8_t:    Device ID of this device on the given SRXL bus
+*/
+uint8_t srxlGetDeviceID(uint8_t busIndex)
+{
+    return (busIndex < SRXL_NUM_OF_BUSES) ? srxlBus[busIndex].fullID.deviceID : 0;
+}
+
+/**
+    @brief  Internal send function called by srxlRun() -- do not call in user code
+
+    @param  pBus:       Pointer to SRXL bus entry for the desired SRXL bus
+    @param  srxlCmd:    Specific type of packet to send
+    @param  replyID:    Device ID of the device this Send command is targeting
+*/
+static void srxlSend(SrxlBus* pBus, SRXL_CMD srxlCmd, uint8_t replyID)
+{
+    if(!pBus || !pBus->initialized)
+        return;
+
+    memset(pBus->srxlOut.raw, 0, SRXL_MAX_BUFFER_SIZE);
+    pBus->srxlOut.header.srxlID = SPEKTRUM_SRXL_ID;
+
+    // VTX Data
+    if(srxlCmd == SRXL_CMD_VTX)
+    {
+        pBus->srxlOut.header.packetType = SRXL_CTRL_ID;
+        pBus->srxlOut.header.length = SRXL_CTRL_BASE_LENGTH + sizeof(SrxlVtxData);
+        pBus->srxlOut.control.payload.cmd = SRXL_CTRL_CMD_VTX;
+        pBus->srxlOut.control.payload.replyID = replyID;
+        pBus->srxlOut.control.payload.vtxData = srxlVtxData;
+    }
+#ifdef SRXL_INCLUDE_MASTER_CODE
+    // Channel Data
+    else if(srxlCmd == SRXL_CMD_CHANNEL || srxlCmd == SRXL_CMD_CHANNEL_FS)
+    {
+        pBus->srxlOut.header.packetType = SRXL_CTRL_ID;
+        uint32_t channelMask;
+        if(srxlCmd == SRXL_CMD_CHANNEL)
+        {
+            pBus->srxlOut.control.payload.cmd = SRXL_CTRL_CMD_CHANNEL;
+            pBus->srxlOut.control.payload.replyID = replyID;
+
+            channelMask = srxlChData.mask;
+        }
+        else // == SRXL_CMD_CHANNEL_FS
+        {
+            // In failsafe mode, we dont want a telemetry reply
+            pBus->srxlOut.control.payload.cmd = SRXL_CTRL_CMD_CHANNEL_FS;
+            pBus->srxlOut.control.payload.replyID = 0;
+
+            channelMask = srxlFailsafeChMask;
+        }
+
+        // Set signal quality info (only a bus master sends this, so assume srxlChData contains the latest values)
+        pBus->srxlOut.control.payload.channelData.rssi = srxlChData.rssi;
+#ifdef SRXL_IS_HUB
+        pBus->srxlOut.control.payload.channelData.frameLosses = srxlRx.frameLosses;
+#else
+        pBus->srxlOut.control.payload.channelData.frameLosses = srxlRx.rcvr[0].fades;
+#endif
+
+        uint8_t channelIndex = 0;
+        uint32_t channelMaskBit = 1;
+        for(uint8_t i = 0; i < 32; ++i, channelMaskBit <<= 1)
+        {
+            if(channelMask & channelMaskBit)
+            {
+                pBus->srxlOut.control.payload.channelData.values[channelIndex++] = srxlChData.values[i];
+            }
+        }
+
+        // Set bits in packet for channels we populated, and clear those mask bits if it was part of a normal channel data command
+        pBus->srxlOut.control.payload.channelData.mask = channelMask;
+        if(srxlCmd == SRXL_CMD_CHANNEL)
+            srxlChData.mask &= ~channelMask;
+
+        pBus->srxlOut.header.length = SRXL_CTRL_BASE_LENGTH + 7 + (2 * channelIndex);
+    }
+#ifdef SRXL_INCLUDE_FWD_PGM_CODE
+    // Forward Programming Pass-thru
+    else if(srxlCmd == SRXL_CMD_FWDPGM)
+    {
+        pBus->srxlOut.header.packetType = SRXL_CTRL_ID;
+        pBus->srxlOut.header.length = SRXL_CTRL_BASE_LENGTH + 3 + srxlFwdPgmBufferLength;
+        pBus->srxlOut.control.payload.cmd = SRXL_CTRL_CMD_FWDPGM;
+        pBus->srxlOut.control.payload.replyID = replyID;
+        memcpy(pBus->srxlOut.control.payload.fpData.data, srxlFwdPgmBuffer, srxlFwdPgmBufferLength);
+    }
+#endif  // SRXL_INCLUDE_FWD_PGM_CODE
+#endif  // SRXL_INCLUDE_MASTER_CODE
+    // RSSI Data
+    else if(srxlCmd == SRXL_CMD_RSSI)
+    {
+        pBus->srxlOut.header.packetType = SRXL_RSSI_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlRssiPacket);
+        pBus->srxlOut.rssi.request = SRXL_RSSI_REQ_REQUEST;  // TODO: Needs to handle both directions!
+        pBus->srxlOut.rssi.antennaA = 0;                     // TODO: Fill in actual data later
+        pBus->srxlOut.rssi.antennaB = 0;
+        pBus->srxlOut.rssi.antennaC = 0;
+        pBus->srxlOut.rssi.antennaD = 0;
+    }
+    else if(srxlCmd == SRXL_CMD_HANDSHAKE)
+    {
+        pBus->srxlOut.header.packetType = SRXL_HANDSHAKE_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlHandshakePacket);
+        pBus->srxlOut.handshake.payload.srcDevID = srxlThisDev.devEntry.deviceID;
+        pBus->srxlOut.handshake.payload.destDevID = replyID;
+        pBus->srxlOut.handshake.payload.priority = srxlThisDev.devEntry.priority;
+        pBus->srxlOut.handshake.payload.baudSupported = pBus->baudSupported;
+        pBus->srxlOut.handshake.payload.info = srxlThisDev.devEntry.info;
+        pBus->srxlOut.handshake.payload.uid = srxlThisDev.uid;
+    }
+    else if(srxlCmd == SRXL_CMD_TELEMETRY)
+    {
+        srxlFillTelemetry(&pBus->srxlOut.telemetry.payload);
+        pBus->srxlOut.header.packetType = SRXL_TELEM_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlTelemetryPacket);
+        // If we successfully received a handshake from the bus master
+        if(pBus->pMasterRcvr)
+        {
+            // If we know that a device on this bus should send it, then target that device
+            if(srxlRx.pTelemRcvr && (srxlRx.pTelemRcvr->busBits & (1u << pBus->fullID.busIndex)))
+                pBus->srxlOut.telemetry.destDevID = srxlRx.pTelemRcvr->deviceID;
+            else
+                pBus->srxlOut.telemetry.destDevID = 0;
+        }
+        else
+        {
+            // Send 0xFF to tell bus master to re-send the handshake so we know where to direct telemetry in the future
+            pBus->srxlOut.telemetry.destDevID = 0xFF;
+        }
+
+#ifdef SRXL_INCLUDE_MASTER_CODE
+        if(srxlRx.pTelemRcvr && (pBus->srxlOut.telemetry.destDevID == srxlRx.pTelemRcvr->deviceID))
+        {
+            // Don't mark telemetry as having been sent if we are sending it ourself over RF
+            if(pBus->srxlOut.telemetry.destDevID != srxlThisDev.pRcvr->deviceID)
+            {
+                srxlTelemetrySent();
+                // Clear telemetry buffer after sending so we don't repeatedly display old data
+//                srxlTelemData.sensorID = srxlTelemData.secondaryID = 0;
+            }
+        }
+#endif
+    }
+    else if(srxlCmd == SRXL_CMD_ENTER_BIND)
+    {
+        pBus->srxlOut.header.packetType = SRXL_BIND_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlBindPacket);
+        pBus->srxlOut.bind.request = SRXL_BIND_REQ_ENTER;
+        pBus->srxlOut.bind.deviceID = replyID;
+        pBus->srxlOut.bind.data.type = DSMX_11MS;
+        pBus->srxlOut.bind.data.options = (replyID != 0xFF) ? SRXL_BIND_OPT_TELEM_TX_ENABLE | SRXL_BIND_OPT_BIND_TX_ENABLE : 0;
+        pBus->srxlOut.bind.data.guid = 0;
+        pBus->srxlOut.bind.data.uid = 0;
+    }
+    else if(srxlCmd == SRXL_CMD_REQ_BIND)
+    {
+        pBus->srxlOut.header.packetType = SRXL_BIND_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlBindPacket);
+        pBus->srxlOut.bind.request = SRXL_BIND_REQ_STATUS;
+        pBus->srxlOut.bind.deviceID = replyID;
+        memset(&(pBus->srxlOut.bind.data), 0, sizeof(SrxlBindData));
+    }
+    else if(srxlCmd == SRXL_CMD_SET_BIND)
+    {
+        pBus->srxlOut.header.packetType = SRXL_BIND_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlBindPacket);
+        pBus->srxlOut.bind.request = SRXL_BIND_REQ_SET_BIND;
+        pBus->srxlOut.bind.deviceID = replyID;
+        pBus->srxlOut.bind.data = srxlBindInfo;
+    }
+    else if(srxlCmd == SRXL_CMD_BIND_INFO)
+    {
+        pBus->srxlOut.header.packetType = SRXL_BIND_ID;
+        pBus->srxlOut.header.length = sizeof(SrxlBindPacket);
+        pBus->srxlOut.bind.request = SRXL_BIND_REQ_BOUND_DATA;
+        pBus->srxlOut.bind.deviceID = replyID;
+        pBus->srxlOut.bind.data = srxlBindInfo;
+    }
+
+    // Compute CRC over entire SRXL packet (excluding the 2 CRC bytes at the end)
+    uint16_t crc = srxlCrc16(pBus->srxlOut.raw);
+
+    // Add CRC to packet in big-endian byte order
+    pBus->srxlOut.raw[pBus->srxlOut.header.length - 2] = (crc >> 8) & 0xFF;
+    pBus->srxlOut.raw[pBus->srxlOut.header.length - 1] = crc & 0xFF;
+
+    // Send the packet out over the assigned UART
+    srxlSendOnUart(pBus->uart, pBus->srxlOut.raw, pBus->srxlOut.header.length);
+}
+
+/**
+    @brief  Parse an SRXL packet received on the given SRXL bus UART
+
+    @param  busIndex:   Index of SRXL bus state information entry in the srxlBus array
+    @param  packet:     Pointer to received packet data
+    @param  length:     Length in bytes of received packet data
+    @return bool:       True if a valid packet was received, else false
+*/
+bool srxlParsePacket(uint8_t busIndex, uint8_t* packet, uint8_t length)
+{
+    // Validate parameters
+    if(busIndex >= SRXL_NUM_OF_BUSES || !packet || length < 5 || length > SRXL_MAX_BUFFER_SIZE)
+        return false;
+
+    // Validate SRXL ID and length
+    if(packet[0] != SPEKTRUM_SRXL_ID || packet[2] != length)
+        return false;
+
+    // Validate checksum
+    uint16_t crc = srxlCrc16(packet);
+    if((((uint16_t)packet[length - 2] << 8) | packet[length - 1]) != crc)
+        return false;
+
+    // Copy packet into our unioned buffer to avoid "strict aliasing" violations
+    SrxlBus* pBus = &srxlBus[busIndex];
+    SrxlPacket* pRx = &(pBus->srxlIn);
+    memcpy(pRx, packet, length);
+
+    // Handle restart with ongoing communications -- bump to run state
+    pBus->timeoutCount_ms = 0;  // TODO: Should we clear this even if packet isn't valid?
+    if(pBus->state < SrxlState_Running && pRx->header.packetType != SRXL_HANDSHAKE_ID)
+        pBus->state = SrxlState_Running;
+
+    // Parse the specific data
+    switch(pRx->header.packetType)
+    {
+    case SRXL_CTRL_ID:  // 0xCD
+    {
+        SrxlControlData* pCtrlData = &(pRx->control.payload);
+
+        // Validate command
+        if(pCtrlData->cmd > SRXL_CTRL_CMD_FWDPGM)
+            break;
+
+        // VTX
+        if(pCtrlData->cmd == SRXL_CTRL_CMD_VTX)
+        {
+            if(srxlSetVtxData(&pCtrlData->vtxData))
+                srxlOnVtx(&srxlVtxData);
+            if(pCtrlData->replyID == pBus->fullID.deviceID || pCtrlData->replyID == 0xFF || srxlThisDev.vtxProxy)
+            {
+                // TODO: Should we ack this somehow
+            }
+        }
+#ifdef SRXL_INCLUDE_FWD_PGM_CODE
+        // Forward Programming
+        else if(pCtrlData->cmd == SRXL_CTRL_CMD_FWDPGM)
+        {
+            if(pCtrlData->replyID == pBus->fullID.deviceID)
+            {
+                memcpy(srxlFwdPgmBuffer, pCtrlData->fpData.data, pRx->header.length - 3 - SRXL_CTRL_BASE_LENGTH);
+                srxlFwdPgmBufferLength = length;
+                if(pCtrlData->replyID == srxlFwdPgmDevice.deviceID)
+                {
+                    // Handle Forward Programming command locally
+                    srxlOnFwdPgm(srxlFwdPgmBuffer, srxlFwdPgmBufferLength);
+                }
+                else if(srxlFwdPgmDevice.deviceID && srxlBus[srxlFwdPgmDevice.busIndex].master)
+                {
+                    // Pass it on through to the next target
+                    srxlBus[srxlFwdPgmDevice.busIndex].txFlags.sendFwdPgmData = 1;
+                }
+            }
+        }
+#endif
+        // Channel Data or Failsafe Data
+        else
+        {
+            bool isFailsafe = (pCtrlData->cmd == SRXL_CTRL_CMD_CHANNEL_FS);
+            srxlChData.rssi = pCtrlData->channelData.rssi;
+            srxlChData.frameLosses = pCtrlData->channelData.frameLosses;
+            if(pBus->pMasterRcvr)
+            {
+                if(pCtrlData->channelData.rssi < 0)
+                {
+                    pBus->pMasterRcvr->rssi_dBm = pCtrlData->channelData.rssi;
+                    pBus->pMasterRcvr->rssiRcvd |= RSSI_RCVD_DBM;
+                }
+                else
+                {
+                    pBus->pMasterRcvr->rssi_Pct = pCtrlData->channelData.rssi;
+                    pBus->pMasterRcvr->rssiRcvd |= RSSI_RCVD_PCT;
+                }
+                // If the receiver is sending alternating dBm/%, then use that as phase
+                if(pBus->pMasterRcvr->rssiRcvd == RSSI_RCVD_BOTH)
+                {
+                    srxlTelemetryPhase = pCtrlData->channelData.rssi >= 0;
+                }
+                pBus->pMasterRcvr->fades = pCtrlData->channelData.frameLosses;
+                pBus->pMasterRcvr->channelMask = isFailsafe ? 0 : pCtrlData->channelData.mask;
+                srxlRx.rxBusBits |= pBus->pMasterRcvr->busBits;
+            }
+
+            // Only save received channel values to srxlChData if it's normal channel data or we're in a hold condition
+            if(!isFailsafe || !srxlRx.lossCountdown)
+            {
+                uint8_t channelIndex = 0;
+                uint32_t channelMaskBit = 1;
+                uint8_t i;
+                for(i = 0; i < 32 && channelMaskBit <= pCtrlData->channelData.mask; ++i, channelMaskBit <<= 1)
+                {
+                    if(pCtrlData->channelData.mask & channelMaskBit)
+                    {
+                        srxlChData.values[i] = pCtrlData->channelData.values[channelIndex++];
+                        srxlChData.mask |= channelMaskBit;
+                    }
+                }
+            }
+
+            srxlChDataIsFailsafe = isFailsafe;  // TODO: Can we still assume this???
+            srxlReceivedChannelData(&(pCtrlData->channelData), isFailsafe);
+
+            // Figure out what type of reply packet to send, if any
+            if(pCtrlData->replyID == 0)
+            {
+                if(pBus->txFlags.enterBind)
+                {
+                    pBus->state = SrxlState_SendEnterBind;
+                    pBus->txFlags.enterBind = 0;
+                }
+                else if(pBus->txFlags.setBindInfo)
+                {
+                    if(srxlRx.pBindRcvr)  // TODO: Double-check this logic
+                    {
+                        pBus->requestID = srxlRx.pBindRcvr->deviceID;
+                        pBus->state = SrxlState_SendSetBindInfo;
+                    }
+                    pBus->txFlags.setBindInfo = 0;
+                }
+                else if(pBus->txFlags.broadcastBindInfo)
+                {
+                    pBus->requestID = 0xFF;
+                    pBus->state = SrxlState_SendSetBindInfo;
+                    pBus->txFlags.broadcastBindInfo = 0;
+                }
+            }
+            else if(pCtrlData->replyID == pBus->fullID.deviceID)
+            {
+                pBus->state = SrxlState_SendTelemetry;
+            }
+        }
+        break;
+    }
+    case SRXL_HANDSHAKE_ID:  // 0x21
+    {
+        if(length < sizeof(SrxlHandshakePacket))
+            return false;
+
+        // If this is an unprompted handshake (dest == 0) from a higher device ID, then we're the master
+        SrxlHandshakeData* pHandshake = &(pRx->handshake.payload);
+        if((pHandshake->destDevID == 0) && (pHandshake->srcDevID > pBus->fullID.deviceID))
+        {
+            // Send a reply immediately to get the slave to shut up
+            pBus->state = SrxlState_SendHandshake;
+            pBus->requestID = pHandshake->srcDevID;
+            pBus->baudSupported = SRXL_SUPPORTED_BAUD_RATES;
+            srxlRun(busIndex, 0);
+            pBus->requestID = pBus->fullID.deviceID;
+            pBus->state = SrxlState_SendHandshake;
+            pBus->master = true;
+            pBus->pMasterRcvr = &srxlRx.rcvr[0];
+        }
+
+        // Add this device to our list of discovered devices
+        SrxlDevEntry newDev = {.deviceID = pHandshake->srcDevID, .priority = pHandshake->priority, .info = pHandshake->info};
+        srxlAddDeviceEntry(pBus, newDev);
+
+        // Bus master needs to track responses and poll next device
+    )
+{
+    srxlRx.lossHoldCount = (countdownReset > 1) ? countdownReset : 45;
+}
+
+void srxlClearCommStats(void)
+{
+    srxlRx.holds = 0;
+    srxlRx.frameLosses = 0;
+    srxlRx.lossCountdown = srxlRx.lossHoldCount + 1;
+}
+
+// Return true on failsafe hold
+bool srxlUpdateCommStats(bool isFade)
+{
+    srxlRx.rxBusBits = 0;
+    if(srxlTelemetryPhase)
+    {
+        srxlRx.bestRssi_dBm = -128;
+        srxlRx.bestRssi_Pct = 0;
+    }
+
+    uint8_t i;
+    for(i = 0; i < srxlRx.rcvrCount; ++i)
+    {
+        if(srxlRx.rcvr[i].channelMask)
+        {
+            srxlRx.lossCountdown = srxlRx.lossHoldCount + 1;
+
+            if((srxlRx.rcvr[i].rssiRcvd & RSSI_RCVD_DBM) && srxlRx.bestRssi_dBm < srxlRx.rcvr[i].rssi_dBm)
+                srxlRx.bestRssi_dBm = srxlRx.rcvr[i].rssi_dBm;
+            if((srxlRx.rcvr[i].rssiRcvd & RSSI_RCVD_PCT) && srxlRx.bestRssi_dBm < srxlRx.rcvr[i].rssi_Pct)
+                srxlRx.bestRssi_Pct = srxlRx.rcvr[i].rssi_Pct;
+        }
+    }
+
+    // Set RSSI based on telemetry phase and type of telemetry received
+    srxlChData.rssi = (srxlTelemetryPhase || srxlChDataIsFailsafe) ? srxlRx.bestRssi_Pct : srxlRx.bestRssi_dBm;
+
+    // Update flight log frame losses and holds
+    if(isFade && srxlRx.lossCountdown)
+    {
+        if(--srxlRx.lossCountdown == 0)
+        {
+            ++srxlRx.holds;
+            srxlRx.frameLosses -= srxlRx.lossHoldCount;
+        }
+        else
+        {
+            ++srxlRx.frameLosses;
+        }
+    }
+
+    static uint8_t telemFadeCount = 0;
+    // If we are allowed to send telemetry by the device downstream (i.e. any slave device)
+    if(srxlRx.pTelemRcvr)
+    {
+        if(srxlRx.pTelemRcvr->channelMask == 0 || (srxlRx.pTelemRcvr->info & SRXL_DEVINFO_TELEM_FULL_RANGE) == 0)
+        {
+            // If our telemetry receiver missed channel data 3 frames in a row, switch
+            if(++telemFadeCount > 3)
+            {
+                srxlRx.pTelemRcvr = srxlChooseTelemRcvr();
+#ifdef SRXL_INCLUDE_MASTER_CODE
+                srxlSetTelemetryTxEnable(srxlRx.pTelemRcvr && (srxlRx.pTelemRcvr == srxlThisDev.pRcvr));
+#endif
+                telemFadeCount = 0;
+            }
+        }
+        else
+        {
+            telemFadeCount = 0;
+        }
+    }
+#ifdef SRXL_INCLUDE_MASTER_CODE
+    // Else check to make sure we're still supposed to suppress telemetry (reset countdown when slave tells us not to send again)
+    else if(++srxlTelemSuppressCount > SRXL_TELEM_SUPPRESS_MAX)
+    {
+        // Enable this device's telemetry tx since we stopped being told not to
+        srxlRx.pTelemRcvr = srxlThisDev.pRcvr;
+        srxlSetTelemetryTxEnable(srxlRx.pTelemRcvr);
+    }
+#endif
+
+    // Return true while we're in hold condition (failsafe)
+    return srxlRx.lossCountdown == 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+MIT License
+
+Copyright (c) 2019 Horizon Hobby, LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+#ifndef __SRXL_H__
+#define __SRXL_H__
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+// Standard C Libraries
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+
+//      7.1 General Overview
+#define SPEKTRUM_SRXL_ID        (0xA6)
+#define SRXL_MAX_BUFFER_SIZE    (80)
+#define SRXL_MAX_DEVICES        (16)
+
+// Supported SRXL device types (upper nibble of device ID)
+typedef enum
+{
+    SrxlDevType_None                = 0,
+    SrxlDevType_RemoteReceiver      = 1,
+    SrxlDevType_Receiver            = 2,
+    SrxlDevType_FlightController    = 3,
+    SrxlDevType_ESC                 = 4,
+    SrxlDevType_SRXLServo1          = 6,
+    SrxlDevType_SRXLServo2          = 7,
+    SrxlDevType_VTX                 = 8,
+    SrxlDevType_Broadcast           = 15
+} SrxlDevType;
+
+// Default device ID list used by master when polling
+static const uint8_t SRXL_DEFAULT_ID_OF_TYPE[16] =
+{
+    [SrxlDevType_None]              = 0x00,
+    [SrxlDevType_RemoteReceiver]    = 0x10,
+    [SrxlDevType_Receiver]          = 0x21,
+    [SrxlDevType_FlightController]  = 0x30,
+    [SrxlDevType_ESC]               = 0x40,
+    [5]                             = 0x60,
+    [SrxlDevType_SRXLServo1]        = 0x60,
+    [SrxlDevType_SRXLServo2]        = 0x70,
+    [SrxlDevType_VTX]               = 0x81,
+    [9]                             = 0xFF,
+    [10]                            = 0xFF,
+    [11]                            = 0xFF,
+    [12]                            = 0xFF,
+    [13]                            = 0xFF,
+    [14]                            = 0xFF,
+    [SrxlDevType_Broadcast]         = 0xFF,
+};
+
+// Set SRXL_CRC_OPTIMIZE_MODE in spm_srxl_config.h to one of the following values
+#define SRXL_CRC_OPTIMIZE_EXTERNAL  (0)  // Uses an external function defined by SRXL_CRC_EXTERNAL_FN for CRC
+#define SRXL_CRC_OPTIMIZE_SPEED     (1)  // Uses table lookup for CRC computation (requires 512 const bytes for CRC table)
+#define SRXL_CRC_OPTIMIZE_SIZE      (2)  // Uses bitwise operations
+#define SRXL_CRC_OPTIMIZE_STM_HW    (3)  // Uses STM32 register-level hardware acceleration (only available on STM32F30x devices for now)
+#define SRXL_CRC_OPTIMIZE_STM_HAL   (4)  // Uses STM32Cube HAL driver for hardware acceleration (only available on STM32F3/F7) -- see srxlCrc16() for details on HAL config
+
+// Set SRXL_STM_TARGET_FAMILY in spm_srxl_config.h to one of the following values when using one of the STM HW-optimized modes
+#define SRXL_STM_TARGET_F3          (3)
+#define SRXL_STM_TARGET_F7          (7)
+
+//      7.2 Handshake Packet
+#define SRXL_HANDSHAKE_ID       (0x21)
+
+// Supported additional baud rates besides default 115200
+// NOTE: Treated as bitmask, ANDed with baud rates from slaves
+#define SRXL_BAUD_115200        (0x00)
+#define SRXL_BAUD_400000        (0x01)
+//#define SRXL_BAUD_NEXT_RATE   (0x02)
+//#define SRXL_BAUD_ANOTHER     (0x04)
+
+// Bit masks for Device Info byte sent via Handshake
+#define SRXL_DEVINFO_NO_RF              (0x00)  // This is the base for non-RF devices
+#define SRXL_DEVINFO_TELEM_TX_ENABLED   (0x01)  // This bit is set if the device is actively configured to transmit telemetry over RF
+#define SRXL_DEVINFO_TELEM_FULL_RANGE   (0x02)  // This bit is set if the device can send full-range telemetry over RF
+#define SRXL_DEVINFO_FWD_PROG_SUPPORT   (0x04)  // This bit is set if the device supports Forward Programming via RF or SRXL
+
+//      7.3 Bind Info Packet
+#define SRXL_BIND_ID                    (0x41)
+#define SRXL_BIND_REQ_ENTER             (0xEB)
+#define SRXL_BIND_REQ_STATUS            (0xB5)
+#define SRXL_BIND_REQ_BOUND_DATA        (0xDB)
+#define SRXL_BIND_REQ_SET_BIND          (0x5B)
+
+// Bit masks for Options byte
+#define SRXL_BIND_OPT_NONE              (0x00)
+#define SRXL_BIND_OPT_TELEM_TX_ENABLE   (0x01)  // Set if this device should be enabled as the current telemetry device to tx over RF
+#define SRXL_BIND_OPT_BIND_TX_ENABLE    (0x02)  // Set if this device should reply to a bind request with a Discover packet over RF
+#define SRXL_BIND_OPT_US_POWER          (0x04)  // Set if this device should request US transmit power levels instead of EU
+
+// Current Bind Status
+typedef enum
+{
+    NOT_BOUND           = 0x00,
+    // Air types
+    DSM2_1024_22MS      = 0x01,
+    DSM2_1024_MC24      = 0x02,
+    DSM2_2048_11MS      = 0x12,
+    DSMX_22MS           = 0xA2,
+    DSMX_11MS           = 0xB2,
+    // Surface types (corresponding Air type bitwise OR'd with 0x40)
+    SURFACE_DSM1        = 0x40,
+    SURFACE_DSM2_16p5MS = 0x63,
+    DSMR_11MS_22MS      = 0xE2,
+    DSMR_5p5MS          = 0xE4,
+} BIND_STATUS;
+
+//      7.4 Parameter Configuration
+#define SRXL_PARAM_ID           (0x50)
+#define SRXL_PARAM_REQ_QUERY    (0x50)
+#define SRXL_PARAM_REQ_WRITE    (0x57)
+
+//      7.5 Signal Quality Packet
+#define SRXL_RSSI_ID            (0x55)
+#define SRXL_RSSI_REQ_REQUEST   (0x52)
+#define SRXL_RSSI_REQ_SEND      (0x53)
+
+//      7.6 Telemetry Sensor Data Packet
+#define SRXL_TELEM_ID           (0x80)
+
+//      7.7 Control Data Packet
+#define SRXL_CTRL_ID                (0xCD)
+#define SRXL_CTRL_BASE_LENGTH       (3 + 2 + 2) // header + cmd/replyID + crc
+#define SRXL_CTRL_CMD_CHANNEL       (0x00)
+#define SRXL_CTRL_CMD_CHANNEL_FS    (0x01)
+#define SRXL_CTRL_CMD_VTX           (0x02)
+#define SRXL_CTRL_CMD_FWDPGM        (0x03)
+
+typedef enum
+{
+    SRXL_CMD_NONE,
+    SRXL_CMD_CHANNEL,
+    SRXL_CMD_CHANNEL_FS,
+    SRXL_CMD_VTX,
+    SRXL_CMD_FWDPGM,
+    SRXL_CMD_RSSI,
+    SRXL_CMD_HANDSHAKE,
+    SRXL_CMD_TELEMETRY,
+    SRXL_CMD_ENTER_BIND,
+    SRXL_CMD_REQ_BIND,
+    SRXL_CMD_SET_BIND,
+    SRXL_CMD_BIND_INFO,
+} SRXL_CMD;
+
+// VTX Band
+#define VTX_BAND_FATSHARK   (0)
+#define VTX_BAND_RACEBAND   (1)
+#define VTX_BAND_E_BAND     (2)
+#define VTX_BAND_B_BAND     (3)
+#define VTX_BAND_A_BAND     (4)
+
+// VTX Pit Mode
+#define VTX_MODE_RACE   (0)
+#define VTX_MODE_PIT    (1)
+
+// VTX Power
+#define VTX_POWER_OFF           (0)
+#define VTX_POWER_1MW_14MW      (1)
+#define VTX_POWER_15MW_25MW     (2)
+#define VTX_POWER_26MW_99MW     (3)
+#define VTX_POWER_100MW_299MW   (4)
+#define VTX_POWER_300MW_600MW   (5)
+#define VTX_POWER_601_PLUS      (6)
+#define VTX_POWER_MANUAL        (7)
+
+// VTX Region
+#define VTX_REGION_US   (0)
+#define VTX_REGION_EU   (1)
+
+// Forward Programming Pass-Thru
+#define FWD_PGM_MAX_DATA_SIZE   (64)
+
+
+// Enable byte packing for all structs defined here!
+#ifdef PACKED
+#define SRXL_EXTERNAL_PACKED
+#elif defined(__GNUC__)
+#define PACKED __attribute__((packed))
+#else
+#pragma pack(push, 1)
+#define PACKED
+#endif
+
+// Spektrum SRXL header
+typedef struct SrxlHeader
+{
+    uint8_t srxlID;     // Always 0xA6 for SRXL2
+    uint8_t packetType;
+    uint8_t length;
+} PACKED SrxlHeader;
+
+// Handshake
+typedef struct SrxlHandshakeData
+{
+    uint8_t     srcDevID;
+    uint8_t     destDevID;
+    uint8_t     priority;
+    uint8_t     baudSupported;  // 0 = 115200, 1 = 400000 (See SRXL_BAUD_xxx definitions above)
+    uint8_t     info;           // See SRXL_DEVINFO_xxx definitions above for defined bits
+    uint32_t    uid;            // Unique/random id to allow detection of two devices on bus with same deviceID
+} PACKED SrxlHandshakeData;
+
+typedef struct SrxlHandshakePacket
+{
+    SrxlHeader          hdr;
+    SrxlHandshakeData   payload;
+    uint16_t            crc;
+} PACKED SrxlHandshakePacket;
+
+// Bind
+typedef struct SrxlBindData
+{
+    uint8_t     type;
+    uint8_t     options;
+    uint64_t    guid;
+    uint32_t    uid;
+} PACKED SrxlBindData;
+
+typedef struct SrxlBindPacket
+{
+    SrxlHeader      hdr;
+    uint8_t         request;
+    uint8_t         deviceID;
+    SrxlBindData    data;
+    uint16_t        crc;
+} PACKED SrxlBindPacket;
+
+// Telemetry
+typedef struct SrxlTelemetryData
+{
+    union
+    {
+        struct
+        {
+            uint8_t sensorID;
+            uint8_t secondaryID;
+            uint8_t data[14];
+        };
+        uint8_t raw[16];
+    };
+} PACKED SrxlTelemetryData;
+
+typedef struct SrxlTelemetryPacket
+{
+    SrxlHeader          hdr;
+    uint8_t             destDevID;
+    SrxlTelemetryData   payload;
+    uint16_t            crc;
+} PACKED SrxlTelemetryPacket;
+
+// Signal Quality
+typedef struct SrxlRssiPacket
+{
+    SrxlHeader  hdr;
+    uint8_t     request;
+    int8_t      antennaA;
+    int8_t      antennaB;
+    int8_t      antennaC;
+    int8_t      antennaD;
+    uint16_t    crc;
+} PACKED SrxlRssiPacket;
+
+// Parameter Config
+typedef struct SrxlParamPacket
+{
+    SrxlHeader  hdr;
+    uint8_t     request;
+    uint8_t     destDevID;
+    uint32_t    paramID;
+    uint32_t    paramVal;
+    uint16_t    crc;
+} PACKED SrxlParamPacket;
+
+// VTX Data
+typedef struct SrxlVtxData
+{
+    uint8_t band;       // VTX Band (0 = Fatshark, 1 = Raceband, 2 = E, 3 = B, 4 = A)
+    uint8_t channel;    // VTX Channel (0-7)
+    uint8_t pit;        // Pit/Race mode (0 = Race, 1 = Pit). Race = normal power, Pit = reduced power
+    uint8_t power;      // VTX Power (0 = Off, 1 = 1mw to 14mW, 2 = 15mW to 25mW, 3 = 26mW to 99mW,
+                        // 4 = 100mW to 299mW, 5 = 300mW to 600mW, 6 = 601mW+, 7 = manual control)
+    uint16_t powerDec;  // VTX Power as a decimal 1mw/unit
+    uint8_t region;     // Region (0 = USA, 1 = EU)
+} PACKED SrxlVtxData;
+
+// Forward Programming Data
+typedef struct SrxlFwdPgmData
+{
+    uint8_t rfu[3];     // 0 for now -- used to word-align data
+    uint8_t data[FWD_PGM_MAX_DATA_SIZE];
+} PACKED SrxlFwdPgmData;
+
+// Channel Data
+typedef struct SrxlChannelData
+{
+    int8_t    rssi;         // Best RSSI when sending channel data, or dropout RSSI when sending failsafe data
+    uint16_t  frameLosses;  // Total lost frames (or fade count when sent from Remote Rx to main Receiver)
+    uint32_t  mask;         // Set bits indicate that channel data with the corresponding index is present
+    uint16_t  values[32];   // Channel values, shifted to full 16-bit range (32768 = mid-scale); lowest 2 bits RFU
+} PACKED SrxlChannelData;
+
+// Control Data
+typedef struct SrxlControlData
+{
+    uint8_t cmd;
+    uint8_t replyID;
+    union
+    {
+        SrxlChannelData channelData;    // Used for Channel Data and Failsafe Channel Data commands
+        SrxlVtxData     vtxData;        // Used for VTX commands
+        SrxlFwdPgmData  fpData;         // Used to pass forward programming data to an SRXL device
+    };
+} PACKED SrxlControlData;
+
+typedef struct SrxlControlPacket
+{
+    SrxlHeader      hdr;
+    SrxlControlData payload;
+//  uint16_t        crc;    // NOTE: Since this packet is variable-length, we can't use this value anyway
+} PACKED SrxlControlPacket;
+
+// SRXL Packets
+typedef union
+{
+    SrxlHeader          header;
+    SrxlBindPacket      bind;
+    SrxlHandshakePacket handshake;
+    SrxlTelemetryPacket telemetry;
+    SrxlRssiPacket      rssi;
+    SrxlParamPacket     parameter;
+    SrxlControlPacket   control;
+    uint8_t             raw[SRXL_MAX_BUFFER_SIZE];
+} SrxlPacket;
+
+// SRXL full device identifier -- SRXL Device ID with bus number
+typedef union
+{
+    struct
+    {
+        uint8_t deviceID;
+        uint8_t busIndex;
+    };
+    uint16_t word;
+} PACKED SrxlFullID;
+
+// Restore packing back to default
+#ifndef SRXL_EXTERNAL_PACKED
+#undef PACKED
+#ifndef __GNUC__
+#pragma pack(pop)
+#endif
+#endif
+
+// Global vars
+extern SrxlChannelData srxlChData;
+extern SrxlTelemetryData srxlTelemData;
+extern SrxlVtxData srxlVtxData;
+
+// Include config here, after all typedefs that might be needed within it
+#include "spm_srxl_config.h"
+
+#ifndef FALLTHROUGH
+#define FALLTHROUGH
+#endif
+
+#if !defined(SRXL_NUM_OF_BUSES)
+#error "SRXL_NUM_OF_BUSES must be defined in spm_srxl_config.h!"
+#elif SRXL_NUM_OF_BUSES <= 0
+#error "SRXL_NUM_OF_BUSES must be defined in spm_srxl_config.h!"
+#elif SRXL_NUM_OF_BUSES > 1
+#define SRXL_IS_HUB
+#endif
+#define SRXL_ALL_BUSES          ((1u << SRXL_NUM_OF_BUSES) - 1)
+#define SRXL_MAX_RCVRS          (2 * SRXL_NUM_OF_BUSES)
+#ifndef SRXL_CRC_OPTIMIZE_MODE  // NOTE: This should be set in spm_srxl_config.h
+#define SRXL_CRC_OPTIMIZE_MODE  SRXL_CRC_OPTIMIZE_SPEED
+#endif
+
+#define RSSI_RCVD_NONE  (0)
+#define RSSI_RCVD_DBM   (1)
+#define RSSI_RCVD_PCT   (2)
+#define RSSI_RCVD_BOTH  (3)
+
+// Internal types
+typedef enum
+{
+    SrxlState_Disabled,             // Default state before initialized or if bus is subsequently disabled
+    SrxlState_ListenOnStartup,      // Wait 50ms to see if anything is already talking (i.e. we probably browned out)
+    SrxlState_SendHandshake,        // Call when handshake should be sent every 50ms
+    SrxlState_ListenForHandshake,   // Wait at least 150ms more for handshake request
+    SrxlState_Running,              // Normal run state
+    SrxlState_SendTelemetry,        // Send telemetry reply when requested
+    SrxlState_SendVTX,              // Send VTX packet when needed
+    SrxlState_SendEnterBind,
+    SrxlState_SendBoundDataReport,
+    SrxlState_SendSetBindInfo,
+} SrxlState;
+
+//#ifdef SRXL_IS_HUB
+typedef struct SrxlRcvrEntry
+{
+    uint8_t     deviceID;       // SRXL device ID of the receiver
+    uint8_t     busBits;        // Supports 8 buses, with each bit corresponding to busIndex (bit 0 = bus 0, bit 7 = bus 7)
+    uint8_t     info;           // Info bits reported during handshake - See SRXL_DEVINFO_XXX mask bits in header
+    uint8_t     rssiRcvd;       // 0 = none, 1 = dBm, 2 = percent, 3 = both dBm and percent
+    int8_t      rssi_dBm;       // Latest RSSI dBm value reported by receiver (negative, varies with receiver type)
+    int8_t      rssi_Pct;       // Latest RSSI percent range estimate reported by receiver (0-100)
+    uint16_t    fades;          // Latest number of fades reported for a given receiver
+    uint32_t    channelMask;    // Latest channel mask for channels provided in channel data packet (0 during fade)
+} SrxlRcvrEntry;
+
+typedef struct SrxlReceiverInfo
+{
+    SrxlRcvrEntry   rcvr[SRXL_MAX_RCVRS];       // Stats for each receiver, filled when ch data is received
+    SrxlRcvrEntry*  rcvrSorted[SRXL_MAX_RCVRS]; // Pointers to receiver entries sorted in telemetry range order
+    uint8_t         rcvrSortInsert;             // Index into rcvrSorted where full-range telem rcvrs should be inserted
+    uint8_t         rcvrCount;                  // Number of entries in rcvr[] and rcvrSorted[]
+    uint8_t         rxBusBits;
+    int8_t          bestRssi_dBm;
+    int8_t          bestRssi_Pct;
+    uint8_t         lossCountdown;  // Reset to lossHoldCount when frame is good, and decrement for each consecutive
+                                    // frame loss -- when we get to 0, convert lossHoldCount frame losses to a hold
+    uint8_t         lossHoldCount;  // Consecutive frame losses required to count as hold
+    uint16_t        frameLosses;    // Increment each time all receivers are in frame loss -- if 45
+                                    // consecutive, subtract those and increment holds
+    uint16_t        holds;          // Increment each time 45 or more consecutive frames are lost (but don't keep
+                                    // incrementing once in that state)
+    SrxlRcvrEntry*  pTelemRcvr;     // Pointer to current assigned telemetry receiver (used for checking
+                                    // for fade to know when to switch)
+    SrxlRcvrEntry*  pBindRcvr;      // Pointer to receiver that we told to Enter Bind Mode (used to
+                                    // process Bound Data Report and send Set Bind Info)
+} SrxlReceiverStats;
+//#endif
+
+typedef struct SrxlDevEntry
+{
+    uint8_t deviceID;
+    uint8_t priority;   // Requested telemetry priority of this device
+    uint8_t info;       // Refer to SRXL_DEVINFO_XXX mask bits in header
+    uint8_t rfu;
+} SrxlDevEntry;
+
+typedef struct SrxlTxFlags
+{
+    unsigned int enterBind : 1;
+    unsigned int getBindInfo : 1;
+    unsigned int setBindInfo : 1;
+    unsigned int broadcastBindInfo : 1;
+    unsigned int reportBindInfo : 1;
+    unsigned int sendVtxData : 1;
+    unsigned int sendFwdPgmData : 1;
+} SrxlTxFlags;
+
+typedef struct SrxlBus
+{
+    SrxlPacket      srxlOut;            // Transmit packet buffer
+    SrxlPacket      srxlIn;             // Receive packet buffer
+
+    SrxlState       state;              // Current state of SRXL state machine
+    SrxlFullID      fullID;             // Device ID and Bus Index of this device, set during init
+    uint8_t         rxDevCount;         // Number of other SRXL devices discovered via handshake
+    SrxlDevEntry    rxDev[SRXL_MAX_DEVICES];    // Device entries for tracking SRXL telemetry priorities
+#ifdef SRXL_INCLUDE_MASTER_CODE
+    uint16_t        rxDevAge[SRXL_MAX_DEVICES]; // Telemetry age value for the associated device
+#endif
+    uint16_t        rxDevPrioritySum;   // Sum of priorities requested for each discovered SRXL device
+    uint16_t        timeoutCount_ms;    // Milliseconds since SRXL packet was received (incremented in srxlRun)
+    uint8_t         requestID;          // Device ID to poll
+    uint8_t         baudSupported;      // Baud rates this device can do: 0 = 115200, 1 = 400000
+    uint8_t         baudRate;           // Current baud rate: 0 = 115200, 1 = 400000
+    uint8_t         frameErrCount;      // Number of consecutive missed frames
+    SrxlTxFlags     txFlags;            // Pending outgoing packet types
+    uint8_t         uart;               // Index number of UART tied to this SRXL bus
+    SrxlRcvrEntry*  pMasterRcvr;        // Receiver entry for the bus master, if one exists
+    bool            master;             // True if this device is the bus master on this bus
+    bool            initialized;        // True when this SRXL bus is initialized
+} SrxlBus;
+
+typedef struct SrxlDevice
+{
+    SrxlDevEntry    devEntry;   // Device info for this local device, shared across all buses.
+    uint32_t        uid;        // ID statistically likely to be unique (Random, hash of serial, etc.)
+    SrxlRcvrEntry*  pRcvr;      // Pointer to our receiver entry, if we're a receiver (don't set for
+                                // flight controller acting as hub -- only true receiver)
+    bool vtxProxy;              // Set true if this device can and should respond to VTX commands
+} SrxlDevice;
+
+
+// Function prototypes
+bool srxlInitDevice(uint8_t deviceID, uint8_t priority, uint8_t info, uint32_t uid);
+bool srxlInitBus(uint8_t busIndex, uint8_t uart, uint8_t baudSupported);
+bool srxlIsBusMaster(uint8_t busIndex);
+uint16_t srxlGetTimeoutCount_ms(uint8_t busIndex);
+uint8_t srxlGetDeviceID(uint8_t busIndex);
+bool srxlParsePacket(uint8_t busIndex, uint8_t *packet, uint8_t length);
+void srxlRun(uint8_t busIndex, int16_t timeoutDelta_ms);
+bool srxlEnterBind(uint8_t bindType, bool broadcast);
+bool srxlSetBindInfo(uint8_t bindType, uint64_t guid, uint32_t uid);
+void srxlOnFrameError(uint8_t busIndex);
+SrxlFullID srxlGetTelemetryEndpoint(void);
+bool srxlSetVtxData(SrxlVtxData *pVtxData);
+bool srxlPassThruFwdPgm(uint8_t *pData, uint8_t length);
+void srxlSetHoldThreshold(uint8_t countdownReset);
+void srxlClearCommStats(void);
+bool srxlUpdateCommStats(bool isFade);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+#ifdef SRXL_INCLUDE_MASTER_CODE
+// NOTE: Most user applications should not be an SRXL2 bus master, so master-specific code is not open.
+// If your application requires this functionality, please inquire about this from Spektrum RC.
+#include "spm_srxl_master.h"
+#endif
+
+#endif //__SRXL_H__
+                                                                                                                                                                                                                     /*
+MIT License
+
+Copyright (c) 2019 Horizon Hobby, LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+// This file is automatically included within spm_srxl.h -- do not include elsewhere!
+
+#ifndef _SRXL_CONFIG_H_
+#define _SRXL_CONFIG_H_
+
+//### USER PROVIDED HEADER FUNCTIONS AND FORWARD DECLARATIONS ###
+
+// User included headers/declarations to access interface functions required below
+//#include <AP_HAL/AP_HAL.h>
+
+extern "C++" {
+#include <AP_Math/crc.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Common/AP_Common.h>
+}
+
+//### USER CONFIGURATION ###
+
+// Set this value to the number of physically separate SRXL buses on the device
+#define SRXL_NUM_OF_BUSES           1
+
+// Set this to the appropriate device ID (See Section 7.1.1 in Spektrum Bi-Directional SRXL Documentation).
+// Typical values are:
+//    Flight Controller = 0x31 (or possibly 0x30 if connected to Base Receiver instead of Remote Receiver)
+//    Smart ESC = 0x40
+//    VTX = 0x81
+// NOTE: This value is not used internally -- it is passed as a parameter to srxlInit() in the example app
+#define SRXL_DEVICE_ID              0x31
+#define SRXL_DEVICE_ID_BASE_RX      0x30
+
+// Set this to the desired priority level for sending telemetry, ranging from 0 to 100.
+// Generally, this number should be 10 times the number of different telemetry packets to regularly send.
+// If there are telemetry messages that should be sent more often, increase this value.
+// If there are messages that are rarely sent, add less than 10 for those.
+// For example, if you had two normal priority messages and one that you plan to send twice as often as those,
+// you could set the priority to 40 (10 + 10 + 2*10)
+// NOTE: This value is not used internally -- it is passed as a parameter to srxlInit() in the example app
+#define SRXL_DEVICE_PRIORITY        20
+
+// Set these information bits based on the capabilities of the device.
+// The only bit currently applicable to third-party devices is the SRXL_DEVINFO_FWD_PROG_SUPPORT flag,
+// which should be set if you would like to allow Forward Programming of the device via SRXL pass-through.
+#define SRXL_DEVICE_INFO            (SRXL_DEVINFO_NO_RF)
+
+// Set this value to 0 for 115200 baud only, or 1 for 400000 baud support
+#define SRXL_SUPPORTED_BAUD_RATES   0
+
+// Set this value to choose which code to include for CRC computation. Choices are:
+//    SRXL_CRC_OPTIMIZE_SPEED   -- Uses table lookup for CRC computation (requires 512 const bytes for CRC table)
+//    SRXL_CRC_OPTIMIZE_SIZE    -- Uses bitwise operations for smaller code size but slower execution
+//    SRXL_CRC_OPTIMIZE_STM_HW  -- Uses STM32 register-level hardware acceleration (only available on STM32F30x devices for now)
+//    SRXL_CRC_OPTIMIZE_STM_HAL -- Uses STM32Cube HAL driver for hardware acceleration (only available on STM32F3/F7) -- see srxlCrc16() for details on HAL config
+
+#define SRXL_CRC_CALCULATE(packet, length, crc) crc16_ccitt(packet, length, crc)
+
+#define SRXL_CRC_OPTIMIZE_MODE      SRXL_CRC_OPTIMIZE_EXTERNAL
+
+// If using STM32 hardware CRC acceleration above, set this flag to the target family. Choices are:
+//    SRXL_STM_TARGET_F3
+//    SRXL_STM_TARGET_F7
+#define SRXL_STM_TARGET_FAMILY      SRXL_STM_TARGET_F3
+
+// If using SRXL_CRC_OPTIMIZE_STM_HW and the CRC hardware is shared with non-SRXL code, then
+// uncomment the following flag to save and restore the CRC registers after use by SRXL:
+//#define SRXL_SAVE_HW_CRC_CONTEXT
+
+// Uncomment the following flag if your code must support Forward Programming received via SRXL
+//#define SRXL_INCLUDE_FWD_PGM_CODE
+
+//### USER PROVIDED INTERFACE FUNCTIONS ###
+
+// User-provided routine to change the baud rate settings on the given UART:
+// uart - the same uint8_t value as the uart parameter passed to srxlInit()
+// baudRate - the actual baud rate (currently either 115200 or 400000)
+void srxlChangeBaudRate(uint8_t uart, uint32_t baudRate);
+
+// User-provided routine to actually transmit a packet on the given UART:
+// uart - the same uint8_t value as the uart parameter passed to srxlInit()
+// pBuffer - a pointer to an array of uint8_t values to send over the UART
+// length - the number of bytes contained in pBuffer that should be sent
+void srxlSendOnUart(uint8_t uart, uint8_t* pBuffer, uint8_t length);
+
+// User-provided callback routine to fill in the telemetry data to send to the master when requested:
+// pTelemetryData - a pointer to the 16-byte SrxlTelemetryData transmit buffer to populate
+// NOTE: srxlTelemData is available as a global variable, so the memcpy line commented out below
+// could be used if you would prefer to just populate that with the next outgoing telemetry packet.
+void srxlFillTelemetry(SrxlTelemetryData* pTelemetryData);
+
+// User-provided callback routine that is called whenever a control data packet is received:
+// pChannelData - a pointer to the received SrxlChannelData structure for manual parsing
+// isFailsafe - true if channel data is set to failsafe values, else false.
+// NOTE: srxlChData is available as a global variable that contains all of the latest values
+// for channel data, so this callback is intended to be used if more control is desired.
+// It might make sense to only use this to trigger your own handling of the received servo values.
+void srxlReceivedChannelData(SrxlChannelData* pChannelData, bool isFailsafe);
+
+// User-provided callback routine to handle reception of a bound data report (either requested or unprompted).
+// Return true if you want this bind information set automatically for all other receivers on all SRXL buses.
+bool srxlOnBind(SrxlFullID device, SrxlBindData info);
+
+// User-provided callback routine to handle reception of a VTX control packet.
+void srxlOnVtx(SrxlVtxData* pVtxData);
+
+// Optional user-provided callback routine to handle Forward Programming command locally if supported
+#ifdef SRXL_INCLUDE_FWD_PGM_CODE
+static inline void srxlOnFwdPgm(uint8_t* pData, uint8_t dataLength)
+{
+    // TODO: Pass data to Forward Programming library
+}
+#endif // SRXL_INCLUDE_FWD_PGM_CODE
+
+// User-provided routine to enter a critical section (only needed with multiple buses or if HW CRC is used externally)
+static inline void srxlEnterCriticalSection(void)
+{
+}
+
+// User-provided routine to exit a critical section (only needed with multiple buses or if HW CRC is used externally)
+static inline void srxlExitCriticalSection(void)
+{
+}
+
+#endif // _SRXL_CONFIG_H_
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+  test that SBUS decoding matches SBUS encoding
+ */
+#include <AP_gtest.h>
+#include <AP_SBusOut/AP_SBusOut.h>
+#include <AP_RCProtocol/AP_RCProtocol.h>
+#include <AP_RCProtocol/AP_RCProtocol_SBUS.h>
+
+#define SBUS_RANGE_MIN 200
+#define SBUS_RANGE_MAX 1800
+#define SBUS_RANGE_RANGE (SBUS_RANGE_MAX - SBUS_RANGE_MIN)
+
+#define SBUS_TARGET_MIN 1000
+#define SBUS_TARGET_MAX 2000
+#define SBUS_TARGET_RANGE (SBUS_TARGET_MAX - SBUS_TARGET_MIN)
+
+// this is 875
+#define SBUS_SCALE_OFFSET (SBUS_TARGET_MIN - ((SBUS_TARGET_RANGE * SBUS_RANGE_MIN / SBUS_RANGE_RANGE)))
+
+TEST(SBUSEncodeDecode, test_sbus_encode_decode)
+{
+    const uint8_t num_channels = 8;
+    uint16_t values_in[num_channels];
+    uint16_t values_out[num_channels];
+    uint8_t frame[25];
+
+    for (uint16_t v=875;v<2155; v++) {
+        for (uint8_t i=0; i<num_channels; i++) {
+            values_in[i] = v;
+        }
+        AP_SBusOut::sbus_format_frame(values_in, num_channels, frame);
+        uint16_t num_values = 0;
+        bool sbus_failsafe=false;
+        AP_RCProtocol_SBUS::sbus_decode(frame, values_out, &num_values, sbus_failsafe, num_channels);
+        EXPECT_EQ(sbus_failsafe, values_in[0] == 875);
+        for (uint8_t i=0; i<num_channels; i++) {
+            if (values_in[i] != values_out[i]) {
+                EXPECT_EQ(values_in[i], values_out[i]);
+            }
+        }
+    }
+}
+
+
+AP_GTEST_MAIN()
+int hal = 0;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_find_tests(
+        use='ap',
+        DOUBLE_PRECISION_SOURCES = ['test_math_double.cpp', 'test_vector3.cpp']
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "AP_RCTelemetry_config.h"
+
+#if HAL_CRSF_TELEM_ENABLED
+
+#include "AP_CRSF_Telem.h"
+#include <AP_VideoTX/AP_VideoTX.h>
+#include <AP_HAL/utility/sparse-endian.h>
+#include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_Common/AP_FWVersion.h>
+#include <AP_GPS/AP_GPS.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_RCProtocol/AP_RCProtocol_CRSF.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Notify/AP_Notify.h>
+#include <AP_OSD/AP_OSD.h>
+#include <AP_Frsky_Telem/AP_Frsky_SPort_Passthrough.h>
+#include <math.h>
+#include <stdio.h>
+#include <AP_HAL/AP_HAL.h>
+
+#include <AP_VideoTX/AP_VideoTX.h>
+
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+//#define CRSF_DEBUG
+#ifdef CRSF_DEBUG
+# define debug(fmt, args...)	hal.console->printf("CRSF: " fmt "\n", ##args)
+#else
+# define debug(fmt, args...)	do {} while(0)
+#endif
+
+extern const AP_HAL::HAL& hal;
+const uint8_t AP_CRSF_Telem::PASSTHROUGH_STATUS_TEXT_FRAME_MAX_SIZE;
+const uint8_t AP_CRSF_Telem::PASSTHROUGH_MULTI_PACKET_FRAME_MAX_SIZE;
+const uint8_t AP_CRSF_Telem::CRSF_RX_DEVICE_PING_MAX_RETRY;
+
+AP_CRSF_Telem *AP_CRSF_Telem::singleton;
+
+AP_CRSF_Telem::AP_CRSF_Telem() : AP_RCTelemetry(0)
+{
+    singleton = this;
+}
+
+AP_CRSF_Telem::~AP_CRSF_Telem(void)
+{
+    singleton = nullptr;
+}
+
+bool AP_CRSF_Telem::init(void)
+{
+    // sanity check that we are using a UART for RC input
+    if (!AP::serialmanager().have_serial(AP_SerialManager::SerialProtocol_RCIN, 0)
+        && !AP::serialmanager().have_serial(AP_SerialManager::SerialProtocol_CRSF, 0)) {
+        return false;
+    }
+
+#if AP_VIDEOTX_ENABLED
+    // Someone explicitly configure CRSF control for VTX
+    if (AP::serialmanager().have_serial(AP_SerialManager::SerialProtocol_CRSF, 0)) {
+        AP::vtx().set_provider_enabled(AP_VideoTX::VTXType::CRSF);
+    }
+#endif
+
+    return AP_RCTelemetry::init();
+}
+
+/*
+  setup ready for passthrough telem
+ */
+void AP_CRSF_Telem::setup_wfq_scheduler(void)
+{
+    // initialize packet weights for the WFQ scheduler
+    // priority[i] = 1/_scheduler.packet_weight[i]
+    // rate[i] = LinkRate * ( priority[i] / (sum(priority[1-n])) )
+
+    // CRSF telemetry rate is 150Hz (4ms) max, so these rates must fit
+    add_scheduler_entry(50, 100);   // heartbeat        10Hz
+    add_scheduler_entry(5, 20);     // parameters       50Hz (generally not active unless requested by the TX)
+    add_scheduler_entry(50, 200);   // baro_vario        5Hz
+    add_scheduler_entry(50, 120);   // Attitude and compass 8Hz
+    add_scheduler_entry(200, 1000); // VTX parameters    1Hz
+    add_scheduler_entry(1300, 500); // battery           2Hz
+    add_scheduler_entry(550, 280);  // GPS               3Hz
+    add_scheduler_entry(550, 500);  // flight mode       2Hz
+    add_scheduler_entry(5000, 100); // passthrough       max 10Hz
+    add_scheduler_entry(5000, 500); // status text       max 2Hz
+    add_scheduler_entry(5, 20);     // command          50Hz (generally not active unless requested by the TX)
+    add_scheduler_entry(5, 500);    // version ping      2Hz (only active at startup)
+    add_scheduler_entry(5, 100);    // device ping      10Hz (only active during TX loss, also see CRSF_RX_TIMEOUT)
+    disable_scheduler_entry(DEVICE_PING);
+}
+
+void AP_CRSF_Telem::setup_custom_telemetry()
+{
+    if (_custom_telem.init_done) {
+        return;
+    }
+
+    if (!rc().option_is_enabled(RC_Channels::Option::CRSF_CUSTOM_TELEMETRY)) {
+        return;
+    }
+
+    // check if passthru already assigned
+    const int8_t frsky_port = AP::serialmanager().find_portnum(AP_SerialManager::SerialProtocol_FrSky_SPort_Passthrough,0);
+    if (frsky_port != -1) {
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "%s: passthrough telemetry conflict on SERIAL%d", get_protocol_string(), frsky_port);
+       _custom_telem.init_done = true;
+       return;
+    }
+
+    // we need crossfire firmware version
+    if (_crsf_version.pending) {
+        return;
+    }
+
+    AP_Frsky_SPort_Passthrough* passthrough = AP::frsky_passthrough_telem();
+    if (passthrough == nullptr) {
+        return;
+    }
+
+    // setup the frsky scheduler for crossfire and elrs
+    passthrough->disable_scheduler_entry(AP_Frsky_SPort_Passthrough::GPS_LAT);
+    passthrough->disable_scheduler_entry(AP_Frsky_SPort_Passthrough::GPS_LON);
+    passthrough->disable_scheduler_entry(AP_Frsky_SPort_Passthrough::TEXT);
+    passthrough->set_scheduler_entry_min_period(AP_Frsky_SPort_Passthrough::ATTITUDE, 350); // 3Hz
+
+    // setup the crossfire scheduler for custom telemetry
+    set_scheduler_entry(FLIGHT_MODE, 1200, 2000);   // 0.5Hz
+    set_scheduler_entry(HEARTBEAT, 2000, 5000);     // 0.2Hz
+
+    _telem_rf_mode = get_rf_mode();
+    // setup custom telemetry for current rf_mode
+    update_custom_telemetry_rates(_telem_rf_mode);
+
+    GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,"%s: custom telem init done, fw %d.%02d", get_protocol_string(), _crsf_version.major, _crsf_version.minor);
+
+    _custom_telem.init_done = true;
+}
+
+void AP_CRSF_Telem::update_custom_telemetry_rates(AP_RCProtocol_CRSF::RFMode rf_mode)
+{
+    // ignore rf mode changes if we are processing parameter packets
+    if (_custom_telem.params_mode_active) {
+        return;
+    }
+
+    if (is_high_speed_telemetry(rf_mode)) {
+        // standard telemetry for high data rates
+        set_scheduler_entry(BATTERY, 1000, 1000);       // 1Hz
+        set_scheduler_entry(ATTITUDE, 1000, 1000);      // 1Hz
+        set_scheduler_entry(BARO_VARIO, 1000, 1000);    // 1Hz
+        set_scheduler_entry(VARIO, 1000, 1000);         // 1Hz
+        // custom telemetry for high data rates
+        set_scheduler_entry(GPS, 550, 500);            // 2.0Hz
+        set_scheduler_entry(PASSTHROUGH, 100, 100);    // 8Hz
+        set_scheduler_entry(STATUS_TEXT, 200, 750);    // 1.5Hz
+    } else {
+        // standard telemetry for low data rates
+        set_scheduler_entry(BATTERY, 1000, 2000);       // 0.5Hz
+        set_scheduler_entry(ATTITUDE, 1000, 3000);      // 0.33Hz
+        set_scheduler_entry(BARO_VARIO, 1000, 3000);    // 0.33Hz
+        set_scheduler_entry(VARIO, 1000, 3000);         // 0.33Hz
+        if (is_elrs()) {
+            // ELRS custom telemetry for low data rates
+            set_scheduler_entry(GPS, 550, 1000);            // 1.0Hz
+            set_scheduler_entry(PASSTHROUGH, 350, 500);     // 2.0Hz
+            set_scheduler_entry(STATUS_TEXT, 500, 2000);    // 0.5Hz
+        } else {
+            // CRSF custom telemetry for low data rates
+            set_scheduler_entry(GPS, 550, 1000);              // 1.0Hz
+            set_scheduler_entry(PASSTHROUGH, 500, 3000);      // 0.3Hz
+            set_scheduler_entry(STATUS_TEXT, 600, 2000);      // 0.5Hz
+        }
+    }
+}
+
+bool AP_CRSF_Telem::process_rf_mode_changes()
+{
+    const AP_RCProtocol_CRSF::RFMode current_rf_mode = get_rf_mode();
+    uint32_t now = AP_HAL::millis();
+
+    // the presence of a uart indicates that we are using CRSF for RC control
+    AP_RCProtocol_CRSF* crsf = AP::crsf();
+    AP_HAL::UARTDriver* uart = nullptr;
+    if (crsf != nullptr) {
+        uart = crsf->get_UART();
+    }
+
+    if (uart == nullptr) {
+        return true;
+    }
+
+    if (!crsf->is_detected()) {
+        return false;
+    }
+    // not ready yet
+    if (!uart->is_initialized()) {
+        return false;
+    }
+#if !defined (STM32H7)
+    // warn the user if their setup is sub-optimal, H7 does not need DMA on serial port
+    if (_telem_bootstrap_msg_pending && !uart->is_dma_enabled()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "%s: running on non-DMA serial port", get_protocol_string());
+    }
+#endif
+    // note if option was set to show LQ in place of RSSI
+    bool current_lq_as_rssi_active = rc().option_is_enabled(RC_Channels::Option::USE_CRSF_LQ_AS_RSSI);
+    if(_telem_bootstrap_msg_pending || _noted_lq_as_rssi_active != current_lq_as_rssi_active){
+        _noted_lq_as_rssi_active = current_lq_as_rssi_active;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s: RSSI now displays %s", get_protocol_string(), current_lq_as_rssi_active ? " as LQ" : "normally");
+    }
+    _telem_bootstrap_msg_pending = false;
+
+    const bool is_high_speed = is_high_speed_telemetry(current_rf_mode);
+    if ((now - _telem_last_report_ms > 5000)) {
+        // report an RF mode change or a change in telemetry rate if we haven't done so in the last 5s
+        if (!rc().option_is_enabled(RC_Channels::Option::SUPPRESS_CRSF_MESSAGE) && (_telem_rf_mode != current_rf_mode || abs(int16_t(_telem_last_avg_rate) - int16_t(_scheduler.avg_packet_rate)) > 25)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s: Link rate %dHz, Telemetry rate %dHz",
+                get_protocol_string(), crsf->get_link_rate(_crsf_version.protocol), get_telemetry_rate());
+        }
+        // tune the scheduler based on telemetry speed high/low transitions
+        if (_telem_is_high_speed != is_high_speed) {
+            update_custom_telemetry_rates(current_rf_mode);
+        }
+        _telem_is_high_speed = is_high_speed;
+        _telem_rf_mode = current_rf_mode;
+        _telem_last_avg_rate = _scheduler.avg_packet_rate;
+        if (_telem_last_report_ms == 0) {   // only want to show bootstrap messages once
+            _telem_bootstrap_msg_pending = true;
+        }
+        _telem_last_report_ms = now;
+    }
+    return true;
+}
+
+// return custom frame id based on fw version
+uint8_t AP_CRSF_Telem::get_custom_telem_frame_id() const
+{
+    if (!_crsf_version.pending &&
+        ((_crsf_version.major > 4 || (_crsf_version.major == 4 && _crsf_version.minor >= 6))
+            || is_elrs())) {
+        return AP_RCProtocol_CRSF::CRSF_FRAMETYPE_AP_CUSTOM_TELEM;
+    }
+    return AP_RCProtocol_CRSF::CRSF_FRAMETYPE_AP_CUSTOM_TELEM_LEGACY;
+}
+
+AP_RCProtocol_CRSF::RFMode AP_CRSF_Telem::get_rf_mode() const
+{
+    AP_RCProtocol_CRSF* crsf = AP::crsf();
+    if (crsf == nullptr) {
+        return AP_RCProtocol_CRSF::RFMode::RF_MODE_UNKNOWN;
+    }
+
+    if (!_crsf_version.pending && _crsf_version.use_rf_mode) {
+        if (is_elrs()) {
+            return static_cast<AP_RCProtocol_CRSF::RFMode>(uint8_t(AP_RCProtocol_CRSF::RFMode::CRSF_RF_MAX_MODES) + crsf->get_link_status().rf_mode);
+        }
+        return static_cast<AP_RCProtocol_CRSF::RFMode>(crsf->get_link_status().rf_mode);
+    } else if (is_tracer()) {
+        return AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_250HZ;
+    }
+
+    /*
+     Note:
+     - CRSF rf mode 2 on UARTS with DMA runs @160Hz
+     - CRSF rf mode 2 on UARTS with no DMA runs @70Hz
+    */
+    if (get_avg_packet_rate() < 40U) {
+        // no DMA CRSF rf mode 1
+        return AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_50HZ;
+    }
+    if (get_avg_packet_rate() > 120U) {
+        // DMA CRSF rf mode 2
+        return AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_150HZ;
+    }
+    if (get_max_packet_rate() < 120U) {
+        // no CRSF DMA rf mode 2
+        return AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_150HZ;
+    }
+    return AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_50HZ;
+}
+
+bool AP_CRSF_Telem::is_high_speed_telemetry(const AP_RCProtocol_CRSF::RFMode rf_mode) const
+{
+    if (_crsf_version.protocol != AP_RCProtocol_CRSF::ProtocolType::PROTOCOL_ELRS) {
+        return rf_mode == AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_150HZ || rf_mode == AP_RCProtocol_CRSF::RFMode::CRSF_RF_MODE_250HZ;
+    }
+    return get_telemetry_rate() > 30;
+}
+
+uint16_t AP_CRSF_Telem::get_telemetry_rate() const
+{
+    if (_crsf_version.protocol != AP_RCProtocol_CRSF::ProtocolType::PROTOCOL_ELRS) {
+        return get_avg_packet_rate();
+    }
+    AP_RCProtocol_CRSF* crsf = AP::crsf();
+    if (crsf == nullptr) {
+        return get_avg_packet_rate();
+    }
+    // ELRS sends 1 telemetry frame every n RC frames
+    // the 1:n ratio is user selected
+    // RC rate is measured by get_avg_packet_rate()
+    // telemetry rate = air rate - RC rate
+    return crsf->get_link_rate(_crsf_version.protocol) - get_avg_packet_rate();
+}
+
+void AP_CRSF_Telem::queue_message(MAV_SEVERITY severity, const char *text)
+{
+    // no need to queue status text messages when crossfire
+    // custom telemetry is not enabled
+    if (!rc().option_is_enabled(RC_Channels::Option::CRSF_CUSTOM_TELEMETRY)) {
+        return;
+    }
+    AP_RCTelemetry::queue_message(severity, text);
+}
+
+/*
+  disable telemetry entries that require a transmitter to be present
+ */
+void AP_CRSF_Telem::disable_tx_entries()
+{
+    disable_scheduler_entry(ATTITUDE);
+    disable_scheduler_entry(BARO_VARIO);
+    disable_scheduler_entry(VARIO);
+    disable_scheduler_entry(BATTERY);
+    disable_scheduler_entry(GPS);
+    disable_scheduler_entry(FLIGHT_MODE);
+    disable_scheduler_entry(PASSTHROUGH);
+    disable_scheduler_entry(STATUS_TEXT);
+    // GENERAL_COMMAND and PARAMETERS will only be sent under very specific circumstances
+}
+
+/*
+  enable telemetry entries that require a transmitter to be present
+ */
+void AP_CRSF_Telem::enable_tx_entries()
+{
+    enable_scheduler_entry(ATTITUDE);
+    enable_scheduler_entry(BARO_VARIO);
+    enable_scheduler_entry(VARIO);
+    enable_scheduler_entry(BATTERY);
+    enable_scheduler_entry(GPS);
+    enable_scheduler_entry(FLIGHT_MODE);
+    enable_scheduler_entry(PASSTHROUGH);
+    enable_scheduler_entry(STATUS_TEXT);
+
+    update_custom_telemetry_rates(_telem_rf_mode);
+}
+
+void AP_CRSF_Telem::enter_scheduler_params_mode()
+{
+    debug("parameter passthrough enabled");
+    set_scheduler_entry(HEARTBEAT, 50, 200);            // heartbeat        5Hz
+    disable_tx_entries();
+}
+
+void AP_CRSF_Telem::exit_scheduler_params_mode()
+{
+    debug("parameter passthrough disabled");
+    // setup the crossfire scheduler for custom telemetry
+    set_scheduler_entry(HEARTBEAT, 2000, 5000);     // 0.2Hz
+    enable_tx_entries();
+}
+
+void AP_CRSF_Telem::adjust_packet_weight(bool queue_empty)
+{
+    uint32_t now_ms = AP_HAL::millis();
+    setup_custom_telemetry();
+
+    /*
+     whenever we detect a pending request we configure the scheduler
+     to allow faster parameters processing.
+     We start a "fast parameter window" that we close after 5sec
+    */
+    bool expired = (now_ms - _custom_telem.params_mode_start_ms) > 5000;
+    if (!_custom_telem.params_mode_active
+        && _pending_request.frame_type > 0
+        && _pending_request.frame_type != AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAM_DEVICE_INFO
+        && !hal.util->get_soft_armed()) {
+        // fast window start
+        _custom_telem.params_mode_start_ms = now_ms;
+        _custom_telem.params_mode_active = true;
+        enter_scheduler_params_mode();
+    } else if (expired && _custom_telem.params_mode_active) {
+        // fast window stop
+        _custom_telem.params_mode_active = false;
+        exit_scheduler_params_mode();
+    }
+}
+
+// WFQ scheduler
+bool AP_CRSF_Telem::is_packet_ready(uint8_t idx, bool queue_empty)
+{
+    if (!process_rf_mode_changes()) {
+        return false;
+    }
+
+    switch (idx) {
+    case PARAMETERS:
+        return _pending_request.frame_type > 0;
+    case VTX_PARAMETERS:
+#if AP_VIDEOTX_ENABLED
+        return AP::vtx().have_params_changed() ||_vtx_power_change_pending || _vtx_freq_change_pending || _vtx_options_change_pending;
+#else
+        return false;
+#endif
+    case PASSTHROUGH:
+        return rc().option_is_enabled(RC_Channels::Option::CRSF_CUSTOM_TELEMETRY);
+    case STATUS_TEXT:
+        return rc().option_is_enabled(RC_Channels::Option::CRSF_CUSTOM_TELEMETRY) && !queue_empty;
+    case GENERAL_COMMAND:
+        return _baud_rate_request.pending || _bind_request_pending;
+    case VERSION_PING:
+        return _crsf_version.pending && AP::crsf()->is_detected(); // only send pings if protocol has been detected
+    case HEARTBEAT:
+        return true; // always send heartbeat if enabled
+    case DEVICE_PING:
+        return !_crsf_version.pending;  // only send pings if version has been negotiated
+    default:
+        return _enable_telemetry;
+    }
+}
+
+// WFQ scheduler
+void AP_CRSF_Telem::process_packet(uint8_t idx)
+{
+    // send packet
+    switch (idx) {
+        case HEARTBEAT: // HEARTBEAT
+            calc_heartbeat();
+            break;
+        case PARAMETERS: // update parameter settings
+            process_pending_requests();
+            break;
+        case BARO_VARIO:
+            calc_baro_vario();
+            break;
+        case VARIO:
+            calc_vario();
+            break;
+        case ATTITUDE:
+            calc_attitude();
+            break;
+#if AP_VIDEOTX_ENABLED
+        case VTX_PARAMETERS: // update various VTX parameters
+            update_vtx_params();
+            break;
+#endif
+        case BATTERY: // BATTERY
+            calc_battery();
+            break;
+        case GPS: // GPS
+            calc_gps();
+            break;
+        case FLIGHT_MODE: // GPS
+            calc_flight_mode();
+            break;
+        case PASSTHROUGH:
+            if (is_high_speed_telemetry(_telem_rf_mode)) {
+                // on fast links we have 1:1 ratio between
+                // passthrough frames and crossfire frames
+                get_single_packet_passthrough_telem_data();
+            } else {
+                // on slower links we pack many passthrough
+                // frames in a single crossfire one (up to 9)
+                const uint8_t size = is_elrs() ? 3 : AP_CRSF_Telem::PASSTHROUGH_MULTI_PACKET_FRAME_MAX_SIZE;
+                get_multi_packet_passthrough_telem_data(size);
+            }
+            break;
+        case STATUS_TEXT:
+            calc_status_text();
+            break;
+        case GENERAL_COMMAND:
+            if (_bind_request_pending) {
+                calc_bind();
+            } else {
+                calc_command_response();
+            }
+            break;
+        case VERSION_PING:
+            // to get crossfire firmware version we send an RX device ping
+            if (_crsf_version.retry_count++ > CRSF_RX_DEVICE_PING_MAX_RETRY) {
+                _crsf_version.pending = false;
+                _crsf_version.minor = 0;
+                _crsf_version.major = 0;
+                disable_scheduler_entry(VERSION_PING);
+                GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,"%s: RX device ping failed", get_protocol_string());
+            } else {
+                calc_device_ping(AP_RCProtocol_CRSF::CRSF_ADDRESS_CRSF_RECEIVER);
+                uint32_t tnow_ms = AP_HAL::millis();
+                if ((tnow_ms - _crsf_version.last_request_info_ms) > 5000) {
+                    _crsf_version.last_request_info_ms = tnow_ms;
+                    GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,"%s: requesting RX device info", get_protocol_string());
+                }
+            }
+            break;
+        case DEVICE_PING:
+            calc_device_ping(AP_RCProtocol_CRSF::CRSF_ADDRESS_CRSF_RECEIVER);
+            break;
+        default:
+            break;
+    }
+}
+
+// Process a frame from the CRSF protocol decoder
+bool AP_CRSF_Telem::_process_frame(AP_RCProtocol_CRSF::FrameType frame_type, void* data) {
+    switch (frame_type) {
+    // this means we are connected to an RC receiver and can send telemetry
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_RC_CHANNELS_PACKED:
+    // the EVO sends battery frames and we should send telemetry back to populate the OSD
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_BATTERY_SENSOR:
+        _enable_telemetry = true;
+        break;
+
+#if AP_VIDEOTX_ENABLED
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_VTX:
+        process_vtx_frame((VTXFrame*)data);
+        break;
+
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_VTX_TELEM:
+        process_vtx_telem_frame((VTXTelemetryFrame*)data);
+        break;
+#endif
+
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAM_DEVICE_PING:
+        process_ping_frame((ParameterPingFrame*)data);
+        break;
+
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAMETER_READ:
+        process_param_read_frame((ParameterSettingsReadFrame*)data);
+        break;
+
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAMETER_WRITE:
+        process_param_write_frame((ParameterSettingsWriteFrame*)data);
+        break;
+
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAM_DEVICE_INFO:
+        process_device_info_frame((ParameterDeviceInfoFrame*)data);
+        break;
+
+    case AP_RCProtocol_CRSF::CRSF_FRAMETYPE_COMMAND:
+        process_command_frame((CommandFrame*)data);
+        break;
+
+    default:
+        break;
+    }
+    return true;
+}
+
+#if AP_VIDEOTX_ENABLED
+void AP_CRSF_Telem::process_vtx_frame(VTXFrame* vtx) {
+    vtx->user_frequency = be16toh(vtx->user_frequency);
+
+    debug("VTX: SmartAudio: %d, Avail: %d, FreqMode: %d, Band: %d, Channel: %d, Freq: %d, PitMode: %d, Pwr: %d, Pit: %d",
+        vtx->smart_audio_ver, vtx->is_vtx_available, vtx->is_in_user_frequency_mode,
+        vtx->band, vtx->channel, vtx->is_in_user_frequency_mode ? vtx->user_frequency : AP_VideoTX::get_frequency_mhz(vtx->band, vtx->channel),
+        vtx->is_in_pitmode, vtx->power, vtx->pitmode);
+    AP_VideoTX& apvtx = AP::vtx();
+
+    // the user may have a VTX connected but not want AP to control it
+    // (for instance because they are using myVTX on the transmitter)
+    if (!apvtx.get_enabled()) {
+        return;
+    }
+
+    apvtx.set_provider_enabled(AP_VideoTX::VTXType::CRSF);
+
+    apvtx.set_band(vtx->band);
+    apvtx.set_channel(vtx->channel);
+    if (vtx->is_in_user_frequency_mode) {
+        apvtx.set_frequency_mhz(vtx->user_frequency);
+    } else {
+        apvtx.set_frequency_mhz(AP_VideoTX::get_frequency_mhz(vtx->band, vtx->channel));
+    }
+    // 14dBm (25mW), 20dBm (100mW), 26dBm (400mW), 29dBm (800mW)
+    switch (vtx->power) {
+        case 0:
+            apvtx.set_power_mw(25);
+            break;
+        case 1:
+            apvtx.set_power_mw(100);
+            break;
+        case 2:
+            apvtx.set_power_mw(400);
+            break;
+        case 3:
+            apvtx.set_power_mw(800);
+            break;
+    }
+    if (vtx->is_in_pitmode) {
+        apvtx.set_options(apvtx.get_options() | uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+    } else {
+        apvtx.set_options(apvtx.get_options() & ~uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+    }
+    // make sure the configured values now reflect reality
+    if (!apvtx.set_defaults() && (_vtx_power_change_pending || _vtx_freq_change_pending || _vtx_options_change_pending)) {
+        AP::vtx().announce_vtx_settings();
+    }
+
+    _vtx_power_change_pending = _vtx_freq_change_pending = _vtx_options_change_pending = false;
+}
+
+void AP_CRSF_Telem::process_vtx_telem_frame(VTXTelemetryFrame* vtx)
+{
+    vtx->frequency = be16toh(vtx->frequency);
+    debug("VTXTelemetry: Freq: %d, PitMode: %d, Power: %d", vtx->frequency, vtx->pitmode, vtx->power);
+
+    AP_VideoTX& apvtx = AP::vtx();
+
+    if (!apvtx.get_enabled()) {
+        return;
+    }
+
+    apvtx.set_provider_enabled(AP_VideoTX::VTXType::CRSF);
+
+    apvtx.set_frequency_mhz(vtx->frequency);
+
+    AP_VideoTX::VideoBand band;
+    uint8_t channel;
+    if (AP_VideoTX::get_band_and_channel(vtx->frequency, band, channel)) {
+        apvtx.set_band(uint8_t(band));
+        apvtx.set_channel(channel);
+    }
+
+    apvtx.set_power_dbm(vtx->power);
+
+    if (vtx->pitmode) {
+        apvtx.set_options(apvtx.get_options() | uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+    } else {
+        apvtx.set_options(apvtx.get_options() & ~uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+    }
+    // make sure the configured values now reflect reality
+    if (!apvtx.set_defaults() && (_vtx_power_change_pending || _vtx_freq_change_pending || _vtx_options_change_pending)) {
+        AP::vtx().announce_vtx_settings();
+    }
+
+    _vtx_power_change_pending = _vtx_freq_change_pending = _vtx_options_change_pending = false;
+}
+#endif  // AP_VIDEOTX_ENABLED
+
+// request for device info
+void AP_CRSF_Telem::process_ping_frame(ParameterPingFrame* ping)
+{
+    debug("process_ping_frame: %d -> %d", ping->origin, ping->destination);
+    if (ping->destination != 0 && ping->destination != AP_RCProtocol_CRSF::CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+        return; // request was not for us
+    }
+
+    _param_request.origin = ping->origin;
+    _pending_request.frame_type = AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAM_DEVICE_INFO;
+    _pending_request.destination = ping->origin;
+}
+
+// request for device info
+void AP_CRSF_Telem::process_device_info_frame(ParameterDeviceInfoFrame* info)
+{
+    debug("process_device_info_frame: 0x%x -> 0x%x", info->origin, info->destination);
+    if (info->destination != 0 && info->destination != AP_RCProtocol_CRSF::CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+        return; // request was not for us
+    }
+
+    // we are only interested in RC device info for firmware version detection
+    if (info->origin != 0 && info->origin != AP_RCProtocol_CRSF::CRSF_ADDRESS_CRSF_RECEIVER) {
+        return;
+    }
+    /*
+        Payload size is 58:
+        char[] Device name ( Null-terminated string, max len is 42 )
+        uint32_t Serial number
+        uint32_t Hardware ID
+        uint32_t Firmware ID (0x00:0x00:0xAA:0xBB AA=major, BB=minor)
+        uint8_t Parameters count
+        uint8_t Parameter version number
+    */
+    // get the terminator of the device name string
+    const uint8_t offset = strnlen((char*)info->payload,42U);
+    if (strncmp((char*)info->payload, "Tracer", 6) == 0) {
+        _crsf_version.protocol = AP_RCProtocol_CRSF::ProtocolType::PROTOCOL_TRACER;
+    } else if (strncmp((char*)&info->payload[offset+1], "ELRS", 4) == 0) {
+        // ELRS magic number is ELRS encoded in the serial number
+        // 0x45 'E' 0x4C 'L' 0x52 'R' 0x53 'S'
+        _crsf_version.protocol = AP_RCProtocol_CRSF::ProtocolType::PROTOCOL_ELRS;
+    }
+
+    if (!is_elrs()) {
+        /*
+            fw major ver = offset + terminator (8bits) + serial (32bits) + hw id (32bits) + 3rd byte of sw id = 11bytes
+            fw minor ver = offset + terminator (8bits) + serial (32bits) + hw id (32bits) + 4th byte of sw id = 12bytes
+        */
+        _crsf_version.major = info->payload[offset+11];
+        _crsf_version.minor = info->payload[offset+12];
+    } else {
+        // ELRS does not populate the version field so cook up something sensible
+        _crsf_version.major = 1;
+        _crsf_version.minor = 0;
+    }
+
+    // should we use rf_mode reported by link statistics?
+    if (is_elrs() || (!is_tracer() && (_crsf_version.major > 3 || (_crsf_version.major == 3 && _crsf_version.minor >= 72)))) {
+        _crsf_version.use_rf_mode = true;
+    }
+
+    _crsf_version.pending = false;
+    disable_scheduler_entry(VERSION_PING);
+}
+
+// request for a general command
+void AP_CRSF_Telem::process_command_frame(CommandFrame* command)
+{
+    debug("process_command_frame: 0x%x -> 0x%x: 0x%x", command->origin, command->destination, command->payload[0]);
+    if (command->destination != 0 && command->destination != AP_RCProtocol_CRSF::CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+        return; // request was not for us
+    }
+
+    // we are only interested in commands from the RX
+    if (command->origin != 0 && command->origin != AP_RCProtocol_CRSF::CRSF_ADDRESS_CRSF_RECEIVER) {
+        return;
+    }
+
+    switch (command->payload[0]) {
+        case AP_RCProtocol_CRSF::CRSF_COMMAND_GENERAL_CRSF_SPEED_PROPOSAL: {
+            uint32_t baud_rate = command->payload[2] << 24 | command->payload[3] << 16
+                | command->payload[4] << 8 | command->payload[5];
+            _baud_rate_request.port_id = command->payload[1];
+            _baud_rate_request.valid = AP::crsf()->change_baud_rate(baud_rate);
+            _baud_rate_request.pending = true;
+            debug("requested baud rate change %lu", baud_rate);
+            break;
+        }
+        default:
+            break; // do nothing
+    }
+}
+
+void AP_CRSF_Telem::process_param_read_frame(ParameterSettingsReadFrame* read_frame)
+{
+    debug("process_param_read_frame: %d -> %d for %d[%d]", read_frame->origin, read_frame->destination,
+        read_frame->param_num, read_frame->param_chunk);
+    if (read_frame->destination != 0 && read_frame->destination != AP_RCProtocol_CRSF::CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+        return; // request was not for us
+    }
+
+    _param_request = *read_frame;
+    _pending_request.frame_type = AP_RCProtocol_CRSF::CRSF_FRAMETYPE_PARAMETER_READ;
+}
+
+void AP_CRSF_Telem::process_pending_requests()
+{
+    // handle ge

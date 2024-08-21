@@ -1,0 +1,2870 @@
+/*
+  ArduPilot bootloader protocol
+
+  based on bl.c from https://github.com/PX4/Bootloader.
+
+  Ported to ChibiOS for ArduPilot by Andrew Tridgell
+ */
+
+/****************************************************************************
+ *
+ *   Copyright (c) 2012-2014 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+#include "ch.h"
+#include "hal.h"
+#include "hwdef.h"
+
+#include "bl_protocol.h"
+#include "support.h"
+#include "can.h"
+#include <AP_HAL_ChibiOS/hwdef/common/watchdog.h>
+#if EXT_FLASH_SIZE_MB
+#include <AP_FlashIface/AP_FlashIface_JEDEC.h>
+#endif
+#include <AP_CheckFirmware/AP_CheckFirmware.h>
+
+// #pragma GCC optimize("O0")
+
+
+// bootloader flash update protocol.
+//
+// Command format:
+//
+//      <opcode>[<command_data>]<EOC>
+//
+// Reply format:
+//
+//      [<reply_data>]<INSYNC><status>
+//
+// The <opcode> and <status> values come from the PROTO_ defines below,
+// the <*_data> fields is described only for opcodes that transfer data;
+// in all other cases the field is omitted.
+//
+// Expected workflow (protocol 3) is:
+//
+// GET_SYNC		verify that the board is present
+// GET_DEVICE		determine which board (select firmware to upload)
+// CHIP_ERASE		erase the program area and reset address counter
+// loop:
+//      PROG_MULTI      program bytes
+// GET_CRC		verify CRC of entire flashable area
+// RESET		finalise flash programming, reset chip and starts application
+//
+
+#define BL_PROTOCOL_VERSION 		5		// The revision of the bootloader protocol
+// protocol bytes
+#define PROTO_INSYNC				0x12    // 'in sync' byte sent before status
+#define PROTO_EOC					0x20    // end of command
+
+// Reply bytes
+#define PROTO_OK					0x10    // INSYNC/OK      - 'ok' response
+#define PROTO_FAILED				0x11    // INSYNC/FAILED  - 'fail' response
+#define PROTO_INVALID				0x13	// INSYNC/INVALID - 'invalid' response for bad commands
+#define PROTO_BAD_SILICON_REV 		0x14 	// On the F4 series there is an issue with < Rev 3 silicon
+// see https://pixhawk.org/help/errata
+// Command bytes
+#define PROTO_GET_SYNC				0x21    // NOP for re-establishing sync
+#define PROTO_GET_DEVICE			0x22    // get device ID bytes
+#define PROTO_CHIP_ERASE			0x23    // erase program area and reset program address
+#define PROTO_PROG_MULTI			0x27    // write bytes at program address and increment
+#define PROTO_READ_MULTI			0x28    // read bytes at address and increment
+#define PROTO_GET_CRC				0x29	// compute & return a CRC
+#define PROTO_GET_OTP				0x2a	// read a byte from OTP at the given address
+#define PROTO_GET_SN				0x2b    // read a word from UDID area ( Serial)  at the given address
+#define PROTO_GET_CHIP				0x2c    // read chip version (MCU IDCODE)
+#define PROTO_SET_DELAY				0x2d    // set minimum boot delay
+#define PROTO_GET_CHIP_DES			0x2e    // read chip version In ASCII
+#define PROTO_BOOT					0x30    // boot the application
+#define PROTO_DEBUG					0x31    // emit debug information - format not defined
+#define PROTO_SET_BAUD				0x33    // baud rate on uart
+
+// External Flash programming 
+#define PROTO_EXTF_ERASE            0x34	// Erase sectors from external flash
+#define PROTO_EXTF_PROG_MULTI       0x35    // write bytes at external flash program address and increment
+#define PROTO_EXTF_READ_MULTI       0x36    // read bytes at address and increment
+#define PROTO_EXTF_GET_CRC          0x37	// compute & return a CRC of data in external flash
+
+#define PROTO_CHIP_FULL_ERASE   0x40    // erase program area and reset program address, skip any flash wear optimization and force an erase
+
+#define PROTO_PROG_MULTI_MAX    64	// maximum PROG_MULTI size
+#define PROTO_READ_MULTI_MAX    255	// size of the size field
+
+/* argument values for PROTO_GET_DEVICE */
+#define PROTO_DEVICE_BL_REV	1	// bootloader revision
+#define PROTO_DEVICE_BOARD_ID	2	// board ID
+#define PROTO_DEVICE_BOARD_REV	3	// board revision
+#define PROTO_DEVICE_FW_SIZE	4	// size of flashable area
+#define PROTO_DEVICE_VEC_AREA	5	// contents of reserved vectors 7-10
+#define PROTO_DEVICE_EXTF_SIZE  6   // size of available external flash
+// all except PROTO_DEVICE_VEC_AREA and PROTO_DEVICE_BOARD_REV should be done
+#define CHECK_GET_DEVICE_FINISHED(x)   ((x & (0xB)) == 0xB)
+
+// interrupt vector table for STM32
+#define SCB_VTOR 0xE000ED08
+
+static virtual_timer_t systick_vt;
+
+/*
+  millisecond timer array
+ */
+#define NTIMERS		    2
+#define TIMER_BL_WAIT	0
+#define TIMER_LED	    1
+
+static enum led_state led_state;
+
+volatile unsigned timer[NTIMERS];
+
+// keep back 32 bytes at the front of flash. This is long enough to allow for aligned
+// access on STM32H7
+#define RESERVE_LEAD_WORDS 8
+
+
+#if EXT_FLASH_SIZE_MB
+extern AP_FlashIface_JEDEC ext_flash;
+#endif
+
+#ifndef BOOT_FROM_EXT_FLASH
+#define BOOT_FROM_EXT_FLASH 0
+#endif
+
+/*
+  1ms timer tick callback
+ */
+static void sys_tick_handler(virtual_timer_t* vt, void *ctx)
+{
+    chSysLockFromISR();
+    chVTSetI(&systick_vt, chTimeMS2I(1), sys_tick_handler, nullptr);
+    chSysUnlockFromISR();
+    uint8_t i;
+    for (i = 0; i < NTIMERS; i++)
+        if (timer[i] > 0) {
+            timer[i]--;
+        }
+
+    if ((led_state == LED_BLINK) && (timer[TIMER_LED] == 0)) {
+        led_toggle(LED_BOOTLOADER);
+        timer[TIMER_LED] = 50;
+    }
+
+    if ((led_state == LED_BAD_FW) && (timer[TIMER_LED] == 0)) {
+        led_toggle(LED_BOOTLOADER);
+        timer[TIMER_LED] = 1000;
+    }
+}
+
+static void delay(unsigned msec)
+{
+    chThdSleep(chTimeMS2I(msec));
+}
+
+void
+led_set(enum led_state state)
+{
+    led_state = state;
+
+    switch (state) {
+    case LED_OFF:
+        led_off(LED_BOOTLOADER);
+        break;
+
+    case LED_ON:
+        led_on(LED_BOOTLOADER);
+        break;
+
+    case LED_BLINK:
+        /* restart the blink state machine ASAP */
+        timer[TIMER_LED] = 0;
+        break;
+
+    case LED_BAD_FW:
+        timer[TIMER_LED] = 0;
+        break;
+    }
+}
+
+static void
+do_jump(uint32_t stacktop, uint32_t entrypoint)
+{
+#if defined(STM32F7) || defined(STM32H7)
+    // disable caches on F7 before starting program
+    __DSB();
+    __ISB();
+    SCB_DisableDCache();
+    SCB_DisableICache();
+#endif
+
+    chSysLock();    
+
+    // we set sp as well as msp to avoid an issue with loading NuttX
+    asm volatile(
+        "mov sp, %0	\n"
+        "msr msp, %0	\n"
+        "bx	%1	\n"
+        : : "r"(stacktop), "r"(entrypoint) :);
+}
+
+#ifndef APP_START_ADDRESS
+#define APP_START_ADDRESS (FLASH_LOAD_ADDRESS + (FLASH_BOOTLOADER_LOAD_KB + APP_START_OFFSET_KB)*1024U)
+#endif
+
+#if !defined(STM32_OTG2_IS_OTG1)
+#define STM32_OTG2_IS_OTG1 0
+#endif
+
+void
+jump_to_app()
+{
+    const uint32_t *app_base = (const uint32_t *)(APP_START_ADDRESS);
+
+#if AP_CHECK_FIRMWARE_ENABLED
+    const auto ok = check_good_firmware();
+    if (ok != check_fw_result_t::CHECK_FW_OK) {
+        // bad firmware, don't try and boot
+        led_set(LED_BAD_FW);
+        return;
+    }
+#endif
+    
+    // If we have QSPI chip start it
+#if EXT_FLASH_SIZE_MB
+    uint8_t* ext_flash_start_addr;
+    if (!ext_flash.start_xip_mode((void**)&ext_flash_start_addr)) {
+        return;
+    }
+#endif
+    /*
+     * We hold back the programming of the lead words until the upload
+     * is marked complete by the host. So if they are not 0xffffffff,
+     * we should try booting it.
+     */
+    for (uint8_t i=0; i<RESERVE_LEAD_WORDS; i++) {
+        if (app_base[i] == 0xffffffff) {
+            goto exit;
+        }
+    }
+
+    /*
+     * The second word of the app is the entrypoint; it must point within the
+     * flash area (or we have a bad flash).
+     */
+    if (app_base[1] < APP_START_ADDRESS) {
+        goto exit;
+    }
+
+#if BOOT_FROM_EXT_FLASH
+    if (app_base[1] >= (APP_START_ADDRESS + board_info.extf_size)) {
+        goto exit;
+    }
+#else
+    if (app_base[1] >= (APP_START_ADDRESS + board_info.fw_size)) {
+        goto exit;
+    }
+#endif
+
+#if HAL_USE_CAN == TRUE ||  HAL_NUM_CAN_IFACES
+    // for CAN firmware we start the watchdog before we run the
+    // application code, to ensure we catch a bad firmare. If we get a
+    // watchdog reset and the firmware hasn't changed the RTC flag to
+    // indicate that it has been running OK for 30s then we will stay
+    // in bootloader
+#ifndef DISABLE_WATCHDOG
+    stm32_watchdog_init();
+#endif
+    stm32_watchdog_pat();
+#endif
+
+    flash_set_keep_unlocked(false);
+    
+    led_set(LED_OFF);
+
+    // resetting the clocks is needed for loading NuttX
+#if defined(STM32H7)
+    rccDisableAPB1L(~0);
+    rccDisableAPB1H(~0);
+#elif defined(STM32G4)
+    rccDisableAPB1R1(~0);
+    rccDisableAPB1R2(~0);
+#elif defined(STM32L4)
+    rccDisableAPB1R1(~0);
+    rccDisableAPB1R2(~0);
+#elif defined(STM32L4PLUS)
+    rccDisableAPB1R1(~0);
+    rccDisableAPB1R2(~0);
+#else
+    rccDisableAPB1(~0);
+#endif
+    rccDisableAPB2(~0);
+#if HAL_USE_SERIAL_USB == TRUE
+#if !STM32_OTG2_IS_OTG1
+    rccResetOTG_FS();
+#endif
+#if defined(rccResetOTG_HS)
+    rccResetOTG_HS();
+#endif
+#endif
+    
+    // disable all interrupt sources
+    port_disable();
+
+    /* switch exception handlers to the application */
+    *(volatile uint32_t *)SCB_VTOR = APP_START_ADDRESS;
+
+    /* extract the stack and entrypoint from the app vector table and go */
+    do_jump(app_base[0], app_base[1]);
+exit:
+#if EXT_FLASH_SIZE_MB
+    ext_flash.stop_xip_mode();
+#endif
+    return;
+}
+
+static void
+sync_response(void)
+{
+    uint8_t data[] = {
+        PROTO_INSYNC,	// "in sync"
+        PROTO_OK	// "OK"
+    };
+
+    cout(data, sizeof(data));
+}
+
+static void
+invalid_response(void)
+{
+    uint8_t data[] = {
+        PROTO_INSYNC,	// "in sync"
+        PROTO_INVALID	// "invalid command"
+    };
+
+    cout(data, sizeof(data));
+}
+
+static void
+failure_response(void)
+{
+    uint8_t data[] = {
+        PROTO_INSYNC,	// "in sync"
+        PROTO_FAILED	// "command failed"
+    };
+
+    cout(data, sizeof(data));
+}
+
+/**
+ * Function to wait for EOC
+ *
+ * @param timeout length of time in ms to wait for the EOC to be received
+ * @return true if the EOC is returned within the timeout perio, else false
+ */
+inline static bool
+wait_for_eoc(unsigned timeout)
+{
+    return cin(timeout) == PROTO_EOC;
+}
+
+static void
+cout_word(uint32_t val)
+{
+    cout((uint8_t *)&val, 4);
+}
+
+#define TEST_FLASH 0
+
+#if TEST_FLASH
+static void test_flash()
+{
+    uint32_t loop = 1;
+    bool init_done = false;
+    while (true) {
+        uint32_t addr = 0;
+        uint32_t page = 0;
+        while (true) {
+            uint32_t v[8];
+            for (uint8_t i=0; i<8; i++) {
+                v[i] = (page<<16) + loop;
+            }
+            if (flash_func_sector_size(page) == 0) {
+                continue;
+            }
+            uint32_t num_writes = flash_func_sector_size(page) / sizeof(v);
+            uprintf("page %u size %u addr=0x%08x v=0x%08x\n",
+                    unsigned(page), unsigned(flash_func_sector_size(page)), unsigned(addr), unsigned(v[0])); delay(10);
+            if (init_done) {
+                for (uint32_t j=0; j<flash_func_sector_size(page)/4; j++) {
+                    uint32_t v1 = (page<<16) + (loop-1);
+                    uint32_t v2 = flash_func_read_word(addr+j*4);
+                    if (v2 != v1) {
+                        uprintf("read error at 0x%08x v=0x%08x v2=0x%08x\n", unsigned(addr+j*4), unsigned(v1), unsigned(v2));
+                        break;
+                    }
+                }
+            }
+            if (!flash_func_erase_sector(page)) {
+                uprintf("erase of %u failed\n", unsigned(page));
+            }
+            for (uint32_t j=0; j<num_writes; j++) {
+                if (!flash_func_write_words(addr+j*sizeof(v), v, ARRAY_SIZE(v))) {
+                    uprintf("write failed at 0x%08x\n", unsigned(addr+j*sizeof(v)));
+                    break;
+                }
+            }
+            addr += flash_func_sector_size(page);
+            page++;
+            if (flash_func_sector_size(page) == 0) {
+                break;
+            }
+        }
+        init_done = true;
+        delay(1000);
+        loop++;
+    }
+}
+#endif
+
+void
+bootloader(unsigned timeout)
+{
+#if TEST_FLASH
+    test_flash();
+#endif
+
+    uint32_t	address = board_info.fw_size;	/* force erase before upload will work */
+#if EXT_FLASH_SIZE_MB
+    uint32_t	extf_address = board_info.extf_size;	/* force erase before upload will work */
+#endif
+    uint32_t	read_address = 0;
+    uint32_t	first_words[RESERVE_LEAD_WORDS];
+    bool done_sync = false;
+    uint8_t done_get_device_flags = 0;
+    bool done_erase = false;
+    static bool done_timer_init;
+    unsigned original_timeout = timeout;
+
+    memset(first_words, 0xFF, sizeof(first_words));
+
+    if (!done_timer_init) {
+        done_timer_init = true;
+        chVTObjectInit(&systick_vt);
+        chVTSet(&systick_vt, chTimeMS2I(1), sys_tick_handler, nullptr);
+    }
+
+    /* if we are working with a timeout, start it running */
+    if (timeout) {
+        timer[TIMER_BL_WAIT] = timeout;
+    }
+
+    /* make the LED blink while we are idle */
+    // ensure we don't override BAD FW LED
+    if (led_state != LED_BAD_FW) {
+        led_set(LED_BLINK);
+    }
+
+    while (true) {
+        volatile int c;
+        int arg;
+        static union {
+            uint8_t		c[256];
+            uint32_t	w[64];
+        } flash_buffer;
+
+        // Wait for a command byte
+        led_off(LED_ACTIVITY);
+
+        do {
+            /* if we have a timeout and the timer has expired and serial forward is not busy, return now */
+#if defined(BOOTLOADER_FORWARD_OTG2_SERIAL)
+            bool ser_forward_active = update_otg2_serial_forward();
+#endif
+            if (timeout && !timer[TIMER_BL_WAIT]
+#if defined(BOOTLOADER_FORWARD_OTG2_SERIAL)
+            // do serial forward only when idle
+            && !ser_forward_active
+#endif
+            ) {
+                return;
+            }
+
+            /* try to get a byte from the host */
+            c = cin(0);
+#if HAL_USE_CAN == TRUE || HAL_NUM_CAN_IFACES
+            if (c < 0) {
+                can_update();
+            }
+#endif
+        } while (c < 0);
+
+        led_on(LED_ACTIVITY);
+
+        // handle the command byte
+        switch (c) {
+
+        // sync
+        //
+        // command:		GET_SYNC/EOC
+        // reply:		INSYNC/OK
+        //
+        case PROTO_GET_SYNC:
+
+            /* expect EOC */
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+            done_sync = true;
+            break;
+
+        // get device info
+        //
+        // command:		GET_DEVICE/<arg:1>/EOC
+        // BL_REV reply:	<revision:4>/INSYNC/EOC
+        // BOARD_ID reply:	<board type:4>/INSYNC/EOC
+        // BOARD_REV reply:	<board rev:4>/INSYNC/EOC
+        // FW_SIZE reply:	<firmware size:4>/INSYNC/EOC
+        // VEC_AREA reply	<vectors 7-10:16>/INSYNC/EOC
+        // bad arg reply:	INSYNC/INVALID
+        //
+        case PROTO_GET_DEVICE:
+            /* expect arg then EOC */
+            arg = cin(1000);
+
+            if (arg < 0) {
+                goto cmd_bad;
+            }
+
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            // reset read pointer
+            read_address = 0;
+
+            switch (arg) {
+            case PROTO_DEVICE_BL_REV: {
+                uint32_t bl_proto_rev = BL_PROTOCOL_VERSION;
+                cout((uint8_t *)&bl_proto_rev, sizeof(bl_proto_rev));
+                break;
+            }
+
+            case PROTO_DEVICE_BOARD_ID:
+                cout((uint8_t *)&board_info.board_type, sizeof(board_info.board_type));
+                break;
+
+            case PROTO_DEVICE_BOARD_REV:
+                cout((uint8_t *)&board_info.board_rev, sizeof(board_info.board_rev));
+                break;
+
+            case PROTO_DEVICE_FW_SIZE:
+                cout((uint8_t *)&board_info.fw_size, sizeof(board_info.fw_size));
+                break;
+
+            case PROTO_DEVICE_VEC_AREA:
+                for (unsigned p = 7; p <= 10; p++) {
+                    uint32_t bytes = flash_func_read_word(p * 4);
+
+                    cout((uint8_t *)&bytes, sizeof(bytes));
+                }
+
+                break;
+
+            case PROTO_DEVICE_EXTF_SIZE:
+                cout((uint8_t *)&board_info.extf_size, sizeof(board_info.extf_size));
+                break;
+
+            default:
+                goto cmd_bad;
+            }
+            done_get_device_flags |= (1<<(arg-1)); // set the flags for use when resetting timeout 
+            break;
+
+        // erase and prepare for programming
+        //
+        // command:		ERASE/EOC
+        // success reply:	INSYNC/OK
+        // erase failure:	INSYNC/FAILURE
+        //
+        case PROTO_CHIP_ERASE:
+#if defined(STM32F7) || defined(STM32H7)
+        case PROTO_CHIP_FULL_ERASE:
+#endif
+
+            if (!done_sync || !CHECK_GET_DEVICE_FINISHED(done_get_device_flags)) {
+                // lower chance of random data on a uart triggering erase
+                goto cmd_bad;
+            }
+
+            /* expect EOC */
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            // once erase is done there is no going back, set timeout
+            // to zero
+            done_erase = true;
+            timeout = 0;
+            
+            flash_set_keep_unlocked(true);
+
+            // clear the bootloader LED while erasing - it stops blinking at random
+            // and that's confusing
+            led_set(LED_OFF);
+
+            // erase all sectors
+            for (uint16_t i = 0; flash_func_sector_size(i) != 0; i++) {
+#if defined(STM32F7) || defined(STM32H7)
+                if (!flash_func_erase_sector(i, c == PROTO_CHIP_FULL_ERASE)) {
+#else
+                if (!flash_func_erase_sector(i)) {
+#endif
+                    goto cmd_fail;
+                }
+            }
+
+            // enable the LED while verifying the erase
+            led_set(LED_ON);
+
+            // verify the erase
+            for (address = 0; address < board_info.fw_size; address += 4) {
+                if (flash_func_read_word(address) != 0xffffffff) {
+                    goto cmd_fail;
+                }
+            }
+
+            address = 0;
+
+            // resume blinking
+            led_set(LED_BLINK);
+            break;
+
+        // program data from start of the flash
+        //
+        // command:		EXTF_ERASE/<len:4>/EOC
+        // success reply:	INSYNC/OK
+        // invalid reply:	INSYNC/INVALID
+        // readback failure:	INSYNC/FAILURE
+        //
+        case PROTO_EXTF_ERASE:
+#if EXT_FLASH_SIZE_MB
+        {
+            if (!done_sync || !CHECK_GET_DEVICE_FINISHED(done_get_device_flags)) {
+                // lower chance of random data on a uart triggering erase
+                goto cmd_bad;
+            }
+            uint32_t cmd_erase_bytes;
+            if (cin_word(&cmd_erase_bytes, 100)) {
+                goto cmd_bad;
+            }
+
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+            uint32_t erased_bytes = 0;
+            uint32_t sector_number = EXT_FLASH_RESERVE_START_KB * 1024 / ext_flash.get_sector_size();
+            uint8_t pct_done = 0;
+            if (cmd_erase_bytes > (ext_flash.get_sector_size() * ext_flash.get_sector_count())) {
+                uprintf("Requested to erase more than we can\n");
+                goto cmd_bad;
+            }
+            uprintf("Erase Command Received\n");
+            sync_response();
+            cout(&pct_done, sizeof(pct_done));
+            // Flash all sectors that encompass the erase_bytes
+            while (erased_bytes < cmd_erase_bytes) {
+                uint32_t delay_ms = 0, timeout_ms = 0;
+                if (!ext_flash.start_sector_erase(sector_number, delay_ms, timeout_ms)) {
+                    goto cmd_fail;
+                }
+                uint32_t next_check_ms = AP_HAL::millis() + delay_ms;
+                while (true) {
+                    cout(&pct_done, sizeof(pct_done));
+                    if (AP_HAL::millis() > next_check_ms) {
+                        if (!ext_flash.is_device_busy()) {
+                            pct_done = erased_bytes*100/cmd_erase_bytes;
+                            uprintf("PCT DONE: %d\n", pct_done);
+                            break;
+                        }
+                        if ((AP_HAL::millis() + timeout_ms) > next_check_ms) {
+                            // We are out of time, return error
+                            goto cmd_fail;
+                        }
+                        next_check_ms = AP_HAL::millis()+delay_ms;
+                    }
+                    chThdSleep(chTimeMS2I(delay_ms));
+                }
+                erased_bytes += ext_flash.get_sector_size();
+                sector_number++;
+            }
+            pct_done = 100;
+            extf_address = 0;
+            cout(&pct_done, sizeof(pct_done));
+        }
+#else
+            goto cmd_bad;
+#endif // EXT_FLASH_SIZE_MB
+            break;
+
+        // program bytes at current external flash address
+        //
+        // command:		PROG_MULTI/<len:1>/<data:len>/EOC
+        // success reply:	INSYNC/OK
+        // invalid reply:	INSYNC/INVALID
+        // readback failure:	INSYNC/FAILURE
+        //
+        case PROTO_EXTF_PROG_MULTI:
+        {
+#if EXT_FLASH_SIZE_MB
+            if (!done_sync || !CHECK_GET_DEVICE_FINISHED(done_get_device_flags)) {
+                // lower chance of random data on a uart triggering erase
+                goto cmd_bad;
+            }
+
+            // expect count
+            led_set(LED_OFF);
+
+            arg = cin(50);
+
+            if (arg < 0) {
+                goto cmd_bad;
+            }
+
+            if ((extf_address + arg) > board_info.extf_size) {
+                goto cmd_bad;
+            }
+
+            if (arg > sizeof(flash_buffer.c)) {
+                goto cmd_bad;
+            }
+
+            for (int i = 0; i < arg; i++) {
+                c = cin(1000);
+
+                if (c < 0) {
+                    goto cmd_bad;
+                }
+
+                flash_buffer.c[i] = c;
+            }
+
+            if (!wait_for_eoc(200)) {
+                goto cmd_bad;
+            }
+
+            uint32_t offset = 0;
+            uint32_t size = arg;
+#if BOOT_FROM_EXT_FLASH
+            // save the first words and don't program it until everything else is done
+            if (extf_address < sizeof(first_words)) {
+                uint8_t n = MIN(sizeof(first_words)-extf_address, arg);
+                memcpy(&first_words[extf_address/4], &flash_buffer.w[0], n);
+                // replace first words with 1 bits we can overwrite later
+                memset(&flash_buffer.w[0], 0xFF, n);
+            }
+#endif
+            uint32_t programming;
+            uint32_t delay_us = 0, timeout_us = 0;
+            uint64_t start_time_us;
+            while (true) {
+                if (size == 0) {
+                    extf_address += arg;
+                    break;
+                }
+                if (!ext_flash.start_program_offset(extf_address+offset+EXT_FLASH_RESERVE_START_KB*1024,
+                    &flash_buffer.c[offset], size, programming, delay_us, timeout_us)) {
+                    // uprintf("ext flash write command failed\n");
+                    goto cmd_fail;
+                }
+                start_time_us = AP_HAL::micros64();
+                // prepare for next run
+                offset += programming;
+                size -= programming;
+                while (true) {
+                    if (AP_HAL::micros64() > (start_time_us+delay_us)) {
+                        if (!ext_flash.is_device_busy()) {
+                            // uprintf("flash program Successful, elapsed %ld us\n", uint32_t(AP_HAL::micros64() - start_time_us));
+                            break;
+                        } else {
+                            // uprintf("Typical flash program time reached, Still Busy?!\n");
+                        }
+                    }
+                }
+            }
+#endif
+            break;
+        }
+
+        // program bytes at current address
+        //
+        // command:		PROG_MULTI/<len:1>/<data:len>/EOC
+        // success reply:	INSYNC/OK
+        // invalid reply:	INSYNC/INVALID
+        // readback failure:	INSYNC/FAILURE
+        //
+        case PROTO_PROG_MULTI:		// program bytes
+            if (!done_sync || !CHECK_GET_DEVICE_FINISHED(done_get_device_flags)) {
+                // lower chance of random data on a uart triggering erase
+                goto cmd_bad;
+            }
+
+            // expect count
+            led_set(LED_OFF);
+
+            arg = cin(50);
+
+            if (arg < 0) {
+                goto cmd_bad;
+            }
+
+            // sanity-check arguments
+            if (arg % 4) {
+                goto cmd_bad;
+            }
+
+            if ((address + arg) > board_info.fw_size) {
+                goto cmd_bad;
+            }
+
+            if (arg > sizeof(flash_buffer.c)) {
+                goto cmd_bad;
+            }
+
+            for (int i = 0; i < arg; i++) {
+                c = cin(1000);
+
+                if (c < 0) {
+                    goto cmd_bad;
+                }
+
+                flash_buffer.c[i] = c;
+            }
+
+            if (!wait_for_eoc(200)) {
+                goto cmd_bad;
+            }
+
+            // save the first words and don't program it until everything else is done
+#if !BOOT_FROM_EXT_FLASH
+            if (address < sizeof(first_words)) {
+                uint8_t n = MIN(sizeof(first_words)-address, arg);
+                memcpy(&first_words[address/4], &flash_buffer.w[0], n);
+                // replace first words with 1 bits we can overwrite later
+                memset(&flash_buffer.w[0], 0xFF, n);
+            }
+#endif
+            arg /= 4;
+            // program the words
+            if (!flash_write_buffer(address, flash_buffer.w, arg)) {
+                goto cmd_fail;
+            }
+            address += arg * 4;
+            break;
+
+        // fetch CRC of the entire flash area
+        //
+        // command:			GET_CRC/EOC
+        // reply:			<crc:4>/INSYNC/OK
+        //
+        case PROTO_GET_CRC: {
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            if (!flash_write_flush()) {
+                goto cmd_bad;
+            }
+
+            // compute CRC of the programmed area
+            uint32_t sum = 0;
+
+            for (unsigned p = 0; p < board_info.fw_size; p += 4) {
+                uint32_t bytes;
+
+#if !BOOT_FROM_EXT_FLASH
+                if (p < sizeof(first_words) && first_words[0] != 0xFFFFFFFF) {
+                    bytes = first_words[p/4];
+                } else
+#endif
+                {
+                    bytes = flash_func_read_word(p);
+                }
+                sum = crc32_small(sum, (uint8_t *)&bytes, sizeof(bytes));
+            }
+
+            cout_word(sum);
+            break;
+        }
+
+        // fetch CRC of the external flash area
+        //
+        // command:		    EXTF_GET_CRC/<len:4>/EOC
+        // reply:			<crc:4>/INSYNC/OK
+        //
+        case PROTO_EXTF_GET_CRC: {
+#if EXT_FLASH_SIZE_MB
+            // expect EOC
+            uint32_t cmd_verify_bytes;
+            if (cin_word(&cmd_verify_bytes, 100)) {
+                goto cmd_bad;
+            }
+
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            // compute CRC of the programmed area
+            uint32_t sum = 0;
+            uint8_t rembytes = cmd_verify_bytes % 4;
+            for (unsigned p = 0; p < (cmd_verify_bytes-rembytes); p+=4) {
+                uint32_t bytes;
+
+#if BOOT_FROM_EXT_FLASH
+                if (p < sizeof(first_words) && first_words[0] != 0xFFFFFFFF) {
+                    bytes = first_words[p/4];
+                } else
+#endif
+                {
+                    ext_flash.read(p+EXT_FLASH_RESERVE_START_KB*1024, (uint8_t *)&bytes, sizeof(bytes));
+                }
+                sum = crc32_small(sum, (uint8_t *)&bytes, sizeof(bytes));
+            }
+            if (rembytes) {
+                uint8_t bytes[3];
+                ext_flash.read(EXT_FLASH_RESERVE_START_KB*1024+cmd_verify_bytes-rembytes, bytes, rembytes);
+                sum = crc32_small(sum, bytes, rembytes);
+            }
+            cout_word(sum);
+            break;
+#endif
+        }
+
+        // read a word from the OTP
+        //
+        // command:			GET_OTP/<addr:4>/EOC
+        // reply:			<value:4>/INSYNC/OK
+        case PROTO_GET_OTP:
+            // expect argument
+        {
+            uint32_t index = 0;
+
+            if (cin_word(&index, 100)) {
+                goto cmd_bad;
+            }
+
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            cout_word(flash_func_read_otp(index));
+        }
+        break;
+
+        // read the SN from the UDID
+        //
+        // command:			GET_SN/<addr:4>/EOC
+        // reply:			<value:4>/INSYNC/OK
+        case PROTO_GET_SN:
+            // expect argument
+        {
+            uint32_t index = 0;
+
+            if (cin_word(&index, 100)) {
+                goto cmd_bad;
+            }
+
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            cout_word(flash_func_read_sn(index));
+        }
+        break;
+
+        // read the chip ID code
+        //
+        // command:			GET_CHIP/EOC
+        // reply:			<value:4>/INSYNC/OK
+        case PROTO_GET_CHIP: {
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            cout_word(get_mcu_id());
+        }
+        break;
+
+        // read the chip  description
+        //
+        // command:			GET_CHIP_DES/EOC
+        // reply:			<value:4>/INSYNC/OK
+        case PROTO_GET_CHIP_DES: {
+            uint8_t buffer[MAX_DES_LENGTH];
+            unsigned len = MAX_DES_LENGTH;
+
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            len = get_mcu_desc(len, buffer);
+            cout_word(len);
+            cout(buffer, len);
+        }
+        break;
+
+#ifdef BOOT_DELAY_ADDRESS
+
+        case PROTO_SET_DELAY: {
+            /*
+              Allow for the bootloader to setup a
+              boot delay signature which tells the
+              board to delay for at least a
+              specified number of seconds on boot.
+             */
+            int v = cin(100);
+
+            if (v < 0) {
+                goto cmd_bad;
+            }
+
+            uint8_t boot_delay = v & 0xFF;
+
+            if (boot_delay > BOOT_DELAY_MAX) {
+                goto cmd_bad;
+            }
+
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+
+            uint32_t sig1 = flash_func_read_word(BOOT_DELAY_ADDRESS);
+            uint32_t sig2 = flash_func_read_word(BOOT_DELAY_ADDRESS + 4);
+
+            if (sig1 != BOOT_DELAY_SIGNATURE1 ||
+                sig2 != BOOT_DELAY_SIGNATURE2) {
+                goto cmd_bad;
+            }
+
+            uint32_t value = (BOOT_DELAY_SIGNATURE1 & 0xFFFFFF00) | boot_delay;
+            flash_func_write_word(BOOT_DELAY_ADDRESS, value);
+
+            if (flash_func_read_word(BOOT_DELAY_ADDRESS) != value) {
+                goto cmd_fail;
+            }
+        }
+        break;
+#endif
+
+        case PROTO_READ_MULTI: {
+            arg = cin(50);
+            if (arg < 0) {
+                goto cmd_bad;
+            }
+            if (arg % 4) {
+                goto cmd_bad;
+            }
+            if ((read_address + arg) > board_info.fw_size) {
+                goto cmd_bad;
+            }
+            // expect EOC
+            if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+            }
+            arg /= 4;
+
+            while (arg-- > 0) {
+                cout_word(flash_func_read_word(read_address));
+                read_address += 4;
+            }
+            break;
+        }
+
+        // finalise programming and boot the system
+        //
+        // command:			BOOT/EOC
+        // reply:			INSYNC/OK
+        //
+        case PROTO_BOOT:
+
+            // expect EOC
+            if (!wait_for_eoc(1000)) {
+                goto cmd_bad;
+            }
+
+            if (!flash_write_flush()) {
+                goto cmd_fail;
+            }
+
+            // program the deferred first word
+            if (first_words[0] != 0xffffffff) {
+#if !BOOT_FROM_EXT_FLASH
+                if (!flash_write_buffer(0, first_words, RESERVE_LEAD_WORDS)) {
+                    goto cmd_fail;
+                }
+#else
+                uint32_t programming;
+                uint32_t delay_us;
+                uint32_t timeout_us;
+                if (!ext_flash.start_program_offset(EXT_FLASH_RESERVE_START_KB*1024, (const uint8_t*)first_words, sizeof(first_words), programming, delay_us, timeout_us)) {
+                    // uprintf("ext flash write command failed\n");
+                    goto cmd_fail;
+                }
+                uint64_t start_time_us = AP_HAL::micros64();
+                while (true) {
+                    if (AP_HAL::micros64() > (start_time_us+delay_us)) {
+                        if (!ext_flash.is_device_busy()) {
+                            // uprintf("flash program Successful, elapsed %ld us\n", uint32_t(AP_HAL::micros64() - start_time_us));
+                            break;
+                        } else {
+                            // uprintf("Typical flash program time reached, Still Busy?!\n");
+                        }
+                    }
+                }
+#endif
+                // revert in case the flash was bad...
+                memset(first_words, 0xff, sizeof(first_words));
+            }
+
+            // send a sync and wait for it to be collected
+            sync_response();
+            delay(100);
+
+            // quiesce and jump to the app
+            return;
+
+        case PROTO_DEBUG:
+            // XXX reserved for ad-hoc debugging as required
+            break;
+
+		case PROTO_SET_BAUD: {
+            if (!done_sync || !CHECK_GET_DEVICE_FINISHED(done_get_device_flags)) {
+                // prevent timeout going to zero on noise
+                goto cmd_bad;
+            }
+            /* expect arg then EOC */
+            uint32_t baud = 0;
+
+            if (cin_word(&baud, 100)) {
+                goto cmd_bad;
+            }
+
+			if (!wait_for_eoc(2)) {
+                goto cmd_bad;
+			}
+
+            // send the sync response for this command
+            sync_response();
+
+            delay(5);
+
+            // set the baudrate
+            port_setbaud(baud);
+
+            lock_bl_port();
+            timeout = 0;
+            
+            // this is different to what every other case in this
+            // switch does!  Most go through sync_response down the
+            // bottom, but we need to undertake an action after
+            // returning the response...
+            continue;
+        }
+            
+        default:
+            continue;
+        }
+
+        // we got a good command on this port, lock to the port
+        lock_bl_port();
+        
+        // once we get both a valid sync and valid get_device then kill
+        // the timeout
+        if (done_sync && CHECK_GET_DEVICE_FINISHED(done_get_device_flags)) {
+            timeout = 0;
+        }
+
+        // send the sync response for this command
+        sync_response();
+        continue;
+cmd_bad:
+        // if we get a bad command it could be line noise on a
+        // uart. Set timeout back to original timeout so we don't get
+        // stuck in the bootloader
+        if (!done_erase) {
+            timeout = original_timeout;
+        }
+        // send an 'invalid' response but don't kill the timeout - could be garbage
+        invalid_response();
+        continue;
+
+cmd_fail:
+        // send a 'command failed' response but don't kill the timeout - could be garbage
+        failure_response();
+        continue;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    void jump_to_app(void);
+void bootloader(unsigned timeout);
+
+/*****************************************************************************
+ * Chip/board functions.
+ */
+
+/* LEDs */
+
+#ifdef BOOT_DELAY_ADDRESS
+# define BOOT_DELAY_SIGNATURE1	0x92c2ecff
+# define BOOT_DELAY_SIGNATURE2	0xc5057d5d
+# define BOOT_DELAY_MAX		30
+#endif
+
+#define MAX_DES_LENGTH 20
+
+#define arraySize(a) (sizeof((a))/sizeof(((a)[0])))
+
+enum led_state {LED_BLINK, LED_ON, LED_OFF, LED_BAD_FW};
+void led_set(enum led_state state);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+  output MSP protocol from AP_Periph for ArduPilot and INAV
+  Thanks to input from Konstantin Sharlaimov
+ */
+
+#include <AP_HAL/AP_HAL_Boards.h>
+#include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_MSP
+
+void AP_Periph_FW::msp_init(AP_HAL::UARTDriver *_uart)
+{
+    if (_uart) {
+        msp.port.uart = _uart;
+        msp.port.msp_version = MSP::MSP_V2_NATIVE;
+        _uart->begin(115200, 512, 512);
+    }
+}
+
+
+/*
+  send a MSP packet
+ */
+void AP_Periph_FW::send_msp_packet(uint16_t cmd, void *p, uint16_t size)
+{
+    uint8_t out_buf[size+16] {};
+    MSP::msp_packet_t pkt = {
+        .buf = { .ptr = out_buf, .end = MSP_ARRAYEND(out_buf), },
+        .cmd = (int16_t)cmd,
+        .flags = 0,
+        .result = 0,
+    };
+
+    sbuf_write_data(&pkt.buf, p, size);
+    sbuf_switch_to_reader(&pkt.buf, &out_buf[0]);
+    
+    MSP::msp_serial_encode(&msp.port, &pkt, MSP::MSP_V2_NATIVE, true);
+}
+
+/*
+  update MSP sensors
+ */
+void AP_Periph_FW::msp_sensor_update(void)
+{
+    if (msp.port.uart == nullptr) {
+        return;
+    }
+#ifdef HAL_PERIPH_ENABLE_GPS
+    send_msp_GPS();
+#endif
+#ifdef HAL_PERIPH_ENABLE_BARO
+    send_msp_baro();
+#endif
+#ifdef HAL_PERIPH_ENABLE_MAG
+    send_msp_compass();
+#endif
+#ifdef HAL_PERIPH_ENABLE_AIRSPEED
+    send_msp_airspeed();
+#endif
+}
+
+
+#ifdef HAL_PERIPH_ENABLE_GPS
+/*
+  send MSP GPS packet
+ */
+void AP_Periph_FW::send_msp_GPS(void)
+{
+    MSP::msp_gps_data_message_t p;
+
+    if (gps.get_type(0) == AP_GPS::GPS_Type::GPS_TYPE_NONE) {
+        return;
+    }
+    if (msp.last_gps_ms == gps.last_message_time_ms(0)) {
+        return;
+    }
+    msp.last_gps_ms = gps.last_message_time_ms(0);
+
+    const Location &loc = gps.location(0);
+    const Vector3f &vel = gps.velocity(0);
+
+    p.instance = 0;
+    p.gps_week = gps.time_week(0);
+    p.ms_tow = gps.get_itow(0);
+    p.fix_type = uint8_t(gps.status(0));
+    p.satellites_in_view = gps.num_sats(0);
+
+    float hacc=0, vacc=0, sacc=0;
+    gps.horizontal_accuracy(0, hacc);
+    gps.vertical_accuracy(0, vacc);
+    gps.speed_accuracy(0, sacc);
+
+    p.horizontal_vel_accuracy = sacc*100;
+    p.horizontal_pos_accuracy = hacc*100;
+    p.vertical_pos_accuracy = vacc*100;
+    p.hdop = gps.get_hdop(0);
+    p.longitude = loc.lng;
+    p.latitude = loc.lat;
+    p.msl_altitude = loc.alt;
+    p.ned_vel_north = vel.x*100;
+    p.ned_vel_east = vel.y*100;
+    p.ned_vel_down = vel.z*100;
+    p.ground_course = wrap_360_cd(gps.ground_course(0)*100);
+    float yaw_deg=0, acc;
+    uint32_t time_ms;
+    if (gps.gps_yaw_deg(0, yaw_deg, acc, time_ms)) {
+        p.true_yaw = wrap_360_cd(yaw_deg*100);
+    } else {
+        p.true_yaw = 65535; // unknown
+    }
+    uint64_t tepoch_us = gps.time_epoch_usec(0);
+    time_t utc_sec = tepoch_us / (1000U * 1000U);
+    struct tm tvd {};
+    struct tm* tm = gmtime_r(&utc_sec, &tvd);
+
+    p.year = tm->tm_year+1900;
+    p.month = tm->tm_mon;
+    p.day = tm->tm_mday;
+    p.hour = tm->tm_hour;
+    p.min = tm->tm_min;
+    p.sec = tm->tm_sec;
+
+    send_msp_packet(MSP2_SENSOR_GPS, &p, sizeof(p));
+}
+#endif // HAL_PERIPH_ENABLE_GPS
+
+
+#ifdef HAL_PERIPH_ENABLE_BARO
+/*
+  send MSP baro packet
+ */
+void AP_Periph_FW::send_msp_baro(void)
+{
+    MSP::msp_baro_data_message_t p;
+
+    if (msp.last_baro_ms == baro.get_last_update(0)) {
+        return;
+    }
+    if (!baro.healthy()) {
+        // don't send any data
+        return;
+    }
+    msp.last_baro_ms = baro.get_last_update(0);
+    
+    p.instance = 0;
+    p.time_ms = msp.last_baro_ms;
+    p.pressure_pa = baro.get_pressure();
+    p.temp = baro.get_temperature() * 100;
+
+    send_msp_packet(MSP2_SENSOR_BAROMETER, &p, sizeof(p));
+}
+#endif // HAL_PERIPH_ENABLE_BARO
+
+#ifdef HAL_PERIPH_ENABLE_MAG
+/*
+  send MSP compass packet
+ */
+void AP_Periph_FW::send_msp_compass(void)
+{
+    MSP::msp_compass_data_message_t p;
+
+    if (msp.last_mag_ms == compass.last_update_ms(0)) {
+        return;
+    }
+    if (!compass.healthy()) {
+        return;
+    }
+    msp.last_mag_ms = compass.last_update_ms(0);
+
+    const Vector3f &field = compass.get_field(0);
+    p.instance = 0;
+    p.time_ms = msp.last_mag_ms;
+    p.magX = field.x;
+    p.magY = field.y;
+    p.magZ = field.z;
+
+    send_msp_packet(MSP2_SENSOR_COMPASS, &p, sizeof(p));
+}
+#endif // HAL_PERIPH_ENABLE_MAG
+
+#ifdef HAL_PERIPH_ENABLE_AIRSPEED
+/*
+  send MSP airspeed packet
+ */
+void AP_Periph_FW::send_msp_airspeed(void)
+{
+    MSP::msp_airspeed_data_message_t p;
+
+    const uint32_t last_update_ms = airspeed.last_update_ms();
+    if (msp.last_airspeed_ms == last_update_ms) {
+        return;
+    }
+    if (!airspeed.healthy()) {
+        // we don't report at all for an unhealthy sensor. This maps
+        // to unhealthy in the flight controller driver
+        return;
+    }
+    msp.last_airspeed_ms = last_update_ms;
+
+    p.instance = 0;
+    p.time_ms = msp.last_airspeed_ms;
+    p.pressure = airspeed.get_corrected_pressure();
+    float temp;
+    if (!airspeed.get_temperature(temp)) {
+        p.temp = INT16_MIN; //invalid temperature
+    } else {
+        p.temp = temp * 100;
+    }
+
+    send_msp_packet(MSP2_SENSOR_AIRSPEED, &p, sizeof(p));
+}
+#endif // HAL_PERIPH_ENABLE_AIRSPEED
+
+
+#endif // HAL_PERIPH_ENABLE_MSP
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_NETWORKING
+
+const AP_Param::GroupInfo Networking_Periph::var_info[] {
+    // @Group:
+    // @Path: ../../libraries/AP_Networking/AP_Networking.cpp
+    AP_SUBGROUPINFO(networking_lib, "", 1, Networking_Periph, AP_Networking),
+
+    /*
+      the NET_Pn_ parameters need to be here as otherwise we
+      are too deep in the parameter tree
+     */
+
+#if AP_NETWORKING_NUM_PORTS > 0
+    // @Group: P1_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[0], "P1_", 2, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 1
+    // @Group: P2_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[1], "P2_", 3, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 2
+    // @Group: P3_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[2], "P3_", 4, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 3
+    // @Group: P4_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[3], "P4_", 5, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 4
+    // @Group: P5_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[4], "P5_", 6, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 5
+    // @Group: P6_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[5], "P6_", 7, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 6
+    // @Group: P7_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[6], "P7_", 8, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 7
+    // @Group: P8_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[7], "P8_", 9, Networking_Periph, AP_Networking::Port),
+#endif
+
+#if AP_NETWORKING_NUM_PORTS > 8
+    // @Group: P9_
+    // @Path: ../../libraries/AP_Networking/AP_Networking_port.cpp
+    AP_SUBGROUPINFO(networking_lib.ports[8], "P9_", 10, Networking_Periph, AP_Networking::Port),
+#endif
+
+
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 0
+    // @Group: PASS1_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[0], "PASS1_", 11, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 1
+    // @Group: PASS2_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[1], "PASS2_", 12, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 2
+    // @Group: PASS3_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[2], "PASS3_", 13, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 3
+    // @Group: PASS4_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[3], "PASS4_", 14, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 4
+    // @Group: PASS5_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[4], "PASS5_", 15, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 5
+    // @Group: PASS6_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[5], "PASS6_", 16, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 6
+    // @Group: PASS7_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[6], "PASS7_", 17, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 7
+    // @Group: PASS8_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[7], "PASS8_", 18, Networking_Periph, Passthru),
+#endif
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 8
+    // @Group: PASS9_
+    // @Path: networking_passthru.cpp
+    AP_SUBGROUPINFO(passthru[8], "PASS9_", 19, Networking_Periph, Passthru),
+#endif
+
+#if AP_NETWORKING_BACKEND_PPP
+    // @Param: PPP_PORT
+    // @DisplayName: PPP serial port
+    // @Description: PPP serial port
+    // @Range: -1 10
+    AP_GROUPINFO("PPP_PORT", 20, Networking_Periph, ppp_port, AP_PERIPH_NET_PPP_PORT_DEFAULT),
+
+    // @Param: PPP_BAUD
+    // @DisplayName: PPP serial baudrate
+    // @Description: PPP serial baudrate
+    // @CopyFieldsFrom: SERIAL1_BAUD
+    AP_GROUPINFO("PPP_BAUD", 21, Networking_Periph, ppp_baud, AP_PERIPH_NET_PPP_BAUD_DEFAULT),
+#endif
+
+    AP_GROUPEND
+};
+
+
+void Networking_Periph::init(void)
+{
+#if AP_NETWORKING_BACKEND_PPP
+    if (ppp_port >= 0) {
+        AP::serialmanager().set_protocol_and_baud(ppp_port, AP_SerialManager::SerialProtocol_PPP, ppp_baud.get());
+    }
+#endif
+
+    networking_lib.init();
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 0
+    for (auto &p : passthru) {
+        p.init();
+    }
+#endif
+}
+
+void Networking_Periph::update(void)
+{
+    networking_lib.update();
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 0
+    for (auto &p : passthru) {
+        p.update();
+    }
+#endif
+
+#if HAL_RAM_RESERVE_START >= 256
+    if (!got_addresses && networking_lib.get_ip_active() != 0) {
+        got_addresses = true;
+        auto *comms = (struct app_bootloader_comms *)HAL_RAM0_START;
+        if (comms->magic != APP_BOOTLOADER_COMMS_MAGIC) {
+            memset(comms, 0, sizeof(*comms));
+        }
+        comms->magic = APP_BOOTLOADER_COMMS_MAGIC;
+        comms->ip = networking_lib.get_ip_active();
+        comms->netmask = networking_lib.get_netmask_active();
+        comms->gateway = networking_lib.get_gateway_active();
+    }
+#endif // HAL_RAM_RESERVE_START
+}
+
+#endif  // HAL_PERIPH_ENABLE_NETWORKING
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+
+#ifdef HAL_PERIPH_ENABLE_NETWORKING
+
+#include <AP_Networking/AP_Networking.h>
+
+#ifndef HAL_PERIPH_NETWORK_NUM_PASSTHRU
+#define HAL_PERIPH_NETWORK_NUM_PASSTHRU 2
+#endif
+
+#ifndef AP_PERIPH_NET_PPP_PORT_DEFAULT
+#define AP_PERIPH_NET_PPP_PORT_DEFAULT -1
+#endif
+
+#ifndef AP_PERIPH_NET_PPP_BAUD_DEFAULT
+#define AP_PERIPH_NET_PPP_BAUD_DEFAULT 12500000
+#endif
+
+class Networking_Periph {
+public:
+    Networking_Periph() {
+        AP_Param::setup_object_defaults(this, var_info);
+    }
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    void init();
+    void update();
+
+private:
+
+#if HAL_PERIPH_NETWORK_NUM_PASSTHRU > 0
+    class Passthru {
+    public:
+        friend class Networking_Periph;
+
+        CLASS_NO_COPY(Passthru);
+
+        Passthru() {
+            AP_Param::setup_object_defaults(this, var_info);
+        }
+
+        void init();
+        void update();
+        
+        static const struct AP_Param::GroupInfo var_info[];
+
+    private:
+        AP_Int8 enabled;
+        AP_Int8 ep1;
+        AP_Int8 ep2;
+        AP_Int32 baud1;
+        AP_Int32 baud2;
+        AP_Int32 options1;
+        AP_Int32 options2;
+
+        AP_HAL::UARTDriver *port1;
+        AP_HAL::UARTDriver *port2;
+    } passthru[HAL_PERIPH_NETWORK_NUM_PASSTHRU];
+#endif // HAL_PERIPH_NETWORK_NUM_PASSTHRU
+
+    AP_Networking networking_lib;
+    bool got_addresses;
+
+#if AP_NETWORKING_BACKEND_PPP
+    AP_Int8 ppp_port;
+    AP_Int32 ppp_baud;
+#endif
+};
+
+#endif // HAL_PERIPH_ENABLE_NETWORKING
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_Periph.h"
+
+#if defined(HAL_PERIPH_ENABLE_NETWORKING) && HAL_PERIPH_NETWORK_NUM_PASSTHRU > 0
+
+#include <AP_SerialManager/AP_SerialManager.h>
+
+const AP_Param::GroupInfo Networking_Periph::Passthru::var_info[] = {
+    // @Param: ENABLE
+    // @DisplayName: Enable Passthrough
+    // @Description: Enable Passthrough of any UART, Network, or CAN ports to any UART, Network, or CAN ports.
+    // @Values: 0:Disabled, 1:Enabled
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO_FLAGS("ENABLE", 1,  Networking_Periph::Passthru, enabled, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: EP1
+    // @DisplayName: Endpoint 1
+    // @Description: Passthrough Endpoint 1. This can be a serial port UART, a Network port, or a CAN port. The selected port will route to Endport 2.
+    // @Values: -1:Disabled, 0:Serial0(usually USB), 1:Serial1, 2:Serial2, 3:Serial3, 4:Serial4, 5:Serial5, 6:Serial6, 7:Serial7, 8:Serial8, 9:Serial9, 21:Network Port1, 22:Network Port2, 23:Network Port3, 24:Network Port4, 25:Network Port5, 26:Network Port6, 27:Network Port7, 28:Network Port8, 29:Network Port9, 41:CAN1 Port1, 42:CAN1 Port2, 43:CAN1 Port3, 44:CAN1 Port4, 45:CAN1 Port5, 46:CAN1 Port6, 47:CAN1 Port7, 48:CAN1 Port8, 49:CAN1 Port9, 51:CAN2 Port1, 52:CAN2 Port2, 53:CAN2 Port3, 54:CAN2 Port4, 55:CAN2 Port5, 56:CAN2 Port6, 57:CAN2 Port7, 58:CAN2 Port8, 59:CAN2 Port9
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("EP1", 2,  Networking_Periph::Passthru, ep1, -1),
+
+    // @Param: EP2
+    // @DisplayName: Endpoint 2
+    // @Description: Passthrough Endpoint 2. This can be a serial port UART, a Network port, or a CAN port. The selected port will route to Endport 1.
+    // @CopyFieldsFrom: NET_PASS1_EP1
+    AP_GROUPINFO("EP2", 3,  Networking_Periph::Passthru, ep2, -1),
+
+    // @Param: BAUD1
+    // @DisplayName: Endpoint 1 Baud Rate
+    // @Description: The baud rate used for Endpoint 1. Only applies to serial ports.
+    // @CopyFieldsFrom: SERIAL1_BAUD
+    AP_GROUPINFO("BAUD1", 4,  Networking_Periph::Passthru, baud1, 115200),
+
+    // @Param: BAUD2
+    // @DisplayName: Endpoint 2 Baud Rate
+    // @Description: The baud rate used for Endpoint 2. Only applies to serial ports.
+    // @CopyFieldsFrom: SERIAL1_BAUD
+    AP_GROUPINFO("BAUD2", 5,  Networking_Periph::Passthru, baud2, 115200),
+
+    // @Param: OPT1
+    // @DisplayName: Serial Port Options EP1
+    // @Description: Control over UART options for Endpoint 1. Only applies to serial ports.
+    // @CopyFieldsFrom: SERIAL1_OPTIONS
+    AP_GROUPINFO("OPT1", 6,  Networking_Periph::Passthru, options1, 0),
+
+    // @Param: OPT2
+    // @DisplayName: Serial Port Options EP2
+    // @Description: Control over UART options for Endpoint 2. Only applies to serial ports.
+    // @CopyFieldsFrom: SERIAL1_OPTIONS
+    AP_GROUPINFO("OPT2", 7,  Networking_Periph::Passthru, options2, 0),
+
+    AP_GROUPEND
+};
+
+void Networking_Periph::Passthru::init()
+{
+    if (enabled == 0) {
+        // Feature is disabled
+        return;
+    }
+
+    if (port1 != nullptr || port2 != nullptr) {
+        // The ports have already been initialized, nothing to do.
+        return;
+    }
+
+    if (ep1 <= -1 || ep2 <= -1 || ep1 == ep2) {
+        // end points are not set or are the same. Can't route to self
+        return;
+    }
+
+    port1 = AP::serialmanager().get_serial_by_id(ep1);
+    port2 = AP::serialmanager().get_serial_by_id(ep2);
+
+    if (port1 != nullptr && port2 != nullptr) {
+        port1->set_options(options1);
+        port1->begin(baud1);
+
+        port2->set_options(options2);
+        port2->begin(baud2);
+    }
+}
+
+void Networking_Periph::Passthru::update()
+{
+    if (enabled == 0 || port1 == nullptr || port2 == nullptr) {
+        return;
+    }
+
+    // Fastest possible connection is 3Mbps serial port, which is roughly 300KB/s payload and we service this at <= 1kHz
+    // Raising this any higher just causes excess stack usage which never gets used.
+    uint8_t buf[300];
+
+    // read from port1, and write to port2
+    auto avail = port1->available();
+    if (avail > 0) {
+        auto space = port2->txspace();
+        const uint32_t n = MIN(space, sizeof(buf));
+        const auto nbytes = port1->read(buf, n);
+        if (nbytes > 0) {
+            port2->write(buf, nbytes);
+        }
+    }
+
+    // read from port2, and write to port1
+    avail = port2->available();
+    if (avail > 0) {
+        auto space = port1->txspace();
+        const uint32_t n = MIN(space, sizeof(buf));
+        const auto nbytes = port2->read(buf, n);
+        if (nbytes > 0) {
+            port1->write(buf, nbytes);
+        }
+    }
+}
+
+#endif  // defined(HAL_PERIPH_ENABLE_NETWORKING) && HAL_PERIPH_NETWORK_NUM_PASSTHRU > 0
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_PROXIMITY
+
+/*
+  proximity support
+ */
+
+#include <dronecan_msgs.h>
+
+void AP_Periph_FW::can_proximity_update()
+{
+    if (proximity.get_type(0) == AP_Proximity::Type::None) {
+        return;
+    }
+
+    uint32_t now = AP_HAL::millis();
+    static uint32_t last_update_ms;
+    if (g.proximity_max_rate > 0 &&
+        now - last_update_ms < 1000/g.proximity_max_rate) {
+        // limit to max rate
+        return;
+    }
+    last_update_ms = now;
+    proximity.update();
+    AP_Proximity::Status status = proximity.get_status();
+    if (status <= AP_Proximity::Status::NoData) {
+        // don't send any data
+        return;
+    }
+
+    ardupilot_equipment_proximity_sensor_Proximity pkt {};
+
+    const uint8_t obstacle_count = proximity.get_obstacle_count();
+
+    // if no objects return
+    if (obstacle_count == 0) {
+        return;
+    }
+
+    // calculate maximum roll, pitch values from objects
+    for (uint8_t i=0; i<obstacle_count; i++) {
+        if (!proximity.get_obstacle_info(i, pkt.yaw, pkt.pitch, pkt.distance)) {
+            // not a valid obstacle
+            continue;
+        }
+
+        pkt.sensor_id = proximity.get_address(0);
+
+        switch (status) {
+        case AP_Proximity::Status::NotConnected:
+            pkt.reading_type = ARDUPILOT_EQUIPMENT_PROXIMITY_SENSOR_PROXIMITY_READING_TYPE_NOT_CONNECTED;
+            break;
+        case AP_Proximity::Status::Good:
+            pkt.reading_type = ARDUPILOT_EQUIPMENT_PROXIMITY_SENSOR_PROXIMITY_READING_TYPE_GOOD;
+            break;
+        case AP_Proximity::Status::NoData:
+        default:
+            pkt.reading_type = ARDUPILOT_EQUIPMENT_PROXIMITY_SENSOR_PROXIMITY_READING_TYPE_NO_DATA;
+            break;
+        }
+
+        uint8_t buffer[ARDUPILOT_EQUIPMENT_PROXIMITY_SENSOR_PROXIMITY_MAX_SIZE];
+        uint16_t total_size = ardupilot_equipment_proximity_sensor_Proximity_encode(&pkt, buffer, !periph.canfdout());
+
+        canard_broadcast(ARDUPILOT_EQUIPMENT_PROXIMITY_SENSOR_PROXIMITY_SIGNATURE,
+                        ARDUPILOT_EQUIPMENT_PROXIMITY_SENSOR_PROXIMITY_ID,
+                        CANARD_TRANSFER_PRIORITY_LOW,
+                        &buffer[0],
+                        total_size);
+
+    }
+}
+
+#endif // HAL_PERIPH_ENABLE_PROXIMITY
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_RANGEFINDER
+
+/*
+  rangefinder support
+ */
+
+#include <dronecan_msgs.h>
+
+#ifndef AP_PERIPH_PROBE_CONTINUOUS
+#define AP_PERIPH_PROBE_CONTINUOUS 0
+#endif
+
+extern const AP_HAL::HAL &hal;
+
+/*
+  update CAN rangefinder
+ */
+void AP_Periph_FW::can_rangefinder_update(void)
+{
+    if (rangefinder.get_type(0) == RangeFinder::Type::NONE) {
+        return;
+    }
+#if AP_PERIPH_PROBE_CONTINUOUS
+    // We only allow continuous probing for rangefinders while vehicle is disarmed. Probing is currently inefficient and leads to longer loop times.
+    if ((rangefinder.num_sensors() == 0) && !hal.util->get_soft_armed() && option_is_set(PeriphOptions::PROBE_CONTINUOUS)) {
+        uint32_t now = AP_HAL::millis();
+        static uint32_t last_probe_ms;
+        if (now - last_probe_ms >= 1000) {
+            last_probe_ms = now;
+            rangefinder.init(ROTATION_NONE);
+        }
+    }
+#endif
+    uint32_t now = AP_HAL::millis();
+    if (g.rangefinder_max_rate > 0 &&
+        now - last_rangefinder_update_ms < uint32_t(1000/g.rangefinder_max_rate)) {
+        // limit to max rate
+        return;
+    }
+    last_rangefinder_update_ms = now;
+
+    // update all rangefinder instances
+    rangefinder.update();
+
+    // cycle through each rangefinder instance to find one to send
+    // equipment.range_sensor only uses 3 CAN frames so we just send all available sensor measurements.
+    for (uint8_t i = 0; i <= rangefinder.num_sensors(); i++) {
+
+        if (rangefinder.get_type(i) == RangeFinder::Type::NONE) {
+            continue;
+        }
+
+        AP_RangeFinder_Backend *backend = rangefinder.get_backend(i);
+        if (backend == nullptr) {
+            continue;
+        }
+
+        RangeFinder::Status status = backend->status();
+        if (status <= RangeFinder::Status::NoData) {
+            // don't send any data for this instance
+            continue;
+        }
+
+        const uint32_t sample_ms = backend->last_reading_ms();
+        if (last_rangefinder_sample_ms[i] == sample_ms) {
+            // don't same the same reading again
+            continue;
+        }
+        last_rangefinder_sample_ms[i] = sample_ms;
+
+        uavcan_equipment_range_sensor_Measurement pkt {};
+        pkt.sensor_id = rangefinder.get_address(i);
+
+        switch (status) {
+        case RangeFinder::Status::OutOfRangeLow:
+            pkt.reading_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_READING_TYPE_TOO_CLOSE;
+            break;
+        case RangeFinder::Status::OutOfRangeHigh:
+            pkt.reading_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_READING_TYPE_TOO_FAR;
+            break;
+        case RangeFinder::Status::Good:
+            pkt.reading_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_READING_TYPE_VALID_RANGE;
+            break;
+        default:
+            pkt.reading_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_READING_TYPE_UNDEFINED;
+            break;
+        }
+
+        switch (backend->get_mav_distance_sensor_type()) {
+        case MAV_DISTANCE_SENSOR_LASER:
+            pkt.sensor_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_SENSOR_TYPE_LIDAR;
+            break;
+        case MAV_DISTANCE_SENSOR_ULTRASOUND:
+            pkt.sensor_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_SENSOR_TYPE_SONAR;
+            break;
+        case MAV_DISTANCE_SENSOR_RADAR:
+            pkt.sensor_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_SENSOR_TYPE_RADAR;
+            break;
+        default:
+            pkt.sensor_type = UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_SENSOR_TYPE_UNDEFINED;
+            break;
+        }
+
+        float dist_m = backend->distance();
+        pkt.range = dist_m;
+
+        uint8_t buffer[UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_MAX_SIZE];
+        uint16_t total_size = uavcan_equipment_range_sensor_Measurement_encode(&pkt, buffer, !periph.canfdout());
+
+        canard_broadcast(UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_SIGNATURE,
+                        UAVCAN_EQUIPMENT_RANGE_SENSOR_MEASUREMENT_ID,
+                        CANARD_TRANSFER_PRIORITY_LOW,
+                        &buffer[0],
+                        total_size);
+
+    }
+}
+
+#endif // HAL_PERIPH_ENABLE_RANGEFINDER
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <AP_RCProtocol/AP_RCProtocol_config.h>
+
+#ifdef HAL_PERIPH_ENABLE_RCIN
+
+#ifndef AP_PERIPH_RC1_PORT_DEFAULT
+#define AP_PERIPH_RC1_PORT_DEFAULT -1
+#endif
+
+#ifndef AP_PERIPH_RC1_PORT_OPTIONS_DEFAULT
+#define AP_PERIPH_RC1_PORT_OPTIONS_DEFAULT 0
+#endif
+
+#include <AP_RCProtocol/AP_RCProtocol.h>
+#include "AP_Periph.h"
+#include <dronecan_msgs.h>
+
+extern const AP_HAL::HAL &hal;
+
+const AP_Param::GroupInfo Parameters_RCIN::var_info[] {
+    // RC_PROTOCOLS copied from RC_Channel/RC_Channels_Varinfo.h
+    // @Param: _PROTOCOLS
+    // @DisplayName: RC protocols enabled
+    // @Description: Bitmask of enabled RC protocols. Allows narrowing the protocol detection to only specific types of RC receivers which can avoid issues with incorrect detection. Set to 1 to enable all protocols.
+    // @User: Advanced
+    // @Bitmask: 0:All,1:PPM,2:IBUS,3:SBUS,4:SBUS_NI,5:DSM,6:SUMD,7:SRXL,8:SRXL2,9:CRSF,10:ST24,11:FPORT,12:FPORT2,13:FastSBUS
+    AP_GROUPINFO("_PROTOCOLS", 1, Parameters_RCIN, rcin_protocols, 1),
+
+    // RC_PROTOCOLS copied from RC_Channel/RC_Channels_Varinfo.h
+    // @Param: _MSGRATE
+    // @DisplayName: DroneCAN RC Message rate
+    // @Description: Rate at which RC input is sent via DroneCAN
+    // @User: Advanced
+    // @Increment: 1
+    // @Range: 0 255
+    // @Units: Hz
+    AP_GROUPINFO("_MSGRATE", 2, Parameters_RCIN, rcin_rate_hz, 50),
+
+    // @Param: 1_PORT
+    // @DisplayName: RC input port
+    // @Description: This is the serial port number where SERIALx_PROTOCOL will be set to RC input.
+    // @Range: 0 10
+    // @Increment: 1
+    // @User: Advanced
+    // @RebootRequired: True
+    AP_GROUPINFO("_PORT", 3, Parameters_RCIN, rcin1_port, AP_PERIPH_RC1_PORT_DEFAULT),
+
+    // @Param: 1_PORT_OPTIONS
+    // @DisplayName: RC input port serial options
+    // @Description: Control over UART options. The InvertRX option controls invert of the receive pin. The InvertTX option controls invert of the transmit pin. The HalfDuplex option controls half-duplex (onewire) mode, where both transmit and receive is done on the transmit wire. The Swap option allows the RX and TX pins to be swapped on STM32F7 based boards.
+    // @Bitmask: 0:InvertRX, 1:InvertTX, 2:HalfDuplex, 3:SwapTXRX, 4: RX_PullDown, 5: RX_PullUp, 6: TX_PullDown, 7: TX_PullUp, 8: RX_NoDMA, 9: TX_NoDMA, 10: Don't forward mavlink to/from, 11: DisableFIFO, 12: Ignore Streamrate
+    AP_GROUPINFO("1_PORT_OPTIONS", 4, Parameters_RCIN, rcin1_port_options, AP_PERIPH_RC1_PORT_OPTIONS_DEFAULT),
+    // @RebootRequired: True
+
+    AP_GROUPEND
+};
+
+Parameters_RCIN::Parameters_RCIN(void)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+void AP_Periph_FW::rcin_init()
+{
+    if (g_rcin.rcin1_port < 0) {
+        return;
+    }
+
+    // init uart for serial RC
+    auto *uart = hal.serial(g_rcin.rcin1_port);
+    if (uart == nullptr) {
+        return;
+    }
+
+    uart->set_options(g_rcin.rcin1_port_options);
+
+    serial_manager.set_protocol_and_baud(
+        g_rcin.rcin1_port,
+        AP_SerialManager::SerialProtocol_RCIN,
+        115200  // baud doesn't matter; RC Protocol autobauds
+        );
+
+    auto &rc = AP::RC();
+    rc.init();
+    rc.set_rc_protocols(g_rcin.rcin_protocols);
+    rc.add_uart(uart);
+
+    rcin_initialised = true;
+}
+
+void AP_Periph_FW::rcin_update()
+{
+    if (!rcin_initialised) {
+        return;
+    }
+
+    auto &rc = AP::RC();
+    if (!rc.new_input()) {
+        return;
+    }
+
+    // log discovered protocols:
+    auto new_rc_protocol = rc.protocol_name();
+    if (new_rc_protocol != rcin_rc_protocol) {
+        can_printf("Decoding (%s)", new_rc_protocol);
+        rcin_rc_protocol = new_rc_protocol;
+    }
+
+    // decimate the input to a parameterized rate
+    const uint8_t rate_hz = g_rcin.rcin_rate_hz;
+    if (rate_hz == 0) {
+        return;
+    }
+
+    const auto now_ms = AP_HAL::millis();
+    const auto interval_ms = 1000U / rate_hz;
+    if (now_ms - rcin_last_sent_RCInput_ms < interval_ms) {
+        return;
+    }
+    rcin_last_sent_RCInput_ms = now_ms;
+
+    // extract data and send CAN packet:
+    const uint8_t num_channels = rc.num_channels();
+    uint16_t channels[MAX_RCIN_CHANNELS];
+    rc.read(channels, num_channels);
+    const int16_t rssi = rc.get_RSSI();
+
+    can_send_RCInput((uint8_t)rssi, channels, num_channels, rc.failsafe_active(), rssi > 0 && rssi <256);
+}
+
+/*
+  send an RCInput CAN message
+ */
+void AP_Periph_FW::can_send_RCInput(uint8_t quality, uint16_t *values, uint8_t nvalues, bool in_failsafe, bool quality_valid)
+{
+    uint16_t status = 0;
+    if (quality_valid) {
+        status |= DRONECAN_SENSORS_RC_RCINPUT_STATUS_QUALITY_VALID;
+    }
+    if (in_failsafe) {
+        status |= DRONECAN_SENSORS_RC_RCINPUT_STATUS_FAILSAFE;
+    }
+
+    // assemble packet
+    dronecan_sensors_rc_RCInput pkt {};
+    pkt.quality = quality;
+    pkt.status = status;
+    pkt.rcin.len = nvalues;
+    for (uint8_t i=0; i<nvalues; i++) {
+        pkt.rcin.data[i] = values[i];
+    }
+
+    // encode and send message:
+    uint8_t buffer[DRONECAN_SENSORS_RC_RCINPUT_MAX_SIZE];
+
+    uint16_t total_size = dronecan_sensors_rc_RCInput_encode(&pkt, buffer, !periph.canfdout());
+
+    canard_broadcast(DRONECAN_SENSORS_RC_RCINPUT_SIGNATURE,
+                     DRONECAN_SENSORS_RC_RCINPUT_ID,
+                     CANARD_TRANSFER_PRIORITY_HIGH,
+                     buffer,
+                     total_size);
+}
+
+#endif  // HAL_PERIPH_ENABLE_RCIN
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #pragma once
+
+#ifdef HAL_PERIPH_ENABLE_RCIN
+
+class Parameters_RCIN {
+public:
+    Parameters_RCIN(void);
+
+    // var_info for holding Parameter information
+    static const struct AP_Param::GroupInfo var_info[];
+
+    AP_Int32 rcin_protocols;
+    AP_Int8 rcin_rate_hz;
+    AP_Int8 rcin1_port;
+    AP_Int16 rcin1_port_options;
+};
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include <AP_HAL/AP_HAL.h>
+#ifdef HAL_PERIPH_ENABLE_RC_OUT
+#include "AP_Periph.h"
+
+// magic value from UAVCAN driver packet
+// dsdl/uavcan/equipment/esc/1030.RawCommand.uavcan
+// Raw ESC command normalized into [-8192, 8191]
+#define UAVCAN_ESC_MAX_VALUE    8191
+
+#define SERVO_OUT_RCIN_MAX      32  // note that we allow for more than is in the enum
+#define SERVO_OUT_MOTOR_MAX     12  // SRV_Channel::k_motor1 ... SRV_Channel::k_motor8, SRV_Channel::k_motor9 ... SRV_Channel::k_motor12
+
+extern const AP_HAL::HAL &hal;
+
+void AP_Periph_FW::rcout_init()
+{
+#if AP_PERIPH_SAFETY_SWITCH_ENABLED
+    // start up with safety enabled. This disables the pwm output until we receive an packet from the rempte system
+    hal.rcout->force_safety_on();
+#else
+    hal.rcout->force_safety_off();
+#endif
+
+#if HAL_WITH_ESC_TELEM && !HAL_GCS_ENABLED
+    if (g.esc_telem_port >= 0) {
+        serial_manager.set_protocol_and_baud(g.esc_telem_port, AP_SerialManager::SerialProtocol_ESCTelemetry, 115200);
+    }
+#endif
+
+#if HAL_PWM_COUNT > 0
+    for (uint8_t i=0; i<HAL_PWM_COUNT; i++) {
+        servo_channels.set_default_function(i, SRV_Channel::Aux_servo_function_t(SRV_Channel::k_rcin1 + i));
+    }
+#endif
+
+    for (uint8_t i=0; i<SERVO_OUT_RCIN_MAX; i++) {
+        SRV_Channels::set_angle(SRV_Channel::Aux_servo_function_t(SRV_Channel::k_rcin1 + i), 1000);
+    }
+
+    uint32_t esc_mask = 0;
+    for (uint8_t i=0; i<SERVO_OUT_MOTOR_MAX; i++) {
+        SRV_Channels::set_range(SRV_Channels::get_motor_function(i), UAVCAN_ESC_MAX_VALUE);
+        uint8_t chan;
+        if (SRV_Channels::find_channel(SRV_Channels::get_motor_function(i), chan)) {
+            esc_mask |= 1U << chan;
+        }
+    }
+
+    // run this once and at 1Hz to configure aux and esc ranges
+    rcout_init_1Hz();
+
+#if HAL_DSHOT_ENABLED
+    hal.rcout->set_dshot_esc_type(SRV_Channels::get_dshot_esc_type());
+#endif
+
+    // run PWM ESCs at configured rate
+    hal.rcout->set_freq(esc_mask, g.esc_rate.get());
+
+    // setup ESCs with the desired PWM type, allowing for DShot
+    SRV_Channels::init(esc_mask, (AP_HAL::RCOutput::output_mode)g.esc_pwm_type.get());
+
+    // run DShot at 1kHz
+    hal.rcout->set_dshot_rate(SRV_Channels::get_dshot_rate(), 400);
+#if HAL_WITH_ESC_TELEM
+    esc_telem_update_period_ms = 1000 / constrain_int32(g.esc_telem_rate.get(), 1, 1000);
+#endif
+}
+
+void AP_Periph_FW::rcout_init_1Hz()
+{
+    // this runs at 1Hz to allow for run-time param changes
+    SRV_Channels::enable_aux_servos();
+
+    for (uint8_t i=0; i<SERVO_OUT_MOTOR_MAX; i++) {
+        servo_channels.set_esc_scaling_for(SRV_Channels::get_motor_function(i));
+    }
+}
+
+void AP_Periph_FW::rcout_esc(int16_t *rc, uint8_t num_channels)
+{
+    if (rc == nullptr) {
+        return;
+    }
+
+    const uint8_t channel_count = MIN(num_channels, SERVO_OUT_MOTOR_MAX);
+    for (uint8_t i=0; i<channel_count; i++) {
+        // we don't support motor reversal yet on ESCs in AP_Periph
+        SRV_Channels::set_output_scaled(SRV_Channels::get_motor_function(i), MAX(0,rc[i]));
+    }
+
+    rcout_has_new_data_to_update = true;
+}
+
+void AP_Periph_FW::rcout_srv_unitless(uint8_t actuator_id, const float command_value)
+{
+#if HAL_PWM_COUNT > 0
+    const SRV_Channel::Aux_servo_function_t function = SRV_Channel::Aux_servo_function_t(SRV_Channel::k_rcin1 + actuator_id - 1);
+    SRV_Channels::set_output_norm(function, command_value);
+
+    rcout_has_new_data_to_update = true;
+#endif
+}
+
+void AP_Periph_FW::rcout_srv_PWM(uint8_t actuator_id, const float command_value)
+{
+#if HAL_PWM_COUNT > 0
+    const SRV_Channel::Aux_servo_function_t function = SRV_Channel::Aux_servo_function_t(SRV_Channel::k_rcin1 + actuator_id - 1);
+    SRV_Channels::set_output_pwm(function, uint16_t(command_value+0.5));
+
+    rcout_has_new_data_to_update = true;
+#endif
+}
+
+void AP_Periph_FW::rcout_handle_safety_state(uint8_t safety_state)
+{
+    if (safety_state == 255) {
+        hal.rcout->force_safety_off();
+    } else {
+        hal.rcout->force_safety_on();
+    }
+    rcout_has_new_data_to_update = true;
+}
+
+void AP_Periph_FW::rcout_update()
+{
+    uint32_t now_ms = AP_HAL::millis();
+
+    const uint16_t esc_timeout_ms = g.esc_command_timeout_ms >= 0 ? g.esc_command_timeout_ms : 0; // Don't allow negative timeouts!
+    const bool has_esc_rawcommand_timed_out = esc_timeout_ms != 0 && ((now_ms - last_esc_raw_command_ms) >= esc_timeout_ms);
+    if (last_esc_num_channels > 0 && has_esc_rawcommand_timed_out) {
+        // If we've seen ESCs previously, and a timeout has occurred, then zero the outputs
+        int16_t esc_output[last_esc_num_channels];
+        memset(esc_output, 0, sizeof(esc_output));
+        rcout_esc(esc_output, last_esc_num_channels);
+
+        // register that the output has been changed
+        rcout_has_new_data_to_update = true;
+    }
+
+    if (!rcout_has_new_data_to_update) {
+        return;
+    }
+    rcout_has_new_data_to_update = false;
+
+    SRV_Channels::calc_pwm();
+    SRV_Channels::cork();
+    SRV_Channels::output_ch_all();
+    SRV_Channels::push();
+#if HAL_WITH_ESC_TELEM
+    if (now_ms - last_esc_telem_update_ms >= esc_telem_update_period_ms) {
+        last_esc_telem_update_ms = now_ms;
+        esc_telem_update();
+    }
+#if AP_EXTENDED_ESC_TELEM_ENABLED
+    esc_telem_extended_update(now_ms);
+#endif
+#endif
+}
+
+#endif // HAL_PERIPH_ENABLE_RC_OUT
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_RELAY
+
+#include <dronecan_msgs.h>
+
+void AP_Periph_FW::handle_hardpoint_command(CanardInstance* canard_instance, CanardRxTransfer* transfer)
+{
+    uavcan_equipment_hardpoint_Command cmd {};
+    if (uavcan_equipment_hardpoint_Command_decode(transfer, &cmd)) {
+        // Failed to decode
+        return;
+    }
+
+    // Command must be 0 or 1, other values may be supported in the future
+    // rejecting them now ensures no change in behaviour
+    if ((cmd.command != 0) && (cmd.command != 1)) {
+        return;
+    }
+
+    // Translate hardpoint ID to relay function
+    AP_Relay_Params::FUNCTION fun;
+    switch (cmd.hardpoint_id) {
+        case 0 ... 15:
+            // 0 to 15 are continuous
+            fun = AP_Relay_Params::FUNCTION(cmd.hardpoint_id + (uint8_t)AP_Relay_Params::FUNCTION::DroneCAN_HARDPOINT_0);
+            break;
+
+        default:
+            // ID not supported
+            return;
+    }
+
+    // Set relay
+    relay.set(fun, cmd.command);
+
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_RPM_STREAM
+
+#include <dronecan_msgs.h>
+
+// Send rpm message occasionally
+void AP_Periph_FW::rpm_sensor_send(void)
+{
+    if (g.rpm_msg_rate <= 0) {
+        return;
+    }
+
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - rpm_last_send_ms < (1000U / g.rpm_msg_rate)) {
+        return;
+    }
+    rpm_last_send_ms = now_ms;
+
+    {
+        const uint8_t num_sensors = rpm_sensor.num_sensors();
+        for (uint8_t i = 0; i < num_sensors; i++) {
+            // Send each sensor in turn
+            const uint8_t index = (rpm_last_sent_index + 1 + i) % num_sensors;
+
+            const int8_t sensor_id = rpm_sensor.get_dronecan_sensor_id(index);
+            if (sensor_id < 0) {
+                // disabled or not configured to send
+                continue;
+            }
+
+            dronecan_sensors_rpm_RPM pkt {};
+            pkt.sensor_id = sensor_id;
+
+            // Get rpm and set health flag
+            if (!rpm_sensor.get_rpm(index, pkt.rpm)) {
+                pkt.flags |= DRONECAN_SENSORS_RPM_RPM_FLAGS_UNHEALTHY;
+            }
+
+            uint8_t buffer[DRONECAN_SENSORS_RPM_RPM_MAX_SIZE];
+            const uint16_t total_size = dronecan_sensors_rpm_RPM_encode(&pkt, buffer, !canfdout());
+
+            canard_broadcast(DRONECAN_SENSORS_RPM_RPM_SIGNATURE,
+                             DRONECAN_SENSORS_RPM_RPM_ID,
+                             CANARD_TRANSFER_PRIORITY_LOW,
+                             &buffer[0],
+                             total_size);
+
+            rpm_last_sent_index = index;
+            break;
+        }
+    }
+}
+
+#endif // HAL_PERIPH_ENABLE_RPM_STREAM
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  serial options support, for serial over DroneCAN
+ */
+
+#include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_SERIAL_OPTIONS
+
+#include "serial_options.h"
+#include <AP_SerialManager/AP_SerialManager_config.h>
+
+extern const AP_HAL::HAL &hal;
+
+const AP_Param::GroupInfo SerialOptions::var_info[] {
+
+#if HAL_HAVE_SERIAL0
+    // @Group: 0_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[0], "0_",  1, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL1
+    // @Group: 1_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[1], "1_",  2, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL2
+    // @Group: 2_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[2], "2_",  3, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL3
+    // @Group: 3_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[3], "3_",  4, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL4
+    // @Group: 4_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[4], "4_",  5, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL5
+    // @Group: 5_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[5], "5_",  6, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL6
+    // @Group: 6_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[6], "6_",  7, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL7
+    // @Group: 7_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[7], "7_",  8, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL8
+    // @Group: 8_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[8], "8_",  9, SerialOptions, SerialOptionsDev),
+#endif
+
+#if HAL_HAVE_SERIAL9
+    // @Group: 9_
+    // @Path: serial_options_dev.cpp
+    AP_SUBGROUPINFO(devs[9], "9_",  10, SerialOptions, SerialOptionsDev),
+#endif
+        
+    AP_GROUPEND
+};
+
+SerialOptions::SerialOptions(void)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+void SerialOptions::init(void)
+{
+    for (uint8_t i=0; i<ARRAY_SIZE(devs); i++) {
+        auto *uart = hal.serial(i);
+        if (uart != nullptr) {
+            auto &d = devs[i];
+            uart->set_options(d.options);
+            uart->set_flow_control(AP_HAL::UARTDriver::flow_control(d.rtscts.get()));
+        }
+    }
+}
+
+#endif  // HAL_PERIPH_ENABLE_SERIAL_OPTIONS
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #pragma once
+
+#ifdef HAL_PERIPH_ENABLE_SERIAL_OPTIONS
+
+#ifndef HAL_UART_NUM_SERIAL_PORTS
+#define HAL_UART_NUM_SERIAL_PORTS AP_HAL::HAL::num_serial
+#endif
+
+class SerialOptionsDev {
+public:
+    SerialOptionsDev(void);
+    static const struct AP_Param::GroupInfo var_info[];
+    AP_Int32 options;
+    AP_Int8 rtscts;
+};
+
+class SerialOptions {
+public:
+    friend class AP_Periph_FW;
+    SerialOptions(void);
+    void init(void);
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+private:
+    SerialOptionsDev devs[HAL_UART_NUM_SERIAL_PORTS];
+};
+
+
+#endif // HAL_PERIPH_ENABLE_SERIAL_OPTIONS
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  serial options support, for serial over DroneCAN
+ */
+
+#include "AP_Periph.h"
+
+#ifdef HAL_PERIPH_ENABLE_SERIAL_OPTIONS
+
+#include "serial_options.h"
+
+SerialOptionsDev::SerialOptionsDev(void)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+const AP_Param::GroupInfo SerialOptionsDev::var_info[] {
+
+    // @Param: OPTIONS
+    // @DisplayName: Serial options
+    // @Description: Control over UART options. The InvertRX option controls invert of the receive pin. The InvertTX option controls invert of the transmit pin. The HalfDuplex option controls half-duplex (onewire) mode, where both transmit and receive is done on the transmit wire. The Swap option allows the RX and TX pins to be swapped on STM32F7 based boards.
+    // @Bitmask: 0:InvertRX, 1:InvertTX, 2:HalfDuplex, 3:SwapTXRX, 4: RX_PullDown, 5: RX_PullUp, 6: TX_PullDown, 7: TX_PullUp, 8: RX_NoDMA, 9: TX_NoDMA, 10: Don't forward mavlink to/from, 11: DisableFIFO, 12: Ignore Streamrate
+    AP_GROUPINFO("OPTIONS", 1, SerialOptionsDev, options, 0),
+
+    // @Param: RTSCTS
+    // @DisplayName: Serial1 flow control
+    // @Description: Enable flow control. You must have the RTS and CTS pins available on the port. If this is set to 2 then flow control will be auto-detected by checking for the output buffer filling on startup.
+    // @Values: 0:Disabled,1:Enabled,2:Auto
+    AP_GROUPINFO("RTSCTS",  2, SerialOptionsDev, rtscts, float(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE)),
+
+    AP_GROUPEND
+};
+
+#endif  // HAL_PERIPH_ENABLE_SERIAL_OPTIONS
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  handle tunnelling of serial data over DroneCAN
+ */
+
+#include <AP_HAL/AP_HAL_Boards.h>
+#include "AP_Periph.h"
+
+#if AP_UART_MONITOR_ENABLED
+
+#include <dronecan_msgs.h>
+
+extern const AP_HAL::HAL &hal;
+
+#define TUNNEL_LOCK_KEY 0xf2e460e4U
+
+#ifndef TUNNEL_DEBUG
+#define TUNNEL_DEBUG 0
+#endif
+
+#if TUNNEL_DEBUG
+# define debug(fmt, args...) can_printf(fmt "\n", ##args)
+#else
+# define debug(fmt, args...)
+#endif
+
+/*
+  get the default port to tunnel if the client requests port -1
+ */
+int8_t AP_Periph_FW::get_default_tunnel_serial_port(void) const
+{
+    int8_t uart_num = -1;
+#ifdef HAL_PERIPH_ENABLE_GPS
+    if (uart_num == -1) {
+        uart_num = g.gps_port;
+    }
+#endif
+#ifdef HAL_PERIPH_ENABLE_RANGEFINDER
+    if (uart_num == -1) {
+        uart_num = g.rangefinder_port[0];
+    }
+#endif
+#ifdef HAL_PERIPH_ENABLE_ADSB
+    if (uart_num == -1) {
+        uart_num = g.adsb_port;
+    }
+#endif
+#ifdef HAL_PERIPH_ENABLE_PROXIMITY
+    if (uart_num == -1) {
+        uart_num = g.proximity_port;
+    }
+#endif
+    return uart_num;
+}
+
+/*
+  handle tunnel data
+ */
+void AP_Periph_FW::handle_tunnel_Targetted(CanardInstance* canard_ins, CanardRxTransfer* transfer)
+{
+    uavcan_tunnel_Targetted pkt;
+    if (uavcan_tunnel_Targetted_decode(transfer, &pkt)) {
+        return;
+    }
+    if (pkt.target_node != canardGetLocalNodeID(canard_ins)) {
+        return;
+    }
+    if (uart_monitor.buffer == nullptr) {
+        uart_monitor.buffer = NEW_NOTHROW ByteBuffer(1024);
+        if (uart_monitor.buffer == nullptr) {
+            return;
+        }
+    }
+    int8_t uart_num = pkt.serial_id;
+    if (uart_num == -1) {
+        uart_num = get_default_tunnel_serial_port();
+    }
+    if (uart_num < 0) {
+        return;
+    }
+    auto *uart = hal.serial(uart_num);
+    if (uart == nullptr) {
+        return;
+    }
+    if (uart_monitor.uart_num != uart_num && uart_monitor.uart != nullptr) {
+        // remove monitor from previous uart
+        hal.serial(uart_monitor.uart_num)->set_monitor_read_buffer(nullptr);
+    }
+    uart_monitor.uart_num = uart_num;
+    if (uart != uart_monitor.uart) {
+        // change of uart or expired, clear old data
+        uart_monitor.buffer->clear();
+        uart_monitor.uart = uart;
+        uart_monitor.baudrate = 0;
+    }
+    if (uart_monitor.uart == nullptr) {
+        return;
+    }
+    /*
+      allow for locked state to change at any time, so users can
+      switch between locked and unlocked while connected
+     */
+    const bool was_locked = uart_monitor.locked;
+    uart_monitor.locked = (pkt.options & UAVCAN_TUNNEL_TARGETTED_OPTION_LOCK_PORT) != 0;
+    if (uart_monitor.locked) {
+        uart_monitor.uart->lock_port(TUNNEL_LOCK_KEY, TUNNEL_LOCK_KEY);
+    } else {
+        uart_monitor.uart->lock_port(0,0);
+    }
+    uart_monitor.node_id = transfer->source_node_id;
+    uart_monitor.protocol = pkt.protocol.protocol;
+    if (pkt.baudrate != uart_monitor.baudrate || !was_locked) {
+        if (uart_monitor.locked && pkt.baudrate != 0) {
+            // ensure we have enough buffer space for a uBlox fw update and fast uCenter data
+            uart_monitor.uart->begin_locked(pkt.baudrate, 2048, 2048, TUNNEL_LOCK_KEY);
+            debug("begin_locked %u", unsigned(pkt.baudrate));
+        }
+        uart_monitor.baudrate = pkt.baudrate;
+    }
+    uart_monitor.uart->set_monitor_read_buffer(uart_monitor.buffer);
+    uart_monitor.last_request_ms = AP_HAL::millis();
+
+    // write to device
+    if (pkt.buffer.len > 0) {

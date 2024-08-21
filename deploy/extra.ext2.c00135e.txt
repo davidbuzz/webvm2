@@ -1,0 +1,899 @@
+import here so that we won't barf if run normally and yappi not available
+    yappi.start()
+
+if args.format == 'mat':
+    # Check that the mat_file argument has been specified
+    if args.mat_file is None:
+        print("mat_file argument must be specified when mat format is selected")
+        sys.exit(1)
+    # Load these modules here, as they're only needed for MAT file creation
+    import scipy.io
+    import numpy as np
+
+filename = args.log
+mlog = mavutil.mavlink_connection(filename, planner_format=args.planner,
+                                  notimestamps=args.notimestamps,
+                                  robust_parsing=args.robust,
+                                  dialect=args.dialect,
+                                  zero_time_base=args.zero_time_base)
+
+output = None
+if args.output:
+    output = open(args.output, mode='wb')
+
+types = args.types
+if types is not None:
+    types = types.split(',')
+
+nottypes = args.nottypes
+if nottypes is not None:
+    nottypes = nottypes.split(',')
+
+ext = os.path.splitext(filename)[1]
+isbin = ext in ['.bin', '.BIN', '.px4log']
+islog = ext in ['.log', '.LOG'] # NOTE: "islog" does not mean a tlog
+istlog = ext in ['.tlog', '.TLOG']
+
+# list of msgs to reduce in rate when --reduce is used
+reduction_msgs = ['NKF*', 'XKF*', 'IMU*', 'AHR2', 'BAR*', 'ATT', 'BAT*', 'CTUN', 'NTUN', 'GP*', 'IMT*', 'MAG*', 'PL', 'POS', 'POW*', 'RATE', 'RC*', 'RFND', 'UBX*', 'VIBE', 'NKQ*', 'MOT*', 'CTRL', 'FTS*', 'DSF', 'CST*', 'LOS*', 'UWB*']
+reduction_yes = set()
+reduction_no = set()
+reduction_count = {}
+
+def reduce_msg(mtype, reduction_ratio):
+    '''return True if this msg should be discarded by reduction'''
+    global reduction_count, reduction_msgs, reduction_yes, reduction_no
+    if mtype in reduction_no:
+        return False
+    if not mtype in reduction_yes:
+        for m in reduction_msgs:
+            if fnmatch.fnmatch(mtype, m):
+                reduction_yes.add(mtype)
+                reduction_count[mtype] = 0
+                break
+        if not mtype in reduction_yes:
+            reduction_no.add(mtype)
+            return False
+    reduction_count[mtype] += 1
+    if reduction_count[mtype] == reduction_ratio:
+        reduction_count[mtype] = 0
+        return False
+    return True
+
+last_msg_rate_t = {}
+
+def reduce_rate_msg(m, reduction_rate):
+    '''return True if this msg should be discarded by reduction'''
+    global last_msg_rate_t
+    mtype = m.get_type()
+    if mtype in ['PARM','MSG','FMT','FMTU','MULT','MODE','EVT','UNIT', 'VER']:
+        return False
+    t = getattr(m,'_timestamp',None)
+    if t is None:
+        return False
+    if not mtype in last_msg_rate_t:
+        last_msg_rate_t[mtype] = t
+    dt = t - last_msg_rate_t[mtype]
+
+    if dt < 0 or dt >= 1.0/reduction_rate:
+        last_msg_rate_t[mtype] = t
+        return False
+    return True
+
+if args.csv_sep == "tab":
+    args.csv_sep = ","
+
+# swiped from DFReader.py
+def to_string(s):
+    '''desperate attempt to convert a string regardless of what garbage we get'''
+    if isinstance(s, str):
+        return s
+    if sys.version_info[0] == 2:
+        # In python2 we want to return unicode for passed in unicode
+        return s
+    return s.decode(errors="backslashreplace")
+
+def match_type(mtype, patterns):
+    '''return True if mtype matches pattern'''
+    for p in patterns:
+        if fnmatch.fnmatch(mtype, p):
+            return True
+    return False
+
+# Write out a header row as we're outputting in CSV format.
+fields = ['timestamp']
+offsets = {}
+if istlog and args.format == 'csv': # we know our fields from the get-go
+    try:
+        currentOffset = 1 # Store how many fields in we are for each message.
+        for type in types:
+            try:
+                typeClass = "MAVLink_{0}_message".format(type.lower())
+                if runningPython3:
+                    fields += [type + '.' + x for x in inspect.getfullargspec(getattr(mavutil.mavlink, typeClass).__init__).args[1:]]
+                else:
+                    fields += [type + '.' + x for x in inspect.getargspec(getattr(mavutil.mavlink, typeClass).__init__).args[1:]]
+                offsets[type] = currentOffset
+                currentOffset += len(fields)
+            except IndexError:
+                sys.exit(1)
+            except AttributeError:
+                print("Message type '%s' not found" % (type))
+                sys.exit(1)
+    except TypeError:
+        print("You must specify a list of message types if outputting CSV format via the --types argument.")
+        sys.exit(1)
+
+    # The first line output are names for all columns
+    print(args.csv_sep.join(fields))
+
+if (isbin or islog) and args.format == 'csv': # need to accumulate columns from message
+    if types is None or len(types) != 1:
+        print("Need exactly one type when dumping CSV from bin file")
+        sys.exit(1)
+
+# Track types found
+available_types = set()
+
+# for DF logs pre-calculate types list
+match_types=None
+if types is not None and hasattr(mlog, 'name_to_id'):
+    for k in mlog.name_to_id.keys():
+        if match_type(k, types):
+            if nottypes is not None and match_type(k, nottypes):
+                continue
+            if match_types is None:
+                match_types = []
+            match_types.append(k)
+
+if (isbin or islog) and args.format == 'csv':
+    # Make sure the specified type was found
+    if match_types is None:
+        print("Specified type '%s' not found in log file" % (types[0]))
+        sys.exit(1)
+    # we need FMT messages for column headings
+    match_types.append("FMT")
+
+# Keep track of data from the current timestep. If the following timestep has the same data, it's stored in here as well. Output should therefore have entirely unique timesteps.
+MAT = {}    # Dictionary to hold output data for 'mat' format option
+while True:
+    m = mlog.recv_match(blocking=args.follow, type=match_types)
+    if m is None:
+        break
+    m_type = m.get_type()
+    available_types.add(m_type)
+    if (isbin or islog) and m_type == "FMT" and args.format == 'csv':
+        if m.Name == types[0]:
+            fields += m.Columns.split(',')
+            print(args.csv_sep.join(fields))
+
+    if args.reduce and reduce_msg(m_type, args.reduce):
+        continue
+
+    if args.reduce_rate > 0 and reduce_rate_msg(m, args.reduce_rate):
+        continue
+
+    if output is not None:
+        if (isbin or islog) and m_type == "FMT":
+            output.write(m.get_msgbuf())
+            continue
+        if (isbin or islog) and (m_type == "PARM" and args.parms):
+            output.write(m.get_msgbuf())
+            continue
+        if m_type == 'PARAM_VALUE' and args.parms:
+            timestamp = getattr(m, '_timestamp', None)
+            output.write(struct.pack('>Q', int(timestamp*1.0e6)) + m.get_msgbuf())
+            continue
+
+    if not mavutil.evaluate_condition(args.condition, mlog.messages) and (
+            not (m_type in ['FMT', 'FMTU', 'MULT', 'PARM', 'MODE', 'UNIT', 'VER'] and args.meta)):
+        continue
+    if args.source_system is not None and args.source_system != m.get_srcSystem():
+        continue
+    if args.source_component is not None and args.source_component != m.get_srcComponent():
+        continue
+    if args.link is not None and args.link != m._link:
+        continue
+
+    if types is not None and m_type != 'BAD_DATA' and not match_type(m_type, types):
+        continue
+
+    if nottypes is not None and match_type(m_type, nottypes):
+        continue
+
+    # Ignore BAD_DATA messages is the user requested or if they're because of a bad prefix. The
+    # latter case is normally because of a mismatched MAVLink version.
+    if m_type == 'BAD_DATA' and (args.no_bad_data is True or m.reason == "Bad prefix"):
+        continue
+
+    # Grab the timestamp.
+    timestamp = getattr(m, '_timestamp', 0.0)
+
+    # If we're just logging, pack in the timestamp and data into the output file.
+    if output:
+        if not (isbin or islog):
+            output.write(struct.pack('>Q', int(timestamp*1.0e6)))
+        try:
+            output.write(m.get_msgbuf())
+        except Exception as ex:
+            print("Failed to write msg %s: %s" % (m_type, str(ex)))
+
+    # If quiet is specified, don't display output to the terminal.
+    if args.quiet:
+        continue
+
+    # If JSON was ordered, serve it up. Split it nicely into metadata and data.
+    if args.format == 'json':
+        # Format our message as a Python dict, which gets us almost to proper JSON format
+        data = m.to_dict()
+
+        # Remove the mavpackettype value as we specify that later.
+        del data['mavpackettype']
+
+        # Also, if it's a BAD_DATA message, make it JSON-compatible by removing array objects
+        if 'data' in data and type(data['data']) is not dict:
+            data['data'] = list(data['data'])
+
+        # Prepare the message as a single object with 'meta' and 'data' keys holding
+        # the message's metadata and actual data respectively.
+        meta = {"type": m_type, "timestamp": timestamp}
+        if args.show_source:
+            meta["srcSystem"] = m.get_srcSystem()
+            meta["srcComponent"] = m.get_srcComponent()
+
+        # convert any array.array (e.g. packed-16-bit fft readings) into lists:
+        for key in data.keys():
+            if type(data[key]) == array.array:
+                data[key] = list(data[key])
+        # convert any byte-strings into utf-8 strings.  Don't die trying.
+        for key in data.keys():
+            if type(data[key]) == bytes:
+                data[key] = to_string(data[key])
+        outMsg = {"meta": meta, "data": data}
+
+        # Now print out this object with stringified properly.
+        print(json.dumps(outMsg))
+
+    # CSV format outputs columnar data with a user-specified delimiter
+    elif args.format == 'csv':
+        data = m.to_dict()
+        if isbin or islog:
+            csv_out = [str(data[y]) if y != "timestamp" else "" for y in fields]
+        else:
+            csv_out = [str(data[y.split('.')[-1]]) if y.split('.')[0] == m_type and y.split('.')[-1] in data else "" for y in fields]
+        csv_out[0] = "{:.8f}".format(timestamp)
+        print(args.csv_sep.join(csv_out))
+
+    # MAT format outputs data to a .mat file specified through the
+    # --mat_file option
+    elif args.format == 'mat':
+        # If this packet contains data (i.e. is not a FMT
+        # packet), append the data in this packet to the
+        # corresponding list
+        if m_type != 'FMT':
+
+            # If this packet type has not yet been
+            # seen, add a new entry to the big dict
+            if m_type not in MAT:
+                MAT[m_type] = {}
+
+            md = m.to_dict()
+            del md['mavpackettype']
+            cols = md.keys()
+            for col in cols:
+                # If this column hasn't had data entered,
+                # make a new key and list
+                if col in MAT[m_type]:
+                    MAT[m_type][col].append(md[col])
+                else:
+                    MAT[m_type][col] = [md[col]]
+    elif args.show_types:
+        # do nothing
+        pass
+    elif args.verbose and istlog:
+        mavutil.dump_message_verbose(sys.stdout, m)
+        print("")
+    elif args.verbose and hasattr(m,"dump_verbose"):
+        m.dump_verbose(sys.stdout)
+        print("")
+    else:
+        # Otherwise we output in a standard Python dict-style format
+        s = "%s.%02u: %s" % (time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.localtime(timestamp)),
+                             int(timestamp*100.0)%100, m)
+        if args.show_source:
+            s += " srcSystem=%u srcComponent=%u" % (m.get_srcSystem(), m.get_srcComponent())
+        if args.show_seq:
+            s += " seq=%u" % m.get_seq()
+        print(s)
+
+# Export the .mat file
+if args.format == 'mat':
+    scipy.io.savemat(args.mat_file, MAT, do_compression=args.compress)
+
+if args.show_types:
+    for msgType in available_types:
+        print(msgType)
+
+if args.profile:
+    yappi.get_func_stats().print_all()
+    yappi.get_thread_stats().print_all()
+                                                                                                                                                                                                                                                                     #!/usr/bin/env python
+
+'''
+show MAVLink packet loss
+'''
+from __future__ import print_function
+
+from argparse import ArgumentParser
+parser = ArgumentParser(description=__doc__)
+parser.add_argument("--no-timestamps", dest="notimestamps", action='store_true', help="Log doesn't have timestamps")
+parser.add_argument("--planner", action='store_true', help="use planner file format")
+parser.add_argument("--robust", action='store_true', help="Enable robust parsing (skip over bad data)")
+parser.add_argument("--condition", default=None, help="condition for packets")
+parser.add_argument("--dialect", default="ardupilotmega", help="MAVLink dialect")
+parser.add_argument("logs", metavar="LOG", nargs="+")
+
+args = parser.parse_args()
+
+from pymavlink import mavutil
+
+
+def mavloss(logfile):
+    '''work out signal loss times for a log file'''
+    print("Processing log %s" % filename)
+    mlog = mavutil.mavlink_connection(filename,
+                                      planner_format=args.planner,
+                                      notimestamps=args.notimestamps,
+                                      dialect=args.dialect,
+                                      robust_parsing=args.robust)
+
+    # Track the reasons for MAVLink parsing errors and print them all out at the end.
+    reason_ids = set()
+    reasons = []
+
+    while True:
+        m = mlog.recv_match(condition=args.condition)
+
+        # Stop parsing the file once we've reached the end
+        if m is None:
+            break
+
+        # Save the parsing failure reason for this message if it's a new one
+        if m.get_type() == 'BAD_DATA':
+            reason_id = ''.join(m.reason.split(' ')[0:3])
+            if reason_id not in reason_ids:
+                reason_ids.add(reason_id)
+                reasons.append(m.reason)
+
+    # Print out the final packet loss results
+    print("%u packets, %u lost %.1f%%" % (
+            mlog.mav_count, mlog.mav_loss, mlog.packet_loss()))
+
+    # Also print out the reasons why losses occurred
+    if len(reasons) > 0:
+        print("Packet loss at least partially attributed to the following:")
+        for r in reasons:
+            print("  * " + r)
+
+for filename in args.logs:
+    mavloss(filename)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #!/usr/bin/env python
+
+'''
+merge two tlogs
+'''
+
+import os
+import struct
+
+from pymavlink import mavutil
+
+
+class MAVMerge(object):
+    def __init__(self, log1, log2, output_filepath=None, quiet=False):
+        self.filename1 = log1
+        self.filename2 = log2
+        self.output_filepath = output_filepath
+        self.output_fh = None
+        self.quiet = quiet
+
+    def emit_message(self, m):
+        '''emit message to stdout, and possibly to output file'''
+        if not self.quiet:
+            print(str(m))
+        if self.output_fh is not None:
+            self.output_fh.write(struct.pack('>Q', int(m._timestamp*1.0e6)))
+            self.output_fh.write(m.get_msgbuf())
+
+    def run(self):
+        mlog1 = mavutil.mavlink_connection(self.filename1, dialect='all')
+        mlog2 = mavutil.mavlink_connection(self.filename2, dialect='all')
+
+        if self.output_filepath is not None:
+            self.output_fh = open(self.output_filepath, mode='wb')
+
+        m1 = mlog1.recv_match()
+        m2 = mlog2.recv_match()
+        while m1 is not None or m2 is not None:
+            if m1 is None:
+                self.emit_message(m2)
+                m2 = mlog2.recv_match()
+                continue
+            if m2 is None:
+                self.emit_message(m1)
+                m1 = mlog1.recv_match()
+                continue
+
+            if m1._timestamp < m2._timestamp:
+                self.emit_message(m1)
+                m1 = mlog1.recv_match()
+            else:
+                self.emit_message(m2)
+                m2 = mlog1.recv_match()
+
+
+if __name__ == '__main__':
+
+    os.environ['MAVLINK20'] = '1'
+
+    from argparse import ArgumentParser
+    parser = ArgumentParser(description=__doc__)
+
+    parser.add_argument("log1", metavar="LOG1")
+    parser.add_argument("log2", metavar="LOG2")
+    parser.add_argument("-o", "--output", default=None, help="output to given file")
+    parser.add_argument("-q", "--quiet", action='store_true', help="don't display packets")
+
+    args = parser.parse_args()
+
+    filename1 = args.log1
+    filename2 = args.log2
+
+    merger = MAVMerge(
+        filename1,
+        filename2,
+        output_filepath=args.output,
+        quiet=args.quiet,
+    )
+    merger.run()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #!/usr/bin/env python
+
+'''
+extract mavlink mission from log
+'''
+from __future__ import print_function
+
+from argparse import ArgumentParser
+parser = ArgumentParser(description=__doc__)
+parser.add_argument("--output", default='mission.txt', help="output file")
+parser.add_argument("logs", metavar="LOG", nargs="+")
+
+args = parser.parse_args()
+
+from pymavlink import mavutil, mavwp
+
+parms = {}
+
+def mavmission(logfile):
+    '''extract mavlink mission'''
+    mlog = mavutil.mavlink_connection(filename)
+
+    wp = mavwp.MAVWPLoader()
+
+    num_wps = None
+    while True:
+        m = mlog.recv_match(type=['MISSION_ITEM','CMD','WAYPOINT','MISSION_ITEM_INT'])
+        if m is None:
+            break
+        if m.get_type() == 'CMD':
+            try:
+                frame = m.Frame
+            except AttributeError:
+                print("Warning: assuming frame is GLOBAL_RELATIVE_ALT")
+                frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+            num_wps = m.CTot
+            m = mavutil.mavlink.MAVLink_mission_item_message(0,
+                                                             0,
+                                                             m.CNum,
+                                                             frame,
+                                                             m.CId,
+                                                             0, 1,
+                                                             m.Prm1, m.Prm2, m.Prm3, m.Prm4,
+                                                             m.Lat, m.Lng, m.Alt)
+
+        if m.get_type() == 'MISSION_ITEM_INT':
+            m = mavutil.mavlink.MAVLink_mission_item_message(m.target_system,
+                                                             m.target_component,
+                                                             m.seq,
+                                                             m.frame,
+                                                             m.command,
+                                                             m.current,
+                                                             m.autocontinue,
+                                                             m.param1,
+                                                             m.param2,
+                                                             m.param3,
+                                                             m.param4,
+                                                             m.x*1.0e-7,
+                                                             m.y*1.0e-7,
+                                                             m.z)
+        if m.current >= 2:
+            continue
+
+        while m.seq > wp.count():
+            print("Adding dummy WP %u" % wp.count())
+            wp.set(m, wp.count())
+        wp.set(m, m.seq)
+
+    if num_wps is not None:
+        while wp.count() > num_wps:
+            wp.remove(wp.wp(wp.count() - 1))
+
+    wp.save(args.output)
+    print("Saved %u waypoints to %s" % (wp.count(), args.output))
+
+
+total = 0.0
+for filename in args.logs:
+    mavmission(filename)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #!/usr/bin/env python3
+
+"""
+map a serial port to an outgoing TCP connection
+Released under GNU GPLv3 or later
+"""
+from __future__ import print_function
+
+from argparse import ArgumentParser
+import errno
+import serial
+import socket
+import time
+
+parser = ArgumentParser(description=__doc__)
+parser.add_argument("--baudrate", default=57600, type=int, help="baud rate")
+parser.add_argument("serialport", type=str, help="serial port")
+parser.add_argument("desthost", type=str, help="destination host")
+parser.add_argument("destport", type=int, help="destination port")
+args = parser.parse_args()
+
+serport = serial.Serial(args.serialport, args.baudrate, timeout=0)
+
+tcpsock = None
+
+
+def open_socket():
+    global tcpsock
+    try:
+        tcpsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcpsock.connect((args.desthost, args.destport))
+        tcpsock.setblocking(0)
+        print("Connected to %s:%u" % (args.desthost, args.destport))
+    except Exception:
+        pass
+
+open_socket()
+
+while True:
+    gotdata = False
+
+    if serport is None:
+        try:
+            print("Reopening %s" % args.serialport)
+            serport = serial.Serial(args.serialport, args.baudrate, timeout=0)
+        except Exception:
+            time.sleep(1)
+            continue
+        print("Opened %s" % args.serialport)
+
+
+    if tcpsock is None:
+        open_socket()
+        time.sleep(0.1)
+        continue
+
+    try:
+        n = serport.inWaiting()
+    except Exception:
+        serport = None
+        time.sleep(1)
+        continue
+    if n > 0:
+        b = serport.read(n)
+        if b:
+            try:
+                tcpsock.send(b)
+            except socket.error:
+                tcpsock.close()
+                tcpsock = None
+                continue
+            gotdata = True
+
+    try:
+        b = tcpsock.recv(1000)
+    except socket.error as e:
+        if e.args[0] in [errno.EWOULDBLOCK, errno.EAGAIN]:
+            time.sleep(0.02)
+            continue
+        tcpsock.close()
+        tcpsock = None
+        continue
+    if b:
+        serport.write(b)
+        gotdata = True
+    if not gotdata:
+        time.sleep(0.02)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            DIRC     1f∆u£    f∆u£        Ω$  Å§          PÑ	E∑Ú⁄‡‚†øÕ∫¯°≠∞Ç6 .editorconfig     f∆u£    f∆u£        Ω%  Å§           Jh˙–‡+'Í•ΩÌﬁim$,Õ .flake8   f∆u£    f∆u£        Ω&  Å§          TOF8K≈X≤ï◊Çë¯ïCøﬂ£ .gitattributes    f∆u£    f∆u£        Ω)  Å§          .(BùürOÅÌ´:Fº ∏+>£ $.github/workflows/mypy-generated.ini      f∆u£    f∆u£        Ω*  Å§          ¨ãF“Àm˝Èòà≠§Ë∏~,Q˙ $.github/workflows/python-publish.yml      f∆u£    f∆u£        Ω+  Å§          –|`œhcç%–‚'ˇYc&E¿ .github/workflows/test.yml        f∆u£    f∆u£        Ω,  Å§          %ﬂ>«'[Êáﬁ[”:mÁ]ÿqâ∆w 
+.gitignore        f∆u£    f∆u£        Ω-  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë .gitmodules       f∆u£    f∆u£        Ω/  Å§          gπµ¡iï~j#)	"íyÖc APM_Mavtest/APM_Mavtest.pde       f∆u£    f∆u£        Ω0  Å§           ≠|£ã&°ø©8˝H"ò}Gù˝ñèå APM_Mavtest/Makefile      f∆u£    f∆u£        Ω1  Å§          %&ÅAÑπmìÙß»§û•ízè}F¯ COPYING   f∆u£    f∆u£        Ω2  Å§          H©•R.]cõﬁ˚§Gg‡æ»ﬁL§ CSVReader.py      f∆u£    f∆u£        Ω3  Å§          Û‡®¬4∑≠q π˝Ê“ïK_kÔØO DFReader.py       f∆u£    f∆u£        Ω4  Å§          PjÈqë.öˆÆö°/n®è• 	README.md f∆u£    f∆u£        Ω5  Å§           Q/ÍóN•êësÁ&Oò‹#Æ”¡KÓÛ __init__.py       f∆u£    f∆u£        Ω7  Å§           î8ßÍ0=îÄâ∂$%ÒUê!5‹ dialects/.gitignore       f∆u£    f∆u£        Ω8  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë dialects/__init__.py      f∆u£    f∆u£        Ω:  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë dialects/v09/__init__.py  f∆u£    f∆u£        Ω<  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë  dialects/v09/python2/__init__.py  f∆u£    f∆u£        Ω>  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë dialects/v10/__init__.py  f∆u£    f∆u£        Ω@  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë  dialects/v10/python2/__init__.py  f∆u£    f∆u£        ΩB  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë dialects/v20/__init__.py  f∆u£    f∆u£        ΩD  Å§            Êù‚õ≤—÷CKã)ÆwZÿ¬‰åSë  dialects/v20/python2/__init__.py  f∆u£    f∆u£        ΩF  Å§          QØ%`=;›¨àe¬üﬁT5\ò examples/README.md        f∆u£    f∆u£        ΩG  Å§           XïÓˇ ÎL!,+wsysFúﬁCãf examples/__init__.py      f∆u£    f∆u£        ΩH  ÅÌ          öM”Œ`≤∑i¢G‚¥i2–pìQå examples/add_msg_to_bin.py        f∆u£    f∆u£        ΩI  ÅÌ          kQ©#}c,b{ùLÍVk'+®  examples/apmsetrate.py    f∆u£    f∆u£        ΩJ  ÅÌ          (˙û¬õ'àûïKD!Û¬¥bß examples/bwtest.py        f∆u£    f∆u£        ΩK  ÅÌ          ∫Œiùë=Àh–¥Ä©©ZDÎ‘B examples/dup_samples.py   f∆u£    f∆u£        ΩL  ÅÌ          b¬X/°0'¬b1Hªæ(6W ◊¬ examples/magtest.py       f∆u£    f∆u£        ΩM  ÅÌ          Íôü/?aóÅo”q˙7áÙ´bDI% examples/mav_accel.py     f∆u£    f∆u£        ΩN  ÅÌ          !∑"À?Ù§¡J•ª%ÕŒáÄY∫  examples/mav_replay_estimator.py  f∆u£    f∆u£        ΩO  ÅÌ          tÏ´¶w'…nC,(„	åÅâ⁄Ô examples/mavgps.py        f∆u£    f∆u£        ΩP  ÅÌ          ∆ŒΩOqT… ?kcGyÜ˘¢ƒÃv examples/mavtcpsniff.py   f∆u£    f∆u£        ΩQ  ÅÌ          ëﬂf{êvêêB|Æ‚%∆µ®ô ∏ùØ examples/mavtest.py       f∆u£    f∆u£        ΩR  ÅÌ          kæ9·€_¯nJFÏ^s∂«t2õÛ examples/mavtester.py     f∆u£    f∆u£        ΩS  ÅÌ          ˝ˆœ¡B—K_áAõ†Â◊\~Ê√˝ examples/min.js   f∆u£    f∆u£        ΩT  Å§          `í$ﬁ°zHQêD}V°1Ñ˜õ >ü examples/testparser.js    f∆u£    f∆u£        ΩU  ÅÌ          Ÿ⁄Dî3”Îv„˙T™Gü∞qtœ examples/wptogpx.py       f∆u£    f∆u£        ΩV  Å§          &Q9∆ÕXMBÉç3pº÷ ¨Ë÷y“y• fgFDM.py  f∆u£    f∆u£        ΩY  Å§           ·æ≥'UX‹‚°Èïà‹ä$Í7£ files/archlinux/PKGBUILD  f∆u£    f∆u£        Ω[  Å§            ∂H|aÁ—ΩÈ:œJ∑®êÉ°m generator/.gitignore      f∆u£    f∆u£        Ω^  Å§           ë∂R°XÍwŸGÅŒÆàÉ”≥ZÙP generator/Ada/examples/README     f∆u£    f∆u£        Ω_  Å§          ÓÀyÜ¡Gˆ¢–Ú`È®è@ã≥‡l|_ #generator/Ada/examples/attitude.adb       f∆u£    f∆u£        Ω`  Å§           „˘Gk2˘ãÏöPª6ˇ%C9o generator/Ada/examples/make.sh    f∆u£    f∆u£        Ωa  Å§          	]·ÛOëˆ˘‚∫z†Zw
+∏ûÄƒÕR{ -generator/Ada/examples/param_request_list.adb     f∆u£    f∆u£        Ωb  Å§          ‰LÃñGTà.¡GõÈû¥w$æœ} /generator/Ada/examples/param_set_sr0_params.adb   f∆u£    f∆u£        Ωc  Å§          NÃ>üﬂ>¬!V˚êÊ‚òçENÉ $generator/Ada/mavlink-connection.adb      f∆u£    f∆u£        Ωd  Å§          _à=.Ãò=ÚÚπÀ0ˆ†ÛƒQi $generator/Ada/mavlink-connection.ads      f∆u£    f∆u£        Ωe  Å§           ÷ï–ò†»áM>Ã+£—ØáÊJ† generator/Ada/mavlink.ads f∆u£    f∆u£        Ωf  Å§          íü¸˚—Ë ÁŒz¬˘jåŒíOµ generator/Ada/x25crc.adb  f∆u£    f∆u£        Ωg  Å§          ºﬁZaâ ∑0¿‹}(3⁄Y∆:Vâ generator/Ada/x25crc.ads  f∆u£    f∆u£        Ωj  Å§          å	)o†wñâ§#>îFræ¶Â } #generator/C/include_v0.9/checksum.h       f∆u£    f∆u£        Ωk  Å§          AÿÚ«y˘àV	<1˘A¢ˇù *generator/C/include_v0.9/mavlink_helpers.h        f∆u£    f∆u£        Ωl  Å§          +§6§%z»ØÈ‰æ∑€>€ïq‰l˜… (generator/C/include_v0.9/mavlink_types.h  f∆u£    f∆u£        Ωm  Å§          .ì&¿.¯+O˛¨OÂôü≤6#Æ #generator/C/include_v0.9/protocol.h       f∆u£    f∆u£        Ωo  Å§          ’[ëø‚“|$Â@oà18º™x›∫ 'generator/C/include_v0.9/test/mavlink.h   f∆u£    f∆u£        Ωp  Å§          Ysê‡LZ¶‚_I96•Ï√∆e$Eà¡ 6generator/C/include_v0.9/test/mavlink_msg_test_types.h    f∆u£    f∆u£        Ωq  Å§          7˙Â˜˚`ÉÑS*SÁ„*Oƒ´à>D $generator/C/include_v0.9/test/test.h      f∆u£    f∆u£        Ωr  Å§          åW]ê^p©‚Ã§¸∑¯b$,2∞V )generator/C/include_v0.9/test/testsuite.h f∆u£    f∆u£        Ωs  Å§          Tms	1„1ˆu´DTÄwÙ∫nDƒ 'generator/C/include_v0.9/test/version.h   f∆u£    f∆u£        Ωu  Å§          ∑¸’·’[=¯=Q!Uµ
+w⁄·K  #generator/C/include_v1.0/checksum.h       f∆u£    f∆u£        Ωv  Å§          M‘^k´9ûƒè∂L—Ì>W’ŒíA¬ .generator/C/include_v1.0/mavlink_conversions.h    f∆u£    f∆u£        Ωw  Å§          Zsß0I&C~‹∑§œëX;'Ã *generator/C/include_v1.0/mavlink_helpers.h        f∆u£    f∆u£        Ωx  Å§          !}[Wz3¶œzRÖ_R^ø˙ÈG’Â∑ (generator/C/include_v1.0/mavlink_types.h  f∆u£    f∆u£        Ωy  Å§          3ÑÙçîî≠ÿ£Xµ#L—+Gu #generator/C/include_v1.0/protocol.h       f∆u£    f∆u£        Ω{  Å§          ŸÂñ∏˚§˝Lu‘ã¬gQÓ·ı+√ 'generator/C/include_v1.0/test/mavlink.h   f∆u£    f∆u£        Ω|  Å§          YßQ#q%X^∫vyds∆Ë/2Í 6generator/C/include_v1.0/test/mavlink_msg_test_types.h    f∆u£    f∆u£        Ω}  Å§          7˚Õ‘π)f[≠AKÓà|Qªzd3Ú $generator/C/include_v1.0/test/test.h      f∆u£    f∆u£        Ω~  Å§          qsbùÁ“00¡ç(∏CZöC
+@ÑY- )generator/C/include_v1.0/test/testsuite.h f∆u£    f∆u£        Ω  Å§          T…¶t"+sñvÉuRÕ;˚$AÄ 'generator/C/include_v1.0/test/version.h   f∆u£    f∆u£        ΩÅ  Å§          Û––—Íºg˝Ñ˚cƒ&#¡†  #generator/C/include_v2.0/checksum.h       f∆u£    f∆u£        ΩÇ  Å§          Ößù=øLn¶2 ‘ÜBöÕdÊ=+3 .generator/C/include_v2.0/mavlink_conversions.h    f∆u£    f∆u£        ΩÉ  Å§          ó0.»ΩkîÚ¯c_õÊ∑˝Ò?‘»Òå +generator/C/include_v2.0/mavlink_get_info.h       f∆u£    f∆u£        ΩÑ  Å§          í+u«]á¶ZdJπïí´—ê„ N6 *generator/C/include_v2.0/mavlink_helpers.h        f∆u£    f∆u£        ΩÖ  Å§          äzÃ–5fàxòü’µºã1¢˛W¨™ )generator/C/include_v2.0/mavlink_sha256.h f∆u£    f∆u£        ΩÜ  Å§          -ﬂ±ÊŸ„Ë[÷≤ﬁ≈ı⁄9†°§kŒ (generator/C/include_v2.0/mavlink_types.h  f∆u£    f∆u£        Ωá  Å§          0ÍÏY<: c±ôR	ßw§±∆›ãmO #generator/C/include_v2.0/protocol.h       f∆u£    f∆u£        Ωä  Å§           .|òeœ˙&fÛ*ç ø	`UìÀ !generator/C/test/posix/.gitignore f∆u£    f∆u£        Ωã  Å§          ú–†^òä7‘–[¡‘Á€•ä¿$Í… generator/C/test/posix/Makefile   f∆u£    f∆u£        Ωå  Å§          K
+O6x("pqÀgxÇ˛O+O—l #generator/C/test/posix/parse_tlog.c       f∆u£    f∆u£        Ωç  Å§          ÏWÈù]“Na«≥ÖöÛˇπnÆ $generator/C/test/posix/sha256_test.c      f∆u£    f∆u£        Ωé  ÅÌ           ÊæõL–9Èï|hΩ ”¶>ˇkPZÍ %generator/C/test/posix/sha256_test.py     f∆u£    f∆u£        Ωè  Å§          -¬ﬁÇ}`™–zYãñ&•ÆWÜ⁄P#˜  generator/C/test/posix/testmav.c  f∆u£    f∆u£        Ωë  Å§          &ò¥´X*Ü8&mâôcrK◊†  #generator/C/test/windows/stdafx.cpp       f∆u£    f∆u£        Ωí  Å§          @G†–%+ãªwÏ†,øy‰Ê_O» !generator/C/test/windows/stdafx.h f∆u£    f∆u£        Ωì  Å§          :êÁgøŒt\ìD¸”t[O	‹˜ $generator/C/test/windows/targetver.h      f∆u£    f∆u£        Ωî  Å§          ˜™É Œ›¿íQOå#bï*Ô"˚ $generator/C/test/windows/testmav.cpp      f∆u£    f∆u£        Ωï  Å§          }7£iyå∑§0XúioiNÑ $generator/C/test/windows/testmav.sln      f∆u£    f∆u£        Ωñ  Å§          > õ.œˆPˇû‡äÔ‹Úºÿ¶@ y $generator/C/test/windows/testmav.suo      f∆u£    f∆u£        Ωó  Å§          íqÅ≥§≥Ü¨¶ª‹•≠øºpdÇ (generator/C/test/windows/testmav.vcxproj  f∆u£    f∆u£        Ωö  Å§          ÔMmBLW—îŸ∞•‘…û #ﬂ˛ (generator/CPP11/include_v2.0/message.hpp  f∆u£    f∆u£        Ωõ  Å§          Ï£ïj¢
+O£3π¨˝BïÚGmÀ4  'generator/CPP11/include_v2.0/msgmap.hpp   f∆u£    f∆u£        Ωû  Å§           F˝>œ™$:3∆¿ä≤w¯˙ {VL %generator/CPP11/test/posix/.gitignore     f∆u£    f∆u£        Ωü  Å§          Ñ∫C”TÎ8èÚ a∞•}4 #generator/CPP11/test/posix/Makefile       f∆u£    f∆u£        Ω†  Å§          u„É¥Àê;2è1øµˇÍsòŒ“ $generator/CPP11/test/posix/mtest.cpp      f∆u£    f∆u£        Ω¢  Å§          	 ëì¬œÅæÍcDwrÀÚ›1uí generator/CS/MAVLink.csproj       f∆u£    f∆u£        Ω£  Å§          ˇ◊Qk˘¿ ÁùD{yXô&cûú>Éé generator/CS/MAVLinkMessage.cs    f∆u£    f∆u£        Ω§  Å§          ñıF|sØz±mõä…açKÔ√ generator/CS/MavlinkCRC.cs        f∆u£    f∆u£        Ω•  Å§          0c%ö?epN¬ıçÔ%UUF9$[Rÿ generator/CS/MavlinkParse.cs      f∆u£    f∆u£        Ω¶  Å§          1YπºA˙Ë/Ì%±íùBô›xßæ‚
+ generator/CS/MavlinkUtil.cs       f∆u£    f∆u£        Ωß  Å§           )®˙˚!≤#Ú
+B¸ù ÅMK generator/__init__.py     f∆u£    f∆u£        Ω®  ÅÌ          ˘∞ª»‰ºâ¯∂&£àÖlﬂŸPƒ generator/gen_js.sh       f∆u£    f∆u£        Ω©  ÅÌ          Ö◊D¸qM∑?È~¯L»üP-,~E% generator/gen_js.stable.sh        f∆u£    f∆u£        Ω¨  Å§          4<{ä\ü«·‚Fn~£-‚fc˛  generator/java/examples/Makefile  f∆u£    f∆u£        Ω≠  Å§           ;k‰∂√ª∂%ı¸Y∂w°;| !generator/java/examples/test.java f∆u£    f∆u£        Ω∞  Å§          ]é®	¢˜“$≠~ºœ‰´)[–© ,generator/java/lib/Messages/Description.java      f∆u£    f∆u£        Ω±  Å§          ó(Öû≠Á˛®7óÿ8[5÷Î¿oµ /generator/java/lib/Messages/MAVLinkMessage.java   f∆u£    f∆u£        Ω≤  Å§          $¯lˇCB¡õCŸù¢≈uG◊…ºÆû /generator/java/lib/Messages/MAVLinkPayload.java   f∆u£    f∆u£        Ω≥  Å§          »|QLœs`\πp€0_tﬂ˘ -generator/java/lib/Messages/MAVLinkStats.java     f∆u£    f∆u£        Ω¥  Å§          'ßÅ¢ß∑ıì?í]Rè>˙-LÀ˜ &generator/java/lib/Messages/Units.java    f∆u£    f∆u£        Ωµ  Å§          €∆*-iY.õÎµ·¡Á÷/fV *generator/java/lib/Messages/UnitsEnum.java        f∆u£    f∆u£        Ω∂  Å§          ∂Ò›\íìÛ≈8UŒQµ1K¿ generator/java/lib/Parser.java    f∆u£    f∆u£        Ω∏  Å§          ;†H«˝)¶m7y4∆Gú-V%Ä #generator/javascript/.eslintrc.json       f∆u£    f∆u£        Ωπ  Å§           'b#‘S¢ÙôØñ¶#8¯¨Óä´„ generator/javascript/.gitignore   f∆u£    f∆u£        Ω∫  Å§           Ä∏˚ÌÛ€"\ÕìrW÷ÿ#2æˆ generator/javascript/Makefile     f∆u£    f∆u£        Ωª  Å§          ª‡pVÉ¡„É”pH2ùeE'4eâ\H generator/javascript/README.md    f∆u£    f∆u£        ΩΩ  Å§          È≠ZÇ‰E~6Æçiôdw±°B ,generator/javascript/local_modules/README.md      f∆u£    f∆u£        Ωø  Å§           sæ®ºFµ«6z„bÒ= &öÌ 4generator/javascript/local_modules/jspack/.npmignore      f∆u£    f∆u£        Ω¿  Å§          ˙÷F›rËˇ d#-Mπ±;áÊ 1generator/javascript/local_modules/jspack/LICENSE f∆u£    f∆u£        Ω¡  Å§          ˛‡Õ√‚Â˚»8Pƒ+i†–ﬁäŒ* 3generator/javascript/local_modules/jspack/README.md       f∆u£    f∆u£        Ω¬  Å§          {–õR©Ü•ñU~Õ∑ËC¨∑)yx‹ˇ† 3generator/javascript/local_modules/jspack/jspack.js       f∆u£    f∆u£        Ω√  Å§          N˘√hñ\π¯2iÃf¡ÇkXg 6generator/javascript/local_modules/jspack/package.json    f∆u£    f∆u£        Ω≈  Å§          O¸rÎI ’Ë+º.qh‚_¯¢ÈåS 7generator/javascript/local_modules/jspack/test/int64.js   f∆u£    f∆u£        Ω«  Å§          -(uµ$ÑÍGà,)‡&ì¥-∫[^ /generator/javascript/local_modules/long/LICENSE   f∆u£    f∆u£        Ω»  Å§          #Yóï¯‘J+î4º‚Q_2[éBk‘ 1generator/javascript/local_modules/long/README.md f∆u£    f∆u£        Ω…  Å§           )Fˆ4ÂuãRxPŒÔ2l óÿû 0generator/javascript/local_modules/long/index.js  f∆u£    f∆u£        Ω   Å§          ˝S"Ù—t6•Q#¨):D6+Rï: 4generator/javascript/local_modules/long/package.json      f∆u£    f∆u£        ΩÃ  Å§          ùe«åõ∑◊uˆc ∂ftçﬁù˚" 3generator/javascript/local_modules/long/src/long.js       f∆u£    f∆u£        ΩŒ  †            π†]›'ê≤“(nπCa=±CŒ,W (generator/javascript/node_modules/jspack  f∆u£    f∆u£        Ωœ  †            "Jé§‹kZ˙A∆Ü„ÒVîŒ|≠˝√ &generator/javascript/node_modules/long    f∆u§    f∆u§        Ω–  Å§         ∞ŒÅíôı◊$¸Ÿˇ’R±zÇ¢» &generator/javascript/package-lock.json    f∆u§    f∆u§        Ω—  Å§          ≠¿ïà∑˚0ëQSÄ+mC~òC#dµÈ !generator/javascript/package.json f∆u§    f∆u§        Ω”  Å§           :9»¯Ì\.[πÁ$<ò√±6Â $generator/javascript/test/.gitignore      f∆u§    f∆u§        Ω‘  Å§           F≤R4Û\ºéÉÀ5Ÿˆ! :generator/javascript/test/capture.mav2.battery_status.tlog        f∆u§    f∆u§        Ω’  Å§          èúÕùBõzY-º h˛ÜD?*†W )generator/javascript/test/capture.mavlink f∆u§    f∆u§        Ω÷  Å§          ;ØMû\˙Ô8é	¨+‹‡Èj÷ìv◊î 'generator/javascript/test/make_tests.py   f∆u§    f∆u§        Ω◊  Å§          -ÈHu#‰≤7s^‡=1i~Èurr &generator/javascript/test/mavlink10.js    f∆u§    f∆u§        Ωÿ  Å§          148ï%ˆâÜ	PΩJ∞˙C?%€^é &generator/javascript/test/mavlink20.js    f∆u§    f∆u§        ΩŸ  Å§          %Û◊ú’R“íDHﬁU˙¢zùôy∑í™0 &generator/javascript/test/message10.js    f∆u§    f∆u§        Ω⁄  Å§          JÛ‹S@áÑ∂3ZÈú∞∫a^ıy/ó° &generator/javascript/test/message20.js    f∆u§    f∆u§        Ω‹  Å§          ;†H«˝)¶m7y4∆Gú-V%Ä *generator/javascript_stable/.eslintrc.json        f∆u§    f∆u§        Ω›  Å§           'b#‘S¢ÙôØñ¶#8¯¨Óä´„ &generator/javascript_stable/.gitignore    f∆u§    f∆u§        Ωﬁ  Å§           Ä∏˚ÌÛ€"\ÕìrW÷ÿ#2æˆ $generator/javascript_stable/Makefile      f∆u§    f∆u§        Ωﬂ  Å§          ≥∑†«≈˙•—I^_RÙ•ûïﬁx-˚Œ %generator/javascript_stable/README.md     f∆u§    f∆u§        Ω‡  Å§         N≈∆Ó~˛GNc≠	øDtáP ù® Ω -generator/javascript_stable/package-lock.json     f∆u§    f∆u§        Ω·  Å§          ﬁÇ2∑ŸÁKﬁg‰+1&û[ï«ë (generator/javascript_stable/package.json  f∆u§    f∆u§        Ω„  Å§          èúÕùBõzY-º h˛ÜD?*†W 0generator/javascript_stable/test/capture.mavlink  f∆u§    f∆u§        Ω‰  Å§          -`∑ìnQ¯∏$◊(NØ<Ë)pT‰Ã -generator/javascript_stable/test/mavlink10.js     f∆u§    f∆u§        ΩÂ  Å§          -•¡DjbúàíxÅ»“sl]ïª£l -generator/javascript_stable/test/mavlink20.js     f∆u§    f∆u§        ΩÊ  Å§          %"§uå_X-2Ó¿•Ùûá˝v∆ÜÀ -generator/javascript_stable/test/message10.js     f∆u§    f∆u§        ΩÁ  Å§          %S¬ﬁ4åÊ7ÿ†æ~é%5≥Ì]ˇß -generator/javascript_stable/test/message20.js     f∆u§    f∆u§        ΩË  Å§          
+ÓÕnîc˝ˆ∏ÖX˛≈˜∆(ÚÆ« generator/mavcrc.py       f∆u§    f∆u§        ΩÈ  ÅÌ          ?1…bÙãa%„—,a/L}< generator/mavgen.py       f∆u§    f∆u§        ΩÍ  Å§          (‡Èü;*Ä˝∂µåY)n„±8∂ø. generator/mavgen_ada.py   f∆u§    f∆u§        ΩÎ  Å§          l∂Á.N;MÅ˚è∞àCÖç¿êQ—  generator/mavgen_c.py     f∆u§    f∆u§        ΩÏ  Å§          2&˚ˇÅœ]	C!L ÒÛô˘ö≠ 1G generator/mavgen_cpp11.py f∆u§    f∆u§        ΩÌ  Å§          6ùsãm†±.ëéF6”õ7¨ÊL generator/mavgen_cs.py    f∆u§    f∆u§        ΩÓ  Å§          j⁄`Nr∞]º,;˛≥¿¡Lij˛
+ generator/mavgen_java.py  f∆u§    f∆u§        ΩÔ  Å§          ∏∂y€œ±“ñqFÑ[ö !%at]ç generator/mavgen_javascript.py    f∆u§    f∆u§        Ω  Å§          ^P'‹Í;´
+SWf‘›BÜùú\Cö/¯ %generator/mavgen_javascript_stable.py     f∆u§    f∆u§        ΩÒ  Å§          í’cﬁãSFà¶∆ßâª‰ò@aÖ/ generator/mavgen_lua.py   f∆u§    f∆u§        ΩÚ  Å§          4∫.NÃÍ©éµª#G∆íS+ËB0 generator/mavgen_objc.py  f∆u§    f∆u§        ΩÛ  Å§          πwu aÚçÿHXYN/eÂÉC,=¥∑A generator/mavgen_python.py        f∆u§    f∆u§        ΩÙ  Å§          :∂'´˙◊£z[˘B|\È R)Ræ generator/mavgen_swift.py f∆u§    f∆u§        Ωı  Å§          =7@ﬂÀ™§ß∫Ωé6ûNÉLñBy¸ generator/mavgen_typescript.py    f∆u§    f∆u§        Ωˆ  Å§          a†Õ˘<
+ûÃ’ü?õE'¶Ω%π´¬ generator/mavgen_wlua.py  f∆u§    f∆u§        Ω˜  Å§          ^DGì∞±uAÍƒ(¸BÑeä≤Øä◊ä generator/mavparse.py     f∆u§    f∆u§        Ω¯  Å§          ;J«¨ Âùg¬©∫µJq&àHõv¥ generator/mavschema.xsd   f∆u§    f∆u§        Ω˘  Å§          ˙€0V∆˚Û'˘ü!Oô™Î‡Qû#2¸ generator/mavtemplate.py  f∆u§    f∆u§        Ω˚  Å§          ™È6tì’¿‚/ú|Jmo*?zOz generator/swift/MAVLink.swift     f∆u§    f∆u§        Ω¸  Å§          í_TÅ$üﬁKü!Ç‘ÇB¸
+e generator/swift/README.md f∆u§    f∆u§        Ω˛  Å§           Ëâƒô‰QÏ¥ÜUœ‘+ˇ°⁄Vôå.  generator/swift/Tests/.gitignore  f∆u§    f∆u§        æ   Å§         Ωmíˇ§ÇW—Õe≈îî8	u¡çƒ<T 7generator/swift/Tests/MAVLink.xcodeproj/project.pbxproj   f∆u§    f∆u§        æ  Å§          ∫˝„Ö€§Ú…Jv(Ê◊¯ôPGˇ /generator/swift/Tests/MAVLink/AppDelegate.swift   f∆u§    f∆u§        æ  Å§          á-≤±«∆√P
+z4ÄvHCBâIK° Ngenerator/swift/Tests/MAVLink/Assets.xcassets/AppIcon.appiconset/Contents.json    f∆u§    f∆u§        æ  Å§          ≈§Xßp9~J«<c.îŒ| "3;ª 5generator/swift/Tests/MAVLink/Base.lproj/MainMenu.xib     f∆u§    f∆u§        æ  Å§          ”\]©™DKÌÌrWGµâÁd*‹˙ (generator/swift/Tests/MAVLink/Info.plist  f∆u§    f∆u§        æ
+  Å§           AH;8¶Ê∞ˇƒm\îv]ËÕhÿÔå 0generator/swift/Tests/MAVLink/MAVLink/.gitignore  f∆u§    f∆u§        æ  Å§          äÇª È±öjÂÍ&iK≥oOà =generator/swift/Tests/MAVLinkTests/CompareWithCImpTests.swift     f∆u§    f∆u§        æ  Å§          6#9;bï°r ögPÜr…Êﬁ <generator/swift/Tests/MAVLinkTests/DataExtensionsTests.swift      f∆u§    f∆u§        æ  Å§          Ü…Ñè¿iÎJˆkﬂÎæuáN”ÃÅÏ' 1generator/swift/Tests/MAVLinkTests/Delegate.swift f∆u§    f∆u§        æ  Å§          ®ll#ƒ:‹àb„´˚—X\áíΩ\ -generator/swift/Tests/MAVLinkTests/Info.plist     f∆u§    f∆u§        æ  Å§           AH;8¶Ê∞ˇƒm\îv]ËÕhÿÔå 5generator/swift/Tests/MAVLinkTests/MAVLink/.gitignore     f∆u§    f∆u§        æ  Å§          ì>÷>ÊÀ°∆¢o˚YÔ;âèE 5generator/swift/Tests/MAVLinkTests/MAVLinkTests.swift     f∆u§    f∆u§        æ  ÅÌ           \ƒ™Ò^œ5›vªGõ`∆Òéb}P 5generator/swift/Tests/MAVLinkTests/Modules/module.map     f∆u§    f∆u§        æ  Å§          
+Ú}“+ì˛ª"¡ÀwÜVø’Û 1generator/swift/Tests/MAVLinkTests/Testdata.swift f∆u§    f∆u§        æ  ÅÌ         \0n”}–¥)ÜM∆ïC©xŸÕ¢ =generator/swift/Tests/MAVLinkTests/Testdata/ardupilotmega.xml     f∆u§    f∆u§        æ  ÅÌ         	ÕÔióa7>ÉœwÜ¯6Sç( 6generator/swift/Tests/MAVLinkTests/Testdata/common.xml    f∆u•    f∆u•        æ  Å§         YÄ ã©≈¯:≤π+˝⁄ÂÁoPú^Ú 7generator/swift/Tests/MAVLinkTests/Testdata/flight.tlog   f∆u•    f∆u•        æ  ÅÌ          #ó;a∏Îïs˜˜â* ô–¡Ap> 8generator/swift/Tests/MAVLinkTests/Testdata/uAvionix.xml  f∆u•    f∆u•        æ  Å§          @æóft}cñˆ‰ ˘!2£¨®B¥l generator/swift/Tests/README.md   f∆u•    f∆u•        æ  ÅÌ          á?öõ˙%ﬁ†gè€6¿õoË/Fá  generator/swift/Tests/ardugen.sh  f∆u•    f∆u•        æ  Å§          hH¢¥É†Sè∆ÿÌ∞øëØ⁄Ù mavexpression.py  f∆u•    f∆u•        æ  Å§         Ëf-—c*©ıCû[6Õóùˇ mavextra.py       f∆u•    f∆u•        æ  Å§          }¯ú»@Pπ˜'5º’ﬂ5C”x 
+mavparm.py        f∆u•    f∆u•        æ   ÅÌ          hvÊT^_sˇﬁæ}ıM0{?_T mavtestgen.py     f∆u•    f∆u•        æ!  Å§         Ü367∞>|.‡SROìN<¶ú™∑!tq 
+mavutil.py        f∆u•    f∆u•        æ"  Å§          w'iØ™—qê~nKã™wË‚^© mavwp.py  f∆u•    f∆u•        æ#  Å§          +∑˘_kRüàj9µ˝é¯’.√•∑ mission.proto     f∆u•    f∆u•        æ$  Å§          &°ÌØó†à6Ç≈_ïÅaÛâÚ€≈° mission2.pb       f∆u•    f∆u•        æ%  Å§          6Ã'≥DÂq!u7
+óªù\›$3˝; pyproject.toml    f∆u•    f∆u•        æ&  Å§           cô%Øêã˜Ω˝ÕmjU§¯‰∂Ö»ÿ 
+pytest.ini        f∆u•    f∆u•        æ'  Å§          Iµﬂ‚/√4WAñY∂gï%E¬N®è quaternion.py     f∆u•    f∆u•        æ(  Å§           ÅÍùˇ•9m/æ‰≤ êcŒÀ< requirements.txt  f∆u•    f∆u•        æ)  ÅÌ          GºπÓJèÄô'ë°—ˇˆﬁ„ª!®Q 	rotmat.py f∆u•    f∆u•        æ*  Å§          õlŒ¡frıO°«J*£Úã	Ã& setup.py  f∆u•    f∆u•        æ+  ÅÌ          |∫˘eÅ;ô©•ÀŸ◊xô test_gen_js.sh    f∆u•    f∆u•        æ,  ÅÌ          [É∫ç√QE ~+‘£Å2g test_generate_all.sh      f∆u•    f∆u•        æ-  ÅÌ          	hV[ƒÎ’∆)}›Ä“RÙÒ»Õ—˘ test_generator.sh f∆u•    f∆u•        æ/  Å§          
+∆m»’HÎ¥◊¥Ôâ6ç”Äˇöï◊ tests/64-fields.xml       f∆u•    f∆u•        æ0  Å§          
+ÚH¬™XbaI+1¥ﬁ¿ó´a∞K tests/65-fields.xml       f∆u•    f∆u•        æ1  Å§           )ØÀ·˚òãóÊø £HùÄVÔÑo tests/__init__.py f∆u•    f∆u•        æ2  Å§          .¨È|"<J@OYπ¸™¨¨h˜j^ tests/fence-110.txt       f∆u•    f∆u•        æ3  Å§           Ñp_∆–±ÙQ;√Ëƒm|¬7DU}è tests/fence.txt   f∆u•    f∆u•        ¬  Å§          ”~C˙q`à(ø!∑Âó{¸Wî tests/generation/child.xml        f∆u•    f∆u•        √  Å§          6”5€%PØ3:N÷ﬂ$≈‘3‰≈  tests/generation/grandchild1.xml  f∆u•    f∆u•        ƒ  Å§          4E‡¬Rﬂ≥àö≠iÎL"uê)óè\  tests/generation/grandchild2.xml  f∆u•    f∆u•        ≈  Å§          M¸Ωp4	≥Á€]1ãw<Q?ø} tests/generation/inbred.xml       f∆u•    f∆u•        ∆  Å§           ¸¸?y'æX¸yHïû,Ω74ì tests/generation/mixin.xml        f∆u•    f∆u•        «  Å§          ô√G>ÿ≠™‘ Gî¯⁄wØ—√´ tests/generation/mixiner.xml      f∆u•    f∆u•        »  Å§           ˚ê∑atÄ*¡í¯ƒOóÜ˙+ŒrÀ? tests/generation/root.xml f∆u•    f∆u•        æ4  Å§           ¨ŒÑ*o©bÏ6$Ï"·8_; tests/rally-110.txt       f∆u•    f∆u•        æ5  Å§           t[fw9Xé2≥~Ï@6Å›ƒ»÷Öå tests/rally.txt   f∆u•    f∆u•        À  Å§          V≥…Å’–¶ ƒ©‡Éäîˆ™Ëf‹\ 0tests/snapshottests/__snapshots__/test_wlua.ambr  f∆u•    f∆u•        Õ  Å§          $XìéÃåµK-Cáıcúp@à0∞ 6tests/snapshottests/resources/autopilot_version.pcapng    f∆u•    f∆u•        Œ  Å§          Xóyuı…Dh…ò»E‹HÖkÖ :tests/snapshottests/resources/command_long_over_tcp.pcapng        f∆u•    f∆u•        œ  Å§          Xóyuı…Dh…ò»E‹HÖkÖ +tests/snapshottests/resources/common.pcapng       f∆u•    f∆u•        –  Å§         	W∞ÀEÑ¡$4èQûß]Ω•j« (tests/snapshottests/resources/common.xml  f∆u•    f∆u•        —  Å§          Ë˘∆%€QéYm§ØÛS€≈æ∂ 6tests/snapshottests/resources/gps_global_origin.pcapng    f∆u•    f∆u•        “  Å§          ∏É©R‰˜ÛÎR”øçÖ§i^ê∆á )tests/snapshottests/resources/minimal.xml f∆u•    f∆u•        ”  Å§          ¨WØéî—ALÉòn©ﬁpsRf¨ 5tests/snapshottests/resources/mission_item_int.pcapng     f∆u•    f∆u•        ‘  Å§           Ê„#πT?Vû
+æ∂*à‰√C⁄) *tests/snapshottests/resources/standard.xml        f∆u•    f∆u•        ’  Å§           1	≠¢>ªw#¯ﬁÿnçòŒSS  tests/snapshottests/test_wlua.py  f∆u•    f∆u•        æ6  Å§           £õw„∑Z‹}¨8R 9]‚H tests/test.BIN    f∆u•    f∆u•        æ7  Å§         y‹àl˜ù–Ê  ´˛XÅ+QÚ*A tests/test.BIN.dumped     f∆u•    f∆u•        æ8  Å§         †–9,¯πÎûÿü8ıö{jW-;ï}xx tests/test.BIN.py3.dumped f∆u•    f∆u•        æ9  Å§          IOñW}%É√Q}O8·Ú}·S_˝s tests/test_fgFDM.py       f∆u•    f∆u•        æ:  Å§          ÓYm∫¥ÙH8º∑AbQzt4‹‚` tests/test_mavexpression.py       f∆u•    f∆u•        æ;  ÅÌ          g6äO˚íbu…˜Ê∑hí˚!-ÒÃÜ tests/test_mavlogdump.py  f∆u•    f∆u•        æ<  Å§          ﬁD≥Ë1ˇ€ó»XN~b„ââ€¸P tests/test_mavparm.py     f∆u•    f∆u•        æ=  ÅÌ          ·Í˚˚˛¯ãuY_o≥ΩRLˇ'ù tests/test_mavxml.py      f∆u•    f∆u•        æ>  ÅÌ          0‰◊æ"{Ò#Ω‰≠}Úá·qB„ tests/test_quaternion.py  f∆u•    f∆u•        æ?  ÅÌ          ˝œÔ	bë‘ı8 OÆ&ßûä† tests/test_rotmat.py      f∆u•    f∆u•        æ@  ÅÌ          r¡LÂ+›D5‹ØH™àá$∑ Bõ tests/test_trim.py        f∆u•    f∆u•        æA  ÅÌ          #HU÷ﬂw>©ÅFE$ˇÄ„Õ9Ó¨A= tests/test_wp.py  f∆u•    f∆u•        ◊  ÅÌ          +m zdçQ¯û∆|ÓOë=∂ÿ> tools/AccelSearch.py      f∆u•    f∆u•        ÿ  ÅÌ          '..˝ÅÔ:LÑ›±[ÓÅ_:í tools/MPU6KSearch.py      f∆u•    f∆u•        Ÿ  Å§           V?Uı∞-Cëo£ÇÁö°œ… tools/__init__.py f∆u•    f∆u•        ⁄  ÅÌ          ˝óüoy=‚ó¢Çâ1˘¬‚≥ÎVÈÈ tools/extract_batch_imu.py        f∆u•    f∆u•        €  ÅÌ          ˚ªã'∫KTÖÄØÏL#U¥ÏKâ tools/extract_parms.py    f∆u•    f∆u•        ‹  ÅÌ          Ó	ˆ≠h£ìñ6ô=≥æ7/¨B∑ tools/find_aliasing.py    f∆u•    f∆u•        ﬁ  Å§          <ŒgπÅ		Rî)?j»km tools/images/gtk-quit.gif f∆u•    f∆u•        ﬂ  Å§          :Mƒ9∑Ü¡âÎö0E∏4dq%E⁄Ñá %tools/images/media-playback-pause.gif     f∆u•    f∆u•        ‡  Å§          4ÏA69ïUe/(`ª„Is@lRÈ %tools/images/media-playback-start.gif     f∆u•    f∆u•        ·  Å§          10bq®ûÛT|'˙π6Œ£˘Bßõ≥~ $tools/images/media-playback-stop.gif      f∆u•    f∆u•        ‚  Å§          ?#¸ˆÿ#Mı¸Õ‚∑›{F+jõñ $tools/images/media-seek-backward.gif      f∆u•    f∆u•        „  Å§          B49≈O“UUxâ!"YE(ız #tools/images/media-seek-forward.gif       f∆u•    f∆u•        ‰  Å§          +îñï}"Îb¯ŒsBÕ9ÌRÃ⁄/Û tools/images/player_end.gif       f∆u•    f∆u•        Â  Å§          œãƒ≤5|T¶Q≤€ÓJ/ìˆ€‘ tools/isb_extract.py      f∆u•    f∆u•        Ê  ÅÌ          †ò‰PS˙pﬂyd∑~«⁄ÃÚ›¯—ƒˆ tools/magfit.py   f∆u•    f∆u•        Á  ÅÌ          I \Öˆ[U@ Äçä$◊-w[Ô tools/magfit_WMM.py       f∆u•    f∆u•        Ë  ÅÌ          	6¢¶k(˙âèøœ3}°îÖIñØ tools/magfit_compassmot.py        f∆u•    f∆u•        È  ÅÌ          †Tö°ﬂÂ›ΩÏ˛H⁄.>LØæﬁ tools/magfit_delta.py     f∆u•    f∆u•        Í  ÅÌ          .Ó$i0Fa‹V◊HM	µ4Ùˇk tools/magfit_elliptical.py        f∆u•    f∆u•        Î  ÅÌ          `€µ÷èúd§‚‰»°ÓûY+M¿u tools/magfit_gps.py       f∆u•    f∆u•        Ï  ÅÌ          ¿5‘ZÂ0R∂jìé’·ß©≈ºéèà tools/magfit_motors.py    f∆u•    f∆u•        Ì  ÅÌ          WÅ_‘˝o¢8†
+7TÛ◊6z|’PY tools/magfit_rotation_gps.py      f∆u•    f∆u•        Ó  ÅÌ          }w˙>©Và$ÁZ‡í&)Nã;@ tools/magfit_rotation_gyro.py     f∆u•    f∆u•        Ô  ÅÌ          mCÕ!âå·—ä¨˝v]˚t-˜ tools/mavextract.py       f∆u•    f∆u•          ÅÌ          	∫‚èºç¯Ö®6Ãe?gãÓ± tools/mavfft.py   f∆u•    f∆u•        Ò  ÅÌ           3uaüπ{ÅL∆‚°9xöù∞hx tools/mavfft_int.py       f∆u•    f∆u•        Ú  ÅÌ          <öm•å¥ ÃPoZîûÙºg‚nf‘·‹ tools/mavfft_isb.py       f∆u•    f∆u•        Û  ÅÌ          -Õà"k∏O|¸ñåœ‹ƒPÃ,Sﬁ tools/mavfft_pid.py       f∆u•    f∆u•        Ù  ÅÌ          	aç_ıöƒe6ÖX´ﬂ±˜ï"<Ÿ< tools/mavfixtimedrift.py  f∆u•    f∆u•        ı  ÅÌ          
+÷zÔAã%F?µ‰r“ã¡4t\ù@ô tools/mavflightmodes.py   f∆u•    f∆u•        ˆ  ÅÌ          
+∑Ω∆‰∆ô˝˙ı˘‘È3ô^í§—zÏ€ tools/mavflighttime.py    f∆u•    f∆u•        ˜  ÅÌ          öVi˜©˚Œa`À „Jÿ≥Û´0ø"¡ tools/mavftpdecode.py     f∆u•    f∆u•        ¯  ÅÌ          ¢Ö◊>&ˇCÎK˚:πc§Dæ‡∆ tools/mavgen.py   f∆u•    f∆u•        ˘  ÅÌ          cΩˇ óƒglÔ√u©K±«—öòŒ– tools/mavgps_CEP.py       f∆u¶    f∆u¶        ˙  ÅÌ          É.'eÅ„g˝ÛL®ÂD¢t›™≠ tools/mavgpslag.py        f∆u¶    f∆u¶        ˚  ÅÌ          '{›t^5%%ﬁÌª…ÜÍ>z+ tools/mavgpslock.py       f∆u¶    f∆u¶        ¸  ÅÌ          .[+0 ´…(ciD√ÖÌ∂W tools/mavgraph.py f∆u¶    f∆u¶        ˝  ÅÌ          º’FgÄ£ö[›S|ß∞C·*ET+ tools/mavkml.py   f∆u¶    f∆u¶        ˛  ÅÌ          ™û=gÉ≤⁄‡ E-Y∫∆ˇ~X f  tools/mavlink_bitmask_decoder.py  f∆u¶    f∆u¶        ˇ  Å§          UπÊUÔ„≈«˜ZHu5ö•jïúN tools/mavlink_messages_size.py    f∆u¶    f∆u¶           ÅÌ          >˚ä„t-d° aFÓµO(∫
+”˝ı tools/mavlogdump.py       f∆u¶    f∆u¶          ÅÌ          öÓ∆…ÈˇÕßZbl~r
+
+lﬁ"’ tools/mavloss.py  f∆u¶    f∆u¶          ÅÌ          ®+Ë(¢æ Çµ
+„â÷4ÅqDNõÀ tools/mavmerge.py f∆u¶    f∆u¶          ÅÌ          	ë…G)kñÔ…Ê(†$‘÷Çì tools/mavmission.py       f∆u¶    f∆u¶          ÅÌ          
+·é∑÷‡v)1Áz|5d
+Y,ΩµG©x tools/mavmsgstats.py      f∆u¶    f∆u¶          ÅÌ          [ÔòúG\ud9î»∞a”P˛ïu5 tools/mavparmdiff.py      f∆u¶    f∆u¶          ÅÌ          i¬ØúaÁögfÒbÊOYRﬂÑød9 tools/mavparms.py f∆u¶    f∆u¶          ÅÌ          "-s˘ÿ3ÿ;µ2]‚±û«/tdB∞ö tools/mavplayback.py      f∆u¶    f∆u¶          ÅÌ          ú]<KwÃ(ø;+–È ø tools/mavsearch.py        f∆u¶    f∆u¶        	  ÅÌ          §˘≈u/‚∑ô6*ﬁ`‰LX,'ßXï tools/mavsigloss.py       f∆u¶    f∆u¶        
+  ÅÌ          +oì$˙‘ÿ˛◊8´Ï“Øä‘„I'π tools/mavsplit_sysid.py   f∆u¶    f∆u¶          Å§          áUﬂ*$êÒä«ô[TÅ=^I“ôèü tools/mavsummarize.py     f∆u¶    f∆u¶          Å§          #D<â∑E”<ƒ}´J‰∑°¢ tools/mavtelemetry_datarates.py   f∆u¶    f∆u¶          ÅÌ          9<≤:bŸËÊB8L)È§Oå›ä tools/mavtogpx.py f∆u¶    f∆u¶          ÅÌ          Uoå4≥˘y®ﬁd2D(Gá\z tools/mavtomfile.py       f∆u¶    f∆u¶          Å§          
+~¨qUª¡L(&∞É3àﬁ4	ã«’ tools/python_array_test_recv.py   f∆u¶    f∆u¶          Å§          SŸ„ÄcF(F≈™tNLåà◊ì>‹ tools/python_array_test_send.py   f∆u¶    f∆u¶          ÅÌ          Í{≥¨Û_ä…÷ù©OQ‘@ÉÆ≤’F  tools/serial_control_to_shell.py  f∆u¶    f∆u¶          ÅÌ          T2ˆ*¡µ'f…ñ]ıCﬂdŒŸÄ∞™ tools/sertotcp.py TREE  - 305 8
+ØçxàﬁùY¸n(p[)IrﬁÖÌfiles 1 1
+]‰Ø°(Y∫fõ óÜF<v9archlinux 1 0
+s—„¨é„ ®$=…Ê»¢–”tests 36 2
+Y/(éI`µYâ7f49∫,@generation 7 0
+∞6ÎûﬁÉ ë⁄˘Çc◊ÓHﬂsnapshottests 10 2
+C˘Á\gŸµcŸyû∆¥resources 8 0
+ûuπ eπÙè⁄à≥ufA'Ç__snapshots__ 1 0
+núﬂ¨ªV™$q™ÁA˚}:ó4∫Rtools 59 1
+ç∫ÛõåÃ‰x©aq˛>T7èÕimages 7 0
+∂©ÒüìP√µíÛ\ocá§p∫.github 3 1
+∏\ë@ÚÀ=˛ç∆IJÀÚ§^>ÿworkflows 3 0
+Áí„∫òbˆÏ‘u∞ìÄﬁóSÿÅdialects 8 3
+≥œ_s◊’Bœˆ®†\+.⁄	›v09 2 1
+ú˝]™ï££]Ω-/Ô¥ÑMÃpython2 1 0
+ùœ⁄Ò¶Ö|_É‹'úv ·ˇØ¯v10 2 1
+ú˝]™ï££]Ω-/Ô¥ÑMÃpython2 1 0
+ùœ⁄Ò¶Ö|_É‹'úv ·ˇØ¯v20 2 1
+ú˝]™ï££]Ω-/Ô¥ÑMÃpython2 1 0
+ùœ⁄Ò¶Ö|_É‹'úv ·ˇØ¯examples 16 0
+në√øG.YNıµ8–¥¢ñ"àúgenerator 152 8
+m{i–∑=¢∂≤Õ‡í¡`º®`C 39 4
+…˚CˆO|ü5:›Vt;6˝Äw®ktest 13 2
+ì"¥ÃÜ‚üù˙RäÕßú”lÀgposix 6 0
+Xàí5¨w™±ö◊ÍÈÒíπ)n⁄îwindows 7 0
+Lââﬂã1Âàˆ~€Ø¡ô•1éÒinclude_v0.9 9 1
+ˇ MÓí*ÑV…ŒZ¡äX`\test 5 0
+òÌ∏'\}ü9!EL.Üˆ±ÌÚinclude_v1.0 10 1
+@Ù'ÎL±Ù8]´;Söâ6_ñÊÇtest 5 0
+±0SN—‹∫IÿæéHDaxÏginclude_v2.0 7 0
+s/Ü ¸—ﬂÖ$˛±rY&0dŸ;CS 5 0
+È≤‰„æQ\Ì%√äÇK7ïˇ¶Ada 10 1
+)S¬xI¶€≤»Qz¨ m…_Ö£Zexamples 5 0
+Ó=Å~!è-I˙ûü~‘ôıÂßı/.java 9 2
+´ŸoÑ«_úI≠¢≥…Í.~ΩÊ…ü®lib 7 1
+fä:=®ûø∫ä7ﬂ¸êã	6PD9Messages 6 0
+Ni•Â3Úq˙@§∑Q∞∆s®J≠examples 2 0
+nπQhx*2ƒ÷ªü≠Õ–;(çÒCPP11 5 2
+éJ:e4úë™"-óJr@X·S“Itest 3 1
+˙º÷´,«6øõóAW_ô´NÂposix 3 0
+¶´VS◊±JfJΩ_ò‡Òá˚Y‘Ginclude_v2.0 2 0
+R|K˛!Ã0¸G|üß)òåHswift 23 1
+(¸‹â6L˚“ä#ôƒk±“CÛTests 21 3
+É39ú‡·ñÄ1}Ù˜;$+,ÄÙMAVLink 5 3
+†‘ÍD›…Î∑Q¨÷6èçªú^ΩMAVLink 1 0
+Áú`CMmE5§¬ÇÃ∏*–èBase.lproj 1 0
+ÈﬂLã¢˛Ü_ôù	£®	˘¨ÓuAssets.xcassets 1 1
+ñ*ö≈∑`ñÅıí?8_':T˛ƒAppIcon.appiconset 1 0
+â>›,°BûAÕÎa\è˙Á‹9MAVLinkTests 12 3
+"øÚ∏eºÓ¶¸«ÈH¢ä[£m.MAVLink 1 0
+Áú`CMmE5§¬ÇÃ∏*–èModules 1 0
+à>ïÁºCFΩ&	ˇ¨˚¡K[“XTestdata 4 0
+		ùJlw~¬Ã.RL‡¿g•(ÀöMAVLink.xcodeproj 1 0
+æM5u(ËﬁôLﬁ∏1î	∆5©Ærjavascript 28 3
+ôä˙∂+ôÑ°+åÓàOØ&·∂&≤Qtest 8 0
+‹™îeƒ†”Â|‹÷'˛!node_modules 2 0
+tnbƒ8_ÈÁ7¬'_Ã+–ælocal_modules 12 2
+'º¨¡lY»ÈêùHX
+ât7“long 5 1
+
+öp≠ ú]¶π09rüú¢—y⁄Êsrc 1 0
+_D∏∞Ò∂`˝›∫“~RÖ˝¬ÉÓ)xjspack 6 1
+ñb˙uZÉ[@aΩ#äq|A±ìHtest 1 0
+◊®øíÂZ¿\Å8>û5‘∑	\™oUjavascript_stable 11 1
+7Áö	!ª*¯ùüYåË~/køtest 5 0
+‘◊…èÄÅ9,pW≠dôYYÔÎùAPM_Mavtest 2 0
+mRÿ3b¶dˆ…ø‹=ØÄ@&dùœ÷8ùRΩA$;2|r][                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           8ba67079211a4315681bc84a44c37b383448d664
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #include "a.h"
+
+A::A( ) { }
+
+A::~A( ) { }
+
+int A::add(int a, int b) {
+	return a + b;
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        // must fail
+1+1;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              int main() {return 0;}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #! /usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2011 (ita)
+
+"""
+Map a compilation failure to a success status. People playing with C++ templates
+might need this.
+"""
+
+top = '.'
+out = 'build'
+
+def options(opt):
+	opt.load('compiler_cxx')
+
+def configure(conf):
+	conf.load('compiler_cxx')
+
+def build(bld):
+	bld.objects(source='success.cpp', target='ok')
+	bld.objects(source='fail.cpp', target='fail', features='fail')
+
+##################################################################
+# the feature 'fail' is defined below
+
+from waflib.Tools.cxx import cxx
+
+# our task class
+class cxxfail(cxx):
+	def run(self):
+		ret = super(cxxfail, self).run()
+		self.outputs[0].write('just a simulation')
+		return not ret
+
+# @extension would apply this to all through TaskGen.mappings
+def one_more_mapping(self, node):
+	return self.create_compiled_task('cxxfail', node)
+
+from waflib.TaskGen import feature, before
+@before('process_source')
+@feature('fail')
+def remap_failure_to_success(self):
+	# override
+	self.mappings = dict(self.mappings)
+	# then change the extension processing
+	self.mappings['.cpp'] = one_more_mapping
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #! /usr/bin/env python
+
+"""
+Create a few c programs, measure the execution times on "waf times"
+"""
+
+def options(opt):
+	opt.load('compiler_c')
+
+def configure(conf):
+	conf.load('compiler_c')
+
+def build(bld):
+
+	# add a task to create a .c file
+	from waflib.TaskGen import feature, before_method
+	@feature('foo')
+	@before_method('process_source')
+	def add_one_c_file(self):
+		node = self.path.find_or_declare('main%d.c' % self.num)
+		self.create_task('write_file', [], node)
+		self.source = [node] # add the .c file to the list of source
+
+	# write a slow main.c file
+	from waflib.Task import Task
+	class write_file(Task):
+		def run(self):
+			self.outputs[0].write('''
+#include <stdio.h>
+int main() {
+	int i;
+	char buf[50];
+	for (i=0; i < %d; ++i) {
+		sprintf(buf, "%%l\\n", i);
+	}
+	return 0;
+}''' % 2 ** (13 + self.generator.num))
+
+	for i in range(10):
+		# create a few programs
+		bld(features='foo c cprogram', num=i, target='app%d' % i)
+
+	if bld.cmd == 'times':
+		# measure the execution times when calling "waf times"
+		def measure(ctx):
+			for x in range(10):
+				tg = ctx.get_tgen_by_name('app%d' % x)
+				name = tg.link_task.outputs[0].abspath()
+				ctx.exec_command('time %s' % name, shell=True)
+		bld.add_post_fun(measure)
+
+from waflib.Build import BuildContext
+class times(BuildContext):
+	cmd = 'times'
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #! /usr/bin/env python
+# encoding: utf-8
+# J√©r√¥me Carretero, 2012 (zougloub)
+# Put this file in ti-dsplink-tree/dsplink/dsp/src/samples/message
+
+def options(opt):
+	opt.load('ticgt')
+
+def configure(cfg):
+	cfg.load("ticgt")
+	cfg.env.INCLUDES += ['.']
+
+	#if cfg.env.CC_NAME == 'ticc':
+	# Take them from the _cflags.txt file
+	cfg.env.CFLAGS += "-o3 -q -pdr -pdv -pden -ml3 -mv6740 --disable:sploop".split()
+	cfg.env.LINKFLAGS += "-c -x".split()
+
+	# Experimental functions, please comment
+	cfg.ti_dsplink_set_platform_flags("OMAPL138", "C674X", "5.XX", "OMAPL138GEM")
+	cfg.ti_set_debug(0)
+
+def build(bld):
+	bld(
+	 target="message",
+	 features="c ti-tconf",
+	 source=[
+	  'DspBios/5.XX/OMAPL138GEM/message.tcf',
+	  'DspBios/5.XX/OMAPL138GEM/message.cmd',
+	  ],
+	 includes='.', # because we need message.tci
+	 use=['DSPLINK', 'DSPBIOS' ], # we need them
+	)
+
+	bld(
+	 target='messagelib',
+	 features='c cstlib',
+	 source=bld.path.ant_glob('*.c'),
+	 use=[
+	  'DSPBIOS', 'DSPLINK',
+	 ],
+	 # Taken from DSP/Link generated _defines.txt files, replaced a -D by a -d
+	 defines=' -dTSK_MODE -dMAX_DSPS=1 -dMAX_PROCESSORS=2 -dID_GPP=1 -dOMAPL138 -dPROC_COMPONENT -dPOOL_COMPONENT -dNOTIFY_COMPONENT -dMPCS_COMPONENT -dRINGIO_COMPONENT -dMPLIST_COMPONENT -dMSGQ_COMPONENT -dMSGQ_ZCPY_LINK -dCHNL_COMPONENT -dCHNL_ZCPY_LINK -dZCPY_LINK -dPROCID=0 -dDA8XXGEM -dDA8XXGEM_INTERFACE=SHMEM_INTERFACE -dPHYINTERFACE=SHMEM_INTERFACE -dDSP_SWI_MODE'.split(" -d")[1:] + [
+	 ],
+	)
+
+	bld(
+	 target='message-demo',
+	 features='c cprogram',
+	 use=[
+	  'messagelib',
+	  'message',
+	 ],
+	)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         *.o
+.conf_check_*
+c4che
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        

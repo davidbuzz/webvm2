@@ -1,0 +1,3331 @@
+ansmission
+            pending_tx_[i].aborted = true;
+            PERF_STATS(stats.tx_timedout);
+        }
+    }
+}
+
+void CANIface::clear_rx()
+{
+    CriticalSectionLocker lock;
+    rx_queue_.clear();
+}
+
+void CANIface::pollErrorFlags()
+{
+    CriticalSectionLocker cs_locker;
+    pollErrorFlagsFromISR();
+}
+
+bool CANIface::canAcceptNewTxFrame(const AP_HAL::CANFrame& frame) const
+{
+    /*
+     * We can accept more frames only if the following conditions are satisfied:
+     *  - There is at least one TX mailbox free (obvious enough);
+     *  - The priority of the new frame is higher than priority of all TX mailboxes.
+     */
+    {
+        static const uint32_t TME = bxcan::TSR_TME0 | bxcan::TSR_TME1 | bxcan::TSR_TME2;
+        const uint32_t tme = can_->TSR & TME;
+
+        if (tme == TME) {   // All TX mailboxes are free (as in freedom).
+            return true;
+        }
+
+        if (tme == 0) {     // All TX mailboxes are busy transmitting.
+            return false;
+        }
+    }
+
+    /*
+     * The second condition requires a critical section.
+     */
+    CriticalSectionLocker lock;
+
+    for (int mbx = 0; mbx < NumTxMailboxes; mbx++) {
+        if (!(pending_tx_[mbx].pushed || pending_tx_[mbx].aborted) && !frame.priorityHigherThan(pending_tx_[mbx].frame)) {
+            return false;       // There's a mailbox whose priority is higher or equal the priority of the new frame.
+        }
+    }
+
+    return true;                // This new frame will be added to a free TX mailbox in the next @ref send().
+}
+
+bool CANIface::isRxBufferEmpty() const
+{
+    CriticalSectionLocker lock;
+    return rx_queue_.available() == 0;
+}
+
+#if !defined(HAL_BUILD_AP_PERIPH) && !defined(HAL_BOOTLOADER_BUILD)
+uint32_t CANIface::getErrorCount() const
+{
+    CriticalSectionLocker lock;
+    return stats.num_busoff_err +
+           stats.rx_errors +
+           stats.rx_overflow +
+           stats.tx_rejected +
+           stats.tx_abort +
+           stats.tx_timedout;
+}
+
+#endif // #if !defined(HAL_BUILD_AP_PERIPH) && !defined(HAL_BOOTLOADER_BUILD)
+
+bool CANIface::set_event_handle(AP_HAL::BinarySemaphore *handle)
+{
+    sem_handle = handle;
+    return true;
+}
+
+
+void CANIface::checkAvailable(bool& read, bool& write, const AP_HAL::CANFrame* pending_tx) const
+{
+    write = false;
+    read = !isRxBufferEmpty();
+
+    if (pending_tx != nullptr) {
+        write = canAcceptNewTxFrame(*pending_tx);
+    }
+}
+
+bool CANIface::select(bool &read, bool &write,
+                      const AP_HAL::CANFrame* pending_tx,
+                      uint64_t blocking_deadline)
+{
+    const bool in_read = read;
+    const bool in_write= write;
+    uint64_t time = AP_HAL::micros64();
+
+    if (!read && !write) {
+        //invalid request
+        return false;
+    }
+
+    discardTimedOutTxMailboxes(time);              // Check TX timeouts - this may release some TX slots
+    pollErrorFlags();
+
+    checkAvailable(read, write, pending_tx);          // Check if we already have some of the requested events
+    if ((read && in_read) || (write && in_write)) {
+        return true;
+    }
+
+#if !defined(HAL_BUILD_AP_PERIPH) && !defined(HAL_BOOTLOADER_BUILD)
+    // we don't support blocking select in AP_Periph and bootloader
+    while (time < blocking_deadline) {
+        if (sem_handle == nullptr) {
+            break;
+        }
+        IGNORE_RETURN(sem_handle->wait(blocking_deadline - time)); // Block until timeout expires or any iface updates
+        checkAvailable(read, write, pending_tx);  // Check what we got
+        if ((read && in_read) || (write && in_write)) {
+            return true;
+        }
+        time = AP_HAL::micros64();
+    }
+#endif // #if !defined(HAL_BUILD_AP_PERIPH) && !defined(HAL_BOOTLOADER_BUILD)
+    return true;
+}
+
+void CANIface::initOnce(bool enable_irq)
+{
+    /*
+     * CAN1, CAN2
+     */
+    {
+        CriticalSectionLocker lock;
+        switch (can_interfaces[self_index_]) {
+        case 0:
+#if defined(RCC_APB1ENR1_CAN1EN)
+            RCC->APB1ENR1 |=  RCC_APB1ENR1_CAN1EN;
+            RCC->APB1RSTR1 |=  RCC_APB1RSTR1_CAN1RST;
+            RCC->APB1RSTR1 &= ~RCC_APB1RSTR1_CAN1RST;
+#else
+            RCC->APB1ENR  |=  RCC_APB1ENR_CAN1EN;
+            RCC->APB1RSTR |=  RCC_APB1RSTR_CAN1RST;
+            RCC->APB1RSTR &= ~RCC_APB1RSTR_CAN1RST;
+#endif
+            break;
+#if defined(RCC_APB1ENR1_CAN2EN)
+        case 1:
+            RCC->APB1ENR1  |=  RCC_APB1ENR1_CAN2EN;
+            RCC->APB1RSTR1 |=  RCC_APB1RSTR1_CAN2RST;
+            RCC->APB1RSTR1 &= ~RCC_APB1RSTR1_CAN2RST;
+            break;
+#elif defined(RCC_APB1ENR_CAN2EN)
+        case 1:
+            RCC->APB1ENR  |=  RCC_APB1ENR_CAN2EN;
+            RCC->APB1RSTR |=  RCC_APB1RSTR_CAN2RST;
+            RCC->APB1RSTR &= ~RCC_APB1RSTR_CAN2RST;
+            break;
+#endif
+#ifdef RCC_APB1ENR_CAN3EN
+        case 2:
+            RCC->APB1ENR  |=  RCC_APB1ENR_CAN3EN;
+            RCC->APB1RSTR |=  RCC_APB1RSTR_CAN3RST;
+            RCC->APB1RSTR &= ~RCC_APB1RSTR_CAN3RST;
+            break;
+#endif
+        }
+    }
+
+    /*
+     * IRQ
+     */
+    if (!irq_init_ && enable_irq) {
+        CriticalSectionLocker lock;
+        switch (can_interfaces[self_index_]) {
+        case 0:
+#ifdef HAL_CAN_IFACE1_ENABLE
+            nvicEnableVector(CAN1_TX_IRQn,  CORTEX_MAX_KERNEL_PRIORITY);
+            nvicEnableVector(CAN1_RX0_IRQn, CORTEX_MAX_KERNEL_PRIORITY);
+            nvicEnableVector(CAN1_RX1_IRQn, CORTEX_MAX_KERNEL_PRIORITY);
+#endif
+            break;
+        case 1:
+#ifdef HAL_CAN_IFACE2_ENABLE
+            nvicEnableVector(CAN2_TX_IRQn,  CORTEX_MAX_KERNEL_PRIORITY);
+            nvicEnableVector(CAN2_RX0_IRQn, CORTEX_MAX_KERNEL_PRIORITY);
+            nvicEnableVector(CAN2_RX1_IRQn, CORTEX_MAX_KERNEL_PRIORITY);
+#endif
+            break;
+        case 2:
+#ifdef HAL_CAN_IFACE3_ENABLE
+            nvicEnableVector(CAN3_TX_IRQn,  CORTEX_MAX_KERNEL_PRIORITY);
+            nvicEnableVector(CAN3_RX0_IRQn, CORTEX_MAX_KERNEL_PRIORITY);
+            nvicEnableVector(CAN3_RX1_IRQn, CORTEX_MAX_KERNEL_PRIORITY);
+#endif
+            break;
+        }
+        irq_init_ = true;
+    }
+}
+
+bool CANIface::init(const uint32_t bitrate, const CANIface::OperatingMode mode)
+{
+    Debug("Bitrate %lu mode %d", static_cast<unsigned long>(bitrate), static_cast<int>(mode));
+    if (self_index_ > HAL_NUM_CAN_IFACES) {
+        Debug("CAN drv init failed");
+        return false;
+    }
+    if (can_ifaces[self_index_] == nullptr) {
+        can_ifaces[self_index_] = this;
+#if !defined(HAL_BOOTLOADER_BUILD)
+        AP_HAL::get_HAL_mutable().can[self_index_] = this;
+#endif
+    }
+
+    bitrate_ = bitrate;
+    mode_ = mode;
+
+    if (can_ifaces[0] == nullptr) {
+        can_ifaces[0] = NEW_NOTHROW CANIface(0);
+        Debug("Failed to allocate CAN iface 0");
+        if (can_ifaces[0] == nullptr) {
+            return false;
+        }
+    }
+    if (self_index_ == 1 && !can_ifaces[0]->is_initialized()) {
+        Debug("Iface 0 is not initialized yet but we need it for Iface 1, trying to init it");
+        Debug("Enabling CAN iface 0");
+        can_ifaces[0]->initOnce(false);
+        Debug("Initing iface 0...");
+        if (!can_ifaces[0]->init(bitrate, mode)) {
+            Debug("Iface 0 init failed");
+            return false;
+        }
+
+        Debug("Enabling CAN iface");
+    }
+    initOnce(true);
+    /*
+     * We need to silence the controller in the first order, otherwise it may interfere with the following operations.
+     */
+    {
+        CriticalSectionLocker lock;
+
+        can_->MCR &= ~bxcan::MCR_SLEEP; // Exit sleep mode
+        can_->MCR |= bxcan::MCR_INRQ;   // Request init
+
+        can_->IER = 0;                  // Disable interrupts while initialization is in progress
+    }
+
+    if (!waitMsrINakBitStateChange(true)) {
+        Debug("MSR INAK not set");
+        can_->MCR = bxcan::MCR_RESET;
+        return false;
+    }
+
+    /*
+     * Object state - interrupts are disabled, so it's safe to modify it now
+     */
+    rx_queue_.clear();
+
+    for (uint32_t i=0; i < NumTxMailboxes; i++) {
+        pending_tx_[i] = CanTxItem();
+    }
+    had_activity_ = false;
+
+    /*
+     * CAN timings for this bitrate
+     */
+    Timings timings;
+    if (!computeTimings(bitrate, timings)) {
+        can_->MCR = bxcan::MCR_RESET;
+        return false;
+    }
+    Debug("Timings: presc=%u sjw=%u bs1=%u bs2=%u",
+          unsigned(timings.prescaler), unsigned(timings.sjw), unsigned(timings.bs1), unsigned(timings.bs2));
+
+    /*
+     * Hardware initialization (the hardware has already confirmed initialization mode, see above)
+     */
+    can_->MCR = bxcan::MCR_ABOM | bxcan::MCR_AWUM | bxcan::MCR_INRQ;  // RM page 648
+
+    can_->BTR = ((timings.sjw & 3U)  << 24) |
+                ((timings.bs1 & 15U) << 16) |
+                ((timings.bs2 & 7U)  << 20) |
+                (timings.prescaler & 1023U) |
+                ((mode == SilentMode) ? bxcan::BTR_SILM : 0);
+
+    can_->IER = bxcan::IER_TMEIE |   // TX mailbox empty
+                bxcan::IER_FMPIE0 |  // RX FIFO 0 is not empty
+                bxcan::IER_FMPIE1;   // RX FIFO 1 is not empty
+
+    can_->MCR &= ~bxcan::MCR_INRQ;   // Leave init mode
+
+    if (!waitMsrINakBitStateChange(false)) {
+        Debug("MSR INAK not cleared");
+        can_->MCR = bxcan::MCR_RESET;
+        return false;
+    }
+
+    /*
+     * Default filter configuration
+     */
+    if (self_index_ == 0) {
+        can_->FMR |= bxcan::FMR_FINIT;
+
+        can_->FMR &= 0xFFFFC0F1;
+        can_->FMR |= static_cast<uint32_t>(NumFilters) << 8;  // Slave (CAN2) gets half of the filters
+
+        can_->FFA1R = 0;                           // All assigned to FIFO0 by default
+        can_->FM1R = 0;                            // Indentifier Mask mode
+
+#if HAL_NUM_CAN_IFACES > 1
+        can_->FS1R = 0x7ffffff;                    // Single 32-bit for all
+        can_->FilterRegister[0].FR1 = 0;          // CAN1 accepts everything
+        can_->FilterRegister[0].FR2 = 0;
+        can_->FilterRegister[NumFilters].FR1 = 0; // CAN2 accepts everything
+        can_->FilterRegister[NumFilters].FR2 = 0;
+        can_->FA1R = 1 | (1 << NumFilters);        // One filter per each iface
+#else
+        can_->FS1R = 0x1fff;
+        can_->FilterRegister[0].FR1 = 0;
+        can_->FilterRegister[0].FR2 = 0;
+        can_->FA1R = 1;
+#endif
+
+        can_->FMR &= ~bxcan::FMR_FINIT;
+    }
+    initialised_ = true;
+
+    return true;
+}
+
+#if !defined(HAL_BUILD_AP_PERIPH) && !defined(HAL_BOOTLOADER_BUILD)
+void CANIface::get_stats(ExpandingString &str)
+{
+    CriticalSectionLocker lock;
+    str.printf("tx_requests:    %lu\n"
+               "tx_rejected:    %lu\n"
+               "tx_success:     %lu\n"
+               "tx_timedout:    %lu\n"
+               "tx_abort:       %lu\n"
+               "rx_received:    %lu\n"
+               "rx_overflow:    %lu\n"
+               "rx_errors:      %lu\n"
+               "num_busoff_err: %lu\n"
+               "num_events:     %lu\n"
+               "ESR:            %lx\n",
+               stats.tx_requests,
+               stats.tx_rejected,
+               stats.tx_success,
+               stats.tx_timedout,
+               stats.tx_abort,
+               stats.rx_received,
+               stats.rx_overflow,
+               stats.rx_errors,
+               stats.num_busoff_err,
+               stats.num_events,
+               stats.esr);
+}
+#endif
+
+/*
+ * Interrupt handlers
+ */
+extern "C"
+{
+#ifdef HAL_CAN_IFACE1_ENABLE
+    // CAN1
+    CH_IRQ_HANDLER(CAN1_TX_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN1_TX_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleTxInterrupt(0);
+        CH_IRQ_EPILOGUE();
+    }
+
+    CH_IRQ_HANDLER(CAN1_RX0_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN1_RX0_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleRxInterrupt(0, 0);
+        CH_IRQ_EPILOGUE();
+    }
+
+    CH_IRQ_HANDLER(CAN1_RX1_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN1_RX1_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleRxInterrupt(0, 1);
+        CH_IRQ_EPILOGUE();
+    }
+#endif
+
+#ifdef HAL_CAN_IFACE2_ENABLE
+    // CAN2
+    CH_IRQ_HANDLER(CAN2_TX_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN2_TX_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleTxInterrupt(1);
+        CH_IRQ_EPILOGUE();
+    }
+
+    CH_IRQ_HANDLER(CAN2_RX0_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN2_RX0_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleRxInterrupt(1, 0);
+        CH_IRQ_EPILOGUE();
+    }
+
+    CH_IRQ_HANDLER(CAN2_RX1_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN2_RX1_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleRxInterrupt(1, 1);
+        CH_IRQ_EPILOGUE();
+    }
+#endif
+
+#ifdef HAL_CAN_IFACE3_ENABLE
+    // CAN3
+    CH_IRQ_HANDLER(CAN3_TX_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN3_TX_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleTxInterrupt(2);
+        CH_IRQ_EPILOGUE();
+    }
+
+    CH_IRQ_HANDLER(CAN3_RX0_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN3_RX0_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleRxInterrupt(2, 0);
+        CH_IRQ_EPILOGUE();
+    }
+
+    CH_IRQ_HANDLER(CAN3_RX1_IRQ_Handler);
+    CH_IRQ_HANDLER(CAN3_RX1_IRQ_Handler)
+    {
+        CH_IRQ_PROLOGUE();
+        handleRxInterrupt(2, 1);
+        CH_IRQ_EPILOGUE();
+    }
+#endif
+    
+} // extern "C"
+
+#endif //!defined(STM32H7XX)
+
+#endif //HAL_NUM_CAN_IFACES
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andy Piper and the betaflight team
+ */
+
+#include <hal.h>
+#include "AP_HAL_ChibiOS.h"
+
+#if HAL_WITH_DSP
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <GCS_MAVLink/GCS.h>
+#include "DSP.h"
+#include <cmath>
+
+using namespace ChibiOS;
+
+#if DEBUG_FFT
+#define TIMER_START(timer) \
+void *istate = hal.scheduler->disable_interrupts_save(); \
+uint32_t timer##now = AP_HAL::micros()
+#define TIMER_END(timer) timer.time(timer##now); \
+hal.scheduler->restore_interrupts(istate)
+#else
+#define TIMER_START(timer)
+#define TIMER_END(timer)
+#endif
+
+#define TICK_CYCLE 10
+
+extern const AP_HAL::HAL& hal;
+
+// The algorithms originally came from betaflight but are now substantially modified based on theory and experiment.
+// https://holometer.fnal.gov/GH_FFT.pdf "Spectrum and spectral density estimation by the Discrete Fourier transform (DFT),
+// including a comprehensive list of window functions and some new flat-top windows." - Heinzel et. al is a great reference
+// for understanding the underlying theory although we do not use spectral density here since time resolution is equally
+// important as frequency resolution. Referred to as [Heinz] throughout the code.
+
+// initialize the FFT state machine
+AP_HAL::DSP::FFTWindowState* DSP::fft_init(uint16_t window_size, uint16_t sample_rate, uint8_t sliding_window_size)
+{
+    DSP::FFTWindowStateARM* fft = NEW_NOTHROW DSP::FFTWindowStateARM(window_size, sample_rate, sliding_window_size);
+    if (fft == nullptr || fft->_hanning_window == nullptr || fft->_rfft_data == nullptr || fft->_freq_bins == nullptr || fft->_derivative_freq_bins == nullptr) {
+        delete fft;
+        return nullptr;
+    }
+    return fft;
+}
+
+// start an FFT analysis
+void DSP::fft_start(FFTWindowState* state, FloatBuffer& samples, uint16_t advance)
+{
+    step_hanning((FFTWindowStateARM*)state, samples, advance);
+}
+
+// perform remaining steps of an FFT analysis
+uint16_t DSP::fft_analyse(AP_HAL::DSP::FFTWindowState* state, uint16_t start_bin, uint16_t end_bin, float noise_att_cutoff)
+{
+    FFTWindowStateARM* fft = (FFTWindowStateARM*)state;
+    step_arm_cfft_f32(fft);
+    step_bitreversal(fft);
+    step_stage_rfft_f32(fft);
+    step_arm_cmplx_mag_f32(fft, start_bin, end_bin, noise_att_cutoff);
+    return step_calc_frequencies_f32(fft, start_bin, end_bin);
+}
+
+// create an instance of the FFT state machine
+DSP::FFTWindowStateARM::FFTWindowStateARM(uint16_t window_size, uint16_t sample_rate, uint8_t sliding_window_size)
+    : AP_HAL::DSP::FFTWindowState::FFTWindowState(window_size, sample_rate, sliding_window_size)
+{
+    if (_freq_bins == nullptr || _hanning_window == nullptr || _rfft_data == nullptr || _derivative_freq_bins == nullptr) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Failed to allocate %u bytes for window %u for DSP",
+            unsigned(sizeof(float) * (window_size * 3 + 2)), unsigned(window_size));
+        return;
+    }
+
+    // initialize the ARM data structure.
+    // it's important not to use arm_rfft_fast_init_f32() as this links all of the twiddle tables
+    // by being selective we save 70k in text space
+
+    switch (window_size) {
+    case 32:
+        arm_rfft_32_fast_init_f32(&_fft_instance);
+        break;
+    case 64:
+        arm_rfft_64_fast_init_f32(&_fft_instance);
+        break;
+    case 128:
+        arm_rfft_128_fast_init_f32(&_fft_instance);
+        break;
+    case 256:
+        arm_rfft_256_fast_init_f32(&_fft_instance);
+        break;
+#if defined(STM32H7)
+// Don't pull in the larger FFT tables unless we have to
+    case 512:
+        arm_rfft_512_fast_init_f32(&_fft_instance);
+        break;
+    case 1024:
+        arm_rfft_1024_fast_init_f32(&_fft_instance);
+        break;
+#endif
+    }
+}
+
+DSP::FFTWindowStateARM::~FFTWindowStateARM() {}
+
+extern "C" {
+    void stage_rfft_f32(arm_rfft_fast_instance_f32 *S, float32_t *p, float32_t *pOut);
+    void arm_cfft_radix8by2_f32(arm_cfft_instance_f32 *S, float32_t *p1);
+    void arm_cfft_radix8by4_f32(arm_cfft_instance_f32 *S, float32_t *p1);
+    void arm_radix8_butterfly_f32(float32_t *pSrc, uint16_t fftLen, const float32_t *pCoef, uint16_t twidCoefModifier);
+    void arm_bitreversal_32(uint32_t *pSrc, const uint16_t bitRevLen, const uint16_t *pBitRevTable);
+}
+
+// step 1: filter the incoming samples through a Hanning window
+void DSP::step_hanning(FFTWindowStateARM* fft, FloatBuffer& samples, uint16_t advance)
+{
+    TIMER_START(_hanning_timer);
+
+    // 5us
+    // apply hanning window to gyro samples and store result in _freq_bins
+    // hanning starts and ends with 0, could be skipped for minor speed improvement
+    samples.peek(&fft->_freq_bins[0], fft->_window_size); // the caller ensures we get a full buffer of samples
+    samples.advance(advance);
+    arm_mult_f32(&fft->_freq_bins[0], &fft->_hanning_window[0], &fft->_freq_bins[0], fft->_window_size);
+
+    TIMER_END(_hanning_timer);
+}
+
+// step 2: guts of complex fft processing
+void DSP::step_arm_cfft_f32(FFTWindowStateARM* fft)
+{
+    arm_cfft_instance_f32 *Sint = &(fft->_fft_instance.Sint);
+    Sint->fftLen = fft->_fft_instance.fftLenRFFT / 2;
+
+    TIMER_START(_arm_cfft_f32_timer);
+
+    switch (fft->_bin_count) {
+    case 16: // window 32
+        // 16us (BF)
+        //  5us F7,  7us F4, 8us H7
+    case 128: // window 256
+        // 37us F7, 81us F4, 17us H7
+        arm_cfft_radix8by2_f32(Sint, fft->_freq_bins);
+        break;
+    case 32: // window 64
+        // 35us (BF)
+        // 10us F7,  24us F4
+    case 256: // window 512
+        // 66us F7, 174us F4, 37us H7
+        arm_cfft_radix8by4_f32(Sint, fft->_freq_bins);
+        break;
+    case 64: // window 128
+        // 70us BF
+        // 21us F7, 34us F4
+    case 512: // window 1024
+        // 152us F7, 73us H7
+        arm_radix8_butterfly_f32(fft->_freq_bins, fft->_bin_count, Sint->pTwiddle, 1);
+        break;
+    }
+
+    TIMER_END(_arm_cfft_f32_timer);
+}
+
+// step 3: reverse the bits of the output
+void DSP::step_bitreversal(FFTWindowStateARM* fft)
+{
+    TIMER_START(_bitreversal_timer);
+    // 6us (BF)
+    // 32   -  2us F7,  3us F4, 1us H7
+    // 64   -  3us F7,  6us F4
+    // 128  -  4us F7,  9us F4
+    // 256  - 10us F7, 20us F4, 5us H7
+    // 512  - 22us F7, 54us F4, 15us H7
+    // 1024 - 42us F7,          15us H7
+    arm_bitreversal_32((uint32_t *)fft->_freq_bins, fft->_fft_instance.Sint.bitRevLength, fft->_fft_instance.Sint.pBitRevTable);
+
+    TIMER_END(_bitreversal_timer);
+}
+
+// step 4: convert from complex to real data
+void DSP::step_stage_rfft_f32(FFTWindowStateARM* fft)
+{
+    TIMER_START(_stage_rfft_f32_timer);
+    // 14us (BF)
+    // 32   -  2us F7,  5us F4,  2us H7
+    // 64   -  5us F7, 16us F4
+    // 128  - 17us F7, 26us F4
+    // 256  - 21us F7, 70us F4,  9us H7
+    // 512  - 35us F7, 71us F4, 17us H7
+    // 1024 - 76us F7,          33us H7
+    // this does not work in place => _freq_bins AND _rfft_data needed
+    stage_rfft_f32(&fft->_fft_instance, fft->_freq_bins, fft->_rfft_data);
+
+    TIMER_END(_stage_rfft_f32_timer);
+}
+
+// step 5: find the magnitudes of the complex data
+void DSP::step_arm_cmplx_mag_f32(FFTWindowStateARM* fft, uint16_t start_bin, uint16_t end_bin, float noise_att_cutoff)
+{
+    TIMER_START(_arm_cmplx_mag_f32_timer);
+
+    // 8us (BF)
+    // 32   -   4us F7,  5us F4,  5us H7
+    // 64   -   7us F7, 13us F4
+    // 128  -  14us F7, 17us F4
+    // 256  -  29us F7, 28us F4,  7us H7
+    // 512  -  55us F7, 93us F4, 13us H7
+    // 1024 - 131us F7,          25us H7
+    // General case for the magnitudes - see https://stackoverflow.com/questions/42299932/dsp-libraries-rfft-strange-results
+    // The frequency of each of those frequency components are given by k*fs/N
+
+    arm_cmplx_mag_squared_f32(&fft->_rfft_data[2], &fft->_freq_bins[1], fft->_bin_count - 1);
+    fft->_freq_bins[0] = sq(fft->_rfft_data[0]);               // DC
+    fft->_freq_bins[fft->_bin_count] = sq(fft->_rfft_data[1]); // Nyquist
+    fft->_rfft_data[fft->_window_size] = fft->_rfft_data[1]; // Nyquist for the interpolator
+    fft->_rfft_data[fft->_window_size + 1] = 0;
+
+    step_cmplx_mag(fft, start_bin, end_bin, noise_att_cutoff);
+
+    TIMER_END(_arm_cmplx_mag_f32_timer);
+}
+
+// step 6: find the bin with the highest energy and interpolate the required frequency
+uint16_t DSP::step_calc_frequencies_f32(FFTWindowStateARM* fft, uint16_t start_bin, uint16_t end_bin)
+{
+    TIMER_START(_step_calc_frequencies);
+    // 4us H7
+
+    step_calc_frequencies(fft, start_bin, end_bin);
+
+    TIMER_END(_step_calc_frequencies);
+
+#if DEBUG_FFT
+    _output_count++;
+    // outputs at approx 1hz
+    if (_output_count % 400 == 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "FFT(us): t1:%lu,t2:%lu,t3:%lu,t4:%lu,t5:%lu,t6:%lu",
+                        _hanning_timer._timer_avg, _arm_cfft_f32_timer._timer_avg, _bitreversal_timer._timer_avg, _stage_rfft_f32_timer._timer_avg, _arm_cmplx_mag_f32_timer._timer_avg, _step_calc_frequencies._timer_avg);
+    }
+#endif
+
+    return fft->_peak_data[CENTER]._bin;
+}
+
+static const float PI_N = M_PI / 32.0f;
+static const float CANDAN_FACTOR = tanf(PI_N) / PI_N;
+
+// Interpolate center frequency using http://users.metu.edu.tr/ccandan//pub_dir/FineDopplerEst_IEEE_SPL_June2011.pdf
+// This is slightly less accurate than Quinn, but much cheaper to calculate
+float DSP::calculate_candans_estimator(const FFTWindowStateARM* fft, uint16_t k_max) const
+{
+    if (k_max <= 1 || k_max == fft->_bin_count) {
+        return 0.0f;
+    }
+
+    const uint16_t k_m1 = (k_max - 1) * 2;
+    const uint16_t k_p1 = (k_max + 1) * 2;
+    const uint16_t k = k_max * 2;
+
+    const float npr = fft->_rfft_data[k_m1] - fft->_rfft_data[k_p1];
+    const float npc = fft->_rfft_data[k_m1 + 1] - fft->_rfft_data[k_p1 + 1];
+    const float dpr = 2.0f * fft->_rfft_data[k] - fft->_rfft_data[k_m1] - fft->_rfft_data[k_p1];
+    const float dpc = 2.0f * fft->_rfft_data[k + 1] - fft->_rfft_data[k_m1 + 1] - fft->_rfft_data[k_p1 + 1];
+
+    const float realn = npr * dpr + npc * dpc;
+    const float reald = dpr * dpr + dpc * dpc;
+
+    // sanity check
+    if (is_zero(reald)) {
+        return 0.0f;
+    }
+
+    float d = CANDAN_FACTOR * (realn / reald);
+
+    // -0.5 < d < 0.5 which is the fraction of the sample spacing about the center element
+    return constrain_float(d, -0.5f, 0.5f);
+}
+
+#if DEBUG_FFT
+ void DSP::StepTimer::time(uint32_t start)
+ {
+    _timer_total += (AP_HAL::micros() - start);
+    _time_ticks = (_time_ticks + 1) % TICK_CYCLE;
+    if (_time_ticks == 0) {
+        _timer_avg = _timer_total / TICK_CYCLE;
+        _timer_total = 0;
+    }
+}
+#endif
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andy Piper and the betaflight team
+ */
+#pragma once
+
+#include <AP_HAL/AP_HAL.h>
+#include "AP_HAL_ChibiOS_Namespace.h"
+
+#if HAL_WITH_DSP
+
+#include <arm_math.h>
+
+#define DEBUG_FFT   0
+
+// ChibiOS implementation of FFT analysis to run on STM32 processors
+class ChibiOS::DSP : public AP_HAL::DSP {
+public:
+    // initialise an FFT instance
+    virtual FFTWindowState* fft_init(uint16_t window_size, uint16_t sample_rate, uint8_t sliding_window_size) override;
+    // start an FFT analysis with an ObjectBuffer
+    virtual void fft_start(FFTWindowState* state, FloatBuffer& samples, uint16_t advance) override;
+    // perform remaining steps of an FFT analysis
+    virtual uint16_t fft_analyse(FFTWindowState* state, uint16_t start_bin, uint16_t end_bin, float noise_att_cutoff) override;
+
+    // STM32-based FFT state
+    class FFTWindowStateARM : public AP_HAL::DSP::FFTWindowState {
+        friend class ChibiOS::DSP;
+    public:
+        FFTWindowStateARM(uint16_t window_size, uint16_t sample_rate, uint8_t sliding_window_size);
+        virtual ~FFTWindowStateARM();
+
+    private:
+        // underlying CMSIS data structure for FFT analysis
+        arm_rfft_fast_instance_f32 _fft_instance;
+    };
+
+protected:
+    void vector_max_float(const float* vin, uint16_t len, float* maxValue, uint16_t* maxIndex) const override {
+        uint32_t mindex;
+        arm_max_f32(vin, len, maxValue, &mindex);
+        *maxIndex = mindex;
+    }
+    void vector_scale_float(const float* vin, float scale, float* vout, uint16_t len) const override {
+        arm_scale_f32(vin, scale, vout, len);
+    }
+    float vector_mean_float(const float* vin, uint16_t len) const override {
+        float mean_value;
+        arm_mean_f32(vin, len, &mean_value);
+        return mean_value;
+    }
+    void vector_add_float(const float* vin1, const float* vin2, float* vout, uint16_t len) const override {
+        arm_add_f32(vin1, vin2, vout, len);
+    }
+
+private:
+    // following are the six independent steps for calculating an FFT
+    void step_hanning(FFTWindowStateARM* fft, FloatBuffer& samples, uint16_t advance);
+    void step_arm_cfft_f32(FFTWindowStateARM* fft);
+    void step_bitreversal(FFTWindowStateARM* fft);
+    void step_stage_rfft_f32(FFTWindowStateARM* fft);
+    void step_arm_cmplx_mag_f32(FFTWindowStateARM* fft, uint16_t start_bin, uint16_t end_bin, float noise_att_cutoff);
+    uint16_t step_calc_frequencies_f32(FFTWindowStateARM* fft, uint16_t start_bin, uint16_t end_bin);
+    // candan's frequency interpolator
+    float calculate_candans_estimator(const FFTWindowStateARM* fft, uint16_t k) const;
+
+#if DEBUG_FFT
+    class StepTimer {
+    public:
+        uint32_t _timer_total;
+        uint32_t _timer_avg;
+        uint8_t _time_ticks;
+
+        void time(uint32_t start);
+    };
+
+    uint32_t  _output_count;
+    StepTimer _hanning_timer;
+    StepTimer _arm_cfft_f32_timer;
+    StepTimer _bitreversal_timer;
+    StepTimer _stage_rfft_f32_timer;
+    StepTimer _arm_cmplx_mag_f32_timer;
+    StepTimer _step_calc_frequencies;
+#endif
+};
+
+#endif                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <hal.h>
+#include "Device.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/utility/OwnPtr.h>
+#include <stdio.h>
+
+#if HAL_USE_I2C == TRUE || HAL_USE_SPI == TRUE || HAL_USE_WSPI == TRUE
+
+#include "Scheduler.h"
+#include "Semaphores.h"
+#include "Util.h"
+#include "hwdef/common/stm32_util.h"
+
+#ifndef HAL_DEVICE_THREAD_STACK
+#define HAL_DEVICE_THREAD_STACK 1024
+#endif
+
+using namespace ChibiOS;
+
+extern const AP_HAL::HAL& hal;
+
+DeviceBus::DeviceBus(uint8_t _thread_priority) :
+        thread_priority(_thread_priority)
+{
+    bouncebuffer_init(&bounce_buffer_tx, 10, false);
+    bouncebuffer_init(&bounce_buffer_rx, 10, false);
+}
+
+DeviceBus::DeviceBus(uint8_t _thread_priority, bool axi_sram) :
+        thread_priority(_thread_priority)
+{
+    bouncebuffer_init(&bounce_buffer_tx, 10, axi_sram);
+    bouncebuffer_init(&bounce_buffer_rx, 10, axi_sram);
+}
+
+/*
+  per-bus callback thread
+*/
+void DeviceBus::bus_thread(void *arg)
+{
+    struct DeviceBus *binfo = (struct DeviceBus *)arg;
+
+    while (true) {
+        uint64_t now = AP_HAL::micros64();
+        DeviceBus::callback_info *callback;
+
+        // find a callback to run
+        for (callback = binfo->callbacks; callback; callback = callback->next) {
+            if (now >= callback->next_usec) {
+                while (now >= callback->next_usec) {
+                    callback->next_usec += callback->period_usec;
+                }
+                // call it with semaphore held
+                WITH_SEMAPHORE(binfo->semaphore);
+                callback->cb();
+            }
+        }
+
+        // work out when next loop is needed
+        uint64_t next_needed = 0;
+        now = AP_HAL::micros64();
+
+        for (callback = binfo->callbacks; callback; callback = callback->next) {
+            if (next_needed == 0 ||
+                callback->next_usec < next_needed) {
+                next_needed = callback->next_usec;
+                if (next_needed < now) {
+                    next_needed = now;
+                }
+            }
+        }
+
+        // delay for at most 50ms, to handle newly added callbacks
+        uint32_t delay = 50000;
+        if (next_needed >= now && next_needed - now < delay) {
+            delay = next_needed - now;
+        }
+        // don't delay for less than 100usec, so one thread doesn't
+        // completely dominate the CPU
+        if (delay < 100) {
+            delay = 100;
+        }
+        hal.scheduler->delay_microseconds(delay);
+    }
+    return;
+}
+
+#if CH_CFG_USE_HEAP == TRUE
+AP_HAL::Device::PeriodicHandle DeviceBus::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb, AP_HAL::Device *_hal_device)
+{
+    if (!thread_started) {
+        thread_started = true;
+
+        hal_device = _hal_device;
+        // setup a name for the thread
+        const uint8_t name_len = 7;
+        char *name = (char *)malloc(name_len);
+        switch (hal_device->bus_type()) {
+        case AP_HAL::Device::BUS_TYPE_I2C:
+            snprintf(name, name_len, "I2C%u",
+                     hal_device->bus_num());
+            break;
+
+        case AP_HAL::Device::BUS_TYPE_SPI:
+            snprintf(name, name_len, "SPI%u",
+                     hal_device->bus_num());
+            break;
+        default:
+            break;
+        }
+
+        thread_ctx = thread_create_alloc(THD_WORKING_AREA_SIZE(HAL_DEVICE_THREAD_STACK),
+                                         name,
+                                         thread_priority,           /* Initial priority.    */
+                                         DeviceBus::bus_thread,    /* Thread function.     */
+                                         this);                     /* Thread parameter.    */
+        if (thread_ctx == nullptr) {
+            AP_HAL::panic("Failed to create bus thread %s", name);
+        }
+    }
+    DeviceBus::callback_info *callback = NEW_NOTHROW DeviceBus::callback_info;
+    if (callback == nullptr) {
+        return nullptr;
+    }
+    callback->cb = cb;
+    callback->period_usec = period_usec;
+    callback->next_usec = AP_HAL::micros64() + period_usec;
+
+    // add to linked list of callbacks on thread
+    callback->next = callbacks;
+    callbacks = callback;
+
+    return callback;
+}
+#endif // CH_CFG_USE_HEAP
+
+/*
+ * Adjust the timer for the next call: it needs to be called from the bus
+ * thread, otherwise it will race with it
+ */
+bool DeviceBus::adjust_timer(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec)
+{
+    if (chThdGetSelfX() != thread_ctx) {
+        return false;
+    }
+
+    DeviceBus::callback_info *callback = static_cast<DeviceBus::callback_info *>(h);
+
+    callback->period_usec = period_usec;
+    callback->next_usec = AP_HAL::micros64() + period_usec;
+
+    return true;
+}
+
+/*
+  setup to use DMA-safe bouncebuffers for device transfers
+ */
+bool DeviceBus::bouncebuffer_setup(const uint8_t *&buf_tx, uint16_t tx_len,
+                                   uint8_t *&buf_rx, uint16_t rx_len)
+{
+    if (buf_rx) {
+        if (!bouncebuffer_setup_read(bounce_buffer_rx, &buf_rx, rx_len)) {
+            return false;
+        }
+    }
+    if (buf_tx) {
+        if (!bouncebuffer_setup_write(bounce_buffer_tx, &buf_tx, tx_len)) {
+            if (buf_rx) {
+                bouncebuffer_abort(bounce_buffer_rx);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+  complete a transfer using DMA bounce buffer
+ */
+void DeviceBus::bouncebuffer_finish(const uint8_t *buf_tx, uint8_t *buf_rx, uint16_t rx_len)
+{
+    if (buf_rx) {
+        bouncebuffer_finish_read(bounce_buffer_rx, buf_rx, rx_len);
+    }
+    if (buf_tx) {
+        bouncebuffer_finish_write(bounce_buffer_tx, buf_tx);
+    }
+}
+
+#endif // HAL_USE_I2C || HAL_USE_SPI
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * This file is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published
+ * by the Free Software Foundation, either version 3 of the License,
+ * or (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <inttypes.h>
+#include <AP_HAL/HAL.h>
+#if !defined(HAL_BOOTLOADER_BUILD)
+#include "Semaphores.h"
+#else
+#include <AP_HAL_Empty/Semaphores.h>
+#endif
+#include "AP_HAL_ChibiOS.h"
+
+#if HAL_USE_I2C == TRUE || HAL_USE_SPI == TRUE || HAL_USE_WSPI == TRUE
+
+#include "Scheduler.h"
+#include "shared_dma.h"
+#include "hwdef/common/bouncebuffer.h"
+
+namespace ChibiOS {
+
+class DeviceBus {
+public:
+    DeviceBus(uint8_t _thread_priority = APM_I2C_PRIORITY);
+    
+    DeviceBus(uint8_t _thread_priority, bool axi_sram);
+
+    struct DeviceBus *next;
+#if defined(HAL_BOOTLOADER_BUILD)
+    Empty::Semaphore semaphore;
+#else
+    Semaphore semaphore;
+#endif
+    Shared_DMA *dma_handle;
+
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb, AP_HAL::Device *hal_device);
+    bool adjust_timer(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec);
+    static void bus_thread(void *arg);
+
+    bool bouncebuffer_setup(const uint8_t *&buf_tx, uint16_t tx_len,
+                            uint8_t *&buf_rx, uint16_t rx_len) WARN_IF_UNUSED;
+    void bouncebuffer_finish(const uint8_t *buf_tx, uint8_t *buf_rx, uint16_t rx_len);
+
+private:
+    struct callback_info {
+        struct callback_info *next;
+        AP_HAL::Device::PeriodicCb cb;
+        uint32_t period_usec;
+        uint64_t next_usec;
+    } *callbacks;
+    uint8_t thread_priority;
+    thread_t* thread_ctx;
+    bool thread_started;
+    AP_HAL::Device *hal_device;
+
+    // support for bounce buffers for DMA-safe transfers
+    struct bouncebuffer_t *bounce_buffer_tx;
+    struct bouncebuffer_t *bounce_buffer_rx;
+};
+
+}
+
+#endif // I2C or SPI
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #pragma once
+
+#include <AP_HAL/AP_HAL.h>
+#include "AP_HAL_ChibiOS_Namespace.h"
+#include "hwdef/common/flash.h"
+
+class ChibiOS::Flash : public AP_HAL::Flash {
+public:
+    uint32_t getpageaddr(uint32_t page) override { return stm32_flash_getpageaddr(page); }
+    uint32_t getpagesize(uint32_t page) override { return stm32_flash_getpagesize(page); }
+    uint32_t getnumpages(void) override { return stm32_flash_getnumpages(); }
+    bool erasepage(uint32_t page) override {
+        WITH_SEMAPHORE(sem);
+        return stm32_flash_erasepage(page); }
+    bool write(uint32_t addr, const void *buf, uint32_t count) override {
+        WITH_SEMAPHORE(sem);
+        return stm32_flash_write(addr, buf, count); }
+    void keep_unlocked(bool set) override { stm32_flash_keep_unlocked(set); }
+    bool ispageerased(uint32_t page) override { return stm32_flash_ispageerased(page); }
+
+private:
+    HAL_Semaphore sem;
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#include <hal.h>
+#include "GPIO.h"
+
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include "hwdef/common/stm32_util.h"
+#include <AP_InternalError/AP_InternalError.h>
+#ifndef HAL_BOOTLOADER_BUILD
+#include <SRV_Channel/SRV_Channel.h>
+#endif
+#ifndef HAL_NO_UARTDRIVER
+#include <GCS_MAVLink/GCS.h>
+#endif
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_Math/AP_Math.h>
+
+using namespace ChibiOS;
+
+#if HAL_WITH_IO_MCU
+#include <AP_IOMCU/AP_IOMCU.h>
+extern AP_IOMCU iomcu;
+#endif
+
+// GPIO pin table from hwdef.dat
+struct gpio_entry {
+    uint8_t pin_num;
+    bool enabled;
+    uint8_t pwm_num;
+    ioline_t pal_line;
+    AP_HAL::GPIO::irq_handler_fn_t fn; // callback for GPIO interface
+    thread_reference_t thd_wait;
+    bool is_input;
+    uint8_t mode;
+    uint16_t isr_quota;
+    uint8_t isr_disabled_ticks;
+    AP_HAL::GPIO::INTERRUPT_TRIGGER_TYPE isr_mode;
+};
+
+#ifdef HAL_GPIO_PINS
+#define HAVE_GPIO_PINS 1
+static struct gpio_entry _gpio_tab[] = HAL_GPIO_PINS;
+#else
+#define HAVE_GPIO_PINS 0
+#endif
+
+
+/*
+  map a user pin number to a GPIO table entry
+ */
+static struct gpio_entry *gpio_by_pin_num(uint8_t pin_num, bool check_enabled=true)
+{
+#if HAVE_GPIO_PINS
+    for (uint8_t i=0; i<ARRAY_SIZE(_gpio_tab); i++) {
+        const auto &t = _gpio_tab[i];
+        if (pin_num == t.pin_num) {
+            if (check_enabled && t.pwm_num != 0 && !t.enabled) {
+                return NULL;
+            }
+            return &_gpio_tab[i];
+        }
+    }
+#endif
+    return NULL;
+}
+
+static void pal_interrupt_cb(void *arg);
+static void pal_interrupt_cb_functor(void *arg);
+
+GPIO::GPIO()
+{}
+
+void GPIO::init()
+{
+#if !APM_BUILD_TYPE(APM_BUILD_iofirmware) && !defined(HAL_BOOTLOADER_BUILD)
+#if HAL_WITH_IO_MCU || HAVE_GPIO_PINS
+    uint8_t chan_offset = 0;
+#endif
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled()) {
+        uint8_t GPIO_mask = 0;
+        for (uint8_t i=0; i<8; i++) {
+            if (SRV_Channels::is_GPIO(i)) {
+                GPIO_mask |= 1U << i;
+            }
+        }
+        iomcu.set_GPIO_mask(GPIO_mask);
+        chan_offset = 8;
+    }
+#endif
+    // auto-disable pins being used for PWM output
+#if HAVE_GPIO_PINS
+    for (uint8_t i=0; i<ARRAY_SIZE(_gpio_tab); i++) {
+        struct gpio_entry *g = &_gpio_tab[i];
+        if (g->pwm_num != 0) {
+            g->enabled = SRV_Channels::is_GPIO((g->pwm_num-1)+chan_offset);
+        }
+    }
+#endif // HAVE_GPIO_PINS
+#endif // HAL_BOOTLOADER_BUILD
+#ifdef HAL_PIN_ALT_CONFIG
+    setup_alt_config();
+#endif
+}
+
+#ifdef HAL_PIN_ALT_CONFIG
+// chosen alternative config
+uint8_t GPIO::alt_config;
+
+/*
+  alternative config table, selected using BRD_ALT_CONFIG
+ */
+static const struct alt_config {
+    uint8_t alternate;
+    uint16_t mode;
+    ioline_t line;
+    PERIPH_TYPE periph_type;
+    uint8_t periph_instance;
+} alternate_config[] HAL_PIN_ALT_CONFIG;
+
+/*
+  change pin configuration based on ALT() lines in hwdef.dat
+ */
+void GPIO::setup_alt_config(void)
+{
+    AP_BoardConfig *bc = AP::boardConfig();
+    if (!bc) {
+        return;
+    }
+    alt_config = bc->get_alt_config();
+    if (alt_config == 0) {
+        // use defaults
+        return;
+    }
+    for (uint8_t i=0; i<ARRAY_SIZE(alternate_config); i++) {
+        const struct alt_config &alt = alternate_config[i];
+        if (alt_config == alt.alternate) {
+            if (alt.periph_type == PERIPH_TYPE::GPIO) {
+                // enable pin in GPIO table
+#if HAVE_GPIO_PINS
+                for (uint8_t j=0; j<ARRAY_SIZE(_gpio_tab); j++) {
+                    struct gpio_entry *g = &_gpio_tab[j];
+                    if (g->pal_line == alt.line) {
+                        g->enabled = true;
+                        break;
+                    }
+                }
+#endif // HAVE_GPIO_PINS
+                continue;
+            }
+            const iomode_t mode = alt.mode & ~PAL_STM32_HIGH;
+            const uint8_t odr = (alt.mode & PAL_STM32_HIGH)?1:0;
+            palSetLineMode(alt.line, mode);
+            palWriteLine(alt.line, odr);
+        }
+    }
+}
+#endif // HAL_PIN_ALT_CONFIG
+
+/*
+  resolve an ioline_t to take account of alternative
+  configurations. This allows drivers to get the right ioline_t for an
+  alternative config. Note that this may return 0, meaning the pin is
+  not mapped to this peripheral in the active config
+*/
+ioline_t GPIO::resolve_alt_config(ioline_t base, PERIPH_TYPE ptype, uint8_t instance)
+{
+#ifdef HAL_PIN_ALT_CONFIG
+    if (alt_config == 0) {
+        // unchanged
+        return base;
+    }
+    for (uint8_t i=0; i<ARRAY_SIZE(alternate_config); i++) {
+        const struct alt_config &alt = alternate_config[i];
+        if (alt_config == alt.alternate) {
+            if (ptype == alt.periph_type && instance == alt.periph_instance) {
+                // we've reconfigured this peripheral with a different line
+                return alt.line;
+            }
+        }
+    }
+    // now search for pins that have been configured off via BRD_ALT_CONFIG
+    for (uint8_t i=0; i<ARRAY_SIZE(alternate_config); i++) {
+        const struct alt_config &alt = alternate_config[i];
+        if (alt_config == alt.alternate) {
+            if (alt.line == base) {
+                // this line is no longer available in this config
+                return 0;
+            }
+        }
+    }
+#endif
+    return base;
+}
+
+
+void GPIO::pinMode(uint8_t pin, uint8_t output)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin);
+    if (g) {
+        if (!output && g->is_input &&
+            (g->mode == PAL_MODE_INPUT_PULLUP ||
+             g->mode == PAL_MODE_INPUT_PULLDOWN)) {
+            // already set
+            return;
+        }
+        g->mode = output?PAL_MODE_OUTPUT_PUSHPULL:PAL_MODE_INPUT;
+#if defined(STM32F7) || defined(STM32H7) || defined(STM32F4) || defined(STM32G4) || defined(STM32L4) || defined(STM32L4PLUS)
+        if (g->mode == PAL_MODE_OUTPUT_PUSHPULL) {
+            // retain OPENDRAIN if already set
+            iomode_t old_mode = palReadLineMode(g->pal_line);
+            if ((old_mode & PAL_MODE_OUTPUT_OPENDRAIN) == PAL_MODE_OUTPUT_OPENDRAIN) {
+                g->mode = PAL_MODE_OUTPUT_OPENDRAIN;
+            }
+        }
+#endif
+        palSetLineMode(g->pal_line, g->mode);
+        g->is_input = !output;
+    }
+}
+
+
+uint8_t GPIO::read(uint8_t pin)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin);
+    if (g) {
+        return palReadLine(g->pal_line);
+    }
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled() && iomcu.valid_GPIO_pin(pin)) {
+        return iomcu.read_virtual_GPIO(pin);
+    }
+#endif
+    return 0;
+}
+
+void GPIO::write(uint8_t pin, uint8_t value)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin);
+    if (g) {
+        if (g->is_input) {
+            // control pullup/pulldown
+            g->mode = value==1?PAL_MODE_INPUT_PULLUP:PAL_MODE_INPUT_PULLDOWN;
+            palSetLineMode(g->pal_line, g->mode);
+        } else if (value == PAL_LOW) {
+            palClearLine(g->pal_line);
+        } else {
+            palSetLine(g->pal_line);
+        }
+        return;
+    }
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled() && iomcu.valid_GPIO_pin(pin)) {
+        iomcu.write_GPIO(pin, value);
+    }
+#endif
+}
+
+void GPIO::toggle(uint8_t pin)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin);
+    if (g) {
+        palToggleLine(g->pal_line);
+        return;
+    }
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled() && iomcu.valid_GPIO_pin(pin)) {
+        iomcu.toggle_GPIO(pin);
+    }
+#endif
+}
+
+/* Alternative interface: */
+AP_HAL::DigitalSource* GPIO::channel(uint16_t pin)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin);
+    if (g != nullptr) {
+        return NEW_NOTHROW DigitalSource(g->pal_line);
+    }
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled() && iomcu.valid_GPIO_pin(pin)) {
+        return NEW_NOTHROW IOMCU_DigitalSource(pin);
+    }
+#endif
+    return nullptr;
+}
+
+extern const AP_HAL::HAL& hal;
+
+/*
+   Attach an interrupt handler to a GPIO pin number. The pin number
+   must be one specified with a GPIO() marker in hwdef.dat
+ */
+bool GPIO::attach_interrupt(uint8_t pin,
+                            irq_handler_fn_t fn,
+                            INTERRUPT_TRIGGER_TYPE mode)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin, false);
+    if (!g) {
+        return false;
+    }
+    g->isr_disabled_ticks = 0;
+    g->isr_quota = 0;
+    if (!_attach_interrupt(g->pal_line,
+                           palcallback_t(fn?pal_interrupt_cb_functor:nullptr),
+                           g,
+                           mode)) {
+        return false;
+    }
+    g->fn = fn;
+    g->isr_mode = mode;
+    return true;
+}
+
+/*
+   Attach an interrupt handler to ioline_t
+ */
+bool GPIO::_attach_interrupt(ioline_t line, AP_HAL::Proc p, uint8_t mode)
+{
+    return _attach_interrupt(line, palcallback_t(p?pal_interrupt_cb:nullptr), (void*)p, mode);
+}
+
+bool GPIO::attach_interrupt(uint8_t pin,
+                            AP_HAL::Proc proc,
+                            INTERRUPT_TRIGGER_TYPE mode) {
+    struct gpio_entry *g = gpio_by_pin_num(pin, false);
+    if (!g) {
+        return false;
+    }
+    g->isr_disabled_ticks = 0;
+    g->isr_quota = 0;
+    g->isr_mode = mode;
+    return _attach_interrupt(g->pal_line, proc, mode);
+}
+
+bool GPIO::_attach_interruptI(ioline_t line, palcallback_t cb, void *p, uint8_t mode)
+{
+    uint32_t chmode = 0;
+    switch(mode) {
+        case INTERRUPT_FALLING:
+            chmode = PAL_EVENT_MODE_FALLING_EDGE;
+            break;
+        case INTERRUPT_RISING:
+            chmode = PAL_EVENT_MODE_RISING_EDGE;
+            break;
+        case INTERRUPT_BOTH:
+            chmode = PAL_EVENT_MODE_BOTH_EDGES;
+            break;
+        default:
+            if (p) {
+                return false;
+            }
+            break;
+    }
+
+    palevent_t *pep = pal_lld_get_line_event(line);
+    if (pep->cb && p != nullptr) {
+        // the pad is already being used for a callback
+        return false;
+    }
+
+    if (!p) {
+        chmode = PAL_EVENT_MODE_DISABLED;
+    }
+
+    palDisableLineEventI(line);
+    palSetLineCallbackI(line, cb, p);
+    palEnableLineEventI(line, chmode);
+
+    return true;
+}
+
+bool GPIO::_attach_interrupt(ioline_t line, palcallback_t cb, void *p, uint8_t mode)
+{
+    osalSysLock();
+    bool ret = _attach_interruptI(line, cb, p, mode);
+    osalSysUnlock();
+    return ret;
+}
+
+bool GPIO::usb_connected(void)
+{
+    return _usb_connected;
+}
+
+DigitalSource::DigitalSource(ioline_t _line) :
+    line(_line)
+{}
+
+void DigitalSource::mode(uint8_t output)
+{
+    palSetLineMode(line, output);
+}
+
+uint8_t DigitalSource::read()
+{
+    return palReadLine(line);
+}
+
+void DigitalSource::write(uint8_t value)
+{
+    palWriteLine(line, value);
+}
+
+void DigitalSource::toggle()
+{
+    palToggleLine(line);
+}
+
+#if HAL_WITH_IO_MCU
+IOMCU_DigitalSource::IOMCU_DigitalSource(uint8_t _pin) :
+    pin(_pin)
+{}
+
+void IOMCU_DigitalSource::write(uint8_t value)
+{
+    iomcu.write_GPIO(pin, value);
+}
+
+void IOMCU_DigitalSource::toggle()
+{
+    iomcu.toggle_GPIO(pin);
+}
+#endif // HAL_WITH_IO_MCU
+
+static void pal_interrupt_cb(void *arg)
+{
+    if (arg != nullptr) {
+        ((AP_HAL::Proc)arg)();
+    }
+}
+
+static void pal_interrupt_cb_functor(void *arg)
+{
+    const uint32_t now = AP_HAL::micros();
+
+    struct gpio_entry *g = (gpio_entry *)arg;
+    if (g == nullptr) {
+        // what?
+        return;
+    }
+    if (!(g->fn)) {
+        return;
+    }
+    if (g->isr_quota >= 1) {
+        /*
+          we have an interrupt quota enabled for this pin. If the
+          quota remaining drops to 1 without it being refreshed in
+          timer_tick then we disable the interrupt source. This is to
+          prevent CPU overload due to very high GPIO interrupt counts
+         */
+        if (g->isr_quota == 1) {
+            osalSysLockFromISR();
+            palDisableLineEventI(g->pal_line);
+            osalSysUnlockFromISR();
+            return;
+        }
+        g->isr_quota--;
+    }
+    (g->fn)(g->pin_num, palReadLine(g->pal_line), now);
+}
+
+/*
+  handle interrupt from pin change for wait_pin()
+ */
+static void pal_interrupt_wait(void *arg)
+{
+    osalSysLockFromISR();
+    struct gpio_entry *g = (gpio_entry *)arg;
+    if (g == nullptr || g->thd_wait == nullptr) {
+        osalSysUnlockFromISR();
+        return;
+    }
+    osalThreadResumeI(&g->thd_wait, MSG_OK);
+    osalSysUnlockFromISR();
+}
+
+/*
+  block waiting for a pin to change. Return true on pin change, false on timeout
+*/
+bool GPIO::wait_pin(uint8_t pin, INTERRUPT_TRIGGER_TYPE mode, uint32_t timeout_us)
+{
+    struct gpio_entry *g = gpio_by_pin_num(pin);
+    if (!g) {
+        return false;
+    }
+
+    osalSysLock();
+    if (g->thd_wait) {
+        // only allow single waiter
+        osalSysUnlock();
+        return false;
+    }
+
+    if (!_attach_interruptI(g->pal_line,
+                           palcallback_t(pal_interrupt_wait),
+                           g,
+                           mode)) {
+        osalSysUnlock();
+        return false;
+    }
+
+    // don't allow for very long timeouts, or below the delta
+    timeout_us = constrain_uint32(TIME_US2I(timeout_us), CH_CFG_ST_TIMEDELTA, TIME_US2I(30000U));
+
+    msg_t msg = osalThreadSuspendTimeoutS(&g->thd_wait, timeout_us);
+    _attach_interruptI(g->pal_line,
+                       palcallback_t(nullptr),
+                       nullptr,
+                       mode);
+    osalSysUnlock();
+
+    return msg == MSG_OK;
+}
+
+// check if a pin number is valid
+bool GPIO::valid_pin(uint8_t pin) const
+{
+    if (gpio_by_pin_num(pin) != nullptr) {
+        return true;
+    }
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled() && iomcu.valid_GPIO_pin(pin)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+// return servo channel associated with GPIO pin.  Returns true on success and fills in servo_ch argument
+// servo_ch uses zero-based indexing
+bool GPIO::pin_to_servo_channel(uint8_t pin, uint8_t& servo_ch) const
+{
+#if HAL_WITH_IO_MCU || HAVE_GPIO_PINS
+    uint8_t fmu_chan_offset = 0;
+#endif
+#if HAL_WITH_IO_MCU
+    if (AP_BoardConfig::io_enabled()) {
+        // check if this is one of the main pins
+        uint8_t main_servo_ch = pin;
+        if (iomcu.convert_pin_number(main_servo_ch)) {
+            servo_ch = main_servo_ch;
+            return true;
+        }
+        // with IOMCU the local (FMU) channels start at 8
+        fmu_chan_offset = 8;
+    }
+#endif
+
+#if HAVE_GPIO_PINS
+    // search _gpio_tab for matching pin
+    for (uint8_t i=0; i<ARRAY_SIZE(_gpio_tab); i++) {
+        if (_gpio_tab[i].pin_num == pin) {
+            if (_gpio_tab[i].pwm_num == 0) {
+                return false;
+            }
+            servo_ch = _gpio_tab[i].pwm_num-1+fmu_chan_offset;
+            return true;
+        }
+    }
+#endif // HAVE_GPIO_PINS
+    return false;
+}
+
+#if defined(STM32F7) || defined(STM32H7) || defined(STM32F4) || defined(STM32F3) || defined(STM32G4) || defined(STM32L4) || defined(STM32L4PLUS)
+
+// allow for save and restore of pin settings
+bool GPIO::get_mode(uint8_t pin, uint32_t &mode)
+{
+    auto *p = gpio_by_pin_num(pin);
+    if (!p) {
+        return false;
+    }
+    mode = uint32_t(palReadLineMode(p->pal_line));
+    return true;
+}
+
+void GPIO::set_mode(uint8_t pin, uint32_t mode)
+{
+    auto *p = gpio_by_pin_num(pin);
+    if (p) {
+        palSetLineMode(p->pal_line, ioline_t(mode));
+    }
+}
+#endif
+
+#ifndef IOMCU_FW
+/*
+  timer to setup interrupt quotas for a 100ms period from
+  monitor thread
+*/
+void GPIO::timer_tick()
+{
+    // allow 100k interrupts/second max for GPIO interrupt sources, which is
+    // 10k per 100ms call to timer_tick()
+#if HAVE_GPIO_PINS
+    const uint16_t quota = 10000U;
+    for (uint8_t i=0; i<ARRAY_SIZE(_gpio_tab); i++) {
+        if (_gpio_tab[i].isr_quota != 1) {
+            // Reset quota for next tick
+            _gpio_tab[i].isr_quota = quota;
+            continue;
+        }
+        // we ran out of ISR quota for this pin since the last
+        // check. This is not really an internal error, but we use
+        // INTERNAL_ERROR() to get the reporting mechanism
+
+        if (_gpio_tab[i].isr_disabled_ticks == 0) {
+#ifndef HAL_NO_UARTDRIVER
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR,"ISR flood on pin %u", _gpio_tab[i].pin_num);
+#endif
+            // Only trigger internal error if armed
+            if (hal.util->get_soft_armed()) {
+                INTERNAL_ERROR(AP_InternalError::error_t::gpio_isr);
+            }
+        }
+        if (hal.util->get_soft_armed()) {
+            // Don't start counting until disarmed
+            _gpio_tab[i].isr_disabled_ticks = 1;
+            continue;
+        }
+
+        // Increment disabled ticks, don't wrap
+        if (_gpio_tab[i].isr_disabled_ticks < UINT8_MAX) {
+            _gpio_tab[i].isr_disabled_ticks++;
+        }
+
+        // 100 * 100ms = 10 seconds
+        const uint8_t ISR_retry_ticks = 100U;
+        if ((_gpio_tab[i].isr_disabled_ticks > ISR_retry_ticks) && (_gpio_tab[i].fn != nullptr)) {
+            // Try re-enabling
+#ifndef HAL_NO_UARTDRIVER
+            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "Retrying pin %d after ISR flood", _gpio_tab[i].pin_num);
+#endif
+            if (attach_interrupt(_gpio_tab[i].pin_num, _gpio_tab[i].fn, _gpio_tab[i].isr_mode)) {
+                // Success, reset quota
+                _gpio_tab[i].isr_quota = quota;
+            } else {
+                // Failed, reset disabled count to try again later
+                _gpio_tab[i].isr_disabled_ticks = 1;
+            }
+        }
+    }
+#endif // HAVE_GPIO_PINS
+}
+
+// Check for ISR floods
+bool GPIO::arming_checks(size_t buflen, char *buffer) const
+{
+#if HAVE_GPIO_PINS
+    for (uint8_t i=0; i<ARRAY_SIZE(_gpio_tab); i++) {
+        if (_gpio_tab[i].isr_disabled_ticks != 0) {
+            hal.util->snprintf(buffer, buflen, "Pin %u disabled (ISR flood)", _gpio_tab[i].pin_num);
+            return false;
+        }
+    }
+#endif // HAVE_GPIO_PINS
+    return true;
+}
+#endif // IOMCU_FW
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+#pragma once
+
+#include "AP_HAL_ChibiOS.h"
+
+/*
+  pin types for alternative configuration
+ */
+enum class PERIPH_TYPE : uint8_t {
+    UART_RX,
+    UART_TX,
+    I2C_SDA,
+    I2C_SCL,
+    OTHER,
+    GPIO,
+};
+
+class ChibiOS::GPIO : public AP_HAL::GPIO {
+public:
+    GPIO();
+    void    init() override;
+    void    pinMode(uint8_t pin, uint8_t output) override;
+    uint8_t read(uint8_t pin) override;
+    void    write(uint8_t pin, uint8_t value) override;
+    void    toggle(uint8_t pin) override;
+
+    /* Alternative interface: */
+    AP_HAL::DigitalSource* channel(uint16_t n) override;
+
+    /* Interrupt interface - fast, for RCOutput and SPI radios */
+    bool    attach_interrupt(uint8_t interrupt_num,
+                             AP_HAL::Proc p,
+                             INTERRUPT_TRIGGER_TYPE mode) override;
+
+    /* Interrupt interface - for AP_HAL::GPIO */
+    bool    attach_interrupt(uint8_t pin,
+                             irq_handler_fn_t fn,
+                             INTERRUPT_TRIGGER_TYPE mode) override;
+
+    /* return true if USB cable is connected */
+    bool    usb_connected(void) override;
+
+    void set_usb_connected() { _usb_connected = true; }
+
+    /* attach interrupt via ioline_t */
+    bool _attach_interrupt(ioline_t line, AP_HAL::Proc p, uint8_t mode);
+
+    /*
+      block waiting for a pin to change. A timeout of 0 means wait
+      forever. Return true on pin change, false on timeout
+     */
+    bool wait_pin(uint8_t pin, INTERRUPT_TRIGGER_TYPE mode, uint32_t timeout_us) override;
+
+#ifndef IOMCU_FW
+    // timer tick
+    void timer_tick(void) override;
+
+    // Check for ISR floods
+    bool arming_checks(size_t buflen, char *buffer) const override;
+#endif
+
+    // check if a pin number is valid
+    bool valid_pin(uint8_t pin) const override;
+
+    // return servo channel associated with GPIO pin.  Returns true on success and fills in servo_ch argument
+    // servo_ch uses zero-based indexing
+    bool pin_to_servo_channel(uint8_t pin, uint8_t& servo_ch) const override;
+
+    /*
+      resolve an ioline to take account of alternative configurations
+     */
+    static ioline_t resolve_alt_config(ioline_t base, PERIPH_TYPE ptype, uint8_t instance);
+
+#if defined(STM32F7) || defined(STM32H7) || defined(STM32F4) || defined(STM32F3) || defined(STM32G4) || defined(STM32L4) || defined(STM32L4PLUS)
+    // allow for save and restore of pin settings
+    bool    get_mode(uint8_t pin, uint32_t &mode) override;
+    void    set_mode(uint8_t pin, uint32_t mode) override;
+#endif
+    
+private:
+    bool _usb_connected;
+    bool _ext_started;
+
+    bool _attach_interruptI(ioline_t line, palcallback_t cb, void *p, uint8_t mode);
+    bool _attach_interrupt(ioline_t line, palcallback_t cb, void *p, uint8_t mode);
+#ifdef HAL_PIN_ALT_CONFIG
+    void setup_alt_config(void);
+    static uint8_t alt_config;
+#endif
+};
+
+class ChibiOS::DigitalSource : public AP_HAL::DigitalSource {
+public:
+    DigitalSource(ioline_t line);
+    void    mode(uint8_t output) override;
+    uint8_t read() override;
+    void    write(uint8_t value) override;
+    void    toggle() override;
+private:
+    ioline_t line;
+};
+
+#if HAL_WITH_IO_MCU
+class ChibiOS::IOMCU_DigitalSource : public AP_HAL::DigitalSource {
+public:
+    IOMCU_DigitalSource(uint8_t _pin);
+    void    write(uint8_t value) override;
+    void    toggle() override;
+    // IOMCU GPIO is write only
+    void    mode(uint8_t output) override {};
+    uint8_t    read() override { return 0; }
+private:
+    uint8_t pin;
+};
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+#include <AP_HAL/AP_HAL.h>
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+
+#include <assert.h>
+
+#include <hal.h>
+#include "HAL_ChibiOS_Class.h"
+#include <AP_HAL_Empty/AP_HAL_Empty_Private.h>
+#include <AP_HAL_ChibiOS/AP_HAL_ChibiOS_Private.h>
+#include "shared_dma.h"
+#include "sdcard.h"
+#include "hwdef/common/usbcfg.h"
+#include "hwdef/common/stm32_util.h"
+#include "hwdef/common/watchdog.h"
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_InternalError/AP_InternalError.h>
+#ifndef HAL_BOOTLOADER_BUILD
+#include <AP_Logger/AP_Logger.h>
+#endif
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_HAL/SIMState.h>
+
+#include <hwdef.h>
+
+#ifndef DEFAULT_SERIAL0_BAUD
+#define SERIAL0_BAUD 115200
+#else
+#define SERIAL0_BAUD DEFAULT_SERIAL0_BAUD
+#endif
+
+#ifndef HAL_SCHEDULER_LOOP_DELAY_ENABLED
+#define HAL_SCHEDULER_LOOP_DELAY_ENABLED 1
+#endif
+
+#ifndef HAL_NO_UARTDRIVER
+static HAL_SERIAL0_DRIVER;
+static HAL_SERIAL1_DRIVER;
+static HAL_SERIAL2_DRIVER;
+static HAL_SERIAL3_DRIVER;
+static HAL_SERIAL4_DRIVER;
+static HAL_SERIAL5_DRIVER;
+static HAL_SERIAL6_DRIVER;
+static HAL_SERIAL7_DRIVER;
+static HAL_SERIAL8_DRIVER;
+static HAL_SERIAL9_DRIVER;
+#else
+static Empty::UARTDriver serial0Driver;
+static Empty::UARTDriver serial1Driver;
+static Empty::UARTDriver serial2Driver;
+static Empty::UARTDriver serial3Driver;
+static Empty::UARTDriver serial4Driver;
+static Empty::UARTDriver serial5Driver;
+static Empty::UARTDriver serial6Driver;
+static Empty::UARTDriver serial7Driver;
+static Empty::UARTDriver serial8Driver;
+static Empty::UARTDriver serial9Driver;
+#endif
+
+#if HAL_USE_I2C == TRUE && defined(HAL_I2C_DEVICE_LIST)
+static ChibiOS::I2CDeviceManager i2cDeviceManager;
+#else
+static Empty::I2CDeviceManager i2cDeviceManager;
+#endif
+
+#if HAL_USE_SPI == TRUE
+static ChibiOS::SPIDeviceManager spiDeviceManager;
+#else
+static Empty::SPIDeviceManager spiDeviceManager;
+#endif
+
+#if HAL_USE_ADC == TRUE && !defined(HAL_DISABLE_ADC_DRIVER)
+static ChibiOS::AnalogIn analogIn;
+#else
+static Empty::AnalogIn analogIn;
+#endif
+
+#ifdef HAL_USE_EMPTY_STORAGE
+static Empty::Storage storageDriver;
+#else
+static ChibiOS::Storage storageDriver;
+#endif
+static ChibiOS::GPIO gpioDriver;
+static ChibiOS::RCInput rcinDriver;
+
+#if HAL_USE_PWM == TRUE
+static ChibiOS::RCOutput rcoutDriver;
+#else
+static Empty::RCOutput rcoutDriver;
+#endif
+
+static ChibiOS::Scheduler schedulerInstance;
+static ChibiOS::Util utilInstance;
+static Empty::OpticalFlow opticalFlowDriver;
+
+#if AP_SIM_ENABLED
+static AP_HAL::SIMState xsimstate;
+#endif
+
+#if HAL_WITH_DSP
+static ChibiOS::DSP dspDriver;
+#endif
+
+#ifndef HAL_NO_FLASH_SUPPORT
+static ChibiOS::Flash flashDriver;
+#else
+static Empty::Flash flashDriver;
+#endif
+
+#if HAL_NUM_CAN_IFACES > 0
+static ChibiOS::CANIface* canDrivers[HAL_NUM_CAN_IFACES];
+#endif
+
+#if HAL_USE_WSPI == TRUE && defined(HAL_WSPI_DEVICE_LIST)
+static ChibiOS::WSPIDeviceManager wspiDeviceManager;
+#endif
+
+#if HAL_WITH_IO_MCU
+HAL_UART_IO_DRIVER;
+#include <AP_IOMCU/AP_IOMCU.h>
+AP_IOMCU iomcu(uart_io);
+#endif
+
+HAL_ChibiOS::HAL_ChibiOS() :
+    AP_HAL::HAL(
+        &serial0Driver,
+        &serial1Driver,
+        &serial2Driver,
+        &serial3Driver,
+        &serial4Driver,
+        &serial5Driver,
+        &serial6Driver,
+        &serial7Driver,
+        &serial8Driver,
+        &serial9Driver,
+        &i2cDeviceManager,
+        &spiDeviceManager,
+#if HAL_USE_WSPI == TRUE && defined(HAL_WSPI_DEVICE_LIST)
+        &wspiDeviceManager,
+#else
+        nullptr,
+#endif
+        &analogIn,
+        &storageDriver,
+        &serial0Driver,
+        &gpioDriver,
+        &rcinDriver,
+        &rcoutDriver,
+        &schedulerInstance,
+        &utilInstance,
+        &opticalFlowDriver,
+        &flashDriver,
+#if AP_SIM_ENABLED
+        &xsimstate,
+#endif
+#if HAL_WITH_DSP
+        &dspDriver,
+#endif
+#if HAL_NUM_CAN_IFACES
+        (AP_HAL::CANIface**)canDrivers
+#else
+        nullptr
+#endif
+        )
+{}
+
+static bool thread_running = false;        /**< Daemon status flag */
+static thread_t* daemon_task;              /**< Handle of daemon task / thread */
+
+extern const AP_HAL::HAL& hal;
+
+
+/*
+  set the priority of the main APM task
+ */
+void hal_chibios_set_priority(uint8_t priority)
+{
+    chSysLock();
+#if CH_CFG_USE_MUTEXES == TRUE
+    if ((daemon_task->hdr.pqueue.prio == daemon_task->realprio) || (priority > daemon_task->hdr.pqueue.prio)) {
+      daemon_task->hdr.pqueue.prio = priority;
+    }
+    daemon_task->realprio = priority;
+#endif
+    chSchRescheduleS();
+    chSysUnlock();
+}
+
+thread_t* get_main_thread()
+{
+    return daemon_task;
+}
+
+static AP_HAL::HAL::Callbacks* g_callbacks;
+
+static void main_loop()
+{
+    daemon_task = chThdGetSelfX();
+
+    /*
+      switch to high priority for main loop
+     */
+    chThdSetPriority(APM_MAIN_PRIORITY);
+
+#ifdef HAL_I2C_CLEAR_BUS
+    // Clear all I2C Buses. This can be needed on some boards which
+    // can get a stuck I2C peripheral on boot
+    ChibiOS::I2CBus::clear_all();
+#endif
+
+#if AP_HAL_SHARED_DMA_ENABLED
+    ChibiOS::Shared_DMA::init();
+#endif
+
+    peripheral_power_enable();
+
+    hal.serial(0)->begin(SERIAL0_BAUD);
+
+#if (HAL_USE_SPI == TRUE) && defined(HAL_SPI_CHECK_CLOCK_FREQ)
+    // optional test of SPI clock frequencies
+    ChibiOS::SPIDevice::test_clock_freq();
+#endif
+
+    hal.analogin->init();
+    hal.scheduler->init();
+
+    /*
+      run setup() at low priority to ensure CLI doesn't hang the
+      system, and to allow initial sensor read loops to run
+     */
+    hal_chibios_set_priority(APM_STARTUP_PRIORITY);
+
+    if (stm32_was_watchdog_reset()) {
+        // load saved watchdog data
+        stm32_watchdog_load((uint32_t *)&utilInstance.persistent_data, (sizeof(utilInstance.persistent_data)+3)/4);
+        utilInstance.last_persistent_data = utilInstance.persistent_data;
+    }
+
+    schedulerInstance.hal_initialized();
+
+    g_callbacks->setup();
+
+#if HAL_ENABLE_SAVE_PERSISTENT_PARAMS
+    utilInstance.apply_persistent_params();
+#endif
+
+#if HAL_FLASH_PROTECTION
+    if (AP_BoardConfig::unlock_flash()) {
+        stm32_flash_unprotect_flash();
+    } else {
+        stm32_flash_protect_flash(false, AP_BoardConfig::protect_flash());
+        stm32_flash_protect_flash(true, AP_BoardConfig::protect_bootloader());
+    }
+#endif
+
+#if !defined(DISABLE_WATCHDOG)
+#ifdef IOMCU_FW
+    stm32_watchdog_init();
+#elif !defined(HAL_BOOTLOADER_BUILD)
+#if !defined(HAL_EARLY_WATCHDOG_INIT)
+    // setup watchdog to reset if main loop stops
+    if (AP_BoardConfig::watchdog_enabled()) {
+        stm32_watchdog_init();
+    }
+#endif
+
+    if (hal.util->was_watchdog_reset()) {
+        INTERNAL_ERROR(AP_InternalError::error_t::watchdog_reset);
+    }
+#endif // IOMCU_FW
+#endif // DISABLE_WATCHDOG
+
+    schedulerInstance.watchdog_pat();
+
+    hal.scheduler->set_system_initialized();
+
+    thread_running = true;
+    chRegSetThreadName(AP_BUILD_TARGET_NAME);
+
+    /*
+      switch to high priority for main loop
+     */
+    chThdSetPriority(APM_MAIN_PRIORITY);
+
+    while (true) {
+        g_callbacks->loop();
+
+#if HAL_SCHEDULER_LOOP_DELAY_ENABLED && !APM_BUILD_TYPE(APM_BUILD_Replay)
+        /*
+          give up 50 microseconds of time if the INS loop hasn't
+          called delay_microseconds_boost(), to ensure low priority
+          drivers get a chance to run. Calling
+          delay_microseconds_boost() means we have already given up
+          time from the main loop, so we don't need to do it again
+          here
+         */
+        if (!schedulerInstance.check_called_boost()) {
+            hal.scheduler->delay_microseconds(50);
+        }
+#endif
+        schedulerInstance.watchdog_pat();
+    }
+    thread_running = false;
+}
+
+void HAL_ChibiOS::run(int argc, char * const argv[], Callbacks* callbacks) const
+{
+#if defined(HAL_EARLY_WATCHDOG_INIT) && !defined(DISABLE_WATCHDOG)
+    stm32_watchdog_init();
+    stm32_watchdog_pat();
+#endif
+    /*
+     * System initializations.
+     * - ChibiOS HAL initialization, this also initializes the configured device drivers
+     *   and performs the board-specific initializations.
+     * - Kernel initialization, the main() function becomes a thread and the
+     *   RTOS is active.
+     */
+
+#if HAL_USE_SERIAL_USB == TRUE
+    usb_initialise();
+#endif
+
+#ifdef HAL_STDOUT_SERIAL
+    //STDOUT Initialisation
+    SerialConfig stdoutcfg =
+    {
+      HAL_STDOUT_BAUDRATE,
+      0,
+      USART_CR2_STOP1_BITS,
+      0
+    };
+    sdStart((SerialDriver*)&HAL_STDOUT_SERIAL, &stdoutcfg);
+#endif
+
+    g_callbacks = callbacks;
+
+    //Takeover main
+    main_loop();
+}
+
+static HAL_ChibiOS hal_chibios;
+
+const AP_HAL::HAL& AP_HAL::get_HAL() {
+    return hal_chibios;
+}
+
+AP_HAL::HAL& AP_HAL::get_HAL_mutable() {
+    return hal_chibios;
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+#pragma once
+
+#include <AP_HAL/AP_HAL.h>
+
+#include <AP_HAL_Empty/AP_HAL_Empty_Namespace.h>
+#include <AP_HAL_ChibiOS/AP_HAL_ChibiOS_Namespace.h>
+#include "hwdef/common/halconf.h"
+#ifdef USE_POSIX
+#include <ff.h>
+#endif
+#include <stdio.h>
+#include "ch.h"
+
+class HAL_ChibiOS : public AP_HAL::HAL {
+public:
+    HAL_ChibiOS();
+    void run(int argc, char* const* argv, Callbacks* callbacks) const override;
+};
+void hal_chibios_set_priority(uint8_t priority);
+#if HAL_NUM_CAN_IFACES
+typedef ChibiOS::CANIface HAL_CANIface;
+#endif
+thread_t* get_main_thread(void);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <hal.h>
+#include "I2CDevice.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include "Util.h"
+#include "GPIO.h"
+
+#if HAL_USE_I2C == TRUE && defined(HAL_I2C_DEVICE_LIST)
+
+#include "Scheduler.h"
+#include "hwdef/common/stm32_util.h"
+#include <AP_InternalError/AP_InternalError.h>
+
+#include "ch.h"
+#include "hal.h"
+
+static const struct I2CInfo {
+    I2CDriver *i2c;
+    uint8_t instance;
+    uint8_t dma_channel_rx;
+    uint8_t dma_channel_tx;
+    ioline_t scl_line;
+    ioline_t sda_line;
+} I2CD[] = { HAL_I2C_DEVICE_LIST };
+
+using namespace ChibiOS;
+extern const AP_HAL::HAL& hal;
+
+I2CBus I2CDeviceManager::businfo[ARRAY_SIZE(I2CD)];
+
+#ifndef HAL_I2C_BUS_BASE
+#define HAL_I2C_BUS_BASE 0
+#endif
+
+// default to 100kHz clock for maximum reliability. This can be
+// changed in hwdef.dat
+#ifndef HAL_I2C_MAX_CLOCK
+#define HAL_I2C_MAX_CLOCK 100000
+#endif
+
+// values calculated with STM32CubeMX tool, PCLK=54MHz
+#ifndef HAL_I2C_F7_100_TIMINGR
+#define HAL_I2C_F7_100_TIMINGR 0x30812E3E
+#endif
+#ifndef HAL_I2C_F7_400_TIMINGR
+#define HAL_I2C_F7_400_TIMINGR 0x6000030D
+#endif
+
+#ifndef HAL_I2C_H7_100_TIMINGR
+#define HAL_I2C_H7_100_TIMINGR 0x00707CBB
+#endif
+#ifndef HAL_I2C_H7_400_TIMINGR
+#define HAL_I2C_H7_400_TIMINGR 0x00300F38
+#endif
+
+#ifndef HAL_I2C_L4_100_TIMINGR
+#define HAL_I2C_L4_100_TIMINGR 0x10909CEC
+#endif
+#ifndef HAL_I2C_L4_400_TIMINGR
+#define HAL_I2C_L4_400_TIMINGR 0x00702991
+#endif
+
+#ifndef HAL_I2C_L4PLUS_100_TIMINGR
+#define HAL_I2C_L4PLUS_100_TIMINGR 0x307075B1
+#endif
+
+#ifndef HAL_I2C_L4PLUS_400_TIMINGR
+#define HAL_I2C_L4PLUS_400_TIMINGR 0x00501BFF
+#endif
+
+#ifndef HAL_I2C_G4_100_TIMINGR
+#define HAL_I2C_G4_100_TIMINGR 0x60505F8C
+#endif
+#ifndef HAL_I2C_G4_400_TIMINGR
+#define HAL_I2C_G4_400_TIMINGR 0x20501E65
+#endif
+
+/*
+  enable clear (toggling SCL) on I2C bus timeouts which leave SDA stuck low
+ */
+#ifndef HAL_I2C_CLEAR_ON_TIMEOUT
+#define HAL_I2C_CLEAR_ON_TIMEOUT 1
+#endif
+
+// get a handle for DMA sharing DMA channels with other subsystems
+void I2CBus::dma_init(void)
+{
+    chMtxObjectInit(&dma_lock);
+    dma_handle = NEW_NOTHROW Shared_DMA(I2CD[busnum].dma_channel_tx, I2CD[busnum].dma_channel_rx,
+                                FUNCTOR_BIND_MEMBER(&I2CBus::dma_allocate, void, Shared_DMA *),
+                                FUNCTOR_BIND_MEMBER(&I2CBus::dma_deallocate, void, Shared_DMA *));
+}
+
+// Clear Bus to avoid bus lockup
+void I2CBus::clear_all()
+{
+    for (uint8_t i=0; i<ARRAY_SIZE(I2CD); i++) {
+        clear_bus(i);
+    }
+}
+
+/*
+  If bus exists, set its data and clock lines to floating
+ */
+void I2CBus::set_bus_to_floating(uint8_t busidx)
+{
+    if (busidx < ARRAY_SIZE(I2CD)) {
+        const struct I2CInfo &info = I2CD[busidx];
+        const ioline_t sda_line = GPIO::resolve_alt_config(info.sda_line, PERIPH_TYPE::I2C_SDA, info.instance);
+        const ioline_t scl_line = GPIO::resolve_alt_config(info.scl_line, PERIPH_TYPE::I2C_SCL, info.instance);
+        palSetLineMode(sda_line, PAL_MODE_INPUT);
+        palSetLineMode(scl_line, PAL_MODE_INPUT);
+    }
+}
+
+
+/*
+  Check enabled I2C/CAN select pins against check_pins bitmask
+ */
+bool I2CBus::check_select_pins(uint8_t check_pins)
+{
+    uint8_t enabled_pins = 0;
+
+#ifdef HAL_GPIO_PIN_GPIO_CAN_I2C1_SEL
+    enabled_pins |= palReadLine(HAL_GPIO_PIN_GPIO_CAN_I2C1_SEL) << 0;
+#endif
+#ifdef HAL_GPIO_PIN_GPIO_CAN_I2C2_SEL
+    enabled_pins |= palReadLine(HAL_GPIO_PIN_GPIO_CAN_I2C2_SEL) << 1;
+#endif
+#ifdef HAL_GPIO_PIN_GPIO_CAN_I2C3_SEL
+    enabled_pins |= palReadLine(HAL_GPIO_PIN_GPIO_CAN_I2C3_SEL) << 2;
+#endif
+#ifdef HAL_GPIO_PIN_GPIO_CAN_I2C4_SEL
+    enabled_pins |= palReadLine(HAL_GPIO_PIN_GPIO_CAN_I2C4_SEL) << 3;
+#endif
+
+    return (enabled_pins & check_pins) == check_pins;
+}
+
+
+/*
+  clear a stuck bus (bus held by a device that is holding SDA low) by
+  clocking out pulses on SCL to let the device complete its
+  transaction
+ */
+void I2CBus::clear_bus(uint8_t busidx)
+{
+#if HAL_I2C_CLEAR_ON_TIMEOUT
+    const struct I2CInfo &info = I2CD[busidx];
+    const ioline_t scl_line = GPIO::resolve_alt_config(info.scl_line, PERIPH_TYPE::I2C_SCL, info.instance);
+    if (scl_line == 0) {
+        return;
+    }
+    const iomode_t mode_saved = palReadLineMode(scl_line);
+    palSetLineMode(scl_line, PAL_MODE_OUTPUT_PUSHPULL);
+    for(uint8_t j = 0; j < 20; j++) {
+        palToggleLine(scl_line);
+        hal.scheduler->delay_microseconds(10);
+    }
+    palSetLineMode(scl_line, mode_saved);
+#endif
+}
+
+#if HAL_I2C_CLEAR_ON_TIMEOUT
+/*
+  read SDA on a bus, to check if it may be stuck
+ */
+uint8_t I2CBus::read_sda(uint8_t busidx)
+{
+    const struct I2CInfo &info = I2CD[busidx];
+    const ioline_t sda_line = GPIO::resolve_alt_config(info.sda_line, PERIPH_TYPE::I2C_SDA, info.instance);
+    if (sda_line == 0) {
+        return 0;
+    }
+    const iomode_t mode_saved = palReadLineMode(sda_line);
+    palSetLineMode(sda_line, PAL_MODE_INPUT);
+    uint8_t ret = palReadLine(sda_line);
+    palSetLineMode(sda_line, mode_saved);
+    return ret;
+}
+#endif
+
+// setup I2C buses
+I2CDeviceManager::I2CDeviceManager(void)
+{
+    for (uint8_t i=0; i<ARRAY_SIZE(I2CD); i++) {
+        businfo[i].busnum = i;
+        businfo[i].dma_init();
+        /*
+          setup default I2C config. As each device is opened we will
+          drop the speed to be the minimum speed requested
+         */
+        businfo[i].busclock = HAL_I2C_MAX_CLOCK;
+#if defined(STM32F7) || defined(STM32F3)
+        if (businfo[i].busclock <= 100000) {
+            businfo[i].i2ccfg.timingr = HAL_I2C_F7_100_TIMINGR;
+            businfo[i].busclock = 100000;
+        } else {
+            businfo[i].i2ccfg.timingr = HAL_I2C_F7_400_TIMINGR;
+            businfo[i].busclock = 400000;
+        }
+#elif defined(STM32H7)
+        if (businfo[i].busclock <= 100000) {
+            businfo[i].i2ccfg.timingr = HAL_I2C_H7_100_TIMINGR;
+            businfo[i].busclock = 100000;
+        } else {
+            businfo[i].i2ccfg.timingr = HAL_I2C_H7_400_TIMINGR;
+            businfo[i].busclock = 400000;
+        }
+#elif defined(STM32L4)
+        if (businfo[i].busclock <= 100000) {
+            businfo[i].i2ccfg.timingr = HAL_I2C_L4_100_TIMINGR;
+            businfo[i].busclock = 100000;
+        } else {
+            businfo[i].i2ccfg.timingr = HAL_I2C_L4_400_TIMINGR;
+            businfo[i].busclock = 400000;
+        }
+#elif defined(STM32L4PLUS)
+        if (businfo[i].busclock <= 100000) {
+            businfo[i].i2ccfg.timingr = HAL_I2C_L4PLUS_100_TIMINGR;
+            businfo[i].busclock = 100000;
+        } else {
+            businfo[i].i2ccfg.timingr = HAL_I2C_L4PLUS_400_TIMINGR;
+            businfo[i].busclock = 400000;
+        }
+
+#elif defined(STM32G4)
+        if (businfo[i].busclock <= 100000) {
+            businfo[i].i2ccfg.timingr = HAL_I2C_G4_100_TIMINGR;
+            businfo[i].busclock = 100000;
+        } else {
+            businfo[i].i2ccfg.timingr = HAL_I2C_G4_400_TIMINGR;
+            businfo[i].busclock = 400000;
+        }
+#else // F1 or F4
+        businfo[i].i2ccfg.op_mode = OPMODE_I2C;
+        businfo[i].i2ccfg.clock_speed = businfo[i].busclock;
+        if (businfo[i].i2ccfg.clock_speed <= 100000) {
+            businfo[i].i2ccfg.duty_cycle = STD_DUTY_CYCLE;
+        } else {
+            businfo[i].i2ccfg.duty_cycle = FAST_DUTY_CYCLE_2;
+        }
+#endif
+    }
+}
+
+I2CDevice::I2CDevice(uint8_t busnum, uint8_t address, uint32_t bus_clock, bool use_smbus, uint32_t timeout_ms) :
+    _retries(2),
+    _address(address),
+    _use_smbus(use_smbus),
+    _timeout_ms(timeout_ms),
+    bus(I2CDeviceManager::businfo[busnum])
+{
+    set_device_bus(busnum+HAL_I2C_BUS_BASE);
+    set_device_address(address);
+    asprintf(&pname, "I2C:%u:%02x",
+             (unsigned)busnum, (unsigned)address);
+    if (bus_clock < bus.busclock) {
+#if defined(STM32F7) || defined(STM32H7) || defined(STM32F3) || defined(STM32G4) || defined(STM32L4) || defined(STM32L4PLUS)
+        if (bus_clock <= 100000) {
+            bus.i2ccfg.timingr = HAL_I2C_F7_100_TIMINGR;
+            bus.busclock = 100000;
+        }
+#else
+        bus.i2ccfg.clock_speed = bus_clock;
+        bus.busclock = bus_clock;
+        if (bus_clock <= 100000) {
+            bus.i2ccfg.duty_cycle = STD_DUTY_CYCLE;
+        }
+#endif
+        DEV_PRINTF("I2C%u clock %ukHz\n", busnum, unsigned(bus.busclock/1000));
+    }
+}
+
+I2CDevice::~I2CDevice()
+{
+#if 0
+    printf("I2C device bus %u address 0x%02x closed\n",
+           (unsigned)bus.busnum, (unsigned)_address);
+#endif
+    free(pname);
+}
+
+/*
+  allocate DMA channel, nothing to do, as we don't keep the bus active between transactions
+ */
+void I2CBus::dma_allocate(Shared_DMA *ctx)
+{
+}
+
+/*
+  deallocate DMA channel
+ */
+void I2CBus::dma_deallocate(Shared_DMA *)
+{
+}
+
+bool I2CDevice::transfer(const uint8_t *send, uint32_t send_len,
+                         uint8_t *recv, uint32_t recv_len)
+{
+    if (!bus.semaphore.check_owner()) {
+        DEV_PRINTF("I2C: not owner of 0x%x for addr 0x%02x\n", (unsigned)get_bus_id(), _address);
+        return false;
+    }
+
+#if defined(STM32F7) || defined(STM32H7) || defined(STM32F3) || defined(STM32G4) || defined(STM32L4) || defined(STM32L4PLUS)
+    if (_use_smbus) {
+        bus.i2ccfg.cr1 |= I2C_CR1_SMBHEN;
+    } else {
+        bus.i2ccfg.cr1 &= ~I2C_CR1_SMBHEN;
+    }
+#else
+    if (_use_smbus) {
+        bus.i2ccfg.op_mode = OPMODE_SMBUS_HOST;
+    } else {
+        bus.i2ccfg.op_mode = OPMODE_I2C;
+    }
+#endif
+
+    if (_split_transfers) {
+        /*
+          splitting the transfer() into two pieces avoids a stop condition
+          with SCL low which is not supported on some devices (such as
+          LidarLite blue label)
+        */
+        if (send && send_len) {
+            if (!_transfer(send, send_len, nullptr, 0)) {
+                return false;
+            }
+        }
+        if (recv && recv_len) {
+            if (!_transfer(nullptr, 0, recv, recv_len)) {
+                return false;
+            }
+        }
+    } else {
+        // combined transfer
+        if (!_transfer(send, send_len, recv, recv_len)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool I2CDevice::_transfer(const uint8_t *send, uint32_t send_len,
+                         uint8_t *recv, uint32_t recv_len)
+{
+    i2cAcquireBus(I2CD[bus.busnum].i2c);
+
+    if (!bus.bouncebuffer_setup(send, send_len, recv, recv_len)) {
+        i2cReleaseBus(I2CD[bus.busnum].i2c);
+        return false;
+    }
+
+    for(uint8_t i=0 ; i <= _retries; i++) {
+        int ret;
+        // calculate a timeout as twice the expected transfer time, and set as min of 4ms
+        uint32_t timeout_ms = 1+2*(((8*1000000UL/bus.busclock)*(send_len+recv_len))/1000);
+        timeout_ms = MAX(timeout_ms, _timeout_ms);
+
+        // we get the lock and start the bus inside the retry loop to
+        // allow us to give up the DMA channel to an SPI device on
+        // retries
+        bus.dma_handle->lock();
+
+        i2cStart(I2CD[bus.busnum].i2c, &bus.i2ccfg);
+        osalDbgAssert(I2CD[bus.busnum].i2c->state == I2C_READY, "i2cStart state");
+
+        osalSysLock();
+        hal.util->persistent_data.i2c_count++;
+        osalSysUnlock();
+
+        if(send_len == 0) {
+            ret = i2cMasterReceiveTimeout(I2CD[bus.busnum].i2c, _address, recv, recv_len, chTimeMS2I(timeout_ms));
+        } else {
+            ret = i2cMasterTransmitTimeout(I2CD[bus.busnum].i2c, _address, send, send_len,
+                                           recv, recv_len, chTimeMS2I(timeout_ms));
+        }
+
+        i2cSoftStop(I2CD[bus.busnum].i2c);
+        osalDbgAssert(I2CD[bus.busnum].i2c->state == I2C_STOP, "i2cStart state");
+
+        bus.dma_handle->unlock();
+
+        if (I2CD[bus.busnum].i2c->errors & I2C_ISR_LIMIT) {
+            INTERNAL_ERROR(AP_InternalError::error_t::i2c_isr);
+            break;
+        }
+
+#ifdef STM32_I2C_ISR_LIMIT
+        AP_HAL::Util::PersistentData &pd = hal.util->persistent_data;
+        pd.i2c_isr_count += I2CD[bus.busnum].i2c->isr_count;
+#endif
+
+        if (ret == MSG_OK) {
+            bus.bouncebuffer_finish(send, recv, recv_len);
+            i2cReleaseBus(I2CD[bus.busnum].i2c);
+            return true;
+        }
+#if HAL_I2C_CLEAR_ON_TIMEOUT
+        if (ret == MSG_TIMEOUT && I2CBus::read_sda(bus.busnum) == 0) {
+            I2CBus::clear_bus(bus.busnum);
+        }
+#endif
+    }
+    bus.bouncebuffer_finish(send, recv, recv_len);
+    i2cReleaseBus(I2CD[bus.busnum].i2c);
+    return false;
+}
+
+bool I2CDevice::read_registers_multiple(uint8_t first_reg, uint8_t *recv,
+                                        uint32_t recv_len, uint8_t times)
+{
+    return false;
+}
+
+
+/*
+  register a periodic callback
+*/
+AP_HAL::Device::PeriodicHandle I2CDevice::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+{
+    return bus.register_periodic_callback(period_usec, cb, this);
+}
+
+
+/*
+  adjust a periodic callback
+*/
+bool I2CDevice::adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec)
+{
+    return bus.adjust_timer(h, period_usec);
+}
+
+AP_HAL::OwnPtr<AP_HAL::I2CDevice>
+I2CDeviceManager::get_device(uint8_t bus, uint8_t address,
+                             uint32_t bus_clock,
+                             bool use_smbus,
+                             uint32_t timeout_ms)
+{
+    bus -= HAL_I2C_BUS_BASE;
+    if (bus >= ARRAY_SIZE(I2CD)) {
+        return AP_HAL::OwnPtr<AP_HAL::I2CDevice>(nullptr);
+    }
+    auto dev = AP_HAL::OwnPtr<AP_HAL::I2CDevice>(NEW_NOTHROW I2CDevice(bus, address, bus_clock, use_smbus, timeout_ms));
+    return dev;
+}
+
+/*
+  get mask of bus numbers for all configured I2C buses
+*/
+uint32_t I2CDeviceManager::get_bus_mask(void) const
+{
+    return ((1U << ARRAY_SIZE(I2CD)) - 1) << HAL_I2C_BUS_BASE;
+}
+
+/*
+  get mask of bus numbers for all configured internal I2C buses
+*/
+uint32_t I2CDeviceManager::get_bus_mask_internal(void) const
+{
+    // assume first bus is internal
+    return get_bus_mask() & HAL_I2C_INTERNAL_MASK;
+}
+
+/*
+  get mask of bus numbers for all configured external I2C buses
+*/
+uint32_t I2CDeviceManager::get_bus_mask_external(void) const
+{
+    // assume first bus is internal
+    return get_bus_mask() & ~HAL_I2C_INTERNAL_MASK;
+}
+
+#endif // HAL_USE_I2C
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (C) 2015-2016  Intel Corporation. All rights reserved.
+ *
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Modified for use in AP_HAL_ChibiOS by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#pragma once
+
+#include <inttypes.h>
+
+#include <AP_HAL/HAL.h>
+#include <AP_HAL/I2CDevice.h>
+#include <AP_HAL/utility/OwnPtr.h>
+#include "AP_HAL_ChibiOS.h"
+
+#if HAL_USE_I2C == TRUE
+
+#include "Semaphores.h"
+#include "Device.h"
+#include "shared_dma.h"
+
+namespace ChibiOS {
+
+class I2CBus : public DeviceBus {
+public:
+    I2CConfig i2ccfg;
+    uint8_t busnum;
+    uint32_t busclock;
+
+    // we need an additional lock in the dma_allocate and
+    // dma_deallocate functions to cope with 3-way contention as we
+    // have two DMA channels that we are handling with the shared_dma
+    // code
+    mutex_t dma_lock;
+
+    void dma_allocate(Shared_DMA *);
+    void dma_deallocate(Shared_DMA *);
+    void dma_init(void);
+    static void clear_all(void);
+    static void clear_bus(uint8_t busidx);
+    static uint8_t read_sda(uint8_t busidx);
+    static bool check_select_pins(uint8_t check_pins);
+    static void set_bus_to_floating(uint8_t busidx);
+};
+
+class I2CDevice : public AP_HAL::I2CDevice {
+public:
+    static I2CDevice *from(AP_HAL::I2CDevice *dev)
+    {
+        return static_cast<I2CDevice*>(dev);
+    }
+
+    I2CDevice(uint8_t bus, uint8_t address, uint32_t bus_clock, bool use_smbus, uint32_t timeout_ms);
+    ~I2CDevice();
+
+    /* See AP_HAL::I2CDevice::set_address() */
+    void set_address(uint8_t address) override { _address = address; }
+
+    /* See AP_HAL::I2CDevice::set_retries() */
+    void set_retries(uint8_t retries) override { _retries = retries; }
+
+    /* See AP_HAL::Device::set_speed(): Empty implementation, not supported. */
+    bool set_speed(enum Device::Speed speed) override { return true; }
+
+    /* See AP_HAL::Device::transfer() */
+    bool transfer(const uint8_t *send, uint32_t send_len,
+                  uint8_t *recv, uint32_t recv_len) override;
+
+    bool read_registers_multiple(uint8_t first_reg, uint8_t *recv,
+                                 uint32_t recv_len, uint8_t times) override;
+
+    /* See AP_HAL::Device::register_periodic_callback() */
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(
+        uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
+
+    /* See AP_HAL::Device::adjust_periodic_callback() */
+    bool adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec) override;
+
+    AP_HAL::Semaphore* get_semaphore() override {
+        // if asking for invalid bus number use bus 0 semaphore
+        return &bus.semaphore;
+    }
+
+    void set_split_transfers(bool set) override {
+        _split_transfers = set;
+    }
+
+private:
+    I2CBus &bus;
+    bool _transfer(const uint8_t *send, uint32_t send_len,
+                         uint8_t *recv, uint32_t recv_len);
+
+    /* I2C interface #2 */
+    uint8_t _retries;
+    uint8_t _address;
+    char *pname;
+    bool _split_transfers;
+    bool _use_smbus;
+    uint32_t _timeout_ms;
+};
+
+class I2CDeviceManager : public AP_HAL::I2CDeviceManager {
+public:
+    friend class I2CDevice;
+
+    static I2CBus businfo[];
+
+    // constructor
+    I2CDeviceManager();
+
+    static I2CDeviceManager *from(AP_HAL::I2CDeviceManager *i2c_mgr)
+    {
+        return static_cast<I2CDeviceManager*>(i2c_mgr);
+    }
+
+    AP_HAL::OwnPtr<AP_HAL::I2CDevice> get_device(uint8_t bus, uint8_t address,
+                                                 uint32_t bus_clock=400000,
+                                                 bool use_smbus = false,
+                                                 uint32_t timeout_ms=4) override;
+
+    /*
+      get mask of bus numbers for all configured I2C buses
+     */
+    uint32_t get_bus_mask(void) const override;
+
+    /*
+      get mask of bus numbers for all configured external I2C buses
+     */
+    uint32_t get_bus_mask_external(void) const override;
+
+    /*
+      get mask of bus numbers for all configured internal I2C buses
+     */
+    uint32_t get_bus_mask_internal(void) const override;
+};
+}
+
+#endif // HAL_USE_I2C
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #pragma once
+
+#include <AP_Logger/LogStructure.h>
+
+#define LOG_IDS_FROM_HAL_CHIBIOS \
+    LOG_MON_MSG,                 \
+    LOG_WDOG_MSG
+
+// @LoggerMessage: MON
+// @Description: Main loop performance monitoring message.
+// @Field: TimeUS: Time since system startup
+// @Field: Dly: Loop delay so far
+// @Field: Tsk: Current task
+// @Field: IErr: Internal error mask
+// @Field: IErrCnt: Count of internal error occurances
+// @Field: IErrLn: Internal Error line
+// @Field: MM: MAVLink message currently being processed
+// @Field: MC: MAVLink command currently being processed
+// @Field: SmLn: If semaphore taken, line of semaphore take call
+// @Field: SPICnt: count of SPI transactions
+// @Field: I2CCnt: count of i2c transactions
+struct PACKED log_MON {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint32_t loop_delay;
+    int8_t current_task;
+    uint32_t internal_error_mask;
+    uint16_t internal_error_count;
+    uint16_t internal_error_line;
+    uint16_t mavmsg;
+    uint16_t mavcmd;
+    uint16_t semline;
+    uint32_t spicnt;
+    uint32_t i2ccnt;
+};
+
+// @LoggerMessage: WDOG
+// @Description: Watchdog diagnostics
+// @Field: TimeUS: Time since system startup
+// @Field: Tsk: current task number
+// @Field: IE: internal error mast
+// @Field: IEC: internal error count
+// @Field: IEL: line internal error was raised on
+// @Field: MvMsg: mavlink message being acted on
+// @Field: MvCmd: mavlink command being acted on
+// @Field: SmLn: line semaphore was taken on
+// @Field: FL: fault_line
+// @Field: FT: fault_type
+// @Field: FA: fault address
+// @Field: FP: fault thread priority
+// @Field: ICSR: ICS regiuster
+// @Field: LR: long return address
+// @Field: TN: Thread name
+struct PACKED log_WDOG {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    int8_t scheduler_task;
+    uint32_t internal_errors;
+    uint16_t internal_error_count;
+    uint16_t internal_error_last_line;
+    uint16_t last_mavlink_msgid;
+    uint16_t last_mavlink_cmd;
+    uint16_t semaphore_line;
+    uint16_t fault_line;
+    uint16_t fault_type;
+    uint32_t fault_addr;
+    uint8_t fault_thd_prio;
+    uint32_t fault_icsr;
+    uint32_t fault_lr;
+    char thread_name4[4];
+};
+
+#define LOG_STRUCTURE_FROM_HAL_CHIBIOS                                  \
+    { LOG_MON_MSG, sizeof(log_MON),                                     \
+      "MON","QIbIHHHHHII","TimeUS,Dly,Tsk,IErr,IErrCnt,IErrLn,MM,MC,SmLn,SPICnt,I2CCnt", "s----------", "F----------", false }, \
+    { LOG_WDOG_MSG, sizeof(log_WDOG),                                   \
+     "WDOG","QbIHHHHHHHIBIIn","TimeUS,Tsk,IE,IEC,IEL,MvMsg,MvCmd,SmLn,FL,FT,FA,FP,ICSR,LR,TN", "s--------------", "F--------------", false },
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#include <hal.h>
+#include "RCInput.h"
+#include "hal.h"
+#include "hwdef/common/ppm.h"
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+
+#include <AP_RCProtocol/AP_RCProtocol_config.h>
+
+#if HAL_WITH_IO_MCU
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_IOMCU/AP_IOMCU.h>
+extern AP_IOMCU iomcu;
+#endif
+
+#include <AP_Math/AP_Math.h>
+
+#ifndef HAL_NO_UARTDRIVER
+#include <GCS_MAVLink/GCS.h>
+#endif
+
+#define SIG_DETECT_TIMEOUT_US 500000
+using namespace ChibiOS;
+extern const AP_HAL::HAL& hal;
+void RCInput::init()
+{
+#if AP_RCPROTOCOL_ENABLED
+    AP::RC().init();
+#endif
+
+#if HAL_USE_ICU == TRUE
+    //attach timer channel on which the signal will be received
+    sig_reader.attach_capture_timer(&RCIN_ICU_TIMER, RCIN_ICU_CHANNEL, STM32_RCIN_DMA_STREAM, STM32_RCIN_DMA_CHANNEL);
+    pulse_input_enabled = true;
+#endif
+
+#if HAL_USE_EICU == TRUE
+    sig_reader.init(&RCININT_EICU_TIMER, RCININT_EICU_CHANNEL);
+    pulse_input_enabled = true;
+#endif
+
+    _init = true;
+}
+
+/*
+  enable or disable pulse input for RC input. This is used to reduce
+  load when we are decoding R/C via a UART
+*/
+void RCInput::pulse_input_enable(bool enable)
+{
+    pulse_input_enabled = enable;
+#if HAL_USE_ICU == TRUE || HAL_USE_EICU == TRUE
+    if (!enable) {
+        sig_reader.disable();
+    }
+#endif
+}
+
+bool RCInput::new_input()
+{
+    if (!_init) {
+        return false;
+    }
+    bool valid;
+    {
+        WITH_SEMAPHORE(rcin_mutex);
+        valid = _rcin_timestamp_last_signal != _last_read;
+        _last_read = _rcin_timestamp_last_signal;
+    }
+
+    return valid;
+}
+
+uint8_t RCInput::num_channels()
+{
+    if (!_init) {
+        return 0;
+    }
+    return _num_channels;
+}
+
+uint16_t RCInput::read(uint8_t channel)
+{
+    if (!_init || (channel >= MIN(RC_INPUT_MAX_CHANNELS, _num_channels))) {
+        return 0;
+    }
+    uint16_t v;
+    {
+        WITH_SEMAPHORE(rcin_mutex);
+        v = _rc_values[channel];
+    }
+    return v;
+}
+
+uint8_t RCInput::read(uint16_t* periods, uint8_t len)
+{
+    if (!_init) {
+        return false;
+    }
+
+    if (len > RC_INPUT_MAX_CHANNELS) {
+        len = RC_INPUT_MAX_CHANNELS;
+    }
+    {
+        WITH_SEMAPHORE(rcin_mutex);
+        memcpy(periods, _rc_values, len*sizeof(periods[0]));
+    }
+    return len;
+}
+
+void RCInput::_timer_tick(void)
+{
+    if (!_init) {
+        return;
+    }
+#ifndef HAL_NO_UARTDRIVER
+    const char *rc_protocol = nullptr;
+    RCSource source = last_source;
+#endif
+
+#if AP_RCPROTOCOL_ENABLED
+    AP_RCProtocol &rcprot = AP::RC();
+
+#if HAL_USE_ICU == TRUE
+    if (pulse_input_enabled) {
+        const uint32_t *p;
+        uint32_t n;
+        while ((p = (const uint32_t *)sig_reader.sigbuf.readptr(n)) != nullptr) {
+            rcprot.process_pulse_list(p, n*2, sig_reader.need_swap);
+            sig_reader.sigbuf.advance(n);
+        }
+    }
+#endif
+
+#if HAL_USE_EICU == TRUE
+    if (pulse_input_enabled) {
+        uint32_t width_s0, width_s1;
+        while(sig_reader.read(width_s0, width_s1)) {
+            rcprot.process_pulse(width_s0, width_s1);
+        }
+    }
+#endif
+
+#endif  // AP_RCPROTOCOL_ENABLED
+
+#if HAL_WITH_IO_MCU
+    uint32_t now = AP_HAL::millis();
+    const bool have_iocmu_rc = (_rcin_last_iomcu_ms != 0 && now - _rcin_last_iomcu_ms < 400);
+    if (!have_iocmu_rc) {
+        _rcin_last_iomcu_ms = 0;
+    }
+#elif AP_RCPROTOCOL_ENABLED
+    const bool have_iocmu_rc = false;
+#endif
+
+#if AP_RCPROTOCOL_ENABLED
+    if (rcprot.new_input() && !have_iocmu_rc) {
+        WITH_SEMAPHORE(rcin_mutex);
+        _rcin_timestamp_last_signal = AP_HAL::micros();
+        _num_channels = rcprot.num_channels();
+        _num_channels = MIN(_num_channels, RC_INPUT_MAX_CHANNELS);
+        rcprot.read(_rc_values, _num_channels);
+        _rssi = rcprot.get_RSSI();
+        _rx_link_quality = rcprot.get_rx_link_quality();
+#ifndef HAL_NO_UARTDRIVER
+        rc_protocol = rcprot.protocol_name();
+        source = rcprot.using_uart() ? RCSource::RCPROT_BYTES : RCSource::RCPROT_PULSES;
+#endif
+    }
+#endif // AP_RCPROTOCOL_ENABLED
+
+#if HAL_WITH_IO_MCU
+    {
+        WITH_SEMAPHORE(rcin_mutex);
+        if (AP_BoardConfig::io_enabled() &&
+            iomcu.check_rcinput(last_iomcu_us, _num_channels, _rc_values, RC_INPUT_MAX_CHANNELS)) {
+            _rcin_timestamp_last_signal = last_iomcu_us;
+            _rcin_last_iomcu_ms = now;
+#ifndef HAL_NO_UARTDRIVER
+            rc_protocol = iomcu.get_rc_protocol();
+            _rssi = iomcu.get_RSSI();
+            source = RCSource::IOMCU;
+#endif
+        }
+    }
+#endif
+
+#ifndef HAL_NO_UARTDRIVER
+    if (rc_protocol && (rc_protocol != last_protocol || source != last_source)) {
+        last_protocol = rc_protocol;
+        last_source = source;
+        GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "RCInput: decoding %s(%u)", last_protocol, unsigned(source));
+    }
+#endif
+
+    // note, we rely on the vehicle code checking new_input()
+    // and a timeout for the last valid input to handle failsafe
+}
+
+/*
+  start a bind operation, if supported
+ */
+bool RCInput::rc_bind(int dsmMode)
+{
+#if HAL_WITH_IO_MCU
+    {
+        WITH_SEMAPHORE(rcin_mutex);
+        if (AP_BoardConfig::io_enabled()) {
+            iomcu.bind_dsm(dsmMode);
+        }
+    }
+#endif
+
+#if AP_RCPROTOCOL_ENABLED
+    // ask AP_RCProtocol to start a bind
+    AP::RC().start_bind();
+#endif
+
+    return true;
+}
+#endif //#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   

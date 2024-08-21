@@ -1,0 +1,2692 @@
+ange in airspeed reports that is allowed due to offset changes between calibrations before a warning is issued. This potential speed error is in percent of ASPD_FBW_MIN. 0 disables. Helps warn of calibrations without pitot being covered.
+    // @Range: 0.0 10.0
+    // @Units: %
+    // @User: Advanced
+    AP_GROUPINFO_FRAME("_OFF_PCNT", 27, AP_Airspeed, max_speed_pcnt, 0, AP_PARAM_FRAME_PLANE),    
+
+#endif
+
+    // @Group: _
+    // @Path: AP_Airspeed_Params.cpp
+    AP_SUBGROUPINFO(param[0], "_", 28, AP_Airspeed, AP_Airspeed_Params),
+
+#if AIRSPEED_MAX_SENSORS > 1
+    // @Group: 2_
+    // @Path: AP_Airspeed_Params.cpp
+    AP_SUBGROUPINFO(param[1], "2_", 29, AP_Airspeed, AP_Airspeed_Params),
+#endif
+
+    // index 30 is used by enable at the top of the table
+
+    AP_GROUPEND
+};
+
+/*
+  this scaling factor converts from the old system where we used a
+  0 to 4095 raw ADC value for 0-5V to the new system which gets the
+  voltage in volts directly from the ADC driver
+ */
+#define SCALING_OLD_CALIBRATION 819 // 4095/5
+
+AP_Airspeed::AP_Airspeed()
+{
+    AP_Param::setup_object_defaults(this, var_info);
+
+    // Setup defaults that only apply to first sensor
+    param[0].type.set_default(ARSPD_DEFAULT_TYPE);
+#ifndef HAL_BUILD_AP_PERIPH
+    param[0].bus.set_default(HAL_AIRSPEED_BUS_DEFAULT);
+    param[0].pin.set_default(ARSPD_DEFAULT_PIN);
+#endif
+
+    if (_singleton != nullptr) {
+        AP_HAL::panic("AP_Airspeed must be singleton");
+    }
+    _singleton = this;
+}
+
+void AP_Airspeed::set_fixedwing_parameters(const AP_FixedWing *_fixed_wing_parameters)
+{
+    fixed_wing_parameters = _fixed_wing_parameters;
+}
+
+// macro for use by HAL_INS_PROBE_LIST
+#define GET_I2C_DEVICE(bus, address) hal.i2c_mgr->get_device(bus, address)
+
+bool AP_Airspeed::add_backend(AP_Airspeed_Backend *backend)
+{
+    if (!backend) {
+        return false;
+    }
+    if (num_sensors >= AIRSPEED_MAX_SENSORS) {
+        AP_HAL::panic("Too many airspeed drivers");
+    }
+    const uint8_t i = num_sensors;
+    sensor[num_sensors++] = backend;
+    if (!sensor[i]->init()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Airspeed %u init failed", i+1);
+        delete sensor[i];
+        sensor[i] = nullptr;
+    }
+    return true;
+}
+
+/*
+  macro to add a backend with check for too many sensors
+  We don't try to start more than the maximum allowed
+ */
+#define ADD_BACKEND(backend) \
+    do { add_backend(backend);     \
+    if (num_sensors == AIRSPEED_MAX_SENSORS) { return; } \
+    } while (0)
+
+
+// convert params to per instance param table
+// PARAMETER_CONVERSION - Added: Dec-2022
+void AP_Airspeed::convert_per_instance()
+{
+    AP_Param::ConversionInfo info;
+#ifndef HAL_BUILD_AP_PERIPH
+    // Vehicle conversion
+    if (!AP_Param::find_key_by_pointer(this, info.old_key)) {
+        return;
+    }
+
+    static const struct convert_table {
+        uint32_t element[2];
+        ap_var_type type;
+        const char* name;
+    }  conversion_table[] = {
+        { {4042, 714}, AP_PARAM_INT8, "TYPE" },      // ARSPD_TYPE, ARSPD2_TYPE
+        { {74, 778}, AP_PARAM_INT8, "USE" },        // ARSPD_USE, ARSPD2_USE
+        { {138, 842}, AP_PARAM_FLOAT, "OFFSET" },    // ARSPD_OFFSET, ARSPD2_OFFSET
+        { {202, 906}, AP_PARAM_FLOAT, "RATIO" },     // ARSPD_RATIO, ARSPD2_RATIO
+        { {266, 970}, AP_PARAM_INT8, "PIN" },        // ARSPD_PIN, ARSPD2_PIN
+#if AP_AIRSPEED_AUTOCAL_ENABLE
+        { {330, 1034}, AP_PARAM_INT8, "AUTOCAL" },    // ARSPD_AUTOCAL, ARSPD2_AUTOCAL
+#endif
+        { {394, 1098}, AP_PARAM_INT8, "TUBE_ORDR" },  // ARSPD_TUBE_ORDER, ARSPD2_TUBE_ORDR
+        { {458, 1162}, AP_PARAM_INT8, "SKIP_CAL" },   // ARSPD_SKIP_CAL, ARSPD2_SKIP_CAL
+        { {522, 1226}, AP_PARAM_FLOAT, "PSI_RANGE" }, // ARSPD_PSI_RANGE, ARSPD2_PSI_RANGE
+        { {586, 1290}, AP_PARAM_INT8, "BUS" },        // ARSPD_BUS, ARSPD2_BUS
+        { {1546, 1610}, AP_PARAM_INT32, "DEVID" },    // ARSPD_DEVID, ARSPD2_DEVID
+    };
+
+#else
+    // Periph conversion
+    if (!AP_Param::find_top_level_key_by_pointer(this, info.old_key)) {
+        return;
+    }
+    const struct convert_table {
+        uint32_t element[2];
+        ap_var_type type;
+        const char* name;
+    }  conversion_table[] = {
+        { {0, 11}, AP_PARAM_INT8, "TYPE" },      // ARSPD_TYPE, ARSPD2_TYPE
+#if AP_AIRSPEED_AUTOCAL_ENABLE
+        { {5, 16}, AP_PARAM_INT8, "AUTOCAL" },    // ARSPD_AUTOCAL, ARSPD2_AUTOCAL
+#endif
+        { {8, 19}, AP_PARAM_FLOAT, "PSI_RANGE" }, // ARSPD_PSI_RANGE, ARSPD2_PSI_RANGE
+        { {24, 25}, AP_PARAM_INT32, "DEVID" },    // ARSPD_DEVID, ARSPD2_DEVID
+    };
+#endif
+
+    char param_name[17] {};
+    info.new_name = param_name;
+
+    for (const auto & elem : conversion_table) {
+        info.type = elem.type;
+        for (uint8_t i=0; i < MIN(AIRSPEED_MAX_SENSORS,2); i++) {
+            info.old_group_element = elem.element[i];
+            if (i == 0) {
+                hal.util->snprintf(param_name, sizeof(param_name), "ARSPD_%s",  elem.name);
+            } else {
+                hal.util->snprintf(param_name, sizeof(param_name), "ARSPD%i_%s", i+1,  elem.name);
+            }
+            AP_Param::convert_old_parameter(&info, 1.0, 0);
+        }
+    }
+}
+
+void AP_Airspeed::init()
+{
+
+    convert_per_instance();
+
+#if ENABLE_PARAMETER
+    // if either type is set then enable if not manually set
+    if (!_enable.configured() && ((param[0].type.get() != TYPE_NONE) || (param[1].type.get() != TYPE_NONE))) {
+        _enable.set_and_save(1);
+    }
+
+    // Check if enabled
+    if (!lib_enabled()) {
+        return;
+    }
+#endif
+
+    if (enabled(0)) {
+        allocate();
+    }
+}
+
+void AP_Airspeed::allocate()
+{
+    if (sensor[0] != nullptr) {
+        // already initialised, periph may call allocate several times to allow CAN detection
+        return;
+    }
+
+#ifdef HAL_AIRSPEED_PROBE_LIST
+    // load sensors via a list from hwdef.dat
+    HAL_AIRSPEED_PROBE_LIST;
+#else
+    // look for sensors based on type parameters
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+#if AP_AIRSPEED_AUTOCAL_ENABLE
+        state[i].calibration.init(param[i].ratio);
+        state[i].last_saved_ratio = param[i].ratio;
+#endif
+
+        // Set the enable automatically to false and set the probability that the airspeed is healhy to start with
+        state[i].failures.health_probability = 1.0f;
+
+        switch ((enum airspeed_type)param[i].type.get()) {
+        case TYPE_NONE:
+            // nothing to do
+            break;
+        case TYPE_I2C_MS4525:
+#if AP_AIRSPEED_MS4525_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_MS4525(*this, i);
+#endif
+            break;
+        case TYPE_SITL:
+#if AP_AIRSPEED_SITL_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_SITL(*this, i);
+#endif
+            break;
+        case TYPE_ANALOG:
+#if AP_AIRSPEED_ANALOG_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_Analog(*this, i);
+#endif
+            break;
+        case TYPE_I2C_MS5525:
+#if AP_AIRSPEED_MS5525_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_MS5525(*this, i, AP_Airspeed_MS5525::MS5525_ADDR_AUTO);
+#endif
+            break;
+        case TYPE_I2C_MS5525_ADDRESS_1:
+#if AP_AIRSPEED_MS5525_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_MS5525(*this, i, AP_Airspeed_MS5525::MS5525_ADDR_1);
+#endif
+            break;
+        case TYPE_I2C_MS5525_ADDRESS_2:
+#if AP_AIRSPEED_MS5525_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_MS5525(*this, i, AP_Airspeed_MS5525::MS5525_ADDR_2);
+#endif
+            break;
+        case TYPE_I2C_SDP3X:
+#if AP_AIRSPEED_SDP3X_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_SDP3X(*this, i);
+#endif
+            break;
+        case TYPE_I2C_DLVR_5IN:
+#if AP_AIRSPEED_DLVR_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_DLVR(*this, i, 5);
+#endif
+            break;
+        case TYPE_I2C_DLVR_10IN:
+#if AP_AIRSPEED_DLVR_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_DLVR(*this, i, 10);
+#endif
+            break;
+        case TYPE_I2C_DLVR_20IN:
+#if AP_AIRSPEED_DLVR_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_DLVR(*this, i, 20);
+#endif
+            break;
+        case TYPE_I2C_DLVR_30IN:
+#if AP_AIRSPEED_DLVR_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_DLVR(*this, i, 30);
+#endif
+            break;
+        case TYPE_I2C_DLVR_60IN:
+#if AP_AIRSPEED_DLVR_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_DLVR(*this, i, 60);
+#endif  // AP_AIRSPEED_DLVR_ENABLED
+            break;
+        case TYPE_I2C_ASP5033:
+#if AP_AIRSPEED_ASP5033_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_ASP5033(*this, i);
+#endif
+            break;
+        case TYPE_UAVCAN:
+#if AP_AIRSPEED_DRONECAN_ENABLED
+            sensor[i] = AP_Airspeed_DroneCAN::probe(*this, i, uint32_t(param[i].bus_id.get()));
+#endif
+            break;
+        case TYPE_NMEA_WATER:
+#if AP_AIRSPEED_NMEA_ENABLED
+#if APM_BUILD_TYPE(APM_BUILD_Rover) || APM_BUILD_TYPE(APM_BUILD_ArduSub) 
+            sensor[i] = NEW_NOTHROW AP_Airspeed_NMEA(*this, i);
+#endif
+#endif
+            break;
+        case TYPE_MSP:
+#if AP_AIRSPEED_MSP_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_MSP(*this, i, 0);
+#endif
+            break;
+        case TYPE_EXTERNAL:
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+            sensor[i] = NEW_NOTHROW AP_Airspeed_External(*this, i);
+#endif
+            break;
+        }
+        if (sensor[i] && !sensor[i]->init()) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Airspeed %u init failed", i + 1);
+            delete sensor[i];
+            sensor[i] = nullptr;
+        }
+        if (sensor[i] != nullptr) {
+            num_sensors = i+1;
+        }
+    }
+
+#if AP_AIRSPEED_DRONECAN_ENABLED
+    // we need a 2nd pass for DroneCAN sensors so we can match order by DEVID
+    // the 2nd pass accepts any devid
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (sensor[i] == nullptr && (enum airspeed_type)param[i].type.get() == TYPE_UAVCAN) {
+            sensor[i] = AP_Airspeed_DroneCAN::probe(*this, i, 0);
+            if (sensor[i] != nullptr) {
+                num_sensors = i+1;
+            }
+        }
+    }
+#endif // AP_AIRSPEED_DRONECAN_ENABLED
+#endif // HAL_AIRSPEED_PROBE_LIST
+
+    // set DEVID to zero for any sensors not found. This allows backends to order
+    // based on previous value of DEVID. This allows for swapping out sensors
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (sensor[i] == nullptr) {
+            // note we use set() not set_and_save() to allow a sensor to be temporarily
+            // removed for one boot without losing its slot
+            param[i].bus_id.set(0);
+        }
+    }
+}
+
+// read the airspeed sensor
+float AP_Airspeed::get_pressure(uint8_t i)
+{
+    if (!enabled(i)) {
+        return 0;
+    }
+    float pressure = 0;
+    if (sensor[i]) {
+        state[i].healthy = sensor[i]->get_differential_pressure(pressure);
+    }
+    return pressure;
+}
+
+// get a temperature reading if possible
+bool AP_Airspeed::get_temperature(uint8_t i, float &temperature)
+{
+    if (!enabled(i)) {
+        return false;
+    }
+    if (sensor[i]) {
+        return sensor[i]->get_temperature(temperature);
+    }
+    return false;
+}
+
+// calibrate the zero offset for the airspeed. This must be called at
+// least once before the get_airspeed() interface can be used
+void AP_Airspeed::calibrate(bool in_startup)
+{
+#ifndef HAL_BUILD_AP_PERIPH
+    if (!lib_enabled()) {
+        return;
+    }
+    if (hal.util->was_watchdog_reset()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,"Airspeed: skipping cal");
+        return;
+    }
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (!enabled(i)) {
+            continue;
+        }
+        if (state[i].use_zero_offset) {
+            param[i].offset.set(0);
+            continue;
+        }
+        if (in_startup && param[i].skip_cal) {
+            continue;
+        }
+        if (sensor[i] == nullptr) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Airspeed %u not initalized, cannot cal", i+1);
+            continue;
+        }
+        state[i].cal.start_ms = AP_HAL::millis();
+        state[i].cal.count = 0;
+        state[i].cal.sum = 0;
+        state[i].cal.read_count = 0;
+        calibration_state[i] = CalibrationState::IN_PROGRESS;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,"Airspeed %u calibration started", i+1);
+    }
+#endif // HAL_BUILD_AP_PERIPH
+}
+
+/*
+  update async airspeed zero offset calibration
+*/
+void AP_Airspeed::update_calibration(uint8_t i, float raw_pressure)
+{
+#ifndef HAL_BUILD_AP_PERIPH
+    if (!enabled(i) || state[i].cal.start_ms == 0) {
+        return;
+    }
+    
+    // consider calibration complete when we have at least 15 samples
+    // over at least 1 second
+    if (AP_HAL::millis() - state[i].cal.start_ms >= 1000 &&
+        state[i].cal.read_count > 15) {
+        if (state[i].cal.count == 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Airspeed %u unhealthy", i + 1);
+            calibration_state[i] = CalibrationState::FAILED;
+        } else {
+            float calibrated_offset = state[i].cal.sum / state[i].cal.count;
+            // check if new offset differs too greatly from last calibration, indicating pitot uncovered in wind
+            if (fixed_wing_parameters != nullptr) {
+                float airspeed_min = fixed_wing_parameters->airspeed_min.get();
+                // use percentage of AIRSPEED_MIN as criteria for max allowed change in offset
+                float max_change = 0.5*(sq((1 + (max_speed_pcnt * 0.01))*airspeed_min) - sq(airspeed_min));
+                if (max_speed_pcnt > 0 && (abs(calibrated_offset-param[i].offset) > max_change) && (abs(param[i].offset) > 0)) {
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Arspd %d offset change large;cover and recal", i +1);
+                }
+            }
+            param[i].offset.set_and_save(calibrated_offset);
+            calibration_state[i] = CalibrationState::SUCCESS;
+            if (_options & AP_Airspeed::OptionsMask::REPORT_OFFSET ){
+                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Airspeed %u calibrated, offset = %4.0f", i + 1, calibrated_offset);
+            } else {
+                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Airspeed %u calibrated", i + 1);
+            }
+        }
+        state[i].cal.start_ms = 0;
+        return;
+    }
+    // we discard the first 5 samples
+    if (state[i].healthy && state[i].cal.read_count > 5) {
+        state[i].cal.sum += raw_pressure;
+        state[i].cal.count++;
+    }
+    state[i].cal.read_count++;
+#endif // HAL_BUILD_AP_PERIPH
+}
+
+// get aggregate calibration state for the Airspeed library:
+AP_Airspeed::CalibrationState AP_Airspeed::get_calibration_state() const
+{
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        switch (calibration_state[i]) {
+        case CalibrationState::SUCCESS:
+        case CalibrationState::NOT_STARTED:
+            continue;
+        case CalibrationState::IN_PROGRESS:
+            return CalibrationState::IN_PROGRESS;
+        case CalibrationState::FAILED:
+            return CalibrationState::FAILED;
+        }
+    }
+    return CalibrationState::SUCCESS;
+}
+
+// read one airspeed sensor
+void AP_Airspeed::read(uint8_t i)
+{
+    if (!enabled(i) || !sensor[i]) {
+        return;
+    }
+    state[i].last_update_ms = AP_HAL::millis();
+
+    // try and get a direct reading of airspeed
+    if (sensor[i]->has_airspeed()) {
+        state[i].healthy = sensor[i]->get_airspeed(state[i].airspeed);
+        state[i].raw_airspeed = state[i].airspeed;  // for logging
+        return;
+    }
+
+#ifndef HAL_BUILD_AP_PERIPH
+    /*
+      get the healthy state before we call get_pressure() as
+      get_pressure() overwrites the healthy state
+     */
+    bool prev_healthy = state[i].healthy;
+#endif
+
+    float raw_pressure = get_pressure(i);
+    float airspeed_pressure = raw_pressure - get_offset(i);
+
+    // remember raw pressure for logging
+    state[i].corrected_pressure = airspeed_pressure;
+
+#ifndef HAL_BUILD_AP_PERIPH
+    if (state[i].cal.start_ms != 0) {
+        update_calibration(i, raw_pressure);
+    }
+
+    // filter before clamping positive
+    if (!prev_healthy) {
+        // if the previous state was not healthy then we should not
+        // use an IIR filter, otherwise a bad reading will last for
+        // some time after the sensor becomes healthy again
+        state[i].filtered_pressure = airspeed_pressure;
+    } else {
+        state[i].filtered_pressure = 0.7f * state[i].filtered_pressure + 0.3f * airspeed_pressure;
+    }
+
+    /*
+      we support different pitot tube setups so user can choose if
+      they want to be able to detect pressure on the static port
+     */
+    switch ((enum pitot_tube_order)param[i].tube_order.get()) {
+    case PITOT_TUBE_ORDER_NEGATIVE:
+        state[i].last_pressure  = -airspeed_pressure;
+        state[i].raw_airspeed   = sqrtf(MAX(-airspeed_pressure, 0) * param[i].ratio);
+        state[i].airspeed       = sqrtf(MAX(-state[i].filtered_pressure, 0) * param[i].ratio);
+        break;
+    case PITOT_TUBE_ORDER_POSITIVE:
+        state[i].last_pressure  = airspeed_pressure;
+        state[i].raw_airspeed   = sqrtf(MAX(airspeed_pressure, 0) * param[i].ratio);
+        state[i].airspeed       = sqrtf(MAX(state[i].filtered_pressure, 0) * param[i].ratio);
+        break;
+    case PITOT_TUBE_ORDER_AUTO:
+    default:
+        state[i].last_pressure  = fabsf(airspeed_pressure);
+        state[i].raw_airspeed   = sqrtf(fabsf(airspeed_pressure) * param[i].ratio);
+        state[i].airspeed       = sqrtf(fabsf(state[i].filtered_pressure) * param[i].ratio);
+        break;
+    }
+#endif // HAL_BUILD_AP_PERIPH
+}
+
+// read all airspeed sensors
+void AP_Airspeed::update()
+{
+    if (!lib_enabled()) {
+        return;
+    }
+
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        read(i);
+    }
+
+#if HAL_GCS_ENABLED
+    // debugging until we get MAVLink support for 2nd airspeed sensor
+    if (enabled(1)) {
+        gcs().send_named_float("AS2", get_airspeed(1));
+    }
+#endif
+
+#if HAL_LOGGING_ENABLED
+    const uint8_t old_primary = primary;
+#endif
+
+    // setup primary
+    if (healthy(primary_sensor.get())) {
+        primary = primary_sensor.get();
+    } else {
+        for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+            if (healthy(i)) {
+                primary = i;
+                break;
+            }
+        }
+    }
+
+    check_sensor_failures();
+
+#if HAL_LOGGING_ENABLED
+    if (primary != old_primary) {
+        AP::logger().Write_Event(LogEvent::AIRSPEED_PRIMARY_CHANGED);
+    }
+    if (_log_bit != (uint32_t)-1 && AP::logger().should_log(_log_bit)) {
+        Log_Airspeed();
+    }
+#endif
+}
+
+#if AP_AIRSPEED_MSP_ENABLED
+/*
+  handle MSP airspeed data
+ */
+void AP_Airspeed::handle_msp(const MSP::msp_airspeed_data_message_t &pkt)
+{
+    if (!lib_enabled()) {
+        return;
+    }
+
+    if (pkt.instance > 1) {
+        return; //supporting 2 airspeed sensors at most
+    }
+
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (sensor[i]) {
+            sensor[i]->handle_msp(pkt);
+        }
+    }
+}
+#endif 
+
+#if AP_AIRSPEED_EXTERNAL_ENABLED
+/*
+  handle airspeed airspeed data
+ */
+void AP_Airspeed::handle_external(const AP_ExternalAHRS::airspeed_data_message_t &pkt)
+{
+    if (!lib_enabled()) {
+        return;
+    }
+
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (param[i].type == TYPE_EXTERNAL && sensor[i]) {
+            sensor[i]->handle_external(pkt);
+        }
+    }
+}
+#endif 
+
+#if HAL_LOGGING_ENABLED
+// @LoggerMessage: HYGR
+// @Description: Hygrometer data
+// @Field: TimeUS: Time since system startup
+// @Field: Id: sensor ID
+// @Field: Humidity: percentage humidity
+// @Field: Temp: temperature in degrees C
+
+void AP_Airspeed::Log_Airspeed()
+{
+    const uint64_t now = AP_HAL::micros64();
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (!enabled(i) || sensor[i] == nullptr) {
+            continue;
+        }
+        float temperature;
+        if (!get_temperature(i, temperature)) {
+            temperature = 0;
+        }
+        const struct log_ARSP pkt{
+            LOG_PACKET_HEADER_INIT(LOG_ARSP_MSG),
+            time_us       : now,
+            instance      : i,
+            airspeed      : get_raw_airspeed(i),
+            diffpressure  : get_differential_pressure(i),
+            temperature   : (int16_t)(temperature * 100.0f),
+            rawpressure   : get_corrected_pressure(i),
+            offset        : get_offset(i),
+            use           : use(i),
+            healthy       : healthy(i),
+            health_prob   : get_health_probability(i),
+            test_ratio    : get_test_ratio(i),
+            primary       : get_primary()
+        };
+        AP::logger().WriteBlock(&pkt, sizeof(pkt));
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+        struct {
+            uint32_t sample_ms;
+            float temperature;
+            float humidity;
+        } hygrometer;
+        if (sensor[i]->get_hygrometer(hygrometer.sample_ms, hygrometer.temperature, hygrometer.humidity) &&
+            hygrometer.sample_ms != state[i].last_hygrometer_log_ms) {
+            AP::logger().WriteStreaming("HYGR",
+                                        "TimeUS,Id,Humidity,Temp",
+                                        "s#%O",
+                                        "F---",
+                                        "QBff",
+                                        AP_HAL::micros64(),
+                                        i,
+                                        hygrometer.humidity,
+                                        hygrometer.temperature);
+            state[i].last_hygrometer_log_ms = hygrometer.sample_ms;
+        }
+#endif
+    }
+}
+#endif
+
+bool AP_Airspeed::use(uint8_t i) const
+{
+#ifndef HAL_BUILD_AP_PERIPH
+    if (!lib_enabled()) {
+        return false;
+    }
+    if (_force_disable_use) {
+        return false;
+    }
+    if (!enabled(i) || !param[i].use) {
+        return false;
+    }
+    if (param[i].use == 2 && !is_zero(SRV_Channels::get_output_scaled(SRV_Channel::k_throttle))) {
+        // special case for gliders with airspeed sensors behind the
+        // propeller. Allow airspeed to be disabled when throttle is
+        // running
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif // HAL_BUILD_AP_PERIPH
+}
+
+/*
+  return true if all enabled sensors are healthy
+ */
+bool AP_Airspeed::all_healthy(void) const
+{
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        if (enabled(i) && !healthy(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AP_Airspeed::lib_enabled() const {
+#if ENABLE_PARAMETER
+    return _enable > 0;
+#endif
+    return true;
+}
+
+// return true if airspeed is enabled
+bool AP_Airspeed::enabled(uint8_t i) const {
+    if (!lib_enabled()) {
+        return false;
+    }
+    if (i < AIRSPEED_MAX_SENSORS) {
+        return param[i].type.get() != TYPE_NONE;
+    }
+    return false;
+}
+
+// return health status of sensor
+bool AP_Airspeed::healthy(uint8_t i) const {
+    bool ok = state[i].healthy && enabled(i) && sensor[i] != nullptr;
+#ifndef HAL_BUILD_AP_PERIPH
+    // sanity check the offset parameter.  Zero is permitted if we are skipping calibration.
+    ok &= (fabsf(param[i].offset) > 0 || state[i].use_zero_offset || param[i].skip_cal);
+#endif
+    return ok;
+}
+
+// return the current airspeed in m/s
+float AP_Airspeed::get_airspeed(uint8_t i) const {
+    if (!enabled(i)) {
+        // we can't have negative airspeed so sending an obviously invalid value
+        return -1.0;
+    }
+    return state[i].airspeed;
+}
+
+// return the unfiltered airspeed in m/s
+float AP_Airspeed::get_raw_airspeed(uint8_t i) const {
+    if (!enabled(i)) {
+        // we can't have negative airspeed so sending an obviously invalid value
+        return -1.0;
+    }
+    return state[i].raw_airspeed;
+}
+
+// return the differential pressure in Pascal for the last airspeed reading
+float AP_Airspeed::get_differential_pressure(uint8_t i) const {
+    if (!enabled(i)) {
+        return 0.0;
+    }
+    return state[i].last_pressure;
+}
+
+// return the current corrected pressure
+float AP_Airspeed::get_corrected_pressure(uint8_t i) const {
+    if (!enabled(i)) {
+        return 0.0;
+    }
+    return state[i].corrected_pressure;
+}
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+bool AP_Airspeed::get_hygrometer(uint8_t i, uint32_t &last_sample_ms, float &temperature, float &humidity) const
+{
+    if (!enabled(i) || sensor[i] == nullptr) {
+        return false;
+    }
+    return sensor[i]->get_hygrometer(last_sample_ms, temperature, humidity);
+}
+#endif // AP_AIRSPEED_HYGROMETER_ENABLE
+
+#else  // build type is not appropriate; provide a dummy implementation:
+const AP_Param::GroupInfo AP_Airspeed::var_info[] = { AP_GROUPEND };
+
+void AP_Airspeed::update() {};
+bool AP_Airspeed::get_temperature(uin#include <AP_gtest.h>
+#include <AP_Common/ExpandingString.h>
+#include <AP_HAL/AP_HAL.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+TEST(ExpandingString, Tests)
+{
+    ExpandingString *test_string = NEW_NOTHROW ExpandingString();
+    test_string->printf("Test\n");
+    EXPECT_STREQ("Test\n", test_string->get_string());
+    EXPECT_STREQ("Test\n", test_string->get_writeable_string());
+    EXPECT_EQ(5u, test_string->get_length());
+    EXPECT_FALSE(test_string->has_failed_allocation());
+    EXPECT_TRUE(test_string->append("Test2\n", 6));
+    test_string->~ExpandingString();
+    EXPECT_STRNE("Test\n", test_string->get_string());
+    test_string = NEW_NOTHROW ExpandingString();
+    char long_string[2048];
+    std::fill(std::begin(long_string),std::end(long_string),'a');
+    test_string->printf("%s", long_string);
+}
+
+AP_GTEST_MAIN()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include <AP_gtest.h>
+#include <stdlib.h>
+#include <AP_Common/ExpandingString.h>
+#include <AP_HAL/AP_HAL.h>
+
+/**
+ * This file test realloc failure on ExpandingString
+ */
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+static uint32_t count = 0;
+
+void *realloc(void *ptr, size_t new_size) {
+    count++;
+    if (count < 3) {
+        if (new_size == 0) {
+            free(ptr);
+            return nullptr;
+        }
+        if (ptr == nullptr) {
+            return malloc(new_size);
+        }
+        void *new_mem = malloc(new_size);
+        if (new_mem != nullptr) {
+            memcpy(new_mem, ptr, new_size);
+            free(ptr);
+        }
+        return new_mem;
+    } else {
+        return nullptr;
+    }
+}
+
+
+// THAT IS UGLY HACK BUT IT WORKS ... it is just used to make print_vprintf return negative value.
+class BufferPrinter : public AP_HAL::BetterStream {
+public:
+    BufferPrinter(char* str, size_t size)  :
+    _offs(0), _str(str), _size(size)  {}
+
+    size_t write(uint8_t c) override { return 1; }
+    size_t write(const uint8_t *buffer, size_t size) override { return 1; }
+
+    size_t _offs;
+    char* const  _str;
+    const size_t _size;
+
+    uint32_t available() override { return 0; }
+    bool read(uint8_t &b) override { return false; }
+    uint32_t txspace() override { return 0; }
+    bool discard_input() override { return false; }
+};
+
+void print_vprintf(AP_HAL::BetterStream *s, const char *fmt, va_list ap);
+void print_vprintf(AP_HAL::BetterStream *s, const char *fmt, va_list ap) {
+    BufferPrinter* p = static_cast<BufferPrinter*>(s);
+    if (count < 2) {
+        p->_offs = -1;
+        return;
+    }
+    if (count == 2) {
+        p->_offs = p->_size * 2;
+    } else {
+        p->_offs = p->_size;
+    }
+    return;
+}
+
+TEST(ExpandingString, Tests)
+{
+    // Test print_vprintf failure.
+    ExpandingString *test_string = NEW_NOTHROW ExpandingString();
+    test_string->printf("Test\n");
+    EXPECT_STREQ("", test_string->get_string());
+    EXPECT_STREQ("", test_string->get_writeable_string());
+    EXPECT_EQ(0u, test_string->get_length());
+    EXPECT_FALSE(test_string->has_failed_allocation());
+    // test failure on second printf expand()
+    test_string = NEW_NOTHROW ExpandingString();
+    test_string->printf("Test\n");
+    EXPECT_STREQ("", test_string->get_string());
+    EXPECT_STREQ("", test_string->get_writeable_string());
+    EXPECT_EQ(0u, test_string->get_length());
+    EXPECT_TRUE(test_string->has_failed_allocation());
+    // Test realloc failure
+    test_string = NEW_NOTHROW ExpandingString();
+    test_string->printf("Test\n");
+    EXPECT_STREQ(nullptr, test_string->get_string());
+    EXPECT_STREQ(nullptr, test_string->get_writeable_string());
+    EXPECT_EQ(0u, test_string->get_length());
+    EXPECT_TRUE(test_string->has_failed_allocation());
+    // test append failure
+    EXPECT_FALSE(test_string->append("Test2\n", 6));
+    // test failure on first printf realloc
+    test_string->printf("Test\n");
+    EXPECT_STREQ(nullptr, test_string->get_string());
+    EXPECT_STREQ(nullptr, test_string->get_writeable_string());
+    EXPECT_EQ(0u, test_string->get_length());
+    EXPECT_TRUE(test_string->has_failed_allocation());
+    // test failure on append realloc
+    test_string = NEW_NOTHROW ExpandingString();
+    EXPECT_FALSE(test_string->append("Test2\n", 6));
+    EXPECT_TRUE(test_string->has_failed_allocation());
+    EXPECT_STREQ(nullptr, test_string->get_string());
+    EXPECT_EQ(0u, test_string->get_length());
+
+    test_string->~ExpandingString();
+    EXPECT_STRNE("Test\n", test_string->get_string());
+}
+
+TEST(ExpandingString, TestsFailure)
+{
+
+
+}
+AP_GTEST_MAIN()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+#define APM_BUILD_DIRECTORY APM_BUILD_UNKNOWN
+
+#include <AP_gtest.h>
+#include <AP_Common/AP_FWVersion.h>
+#include <GCS_MAVLink/GCS_Dummy.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+
+TEST(AP_FWVersion, FWVersion)
+{
+    EXPECT_EQ(AP::fwversion().header, 0x61706677766572fbu);
+    EXPECT_EQ(AP::fwversion().header_version, 0x0200U);
+    EXPECT_EQ(AP::fwversion().pointer_size, static_cast<uint8_t>(sizeof(void*)));
+    EXPECT_EQ(AP::fwversion().reserved, 0);
+    EXPECT_EQ(AP::fwversion().vehicle_type, static_cast<uint8_t>(APM_BUILD_DIRECTORY));
+    EXPECT_EQ(AP::fwversion().board_type, static_cast<uint8_t>(CONFIG_HAL_BOARD));
+    EXPECT_EQ(AP::fwversion().board_subtype, static_cast<uint16_t>(CONFIG_HAL_BOARD_SUBTYPE));
+    EXPECT_EQ(AP::fwversion().major, FW_MAJOR);
+    EXPECT_EQ(AP::fwversion().minor, FW_MINOR);
+    EXPECT_EQ(AP::fwversion().patch, FW_PATCH);
+    EXPECT_EQ(AP::fwversion().fw_type, FW_TYPE);
+    EXPECT_EQ(AP::fwversion().os_sw_version, 0u);
+    EXPECT_STREQ(AP::fwversion().fw_string, THISFIRMWARE);
+    EXPECT_STREQ(AP::fwversion().fw_hash_str, "");
+    EXPECT_STREQ(AP::fwversion().fw_short_string, THISFIRMWARE);
+    EXPECT_EQ(AP::fwversion().fw_hash, 0u);
+    EXPECT_EQ(AP::fwversion().middleware_name, nullptr);
+    EXPECT_EQ(AP::fwversion().middleware_hash_str, nullptr);
+    EXPECT_EQ(AP::fwversion().os_name, nullptr);
+    EXPECT_EQ(AP::fwversion().os_hash_str, nullptr);
+}
+
+AP_GTEST_MAIN()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include <AP_gtest.h>
+#include <AP_Common/Location.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Terrain/AP_Terrain.h>
+#include <GCS_MAVLink/GCS_Dummy.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+class DummyVehicle {
+public:
+    bool start_cmd(const AP_Mission::Mission_Command& cmd) { return true; };
+    bool verify_cmd(const AP_Mission::Mission_Command& cmd) { return true; };
+    void mission_complete() { };
+    AP_AHRS ahrs{AP_AHRS::FLAG_ALWAYS_USE_EKF};
+
+    AP_Mission mission{
+        FUNCTOR_BIND_MEMBER(&DummyVehicle::start_cmd, bool, const AP_Mission::Mission_Command &),
+        FUNCTOR_BIND_MEMBER(&DummyVehicle::verify_cmd, bool, const AP_Mission::Mission_Command &),
+        FUNCTOR_BIND_MEMBER(&DummyVehicle::mission_complete, void)};
+    AP_Terrain terrain;
+};
+
+const struct AP_Param::GroupInfo        GCS_MAVLINK_Parameters::var_info[] = {
+    AP_GROUPEND
+};
+GCS_Dummy _gcs;
+
+static DummyVehicle vehicle;
+
+#define EXPECT_VECTOR2F_EQ(v1, v2)              \
+do {                                        \
+EXPECT_FLOAT_EQ(v1[0], v2[0]);          \
+EXPECT_FLOAT_EQ(v1[1], v2[1]);          \
+} while (false);
+
+#define EXPECT_VECTOR3F_EQ(v1, v2)              \
+do {                                        \
+EXPECT_FLOAT_EQ(v1[0], v2[0]);          \
+EXPECT_FLOAT_EQ(v1[1], v2[1]);          \
+EXPECT_FLOAT_EQ(v1[2], v2[2]);          \
+} while (false);
+
+#define EXPECT_VECTOR2F_NEAR(v1, v2, acc)              \
+do {                                        \
+EXPECT_NEAR(v1[0], v2[0], acc);          \
+EXPECT_NEAR(v1[1], v2[1], acc);          \
+} while (false);
+
+#define EXPECT_VECTOR3F_NEAR(v1, v2, acc)              \
+do {                                        \
+EXPECT_NEAR(v1[0], v2[0], acc);          \
+EXPECT_NEAR(v1[1], v2[1], acc);          \
+EXPECT_NEAR(v1[2], v2[2], acc);          \
+} while (false);
+
+TEST(Location, LatLngWrapping)
+{
+    struct {
+        int32_t start_lat;
+        int32_t start_lng;
+        Vector2f delta_metres_ne;
+        int32_t expected_lat;
+        int32_t expected_lng;
+    } tests[] {
+        {519634000, 1797560000, Vector2f{0, 100000}, 519634000, -1787860777}
+    };
+
+    for (auto &test : tests) {
+        // forward
+        {
+            Location loc{test.start_lat, test.start_lng, 0, Location::AltFrame::ABOVE_HOME};
+            loc.offset(test.delta_metres_ne[0], test.delta_metres_ne[1]);
+            EXPECT_EQ(test.expected_lat, loc.lat);
+            EXPECT_EQ(test.expected_lng, loc.lng);
+            EXPECT_EQ(0, loc.alt);
+        }
+        // and now reverse
+        {
+            Location rev{test.expected_lat, test.expected_lng, 0, Location::AltFrame::ABOVE_HOME};
+            rev.offset(-test.delta_metres_ne[0], -test.delta_metres_ne[1]);
+            EXPECT_EQ(rev.lat, test.start_lat);
+            EXPECT_EQ(rev.lng, test.start_lng);
+            EXPECT_EQ(0, rev.alt);
+        }
+    }
+}
+
+TEST(Location, LocOffsetDouble)
+{
+    struct {
+        int32_t home_lat;
+        int32_t home_lng;
+        Vector2d delta_metres_ne1;
+        Vector2d delta_metres_ne2;
+        Vector2d expected_pos_change;
+    } tests[] {
+               -353632620, 1491652373,
+               Vector2d{4682795.4576701336, 5953662.7673837934},
+               Vector2d{4682797.1904749088, 5953664.1586009059},
+               Vector2d{1.7365739,1.4261966},
+    };
+
+    for (auto &test : tests) {
+        Location home{test.home_lat, test.home_lng, 0, Location::AltFrame::ABOVE_HOME};
+        Location loc1 = home;
+        Location loc2 = home;
+        loc1.offset(test.delta_metres_ne1.x, test.delta_metres_ne1.y);
+        loc2.offset(test.delta_metres_ne2.x, test.delta_metres_ne2.y);
+        Vector2d diff = loc1.get_distance_NE_double(loc2);
+        EXPECT_FLOAT_EQ(diff.x, test.expected_pos_change.x);
+        EXPECT_FLOAT_EQ(diff.y, test.expected_pos_change.y);
+    }
+}
+
+TEST(Location, LocOffset3DDouble)
+{
+    Location loc {
+        -353632620, 1491652373, 60000, Location::AltFrame::ABSOLUTE
+    };
+    // this is ned, so our latitude should change, and our new
+    // location should be above the original:
+    loc.offset(Vector3d{1000, 0, -10});
+    EXPECT_EQ(loc.lat, -353542788);
+    EXPECT_EQ(loc.lng, 1491652373);
+    EXPECT_EQ(loc.alt, 61000);
+}
+
+TEST(Location, Tests)
+{
+    Location test_location;
+    EXPECT_TRUE(test_location.is_zero());
+    EXPECT_FALSE(test_location.initialised());
+    const Location test_home{-35362938, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    EXPECT_EQ(-35362938, test_home.lat);
+    EXPECT_EQ(149165085, test_home.lng);
+    EXPECT_EQ(100, test_home.alt);
+    EXPECT_EQ(0, test_home.relative_alt);
+    EXPECT_EQ(0, test_home.terrain_alt);
+    EXPECT_EQ(0, test_home.origin_alt);
+    EXPECT_EQ(0, test_home.loiter_ccw);
+    EXPECT_EQ(0, test_home.loiter_xtrack);
+    EXPECT_TRUE(test_home.initialised());
+
+    const Vector3f test_vect{-42, 42, 0};
+    Location test_location3{test_vect, Location::AltFrame::ABOVE_HOME};
+    EXPECT_EQ(0, test_location3.lat);
+    EXPECT_EQ(0, test_location3.lng);
+    EXPECT_EQ(0, test_location3.alt);
+    EXPECT_EQ(1, test_location3.relative_alt);
+    EXPECT_EQ(0, test_location3.terrain_alt);
+    EXPECT_EQ(0, test_location3.origin_alt);
+    EXPECT_EQ(0, test_location3.loiter_ccw);
+    EXPECT_EQ(0, test_location3.loiter_xtrack);
+    EXPECT_FALSE(test_location3.initialised());
+    // EXPECT_EXIT(test_location3.change_alt_frame(Location::AltFrame::ABSOLUTE), PANIC something); // TODO check PANIC
+
+    test_location3.set_alt_cm(-420, Location::AltFrame::ABSOLUTE);
+    EXPECT_EQ(-420, test_location3.alt);
+    EXPECT_EQ(0, test_location3.relative_alt);
+    EXPECT_EQ(0, test_location3.terrain_alt);
+    EXPECT_EQ(0, test_location3.origin_alt);
+    EXPECT_EQ(Location::AltFrame::ABSOLUTE, test_location3.get_alt_frame());
+
+    test_location3.set_alt_cm(420, Location::AltFrame::ABOVE_HOME);
+    EXPECT_EQ(420, test_location3.alt);
+    EXPECT_EQ(1, test_location3.relative_alt);
+    EXPECT_EQ(0, test_location3.terrain_alt);
+    EXPECT_EQ(0, test_location3.origin_alt);
+    EXPECT_EQ(Location::AltFrame::ABOVE_HOME, test_location3.get_alt_frame());
+
+    test_location3.set_alt_cm(-420, Location::AltFrame::ABOVE_ORIGIN);
+    EXPECT_EQ(-420, test_location3.alt);
+    EXPECT_EQ(0, test_location3.relative_alt);
+    EXPECT_EQ(0, test_location3.terrain_alt);
+    EXPECT_EQ(1, test_location3.origin_alt);
+    EXPECT_EQ(Location::AltFrame::ABOVE_ORIGIN, test_location3.get_alt_frame());
+
+    test_location3.set_alt_cm(420, Location::AltFrame::ABOVE_TERRAIN);
+    EXPECT_EQ(420, test_location3.alt);
+    EXPECT_EQ(1, test_location3.relative_alt);
+    EXPECT_EQ(1, test_location3.terrain_alt);
+    EXPECT_EQ(0, test_location3.origin_alt);
+    EXPECT_EQ(Location::AltFrame::ABOVE_TERRAIN, test_location3.get_alt_frame());
+
+    // No TERRAIN, NO HOME, NO ORIGIN
+    AP::terrain()->set_enabled(false);
+    for (auto current_frame = Location::AltFrame::ABSOLUTE;
+         current_frame <= Location::AltFrame::ABOVE_TERRAIN;
+         current_frame = static_cast<Location::AltFrame>(
+                 (uint8_t) current_frame + 1)) {
+        for (auto desired_frame = Location::AltFrame::ABSOLUTE;
+             desired_frame <= Location::AltFrame::ABOVE_TERRAIN;
+             desired_frame = static_cast<Location::AltFrame>(
+                     (uint8_t) desired_frame + 1)) {
+            test_location3.set_alt_cm(420, current_frame);
+            if (current_frame == desired_frame) {
+                EXPECT_TRUE(test_location3.change_alt_frame(desired_frame));
+                continue;
+            }
+            if (current_frame == Location::AltFrame::ABOVE_TERRAIN
+                    || desired_frame == Location::AltFrame::ABOVE_TERRAIN) {
+                EXPECT_FALSE(test_location3.change_alt_frame(desired_frame));
+            } else if (current_frame == Location::AltFrame::ABOVE_ORIGIN
+                    || desired_frame == Location::AltFrame::ABOVE_ORIGIN) {
+                EXPECT_FALSE(test_location3.change_alt_frame(desired_frame));
+            } else if (current_frame == Location::AltFrame::ABOVE_HOME
+                    || desired_frame == Location::AltFrame::ABOVE_HOME) {
+                EXPECT_FALSE(test_location3.change_alt_frame(desired_frame));
+            } else {
+                EXPECT_TRUE(test_location3.change_alt_frame(desired_frame));
+            }
+        }
+    }
+    // NO TERRAIN, NO ORIGIN
+    EXPECT_TRUE(vehicle.ahrs.set_home(test_home));
+    for (auto current_frame = Location::AltFrame::ABSOLUTE;
+         current_frame <= Location::AltFrame::ABOVE_TERRAIN;
+         current_frame = static_cast<Location::AltFrame>(
+                 (uint8_t) current_frame + 1)) {
+        for (auto desired_frame = Location::AltFrame::ABSOLUTE;
+             desired_frame <= Location::AltFrame::ABOVE_TERRAIN;
+             desired_frame = static_cast<Location::AltFrame>(
+                     (uint8_t) desired_frame + 1)) {
+            test_location3.set_alt_cm(420, current_frame);
+            if (current_frame == desired_frame) {
+                EXPECT_TRUE(test_location3.change_alt_frame(desired_frame));
+                continue;
+            }
+            if (current_frame == Location::AltFrame::ABOVE_TERRAIN
+                    || desired_frame == Location::AltFrame::ABOVE_TERRAIN) {
+                EXPECT_FALSE(test_location3.change_alt_frame(desired_frame));
+            } else if (current_frame == Location::AltFrame::ABOVE_ORIGIN
+                    || desired_frame == Location::AltFrame::ABOVE_ORIGIN) {
+                EXPECT_FALSE(test_location3.change_alt_frame(desired_frame));
+            } else {
+                EXPECT_TRUE(test_location3.change_alt_frame(desired_frame));
+            }
+
+        }
+    }
+    // NO Origin
+    AP::terrain()->set_enabled(true);
+    for (auto current_frame = Location::AltFrame::ABSOLUTE;
+         current_frame <= Location::AltFrame::ABOVE_TERRAIN;
+         current_frame = static_cast<Location::AltFrame>(
+                 (uint8_t) current_frame + 1)) {
+        for (auto desired_frame = Location::AltFrame::ABSOLUTE;
+             desired_frame <= Location::AltFrame::ABOVE_TERRAIN;
+             desired_frame = static_cast<Location::AltFrame>(
+                     (uint8_t) desired_frame + 1)) {
+            test_location3.set_alt_cm(420, current_frame);
+            if (current_frame == desired_frame) {
+                EXPECT_TRUE(test_location3.change_alt_frame(desired_frame));
+                continue;
+            }
+            if (current_frame == Location::AltFrame::ABOVE_ORIGIN
+                    || desired_frame == Location::AltFrame::ABOVE_ORIGIN) {
+                EXPECT_FALSE(test_location3.change_alt_frame(desired_frame));
+            } else {
+                EXPECT_TRUE(test_location3.change_alt_frame(desired_frame));
+            }
+        }
+    }
+
+    Vector2f test_vec2;
+    EXPECT_FALSE(test_home.get_vector_xy_from_origin_NE(test_vec2));
+    Vector3f test_vec3;
+    EXPECT_FALSE(test_home.get_vector_from_origin_NEU(test_vec3));
+
+    Location test_origin = test_home;
+    test_origin.offset(2, 2);
+    const Vector3f test_vecto{200, 200, 10};
+    const Location test_location4{test_vecto, Location::AltFrame::ABOVE_ORIGIN};
+    EXPECT_EQ(10, test_location4.alt);
+    EXPECT_EQ(0, test_location4.relative_alt);
+    EXPECT_EQ(0, test_location4.terrain_alt);
+    EXPECT_EQ(1, test_location4.origin_alt);
+    EXPECT_EQ(0, test_location4.loiter_ccw);
+    EXPECT_EQ(0, test_location4.loiter_xtrack);
+    EXPECT_TRUE(test_location4.initialised());
+
+    // can't create a Location using a vector here as there's no origin for the vector to be relative to:
+    // const Location test_location_empty{test_vect, Location::AltFrame::ABOVE_HOME};
+    // EXPECT_FALSE(test_location_empty.get_vector_from_origin_NEU(test_vec3));
+}
+
+TEST(Location, Distance)
+{
+    const Location test_home{-35362938, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    const Location test_home2{-35363938, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    EXPECT_FLOAT_EQ(11.131885, test_home.get_distance(test_home2));
+    EXPECT_FLOAT_EQ(0, test_home.get_distance(test_home));
+    EXPECT_VECTOR2F_EQ(Vector2f(0, 0), test_home.get_distance_NE(test_home));
+    EXPECT_VECTOR2F_EQ(Vector2f(-11.131885, 0), test_home.get_distance_NE(test_home2));
+    EXPECT_VECTOR2F_EQ(Vector3f(0, 0, 0), test_home.get_distance_NED(test_home));
+    EXPECT_VECTOR2F_EQ(Vector3f(-11.131885, 0, 0), test_home.get_distance_NED(test_home2));
+    Location test_loc = test_home;
+    test_loc.offset(-11.131886, 0);
+    EXPECT_TRUE(test_loc.same_latlon_as(test_home2));
+    test_loc = test_home;
+    test_loc.offset(-11.131885, 0);
+    test_loc.offset_bearing(0, 11.131885);
+    EXPECT_TRUE(test_loc.same_latlon_as(test_home));
+
+    test_loc.offset_bearing_and_pitch(0, 2, -11.14);
+    EXPECT_TRUE(test_loc.same_latlon_as(test_home2));
+    EXPECT_EQ(62, test_loc.alt);
+
+    test_loc = Location(-35362633, 149165085, 0, Location::AltFrame::ABOVE_HOME);
+    int32_t bearing = test_home.get_bearing_to(test_loc);
+    EXPECT_EQ(0, bearing);
+
+    test_loc = Location(-35363711, 149165085, 0, Location::AltFrame::ABOVE_HOME);
+    bearing = test_home.get_bearing_to(test_loc);
+    EXPECT_EQ(18000, bearing);
+
+    test_loc = Location(-35362938, 149166085, 0, Location::AltFrame::ABOVE_HOME);
+    bearing = test_home.get_bearing_to(test_loc);
+    EXPECT_EQ(9000, bearing);
+
+    test_loc = Location(-35362938, 149164085, 0, Location::AltFrame::ABOVE_HOME);
+    bearing = test_home.get_bearing_to(test_loc);
+    EXPECT_EQ(27000, bearing);
+
+    test_loc = Location(-35361938, 149164085, 0, Location::AltFrame::ABOVE_HOME);
+    bearing = test_home.get_bearing_to(test_loc);
+    EXPECT_EQ(31503, bearing);
+    const float bearing_rad = test_home.get_bearing(test_loc);
+    EXPECT_FLOAT_EQ(5.4982867, bearing_rad);
+
+}
+
+TEST(Location, Sanitize)
+{
+    // we will sanitize test_loc with test_default_loc
+    // test_home is just for reference
+    const Location test_home{-35362938, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    EXPECT_TRUE(vehicle.ahrs.set_home(test_home));
+    const Location test_default_loc{-35362938, 149165085, 200, Location::AltFrame::ABSOLUTE};
+    Location test_loc;
+    test_loc.set_alt_cm(0, Location::AltFrame::ABOVE_HOME);
+    EXPECT_TRUE(test_loc.sanitize(test_default_loc));
+    EXPECT_TRUE(test_loc.same_latlon_as(test_default_loc));
+    int32_t default_loc_alt;
+    // we should compare test_loc alt and test_default_loc alt in same frame , in this case, ABOVE HOME
+    EXPECT_TRUE(test_default_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, default_loc_alt));
+    EXPECT_EQ(test_loc.alt, default_loc_alt);
+    test_loc = Location(91*1e7, 0, 0, Location::AltFrame::ABSOLUTE);
+    EXPECT_TRUE(test_loc.sanitize(test_default_loc));
+    EXPECT_TRUE(test_loc.same_latlon_as(test_default_loc));
+    EXPECT_NE(test_default_loc.alt, test_loc.alt);
+    test_loc = Location(0, 181*1e7, 0, Location::AltFrame::ABSOLUTE);
+    EXPECT_TRUE(test_loc.sanitize(test_default_loc));
+    EXPECT_TRUE(test_loc.same_latlon_as(test_default_loc));
+    EXPECT_NE(test_default_loc.alt, test_loc.alt);
+    test_loc = Location(42*1e7, 42*1e7, 420, Location::AltFrame::ABSOLUTE);
+    EXPECT_FALSE(test_loc.sanitize(test_default_loc));
+    EXPECT_FALSE(test_loc.same_latlon_as(test_default_loc));
+    EXPECT_NE(test_default_loc.alt, test_loc.alt);
+}
+
+TEST(Location, Line)
+{
+    const Location test_home{35362938, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    const Location test_wp_last{35362960, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    Location test_wp{35362940, 149165085, 100, Location::AltFrame::ABSOLUTE};
+    EXPECT_FALSE(test_wp.past_interval_finish_line(test_home, test_wp_last));
+    EXPECT_TRUE(test_wp.past_interval_finish_line(test_home, test_home));
+    test_wp.lat = 35362970;
+    EXPECT_TRUE(test_wp.past_interval_finish_line(test_home, test_wp_last));
+}
+
+/*
+  check if we obey basic euclidean geometry rules of position
+  addition/subtraction
+ */
+TEST(Location, OffsetError)
+{
+    // test at 10km from origin
+    const float ofs_ne = 10e3 / sqrtf(2.0);
+    for (float lat = -80; lat <= 80; lat += 10.0) {
+        Location origin{int32_t(lat*1e7), 0, 0, Location::AltFrame::ABOVE_HOME};
+        Location loc = origin;
+        loc.offset(ofs_ne, ofs_ne);
+        Location loc2 = loc;
+        loc2.offset(-ofs_ne, -ofs_ne);
+        float dist = origin.get_distance(loc2);
+        EXPECT_FLOAT_EQ(dist, 0);
+    }
+}
+
+AP_GTEST_MAIN()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #include <AP_gtest.h>
+#include <AP_HAL/UARTDriver.h>
+#include <AP_Common/NMEA.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+class DummyUart: public AP_HAL::UARTDriver {
+public:
+    bool is_initialized() override { return true; };
+    bool tx_pending() override { return false; };
+    uint32_t txspace() override { return _txspace; };
+
+    void set_txspace(uint32_t space) {
+        _txspace = space;
+    }
+    uint32_t _txspace;
+
+protected:
+    uint32_t _available() override { return 1; };
+    void _begin(uint32_t baud, uint16_t rxSpace, uint16_t txSpace) override {  };
+    void _end() override {  };
+    void _flush() override {  };
+    size_t _write(const uint8_t *buffer, size_t size) override { return 1; };
+    ssize_t _read(uint8_t *buf, uint16_t count) override { return 0; };
+    bool _discard_input() override { return false; }
+};
+
+static DummyUart test_uart;
+
+
+TEST(NMEA, Printf)
+{
+    // test not enough space
+    test_uart.set_txspace(2);
+    EXPECT_FALSE(nmea_printf(&test_uart, "TEST"));
+    // normal test
+    test_uart.set_txspace(9);
+    EXPECT_TRUE(nmea_printf(&test_uart, "TEST"));
+}
+
+AP_GTEST_MAIN()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include <AP_gtest.h>
+#include <AP_HAL/UARTDriver.h>
+#include <AP_Common/NMEA.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+static uint32_t count = 0;
+
+void *malloc(size_t size) {
+    if (count == 1) {
+        return nullptr;
+    }
+    return calloc(size, 1);
+}
+
+// THAT IS UGLY HACK BUT IT WORKS ... it is just used to make print_vprintf return negative value.
+class BufferPrinter : public AP_HAL::BetterStream {
+public:
+    BufferPrinter(char* str, size_t size)  :
+    _offs(0), _str(str), _size(size)  {}
+
+    size_t write(uint8_t c) override { return 1; }
+    size_t write(const uint8_t *buffer, size_t size) override { return 1; }
+
+    size_t _offs;
+    char* const  _str;
+    const size_t _size;
+
+    uint32_t available() override { return 0; }
+    bool read(uint8_t &c) override { return false; };
+    uint32_t txspace() override { return 0; }
+    bool discard_input() override { return false; }
+};
+
+void print_vprintf(AP_HAL::BetterStream *s, const char *fmt, va_list ap);
+void print_vprintf(AP_HAL::BetterStream *s, const char *fmt, va_list ap) {
+    BufferPrinter* p = static_cast<BufferPrinter*>(s);
+    count++;
+    if (count < 3) {
+        p->_offs = 4;
+        return;
+    }
+    p->_offs = -1;
+    return;
+}
+
+class DummyUart: public AP_HAL::UARTDriver {
+public:
+    bool is_initialized() override { return true; };
+    bool tx_pending() override { return false; };
+    uint32_t txspace() override { return _txspace; };
+
+    void set_txspace(uint32_t space) {
+        _txspace = space;
+    }
+    uint32_t _txspace;
+protected:
+    void _begin(uint32_t baud, uint16_t rxSpace, uint16_t txSpace) override {  };
+    ssize_t _read(uint8_t *buf, uint16_t size) override { return 0; };
+    void _end() override {  };
+    void _flush() override {  };
+    uint32_t _available() override { return 1; };
+    size_t _write(const uint8_t *buffer, size_t size) override { return 1; };
+    bool _discard_input() override { return false; }
+};
+
+static DummyUart test_uart;
+
+TEST(NMEA, VAPrintf)
+{
+    // test Malloc failure
+    EXPECT_FALSE(nmea_printf(&test_uart, "test"));
+    // test second vsnprintf failure;
+    EXPECT_FALSE(nmea_printf(&test_uart, "test"));
+    // test first vsnprintf failure;
+    EXPECT_FALSE(nmea_printf(&test_uart, "test"));
+}
+
+AP_GTEST_MAIN()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include <AP_AHRS/AP_AHRS.h>
+
+#include <AP_Compass/AP_Compass.h>
+
+#include "Compass_learn.h"
+#include <GCS_MAVLink/GCS.h>
+#include <AP_Vehicle/AP_Vehicle.h>
+#include <AP_NavEKF/EKFGSF_yaw.h>
+
+#if COMPASS_LEARN_ENABLED
+
+#include <AP_Logger/AP_Logger.h>
+
+extern const AP_HAL::HAL &hal;
+
+// constructor
+CompassLearn::CompassLearn(Compass &_compass) :
+    compass(_compass)
+{
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CompassLearn: Initialised");
+}
+
+// accuracy threshold applied for GSF yaw estimate
+#define YAW_ACCURACY_THRESHOLD_DEG 5.0
+
+/*
+  update when new compass sample available
+ */
+void CompassLearn::update(void)
+{
+    const AP_Vehicle *vehicle = AP::vehicle();
+    if (compass.get_learn_type() != Compass::LEARN_INFLIGHT ||
+        !hal.util->get_soft_armed() ||
+        vehicle->get_time_flying_ms() < 3000) {
+        // only learn when flying and with enough time to be clear of
+        // the ground
+        return;
+    }
+
+    const auto &ahrs = AP::ahrs();
+    const auto *gsf = ahrs.get_yaw_estimator();
+    if (gsf == nullptr) {
+        // no GSF available
+        return;
+    }
+    if (degrees(fabsf(ahrs.get_pitch())) > 50) {
+        // we don't want to be too close to nose up, or yaw gets
+        // problematic. Tailsitters need to wait till they are in
+        // forward flight
+        return;
+    }
+
+    AP_Notify::flags.compass_cal_running = true;
+
+    ftype yaw_rad, yaw_variance;
+    uint8_t n_clips;
+    if (!gsf->getYawData(yaw_rad, yaw_variance, &n_clips) ||
+        !is_positive(yaw_variance) ||
+        n_clips > 1 ||
+        yaw_variance >= sq(radians(YAW_ACCURACY_THRESHOLD_DEG))) {
+        // not converged
+        return;
+    }
+
+    const bool result = compass.mag_cal_fixed_yaw(degrees(yaw_rad), (1U<<HAL_COMPASS_MAX_SENSORS)-1, 0, 0, true);
+    if (result) {
+        AP_Notify::flags.compass_cal_running = false;
+        compass.set_learn_type(Compass::LEARN_NONE, true);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CompassLearn: Finished");
+    }
+}
+
+#endif // COMPASS_LEARN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #include "AP_DAL_Beacon.h"
+
+#if AP_BEACON_ENABLED
+
+#include <AP_Logger/AP_Logger.h>
+#include "AP_DAL.h"
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+AP_DAL_Beacon::AP_DAL_Beacon()
+{
+#if !APM_BUILD_TYPE(APM_BUILD_AP_DAL_Standalone) && !APM_BUILD_TYPE(APM_BUILD_Replay)
+    const auto *bcon = AP::beacon();
+    _RBCH.count = bcon->count();
+    for (uint8_t i=0; i<ARRAY_SIZE(_RBCI); i++) {
+        _RBCI[i].instance = i;
+    }
+#endif
+}
+
+void AP_DAL_Beacon::start_frame()
+{
+    const auto *bcon = AP::beacon();
+
+    const log_RBCH old = _RBCH;
+    if (bcon != nullptr) {
+        _RBCH.get_vehicle_position_ned_returncode = bcon->get_vehicle_position_ned(_RBCH.vehicle_position_ned, _RBCH.accuracy_estimate);
+        Location loc;
+        _RBCH.get_origin_returncode = bcon->get_origin(loc);
+        _RBCH.enabled = bcon->enabled();
+        _RBCH.origin_lat = loc.lat;
+        _RBCH.origin_lng = loc.lng;
+        _RBCH.origin_alt = loc.alt;
+    }
+    WRITE_REPLAY_BLOCK_IFCHANGED(RBCH, _RBCH, old);
+    if (bcon == nullptr) {
+        return;
+    }
+
+    for (uint8_t i=0; i<ARRAY_SIZE(_RBCI); i++) {
+        log_RBCI &RBCI = _RBCI[i];
+        const log_RBCI old_RBCI = RBCI;
+        RBCI.last_update_ms = bcon->beacon_last_update_ms(i);
+        RBCI.position = bcon->beacon_position(i);
+        RBCI.distance = bcon->beacon_distance(i);
+        RBCI.healthy = bcon->beacon_healthy(i);
+
+        WRITE_REPLAY_BLOCK_IFCHANGED(RBCI, RBCI, old_RBCI);
+    }
+}
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #pragma once
+
+#include <AP_Beacon/AP_Beacon.h>
+
+#if AP_BEACON_ENABLED
+
+#include <AP_Logger/LogStructure.h>
+
+class AP_DAL_Beacon {
+public:
+
+    // Beacon-like methods:
+    uint8_t count() const {
+        return _RBCH.count;
+    }
+
+    bool get_origin(Location &loc) const {
+        loc.zero();
+        loc.lat = _RBCH.origin_lat;
+        loc.lng = _RBCH.origin_lng;
+        loc.alt = _RBCH.origin_alt;
+        return _RBCH.get_origin_returncode;
+    }
+
+    // return beacon enabled
+    bool enabled(void) const {
+        return _RBCH.enabled;
+    }
+
+    // return beacon health
+    bool beacon_healthy(uint8_t i) const {
+        return _RBCI[i].healthy;
+    }
+
+    // return last update time from beacon in milliseconds
+    uint32_t beacon_last_update_ms(uint8_t i) const {
+        return _RBCI[i].last_update_ms;
+    }
+
+    // return distance to beacon in meters
+    float beacon_distance(uint8_t i) const {
+        return _RBCI[i].distance;
+    }
+
+    // return NED position of beacon in meters relative to the beacon systems origin
+    const Vector3f &beacon_position(uint8_t i) const {
+        return _RBCI[i].position;
+    }
+
+    // return vehicle position in NED from position estimate system's origin in meters
+    bool get_vehicle_position_ned(Vector3f& pos, float& accuracy_estimate) const {
+        pos = _RBCH.vehicle_position_ned;
+        accuracy_estimate = _RBCH.accuracy_estimate;
+        return _RBCH.get_vehicle_position_ned_returncode;
+    }
+
+    // AP_DAL methods:
+    AP_DAL_Beacon();
+
+    AP_DAL_Beacon *beacon() {
+        return this;
+    }
+
+    void start_frame();
+
+    void handle_message(const log_RBCH &msg) {
+        _RBCH = msg;
+    }
+    void handle_message(const log_RBCI &msg) {
+        _RBCI[msg.instance] = msg;
+    }
+
+private:
+
+    struct log_RBCH _RBCH;
+    struct log_RBCI _RBCI[AP_BEACON_MAX_BEACONS];
+};
+
+#endif  // AP_BEACON_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #include "AP_DAL_Compass.h"
+
+#include <AP_Compass/AP_Compass.h>
+
+#include <AP_Logger/AP_Logger.h>
+#include "AP_DAL.h"
+
+AP_DAL_Compass::AP_DAL_Compass()
+{
+    for (uint8_t i=0; i<ARRAY_SIZE(_RMGI); i++) {
+        _RMGI[i].instance = i;
+    }
+}
+
+void AP_DAL_Compass::start_frame()
+{
+    const auto &compass = AP::compass();
+
+    const log_RMGH old = _RMGH;
+    _RMGH.available = compass.available();
+    _RMGH.count = compass.get_count();
+    _RMGH.auto_declination_enabled = compass.auto_declination_enabled();
+    _RMGH.declination = compass.get_declination();
+    _RMGH.num_enabled = compass.get_num_enabled();
+    _RMGH.consistent = compass.consistent();
+    _RMGH.first_usable = compass.get_first_usable();
+    _RMGH.learn_offsets_enabled = compass.learn_offsets_enabled();
+
+    WRITE_REPLAY_BLOCK_IFCHANGED(RMGH, _RMGH, old);
+
+    for (uint8_t i=0; i<_RMGH.count; i++) {
+        log_RMGI &RMGI = _RMGI[i];
+        const log_RMGI old_RMGI = RMGI;
+        RMGI.use_for_yaw = compass.use_for_yaw(i);
+        RMGI.healthy = compass.healthy(i);
+        RMGI.offsets = compass.get_offsets(i);
+        RMGI.have_scale_factor = compass.have_scale_factor(i);
+        RMGI.last_update_usec = compass.last_update_usec(i);
+        RMGI.field = compass.get_field(i);
+
+        WRITE_REPLAY_BLOCK_IFCHANGED(RMGI, RMGI, old_RMGI);
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #include "AP_DAL_RangeFinder.h"
+
+#include <AP_Logger/AP_Logger.h>
+
+#include <AP_RangeFinder/AP_RangeFinder_Backend.h>
+
+#if AP_RANGEFINDER_ENABLED
+
+#include "AP_DAL.h"
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_InternalError/AP_InternalError.h>
+
+AP_DAL_RangeFinder::AP_DAL_RangeFinder()
+{
+#if !APM_BUILD_TYPE(APM_BUILD_AP_DAL_Standalone) && !APM_BUILD_TYPE(APM_BUILD_Replay)
+    _RRNH.num_sensors = AP::rangefinder()->num_sensors();
+    _RRNI = NEW_NOTHROW log_RRNI[_RRNH.num_sensors];
+    _backend = NEW_NOTHROW AP_DAL_RangeFinder_Backend *[_RRNH.num_sensors];
+    if (!_RRNI || !_backend) {
+        goto failed;
+    }
+    for (uint8_t i=0; i<_RRNH.num_sensors; i++) {
+        _RRNI[i].instance = i;
+    }
+    for (uint8_t i=0; i<_RRNH.num_sensors; i++) {
+        // this avoids having to discard a const....
+        _backend[i] = NEW_NOTHROW AP_DAL_RangeFinder_Backend(_RRNI[i]);
+        if (!_backend[i]) {
+            goto failed;
+        }
+    }
+    return;
+failed:
+    AP_BoardConfig::allocation_error("DAL backends");
+#endif
+}
+
+int16_t AP_DAL_RangeFinder::ground_clearance_cm_orient(enum Rotation orientation) const
+{
+#if !APM_BUILD_TYPE(APM_BUILD_AP_DAL_Standalone)
+    const auto *rangefinder = AP::rangefinder();
+
+    if (orientation != ROTATION_PITCH_270) {
+        // the EKF only asks for this from a specific orientation.  Thankfully.
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        return rangefinder->ground_clearance_cm_orient(orientation);
+    }
+#endif
+
+    return _RRNH.ground_clearance_cm;
+}
+
+int16_t AP_DAL_RangeFinder::max_distance_cm_orient(enum Rotation orientation) const
+{
+#if !APM_BUILD_TYPE(APM_BUILD_AP_DAL_Standalone)
+    if (orientation != ROTATION_PITCH_270) {
+        const auto *rangefinder = AP::rangefinder();
+        // the EKF only asks for this from a specific orientation.  Thankfully.
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        return rangefinder->max_distance_cm_orient(orientation);
+    }
+#endif
+
+    return _RRNH.max_distance_cm;
+}
+
+void AP_DAL_RangeFinder::start_frame()
+{
+    const auto *rangefinder = AP::rangefinder();
+    if (rangefinder == nullptr) {
+        return;
+    }
+
+    const log_RRNH old = _RRNH;
+
+    // EKF only asks for this *down*.
+    _RRNH.ground_clearance_cm = rangefinder->ground_clearance_cm_orient(ROTATION_PITCH_270);
+    _RRNH.max_distance_cm = rangefinder->max_distance_cm_orient(ROTATION_PITCH_270);
+
+    WRITE_REPLAY_BLOCK_IFCHANGED(RRNH, _RRNH, old);
+
+    for (uint8_t i=0; i<_RRNH.num_sensors; i++) {
+        auto *backend = rangefinder->get_backend(i);
+        if (backend == nullptr) {
+            continue;
+        }
+        _backend[i]->start_frame(backend);
+    }
+}
+
+
+
+
+AP_DAL_RangeFinder_Backend::AP_DAL_RangeFinder_Backend(struct log_RRNI &RRNI) :
+    _RRNI(RRNI)
+{
+}
+
+void AP_DAL_RangeFinder_Backend::start_frame(AP_RangeFinder_Backend *backend) {
+    const log_RRNI old = _RRNI;
+    _RRNI.orientation = backend->orientation();
+    _RRNI.status = (uint8_t)backend->status();
+    _RRNI.pos_offset = backend->get_pos_offset();
+    _RRNI.distance_cm = backend->distance_cm();
+    WRITE_REPLAY_BLOCK_IFCHANGED(RRNI, _RRNI, old);
+}
+
+// return true if we have a range finder with the specified orientation
+bool AP_DAL_RangeFinder::has_orientation(enum Rotation orientation) const
+{
+    for (uint8_t i=0; i<_RRNH.num_sensors; i++) {
+        if (_RRNI[i].orientation == orientation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+AP_DAL_RangeFinder_Backend *AP_DAL_RangeFinder::get_backend(uint8_t id) const
+{
+   if (id >= RANGEFINDER_MAX_INSTANCES) {
+       INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+       return nullptr;
+   }
+   if (id >= _RRNH.num_sensors) {
+        return nullptr;
+    }
+
+   return _backend[id];
+}
+
+void AP_DAL_RangeFinder::handle_message(const log_RRNH &msg)
+{
+    _RRNH = msg;
+    if (_RRNH.num_sensors > 0 && _RRNI == nullptr) {
+        _RRNI = NEW_NOTHROW log_RRNI[_RRNH.num_sensors];
+        _backend = NEW_NOTHROW AP_DAL_RangeFinder_Backend *[_RRNH.num_sensors];
+    }
+}
+
+void AP_DAL_RangeFinder::handle_message(const log_RRNI &msg)
+{
+    if (_RRNI != nullptr && msg.instance < _RRNH.num_sensors) {
+        _RRNI[msg.instance] = msg;
+        if (_backend != nullptr && _backend[msg.instance] == nullptr) {
+            _backend[msg.instance] = NEW_NOTHROW AP_DAL_RangeFinder_Backend(_RRNI[msg.instance]);
+        }
+    }
+}
+
+#endif  // AP_RANGEFINDER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #pragma once
+
+#include <AP_RangeFinder/AP_RangeFinder.h>
+
+#if AP_RANGEFINDER_ENABLED
+
+#include <AP_Logger/LogStructure.h>
+
+class AP_RangeFinder_Backend;
+
+class AP_DAL_RangeFinder {
+public:
+
+    // RangeFinder-like methods:
+    enum class Status {
+        NotConnected = 0,
+        NoData,
+        OutOfRangeLow,
+        OutOfRangeHigh,
+        Good
+    };
+
+    int16_t ground_clearance_cm_orient(enum Rotation orientation) const;
+    int16_t max_distance_cm_orient(enum Rotation orientation) const;
+
+    // return true if we have a range finder with the specified orientation
+    bool has_orientation(enum Rotation orientation) const;
+
+    // DAL methods:
+    AP_DAL_RangeFinder();
+
+    void start_frame();
+
+    class AP_DAL_RangeFinder_Backend *get_backend(uint8_t id) const;
+
+    void handle_message(const log_RRNH &msg);
+    void handle_message(const log_RRNI &msg);
+
+private:
+
+    struct log_RRNH _RRNH;
+    struct log_RRNI *_RRNI;
+    AP_DAL_RangeFinder_Backend **_backend;
+};
+
+
+class AP_DAL_RangeFinder_Backend {
+public:
+
+    AP_DAL_RangeFinder_Backend(struct log_RRNI &RRNI);
+
+    // RangeFinder-backend-like methods
+
+    enum Rotation orientation() const {
+        return (Rotation)_RRNI.orientation;
+    }
+
+    AP_DAL_RangeFinder::Status status() const {
+        return (AP_DAL_RangeFinder::Status)_RRNI.status;
+    }
+
+    uint16_t distance_cm() const { return _RRNI.distance_cm; }
+
+    const Vector3f &get_pos_offset() const { return _RRNI.pos_offset; }
+
+    // DAL methods:
+    void start_frame(AP_RangeFinder_Backend *backend);
+
+private:
+
+    struct log_RRNI &_RRNI;
+};
+
+#endif  // AP_RANGEFINDER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #include "AP_DAL_VisualOdom.h"
+
+#include <AP_VisualOdom/AP_VisualOdom.h>
+
+#if HAL_VISUALODOM_ENABLED
+
+#include <AP_Logger/AP_Logger.h>
+#include "AP_DAL.h"
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+
+/*
+   update position offsets to align to AHRS position
+   should only be called when this library is not being used as the position source
+   This function does not change EKF state, so does not need to be logged
+*/
+void AP_DAL_VisualOdom::align_position_to_ahrs(bool align_xy, bool align_z)
+{
+#if !APM_BUILD_TYPE(APM_BUILD_AP_DAL_Standalone)
+    auto *vo = AP::visualodom();
+    vo->align_position_to_ahrs(align_xy, align_z);
+#endif
+}
+
+void AP_DAL_VisualOdom::start_frame()
+{
+    const auto *vo = AP::visualodom();
+
+    const log_RVOH old = RVOH;
+    if (vo != nullptr) {
+        RVOH.pos_offset = vo->get_pos_offset();
+        RVOH.delay_ms = vo->get_delay_ms();
+        RVOH.healthy = vo->healthy();
+        RVOH.enabled = vo->enabled();
+    }
+
+    WRITE_REPLAY_BLOCK_IFCHANGED(RVOH, RVOH, old);
+}
+
+#endif // HAL_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #pragma once
+
+#include <AP_Logger/LogStructure.h>
+
+#include <AP_VisualOdom/AP_VisualOdom.h>
+
+#if HAL_VISUALODOM_ENABLED
+
+class AP_DAL_VisualOdom {
+public:
+
+    // return VisualOdom health
+    bool healthy() const {
+        return RVOH.healthy;
+    }
+
+    bool enabled() const {
+        return RVOH.enabled;
+    }
+
+    uint16_t get_delay_ms() const {
+        return RVOH.delay_ms;
+    }
+
+    // return a 3D vector defining the position offset of the camera in meters relative to the body frame origin
+    const Vector3f &get_pos_offset() const {
+        return RVOH.pos_offset;
+    }
+
+    // update position offsets to align to AHRS position
+    // should only be called when this library is not being used as the position source
+    void align_position_to_ahrs(bool align_xy, bool align_z);
+
+    void start_frame();
+
+    void handle_message(const log_RVOH &msg) {
+        RVOH = msg;
+    }
+
+private:
+
+    struct log_RVOH RVOH;
+};
+
+#endif // HAL_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #pragma once
+
+#include <AP_Logger/LogStructure.h>
+#include <AP_Math/vector3.h>
+#include <AP_Math/vector2.h>
+#include <AP_Math/matrix3.h>
+#include <AP_Math/quaternion.h>
+
+#define LOG_IDS_FROM_DAL \
+    LOG_RFRH_MSG, \
+    LOG_RFRF_MSG, \
+    LOG_REV2_MSG, \
+    LOG_RSO2_MSG, \
+    LOG_RWA2_MSG, \
+    LOG_REV3_MSG, \
+    LOG_RSO3_MSG, \
+    LOG_RWA3_MSG, \
+    LOG_REY3_MSG, \
+    LOG_RFRN_MSG, \
+    LOG_RISH_MSG, \
+    LOG_RISI_MSG, \
+    LOG_RBRH_MSG, \
+    LOG_RBRI_MSG, \
+    LOG_RRNH_MSG, \
+    LOG_RRNI_MSG, \
+    LOG_RGPH_MSG, \
+    LOG_RGPI_MSG, \
+    LOG_RGPJ_MSG, \
+    LOG_RASH_MSG, \
+    LOG_RASI_MSG, \
+    LOG_RBCH_MSG, \
+    LOG_RBCI_MSG, \
+    LOG_RVOH_MSG, \
+    LOG_RMGH_MSG, \
+    LOG_RMGI_MSG, \
+    LOG_ROFH_MSG, \
+    LOG_REPH_MSG, \
+    LOG_RSLL_MSG, \
+    LOG_REVH_MSG, \
+    LOG_RWOH_MSG, \
+    LOG_RBOH_MSG
+
+// Replay Data Structures
+struct log_RFRH {
+    uint64_t time_us;
+    uint32_t time_flying_ms;
+    uint8_t _end;
+};
+
+struct log_RFRF {
+    uint8_t frame_types;
+    uint8_t core_slow;
+    uint8_t _end;
+};
+
+struct log_RFRN {
+    int32_t lat;
+    int32_t lng;
+    int32_t alt;
+    float EAS2TAS;
+    uint32_t available_memory;
+    Vector3f ahrs_trim;
+    uint8_t vehicle_class;
+    uint8_t ekf_type;
+    uint8_t armed:1;
+    uint8_t unused:1;  // was get_compass_is_null
+    uint8_t fly_forward:1;
+    uint8_t ahrs_airspeed_sensor_enabled:1;
+    uint8_t opticalflow_enabled:1;
+    uint8_t wheelencoder_enabled:1;
+    uint8_t takeoff_expected:1;
+    uint8_t touchdown_expected:1;
+    uint8_t _end;
+};
+
+// Replay Data Structure - Inertial Sensor header
+struct log_RISH {
+    uint16_t loop_rate_hz;
+    uint8_t first_usable_gyro;
+    uint8_t first_usable_accel;
+    float loop_delta_t;
+    uint8_t accel_count;
+    uint8_t gyro_count;
+    uint8_t _end;
+};
+
+// Replay Data Structure - Inertial Sensor instance data
+struct log_RISI {
+    Vector3f delta_velocity;
+    Vector3f delta_angle;
+    float delta_velocity_dt;
+    float delta_angle_dt;
+    uint8_t use_accel:1;
+    uint8_t use_gyro:1;
+    uint8_t get_delta_velocity_ret:1;
+    uint8_t get_delta_angle_ret:1;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: REV2
+// @Description: Replay Event
+struct log_REV2 {
+    uint8_t event;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RSO2
+// @Description: Replay Set Origin event
+struct log_RSO2 {
+    int32_t lat;
+    int32_t lng;
+    int32_t alt;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RWA2
+// @Description: Replay set-default-airspeed event
+struct log_RWA2 {
+    float airspeed;
+    float uncertainty;
+    uint8_t _end;
+};
+
+// same structures for EKF3
+#define log_REV3 log_REV2
+#define log_RSO3 log_RSO2
+#define log_RWA3 log_RWA2
+
+// @LoggerMessage: REY3
+// @Description: Replay Euler Yaw event
+struct log_REY3 {
+    float yawangle;
+    float yawangleerr;
+    uint32_t timestamp_ms;
+    uint8_t type;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RBRH
+// @Description: Replay Data Barometer Header
+struct log_RBRH {
+    uint8_t primary;
+    uint8_t num_instances;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RBRI
+// @Description: Replay Data Barometer Instance
+struct log_RBRI {
+    uint32_t last_update_ms;
+    float altitude;  // from get_altitude
+    bool healthy;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RRNH
+// @Description: Replay Data Rangefinder Header
+struct log_RRNH {
+    // this is rotation-pitch-270!
+    int16_t ground_clearance_cm;
+    int16_t max_distance_cm;
+    uint8_t num_sensors;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RRNI
+// @Description: Replay Data Rangefinder Instance
+struct log_RRNI {
+    Vector3f pos_offset;
+    uint16_t distance_cm;
+    uint8_t orientation;
+    uint8_t status;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RGPH
+// @Description: Replay Data GPS Header
+struct log_RGPH {
+    uint8_t num_sensors;
+    uint8_t primary_sensor;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RGPI
+// @Description: Replay Data GPS Instance, infrequently changing data
+struct log_RGPI {
+    Vector3f antenna_offset;
+    float lag_sec;
+    uint8_t have_vertical_velocity:1;
+    uint8_t horizontal_accuracy_returncode:1;
+    uint8_t vertical_accuracy_returncode:1;
+    uint8_t get_lag_returncode:1;
+    uint8_t speed_accuracy_returncode:1;
+    uint8_t gps_yaw_deg_returncode:1;
+    uint8_t status;
+    uint8_t num_sats;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RGPJ
+// @Description: Replay Data GPS Instance - rapidly changing data
+struct log_RGPJ {
+    uint32_t last_message_time_ms;
+    Vector3f velocity;
+    float sacc;
+    float yaw_deg;
+    float yaw_accuracy_deg;
+    uint32_t yaw_deg_time_ms;
+    int32_t lat;
+    int32_t lng;
+    int32_t alt;
+    float hacc;
+    float vacc;
+    uint16_t hdop;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// Replay Data Structure - Airspeed Sensor header
+struct log_RASH {
+    uint8_t num_sensors;
+    uint8_t primary;
+    uint8_t _end;
+};
+
+// Replay Data Structure - Airspeed Sensor instance
+struct log_RASI {
+    float airspeed;
+    uint32_t last_update_ms;
+    bool healthy;
+    bool use;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RMGH
+// @Description: Replay Data Magnetometer Header
+struct log_RMGH {
+    float declination;
+    bool available;
+    uint8_t count;
+    bool auto_declination_enabled;
+    uint8_t num_enabled;
+    bool learn_offsets_enabled;
+    bool consistent;
+    uint8_t first_usable;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RMGI
+// @Description: Replay Data Magnetometer Instance
+struct log_RMGI {
+    uint32_t last_update_usec;
+    Vector3f offsets;
+    Vector3f field;
+    bool use_for_yaw;
+    bool healthy;
+    bool have_scale_factor;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RBCH
+// @Description: Replay Data Beacon Header
+struct log_RBCH {
+    Vector3f vehicle_position_ned;
+    float accuracy_estimate;
+    int32_t origin_lat;
+    int32_t origin_lng;
+    int32_t origin_alt;
+    uint8_t get_vehicle_position_ned_returncode:1;
+    uint8_t get_origin_returncode:1;
+    uint8_t enabled:1;
+    uint8_t count;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RBCI
+// @Description: Replay Data Beacon Instance
+struct log_RBCI {
+    uint32_t last_update_ms;
+    Vector3f position;
+    float distance;
+    uint8_t healthy;
+    uint8_t instance;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RVOH
+// @Description: Replay Data Visual Odometry data
+struct log_RVOH {
+    Vector3f pos_offset;
+    uint32_t delay_ms;
+    uint8_t healthy;
+    bool enabled;
+    uint8_t _end;
+};
+
+// @LoggerMessage: ROFH
+// @Description: Replay optical flow data
+struct log_ROFH {
+    Vector2f rawFlowRates;
+    Vector2f rawGyroRates;
+    uint32_t msecFlowMeas;
+    Vector3f posOffset;
+    float heightOverride;
+    uint8_t rawFlowQuality;
+    uint8_t _end;
+};
+
+// @LoggerMessage: REPH
+// @Description: Replay external position data
+struct log_REPH {
+    Vector3f pos;
+    Quaternion quat;
+    float posErr;
+    float angErr;
+    uint32_t timeStamp_ms;
+    uint32_t resetTime_ms;
+    uint16_t delay_ms;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RSLL
+// @Description: Replay Set Lat Lng event
+struct log_RSLL {
+    int32_t lat; // WGS-84 latitude in 1E-7 degrees
+    int32_t lng; // WGS-84 longitude in 1E7 degrees
+    float posAccSD; // horizontal position 1 STD uncertainty (m)
+    uint32_t timestamp_ms;
+    uint8_t _end;
+};
+
+// @LoggerMessage: REVH
+// @Description: Replay external position data
+struct log_REVH {
+    Vector3f vel;
+    float err;
+    uint32_t timeStamp_ms;
+    uint16_t delay_ms;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RWOH
+// @Description: Replay wheel odometry data
+struct log_RWOH {
+    float delAng;
+    float delTime;
+    uint32_t timeStamp_ms;
+    Vector3f posOffset;
+    float radius;
+    uint8_t _end;
+};
+
+// @LoggerMessage: RBOH
+// @Description: Replay body odometry data
+struct log_RBOH {
+    float quality;
+    Vector3f delPos;
+    Vector3f delAng;
+    float delTime;
+    uint32_t timeStamp_ms;
+    Vector3f posOffset;
+    uint16_t delay_ms;
+    uint8_t _end;
+};
+
+#define RLOG_SIZE(sname) 3+offsetof(struct log_ ##sname,_end)
+
+#define LOG_STRUCTURE_FROM_DAL        \
+    { LOG_RFRH_MSG, RLOG_SIZE(RFRH),                          \
+      "RFRH", "QI", "TimeUS,TF", "s-", "F-" }, \
+    { LOG_RFRF_MSG, RLOG_SIZE(RFRF),                          \
+      "RFRF", "BB", "FTypes,Slow", "--", "--" }, \
+    { LOG_RFRN_MSG, RLOG_SIZE(RFRN),                            \
+      "RFRN", "IIIfIfffBBB", "HLat,HLon,HAlt,E2T,AM,TX,TY,TZ,VC,EKT,Flags", "DUm????????", "GGB--------" }, \
+    { LOG_REV2_MSG, RLOG_SIZE(REV2),                                   \
+      "REV2", "B", "Event", "-", "-" }, \
+    { LOG_RSO2_MSG, RLOG_SIZE(RSO2),                         \
+      "RSO2", "III", "Lat,Lon,Alt", "DUm", "GGB" }, \
+    { LOG_RWA2_MSG, RLOG_SIZE(RWA2),                         \
+      "RWA2", "ff", "Airspeed,uncertainty", "nn", "00" }, \
+    { LOG_REV3_MSG, RLOG_SIZE(REV3),                \
+      "REV3", "B", "Event", "-", "-" }, \
+    { LOG_RSO3_MSG, RLOG_SIZE(RSO3),                         \
+      "RSO3", "III", "Lat,Lon,Alt", "DUm", "GGB" }, \
+    { LOG_RWA3_MSG, RLOG_SIZE(RWA3),                         \
+      "RWA3", "ff", "Airspeed,Uncertainty", "nn", "00" }, \
+    { LOG_REY3_MSG, RLOG_SIZE(REY3),                                   \
+      "REY3", "ffIB", "yawangle,yawangleerr,timestamp_ms,type", "???-", "???-" }, \
+    { LOG_RISH_MSG, RLOG_SIZE(RISH),                                   \
+      "RISH", "HBBfBB", "LR,PG,PA,LD,AC,GC", "------", "------" }, \
+    { LOG_RISI_MSG, RLOG_SIZE(RISI),                                   \
+      "RISI", "ffffffffBB", "DVX,DVY,DVZ,DAX,DAY,DAZ,DVDT,DADT,Flags,I", "---------#", "----------" }, \
+    { LOG_RASH_MSG, RLOG_SIZE(RASH),                                   \
+      "RASH", "BB", "Primary,NumInst", "--", "--" },  \
+    { LOG_RASI_MSG, RLOG_SIZE(RASI),                                   \
+      "RASI", "fIBBB", "pd,UpdateMS,H,Use,I", "----#", "-----" }, \
+    { LOG_RBRH_MSG, RLOG_SIZE(RBRH),                                   \
+      "RBRH", "BB", "Primary,NumInst", "--", "--" },  \
+    { LOG_RBRI_MSG, RLOG_SIZE(RBRI),                                   \
+      "RBRI", "IfBB", "LastUpdate,Alt,H,I", "---#", "----" }, \
+    { LOG_RRNH_MSG, RLOG_SIZE(RRNH),                                   \
+      "RRNH", "hhB", "GCl,MaxD,NumSensors", "???", "???" },  \
+    { LOG_RRNI_MSG, RLOG_SIZE(RRNI),                                   \
+      "RRNI", "fffHBBB", "PX,PY,PZ,Dist,Orient,Status,I", "------#", "-------" }, \
+    { LOG_RGPH_MSG, RLOG_SIZE(RGPH),                                   \
+      "RGPH", "BB", "NumInst,Primary", "--", "--" },  \
+    { LOG_RGPI_MSG, RLOG_SIZE(RGPI),                                   \
+      "RGPI", "ffffBBBB", "OX,OY,OZ,Lg,Flags,Stat,NSats,I", "-------#", "--------" }, \
+    { LOG_RGPJ_MSG, RLOG_SIZE(RGPJ),                                   \
+      "RGPJ", "IffffffIiiiffHB", "TS,VX,VY,VZ,SA,Y,YA,YT,Lat,Lon,Alt,HA,VA,HD,I", "--------------#", "---------------" }, \
+    { LOG_RMGH_MSG, RLOG_SIZE(RMGH),                                   \
+      "RMGH", "fBBBBBBB", "Dec,Avail,NumInst,AutoDec,NumEna,LOE,C,FUsable", "--------", "--------" },  \
+    { LOG_RMGI_MSG, RLOG_SIZE(RMGI),                                   \
+      "RMGI", "IffffffBBBB", "LU,OX,OY,OZ,FX,FY,FZ,UFY,H,HSF,I", "----------#", "-----------" },                                        \
+    { LOG_RBCH_MSG, RLOG_SIZE(RBCH),                                   \
+      "RBCH", "ffffiiiBB", "PX,PY,PZ,AE,OLat,OLng,OAlt,Flags,NumInst", "---------", "---------" },  \
+    { LOG_RBCI_MSG, RLOG_SIZE(RBCI),                                   \
+      "RBCI", "IffffBB", "LU,PX,PY,PZ,Dist,H,I", "smmmm-#", "?0000--" }, \
+    { LOG_RVOH_MSG, RLOG_SIZE(RVOH),                                   \
+      "RVOH", "fffIBB", "OX,OY,OZ,Del,H,Ena", "------", "------" }, \
+    { LOG_ROFH_MSG, RLOG_SIZE(ROFH),                                   \
+      "ROFH", "ffffIffffB", "FX,FY,GX,GY,Tms,PX,PY,PZ,HgtOvr,Qual", "----------", "----------" }, \
+    { LOG_REPH_MSG, RLOG_SIZE(REPH),                                   \
+      "REPH", "fffffffffIIH", "PX,PY,PZ,Q1,Q2,Q3,Q4,PEr,AEr,TS,RT,D", "------------", "------------" }, \
+    { LOG_RSLL_MSG, RLOG_SIZE(RSLL),                         \
+      "RSLL", "IIfI", "Lat,Lng,PosAccSD,TS", "DU--", "GG--" }, \
+    { LOG_REVH_MSG, RLOG_SIZE(REVH),                                   \
+      "REVH", "ffffIH", "VX,VY,VZ,Er,TS,D", "------", "------" }, \
+    { LOG_RWOH_MSG, RLOG_SIZE(RWOH),                                   \
+      "RWOH", "ffIffff", "DA,DT,TS,PX,PY,PZ,R", "-------", "-------" }, \
+    { LOG_RBOH_MSG, RLOG_SIZE(RBOH),                                   \
+      "RBOH", "ffffffffIfffH", "Q,DPX,DPY,DPZ,DAX,DAY,DAZ,DT,TS,OX,OY,OZ,D", "-------------", "-------------" },
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     //
+// Ensure that AP_NavEKF libraries can be compiled when not linked to
+// anything except the DAL.
+//
+
+#include <AP_DAL/AP_DAL.h>
+#include <AP_NavEKF3/AP_NavEKF3.h>
+#include <AP_Logger/AP_Logger.h>
+
+void AP_Param::setup_object_defaults(void const*, AP_Param::GroupInfo const*) {}
+
+template<typename T, ap_var_type PT>
+void AP_ParamT<T, PT>::set_and_default(const T &v) {}
+template class AP_ParamT<int8_t, AP_PARAM_INT8>;
+
+
+int AP_HAL::Util::vsnprintf(char*, size_t, char const*, va_list) { return -1; }
+
+void *nologger = nullptr;
+AP_Logger &AP::logger() {
+    return *((AP_Logger*)nologger);  // this is not usually a good idea...
+}
+void AP_Logger::WriteBlock(void const*, unsigned short) {}
+
+class AP_HAL_DAL_Standalone : public AP_HAL::HAL {
+public:
+    AP_HAL_DAL_Standalone() :
+        AP_HAL::HAL(
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr
+            ) {}
+    void run(int argc, char* const argv[], Callbacks* callbacks) const override {}
+    void setup() { }
+    void loop() { }
+};
+
+AP_HAL_DAL_Standalone _hal;
+const AP_HAL::HAL &hal = _hal;
+
+NavEKF2 navekf2;
+NavEKF3 navekf3;
+
+int main(int argc, const char *argv[])
+{
+    navekf2.InitialiseFilter();
+    navekf3.InitialiseFilter();
+    navekf2.UpdateFilter();
+    navekf3.UpdateFilter();
+    return navekf2.healthy() && navekf3.healthy()?0:1;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_stlib(
+        name='AP_DAL' + '_libs',
+        ap_vehicle='AP_DAL_Standalone',
+        ap_libraries=[
+            'AP_NavEKF2',
+            'AP_NavEKF3',
+            'AP_NavEKF',
+            'AP_Common',
+            'AP_Math',
+            'AP_DAL',
+            'AP_InternalError',
+            'AP_Declination',
+            'AP_RTC',
+        ],
+    )
+
+    # only valid to build with no GCS and no scripting
+    if '-DHAL_GCS_ENABLED=0' in bld.env.CXXFLAGS and 'AP_SCRIPTING_ENABLED=1' not in bld.env.DEFINES:
+        bld.ap_program(
+            program_groups=['tool'],
+            use='AP_DAL_libs',
+        )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #include <AP_HAL/AP_HAL_Boards.h>
+
+#if AP_DDS_ENABLED
+#include <uxr/client/util/ping.h>
+
+#include <AP_GPS/AP_GPS.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_RTC/AP_RTC.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
+#include <GCS_MAVLink/GCS.h>
+#include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_Arming/AP_Arming.h>
+#include <AP_Vehicle/AP_Vehicle.h>
+#include <AP_ExternalControl/AP_ExternalControl_config.h>
+
+#include "ardupilot_msgs/srv/ArmMotors.h"
+#include "ardupilot_msgs/srv/ModeSwitch.h"
+
+#if AP_EXTERNAL_CONTROL_ENABLED
+#include "AP_DDS_ExternalControl.h"
+#endif
+#include "AP_DDS_Frames.h"
+
+#include "AP_DDS_Client.h"
+#include "AP_DDS_Topic_Table.h"
+#include "AP_DDS_Service_Table.h"
+#include "AP_DDS_External_Odom.h"
+
+// Enable DDS at runtime by default
+static constexpr uint8_t ENABLED_BY_DEFAULT = 1;
+static constexpr uint16_t DELAY_TIME_TOPIC_MS = 10;
+static constexpr uint16_t DELAY_BATTERY_STATE_TOPIC_MS = 1000;
+static constexpr uint16_t DELAY_IMU_TOPIC_MS = 5;
+static constexpr uint16_t DELAY_LOCAL_POSE_TOPIC_MS = 33;
+static constexpr uint16_t DELAY_LOCAL_VELOCITY_TOPIC_MS = 33;
+static constexpr uint16_t DELAY_GEO_POSE_TOPIC_MS = 33;
+static constexpr uint16_t DELAY_CLOCK_TOPIC_MS = 10;
+static constexpr uint16_t DELAY_GPS_GLOBAL_ORIGIN_TOPIC_MS = 1000;
+static constexpr uint16_t DELAY_PING_MS = 500;
+
+// Define the subscriber data members, which are static class scope.
+// If these are created on the stack in the subscriber,
+// the AP_DDS_Client::on_topic frame size is exceeded.
+sensor_msgs_msg_Joy AP_DDS_Client::rx_joy_topic {};
+tf2_msgs_msg_TFMessage AP_DDS_Client::rx_dynamic_transforms_topic {};
+geometry_msgs_msg_TwistStamped AP_DDS_Client::rx_velocity_control_topic {};
+ardupilot_msgs_msg_GlobalPosition AP_DDS_Client::rx_global_position_control_topic {};
+
+
+const AP_Param::GroupInfo AP_DDS_Client::var_info[] {
+
+    // @Param: _ENABLE
+    // @DisplayName: DDS enable
+    // @Description: Enable DDS subsystem
+    // @Values: 0:Disabled,1:Enabled
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO_FLAGS("_ENABLE", 1, AP_DDS_Client, enabled, ENABLED_BY_DEFAULT, AP_PARAM_FLAG_ENABLE),
+
+#if AP_DDS_UDP_ENABLED
+    // @Param: _UDP_PORT
+    // @DisplayName: DDS UDP port
+    // @Description: UDP port number for DDS
+    // @Range: 1 65535
+    // @RebootRequired: True
+    // @User: Standard
+    AP_GROUPINFO("_UDP_PORT", 2, AP_DDS_Client, udp.port, 2019),
+
+    // @Group: _IP
+    // @Path: ../AP_Networking/AP_Networking_address.cpp
+    AP_SUBGROUPINFO(udp.ip, "_IP", 3,  AP_DDS_Client, AP_Networking_IPV4),
+
+#endif
+
+    // @Param: _DOMAIN_ID
+    // @DisplayName: DDS DOMAIN ID
+    // @Description: Set the ROS_DOMAIN_ID
+    // @Range: 0 232
+    // @RebootRequired: True
+    // @User: Standard
+    AP_GROUPINFO("_DOMAIN_ID", 4, AP_DDS_Client, domain_id, 0),
+
+    AP_GROUPEND
+};
+
+static void initialize(geometry_msgs_msg_Quaternion& q)
+{
+    q.x = 0.0;
+    q.y = 0.0;
+    q.z = 0.0;
+    q.w = 1.0;
+}
+
+AP_DDS_Client::~AP_DDS_Client()
+{
+    // close transport
+    if (is_using_serial) {
+        uxr_close_custom_transport(&serial.transport);
+    } else {
+#if AP_DDS_UDP_ENABLED
+        uxr_close_custom_transport(&udp.transport);
+#endif
+    }
+}
+
+void AP_DDS_Client::update_topic(builtin_interfaces_msg_Time& msg)
+{
+    uint64_t utc_usec;
+    if (!AP::rtc().get_utc_usec(utc_usec)) {
+        utc_usec = AP_HAL::micros64();
+    }
+    msg.sec = utc_usec / 1000000ULL;
+    msg.nanosec = (utc_usec % 1000000ULL) * 1000UL;
+
+}
+
+bool AP_DDS_Client::update_topic(sensor_msgs_msg_NavSatFix& msg, const uint8_t instance)
+{
+    // Add a lambda that takes in navsatfix msg and populates the cov
+    // Make it constexpr if possible
+    // https://www.fluentcpp.com/2021/12/13/the-evolutions-of-lambdas-in-c14-c17-and-c20/
+    // constexpr auto times2 = [] (sensor_msgs_msg_NavSatFix* msg) { return n * 2; };
+
+    // assert(instance >= GPS_MAX_RECEIVERS);
+    if (instance >= GPS_MAX_RECEIVERS) {
+        return false;
+    }
+
+    auto &gps = AP::gps();
+    WITH_SEMAPHORE(gps.get_semaphore());
+
+    if (

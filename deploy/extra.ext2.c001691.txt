@@ -1,0 +1,2153 @@
+l, raw_frame.canfd)
+
+        transfer_frames = self._transfer_manager.receive_frame(frame)
+        if not transfer_frames:
+            return
+
+        transfer = transport.Transfer()
+        transfer.from_frames(transfer_frames)
+
+        self._transfer_hook_dispatcher.call_hooks(self._transfer_hook_dispatcher.TRANSFER_DIRECTION_INCOMING, transfer)
+
+        if (transfer.service_not_message and not transfer.request_not_response) and \
+                transfer.dest_node_id == self._node_id:
+            # This is a reply to a request we sent. Look up the original request and call the appropriate callback
+            requests = self._outstanding_requests.keys()
+            for key in requests:
+                if transfer.is_response_to(self._outstanding_requests[key]):
+                    # Call the request's callback and remove it from the active list
+                    event = TransferEvent(transfer, self, 'response')
+                    self._outstanding_request_callbacks[key](event)
+                    del self._outstanding_requests[key]
+                    del self._outstanding_request_callbacks[key]
+                    break
+        elif not transfer.service_not_message or \
+            self._handler_dispatcher.is_response_sniffing_enabled(transfer) or \
+            transfer.dest_node_id == self._node_id:
+            # This is a request or a broadcast; look up the appropriate handler by data type ID
+            self._handler_dispatcher.call_handlers(transfer)
+
+    def _next_transfer_id(self, key):
+        transfer_id = self._next_transfer_ids[key]
+        self._next_transfer_ids[key] = (transfer_id + 1) & 0x1F
+        return transfer_id
+
+    def _throw_if_anonymous(self):
+        if not self._node_id:
+            raise dronecan.UAVCANException('The local node is configured in anonymous mode')
+
+    def _fill_node_status(self, msg):
+        msg.uptime_sec = int(time.monotonic() - self.start_time_monotonic + 0.5)
+        msg.health = self.health
+        msg.mode = self.mode
+        msg.vendor_specific_status_code = self.vendor_specific_status_code
+
+    def _send_node_status(self):
+        self._fill_node_status(self.node_info.status)
+        if self._node_id:
+            # TODO: transmit self.node_info.status instead of creating a new object
+            msg = dronecan.uavcan.protocol.NodeStatus()  # @UndefinedVariable
+            self._fill_node_status(msg)
+            self.broadcast(msg)
+
+    def add_transfer_hook(self, hook, **kwargs):
+        """
+        :param hook:    Callable hook; expected signature: hook(transfer).
+        :param kwargs:  Extra arguments for the hook.
+        :return:        A handle object that can be used to unregister the hook by calling remove() on it.
+        """
+        return self._transfer_hook_dispatcher.add_hook(hook, **kwargs)
+
+    def add_handler(self, dronecan_type, handler, **kwargs):
+        """
+        Adds a handler for the specified data type.
+        :param dronecan_type: DSDL data type. Only transfers of this type will be accepted for this handler.
+        :param handler:     The handler. This must be either a callable or a class.
+        :param **kwargs:    Extra arguments for the handler.
+        :return: A remover object that can be used to unregister the handler as follows:
+            x = node.add_handler(...)
+            # Remove the handler like this:
+            x.remove()
+            # Or like this:
+            if x.try_remove():
+                print('The handler has been removed successfully')
+            else:
+                print('There is no such handler')
+        """
+        return self._handler_dispatcher.add_handler(dronecan_type, handler, **kwargs)
+
+    def remove_handlers(self, dronecan_type):
+        """Removes all handlers for the specified DSDL data type.
+        """
+        self._handler_dispatcher.remove_handlers(dronecan_type)
+
+    def spin(self, timeout=None):
+        """
+        Runs background processes until timeout expires.
+        Note that all processing is implemented in one thread.
+        :param timeout: The method will return once this amount of time expires.
+                        If None, the method will never return.
+                        If zero, the method will handle only those events that are ready, then return immediately.
+        :returns: number of received frames
+        """
+        count = 0
+        if timeout != 0:
+            deadline = (time.monotonic() + timeout) if timeout is not None else sys.float_info.max
+
+            def execute_once():
+                next_event_at = self._poll_scheduler_and_get_next_deadline()
+                if next_event_at is None:
+                    next_event_at = sys.float_info.max
+
+                read_timeout = min(next_event_at, deadline) - time.monotonic()
+                read_timeout = max(read_timeout, 0)
+                read_timeout = min(read_timeout, 1)
+
+                frame = self._can_driver.receive(read_timeout)
+                if frame:
+                    self._recv_frame(frame)
+                    return 1
+                return 0
+
+            count += execute_once()
+            while time.monotonic() < deadline:
+                execute_once()
+        else:
+            while True:
+                frame = self._can_driver.receive(0)
+                if frame:
+                    self._recv_frame(frame)
+                    count += 1
+                else:
+                    break
+            self._poll_scheduler_and_get_next_deadline()
+        return count
+
+    def request(self, payload, dest_node_id, callback, priority=None, timeout=None, canfd=None):
+        self._throw_if_anonymous()
+
+        if canfd is None:
+            canfd = self._send_canfd
+
+        # Preparing the transfer
+        transfer_id = self._next_transfer_id((get_dronecan_data_type(payload).default_dtid, dest_node_id))
+        transfer = transport.Transfer(payload=payload,
+                                      source_node_id=self._node_id,
+                                      dest_node_id=dest_node_id,
+                                      transfer_id=transfer_id,
+                                      transfer_priority=priority or DEFAULT_TRANSFER_PRIORITY,
+                                      service_not_message=True,
+                                      request_not_response=True,
+                                      canfd=canfd)
+
+        # Calling hooks
+        self._transfer_hook_dispatcher.call_hooks(self._transfer_hook_dispatcher.TRANSFER_DIRECTION_OUTGOING, transfer)
+
+        # Sending the transfer
+        for frame in transfer.to_frames():
+            self._can_driver.send(frame.message_id, frame.bytes, extended=True, canfd=canfd)
+
+        # Registering a callback that will be invoked if there was no response after 'timeout' seconds
+        def on_timeout():
+            try:
+               del self._outstanding_requests[transfer.key]
+            except KeyError:
+                pass
+            try:
+                del self._outstanding_request_callbacks[transfer.key]
+            except KeyError:
+                pass
+            callback(None)
+
+        timeout = timeout or DEFAULT_SERVICE_TIMEOUT
+        timeout_caller_handle = self.defer(timeout, on_timeout)
+
+        # This wrapper will automatically cancel the timeout callback if there was a response
+        def timeout_cancelling_wrapper(event):
+            timeout_caller_handle.try_remove()
+            callback(event)
+
+        # Registering the pending request using the wrapper above instead of the callback
+        self._outstanding_requests[transfer.key] = transfer
+        self._outstanding_request_callbacks[transfer.key] = timeout_cancelling_wrapper
+
+        logger.debug("Node.request(dest_node_id={0:d}): sent {1!r}".format(dest_node_id, payload))
+
+    def respond(self, payload, dest_node_id, transfer_id, priority, canfd=None):
+        self._throw_if_anonymous()
+
+        if canfd is None:
+            canfd = self._send_canfd
+
+        transfer = transport.Transfer(
+            payload=payload,
+            source_node_id=self._node_id,
+            dest_node_id=dest_node_id,
+            transfer_id=transfer_id,
+            transfer_priority=priority,
+            service_not_message=True,
+            request_not_response=False,
+            canfd=canfd
+        )
+
+        self._transfer_hook_dispatcher.call_hooks(self._transfer_hook_dispatcher.TRANSFER_DIRECTION_OUTGOING, transfer)
+
+        for frame in transfer.to_frames():
+            self._can_driver.send(frame.message_id, frame.bytes, extended=True, canfd=canfd)
+
+        logger.debug("Node.respond(dest_node_id={0:d}, transfer_id={0:d}, priority={0:d}): sent {1!r}"
+                     .format(dest_node_id, transfer_id, priority, payload))
+
+    def broadcast(self, payload, priority=None, canfd=None):
+        self._throw_if_anonymous()
+
+        if canfd is None:
+            canfd = self._send_canfd
+        
+        transfer_id = self._next_transfer_id(get_dronecan_data_type(payload).default_dtid)
+        transfer = transport.Transfer(payload=payload,
+                                      source_node_id=self._node_id,
+                                      transfer_id=transfer_id,
+                                      transfer_priority=priority or DEFAULT_TRANSFER_PRIORITY,
+                                      service_not_message=False,
+                                      canfd=canfd)
+
+        self._transfer_hook_dispatcher.call_hooks(self._transfer_hook_dispatcher.TRANSFER_DIRECTION_OUTGOING, transfer)
+
+        for frame in transfer.to_frames():
+            self._can_driver.send(frame.message_id, frame.bytes, extended=True, canfd=canfd)
+
+    def close(self):
+        self._can_driver.close()
+
+
+def make_node(can_device_name, **kwargs):
+    """Constructs a node instance with specified CAN device.
+    :param can_device_name: CAN device name, e.g. "/dev/ttyACM0", "COM9", "can0".
+    :param kwargs: These arguments will be supplied to the CAN driver factory and to the node constructor.
+    """
+    can = driver.make_driver(can_device_name, **kwargs)
+    return Node(can, **kwargs)
+
+
+class Monitor(object):
+    def __init__(self, event):
+        self.message = event.message
+        self.transfer = event.transfer
+        self.node = event.node
+
+    def on_message(self):
+        pass
+
+
+class Service(object):
+    def __init__(self, event):
+        self.request = event.request
+        self.transfer = event.transfer
+        self.node = event.node
+        self.response = get_dronecan_data_type(self.request).Response()
+
+    def on_request(self):
+        pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #
+# Copyright (C) 2014-2015  UAVCAN Development Team  <uavcan.org>
+#
+# This software is distributed under the terms of the MIT License.
+#
+# Author: Ben Dyer <ben_dyer@mac.com>
+#         Pavel Kirienko <pavel.kirienko@zubax.com>
+#
+
+from __future__ import division, absolute_import, print_function, unicode_literals
+import sys
+import time
+import math
+import copy
+import struct
+import functools
+
+try:
+    import collections.abc  # Python 3
+    MutableSequence = collections.abc.MutableSequence
+except ImportError:
+    import collections  # Python 2
+    MutableSequence = collections.MutableSequence
+
+import dronecan
+import dronecan.dsdl as dsdl
+import dronecan.dsdl.common as common
+
+
+try:
+    long        # Python 2
+except NameError:
+    long = int  # Python 3
+
+if sys.version_info[0] < 3:
+    bchr = chr
+else:
+    def bchr(x):
+        return bytes([x])
+
+
+def get_dronecan_data_type(obj):
+    # noinspection PyProtectedMember
+    return obj._type
+
+
+def is_union(obj):
+    if not isinstance(obj, CompoundValue):
+        raise ValueError('Only CompoundValue can be union')
+    # noinspection PyProtectedMember
+    return obj._is_union
+
+
+def get_active_union_field(obj):
+    if not is_union(obj):
+        raise ValueError('Object is not a union')
+    # noinspection PyProtectedMember
+    return obj._union_field
+
+
+def switch_union_field(obj, value):
+    if not is_union(obj):
+        raise ValueError('Object is not a union')
+    # noinspection PyProtectedMember
+    obj._union_field = value
+
+
+def get_fields(obj):
+    if not isinstance(obj, CompoundValue):
+        raise ValueError('Only CompoundValue can have fields')
+    # noinspection PyProtectedMember
+    return obj._fields
+
+
+def get_constants(obj):
+    if not isinstance(obj, CompoundValue):
+        raise ValueError('Only CompoundValue can have constants')
+    # noinspection PyProtectedMember
+    return obj._constants
+
+
+def is_request(obj):
+    # noinspection PyProtectedMember
+    return obj._mode == 'request'
+
+
+def is_response(obj):
+    # noinspection PyProtectedMember
+    return obj._mode == 'response'
+
+
+def bits_from_bytes(s):
+    return "".join(format(c, "08b") for c in s)
+
+
+def bytes_from_bits(s):
+    #pad bytes if not a multiple of 8
+    if len(s) % 8 != 0:
+        s += '0' * (8 - len(s) % 8)
+    return bytearray(int(s[i:i + 8], 2) for i in range(0, len(s), 8))
+
+
+def be_from_le_bits(s, bitlen):
+    if len(s) < bitlen:
+        raise ValueError("Not enough bits; need {0} but got {1}".format(bitlen, len(s)))
+    elif len(s) > bitlen:
+        s = s[0:bitlen]
+
+    return "".join([s[i:i + 8] for i in range(0, len(s), 8)][::-1])
+
+
+def le_from_be_bits(s, bitlen):
+    if len(s) < bitlen:
+        raise ValueError("Not enough bits; need {0} but got {1}".format(bitlen, len(s)))
+    elif len(s) > bitlen:
+        s = s[len(s) - bitlen:]
+
+    return "".join([s[max(0, i - 8):i] for i in range(len(s), 0, -8)])
+
+
+def format_bits(s):
+    return " ".join(s[i:i + 8] for i in range(0, len(s), 8))
+
+
+def union_tag_bits_from_num_elements(num_elements):
+    return int(math.ceil(math.log(num_elements, 2)))
+
+def array_len_bits_from_max_size(max_size):
+    return int(math.ceil(math.log(max_size+1, 2)))
+
+def enum_mark_last(iterable, start=0):
+    """
+    Returns a generator over iterable that tells whether the current item is the last one.
+    Usage:
+        >>> iterable = range(10)
+        >>> for index, is_last, item in enum_mark_last(iterable):
+        >>>     print(index, item, end='\n' if is_last else ', ')
+    """
+    it = iter(iterable)
+    count = start
+    try:
+        last = next(it)
+    except StopIteration:
+        return
+    for val in it:
+        yield count, False, last
+        last = val
+        count += 1
+    yield count, True, last
+
+
+class Float32IntegerUnion(object):
+    """
+    Yes we've got ourselves a tiny little union here:
+        union FloatIntegerUnion
+        {
+            std::uint32_t u;
+            float f;
+        };
+    This is madness.
+    """
+
+    def __init__(self, integer=None, floating_point=None):
+        self._bytes = struct.pack("=L", 0)
+        if integer is not None:
+            assert floating_point is None
+            self.u = int(integer)
+        if floating_point is not None:
+            self.f = float(floating_point)
+
+    @property
+    def f(self):
+        return struct.unpack("=f", self._bytes)[0]
+
+    @f.setter
+    def f(self, value):
+        assert isinstance(value, float)
+        self._bytes = struct.pack("=f", value)
+
+    @property
+    def u(self):
+        return struct.unpack("=I", self._bytes)[0]
+
+    @u.setter
+    def u(self, value):
+        assert isinstance(value, (int, long))
+        self._bytes = struct.pack("=I", value)
+
+
+def f16_from_f32(float32):
+    # Directly translated from libuavcan's implementation in C++
+    f32infty = Float32IntegerUnion(integer=255 << 23)
+    f16infty = Float32IntegerUnion(integer=31 << 23)
+    magic = Float32IntegerUnion(integer=15 << 23)
+    inval = Float32IntegerUnion(floating_point=float32)
+    sign_mask = 0x80000000
+    round_mask = ~0xFFF
+
+    sign = inval.u & sign_mask
+    inval.u ^= sign
+
+    if inval.u >= f32infty.u:                           # Inf or NaN (all exponent bits set)
+        out = 0x7FFF if inval.u > f32infty.u else 0x7C00
+    else:
+        inval.u &= round_mask
+        inval.f *= magic.f
+        inval.u -= round_mask
+        if inval.u > f16infty.u:
+            inval.u = f16infty.u                        # Clamp to signed infinity if overflowed
+        out = (inval.u >> 13) & 0xFFFF                  # Take the bits!
+
+    return out | (sign >> 16) & 0xFFFF
+
+
+def f32_from_f16(float16):
+    # Directly translated from libuavcan's implementation in C++
+    magic = Float32IntegerUnion(integer=(254 - 15) << 23)
+    was_inf_nan = Float32IntegerUnion(integer=(127 + 16) << 23)
+
+    out = Float32IntegerUnion(integer=(float16 & 0x7FFF) << 13)     # exponent/mantissa bits
+    out.f *= magic.f                                                # exponent adjust
+    if out.f >= was_inf_nan.f:                                      # make sure Inf/NaN survive
+        out.u |= 255 << 23
+    out.u |= (float16 & 0x8000) << 16                               # sign bit
+
+    return out.f
+
+
+def cast(value, dtype):
+    if dtype.cast_mode == dsdl.PrimitiveType.CAST_MODE_SATURATED:
+        if value > dtype.value_range[1]:
+            value = dtype.value_range[1]
+        elif value < dtype.value_range[0]:
+            value = dtype.value_range[0]
+        return value
+    elif dtype.cast_mode == dsdl.PrimitiveType.CAST_MODE_TRUNCATED and dtype.kind == dsdl.PrimitiveType.KIND_FLOAT:
+        if not math.isnan(value) and value > dtype.value_range[1]:
+            value = float("+inf")
+        elif not math.isnan(value) and value < dtype.value_range[0]:
+            value = float("-inf")
+        return value
+    elif dtype.cast_mode == dsdl.PrimitiveType.CAST_MODE_TRUNCATED:
+        return value & ((1 << dtype.bitlen) - 1)
+    else:
+        raise ValueError("Invalid cast_mode: " + repr(dtype))
+
+
+class BaseValue(object):
+    # noinspection PyUnusedLocal
+    def __init__(self, _dronecan_type, *_args, **_kwargs):
+        self._type = _dronecan_type
+        self._bits = None
+
+    def _unpack(self, stream, tao):
+        if self._type.bitlen:
+            self._bits = be_from_le_bits(stream, self._type.bitlen)
+            return stream[self._type.bitlen:]
+        else:
+            return stream
+
+    def _pack(self, tao):
+        if self._bits:
+            return le_from_be_bits(self._bits, self._type.bitlen)
+        else:
+            return "0" * self._type.bitlen
+
+
+class VoidValue(BaseValue):
+    def _unpack(self, stream, tao):
+        return stream[self._type.bitlen:]
+
+    def _pack(self, tao):
+        return "0" * self._type.bitlen
+
+
+class PrimitiveValue(BaseValue):
+    def __init__(self, _dronecan_type, *args, **kwargs):
+        super(PrimitiveValue, self).__init__(_dronecan_type, *args, **kwargs)
+        # Default initialization
+        self.value = 0
+
+    def __repr__(self):
+        return repr(self.value)
+
+    @property
+    def value(self):
+        if not self._bits:
+            return None
+
+        int_value = int(self._bits, 2)
+        if self._type.kind == dsdl.PrimitiveType.KIND_BOOLEAN:
+            return bool(int_value)
+        elif self._type.kind == dsdl.PrimitiveType.KIND_UNSIGNED_INT:
+            return int_value
+        elif self._type.kind == dsdl.PrimitiveType.KIND_SIGNED_INT:
+            if int_value >= (1 << (self._type.bitlen - 1)):
+                int_value = -((1 << self._type.bitlen) - int_value)
+            return int_value
+        elif self._type.kind == dsdl.PrimitiveType.KIND_FLOAT:
+            if self._type.bitlen == 16:
+                return f32_from_f16(int_value)
+            elif self._type.bitlen == 32:
+                return struct.unpack("<f", struct.pack("<L", int_value))[0]
+            elif self._type.bitlen == 64:
+                return struct.unpack("<d", struct.pack("<Q", int_value))[0]
+            else:
+                raise ValueError('Bad float')
+
+    @value.setter
+    def value(self, new_value):
+        if new_value is None:
+            raise ValueError("Can't serialize a None value")
+        elif self._type.kind == dsdl.PrimitiveType.KIND_BOOLEAN:
+            self._bits = "1" if new_value else "0"
+        elif self._type.kind == dsdl.PrimitiveType.KIND_UNSIGNED_INT:
+            new_value = cast(new_value, self._type)
+            self._bits = format(new_value, "0" + str(self._type.bitlen) + "b")
+        elif self._type.kind == dsdl.PrimitiveType.KIND_SIGNED_INT:
+            new_value = cast(new_value, self._type)
+            if new_value < 0:                       # Computing two's complement for negatives
+                new_value += 2 ** self._type.bitlen
+            self._bits = format(new_value, "0" + str(self._type.bitlen) + "b")
+        elif self._type.kind == dsdl.PrimitiveType.KIND_FLOAT:
+            new_value = cast(new_value, self._type)
+            if self._type.bitlen == 16:
+                int_value = f16_from_f32(new_value)
+            elif self._type.bitlen == 32:
+                int_value = struct.unpack("<L", struct.pack("<f", new_value))[0]
+            elif self._type.bitlen == 64:
+                int_value = struct.unpack("<Q", struct.pack("<d", new_value))[0]
+            else:
+                raise ValueError('Bad float, no donut')
+            self._bits = format(int_value, "0" + str(self._type.bitlen) + "b")
+
+
+# noinspection PyProtectedMember
+class ArrayValue(BaseValue, MutableSequence):
+    def __init__(self, _dronecan_type, *args, **kwargs):
+        super(ArrayValue, self).__init__(_dronecan_type, *args, **kwargs)
+
+        if isinstance(self._type.value_type, dsdl.PrimitiveType):
+            self.__item_ctor = functools.partial(PrimitiveValue, self._type.value_type)
+        elif isinstance(self._type.value_type, dsdl.ArrayType):
+            self.__item_ctor = functools.partial(ArrayValue, self._type.value_type)
+        elif isinstance(self._type.value_type, dsdl.CompoundType):
+            self.__item_ctor = functools.partial(CompoundValue, self._type.value_type)
+
+        if self._type.mode == dsdl.ArrayType.MODE_STATIC:
+            self.__items = list(self.__item_ctor() for _ in range(self._type.max_size))
+        else:
+            self.__items = []
+
+    def __repr__(self):
+        return "ArrayValue(type={0!r}, items={1!r})".format(self._type, self.__items)
+
+    def __str__(self):
+        if self._type.is_string_like:
+            # noinspection PyBroadException
+            try:
+                return self.decode()
+            except Exception:
+                pass
+        return self.__repr__()
+
+    def __getitem__(self, idx):
+        if isinstance(self.__items[idx], PrimitiveValue):
+            return self.__items[idx].value if self.__items[idx]._bits else 0
+        else:
+            return self.__items[idx]
+
+    def __setitem__(self, idx, value):
+        if idx >= self._type.max_size:
+            raise IndexError("Index {0} too large (max size {1})".format(idx, self._type.max_size))
+        if isinstance(self._type.value_type, dsdl.PrimitiveType):
+            self.__items[idx].value = value
+        else:
+            self.__items[idx] = value
+
+    def __delitem__(self, idx):
+        del self.__items[idx]
+
+    def __len__(self):
+        return len(self.__items)
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.decode() == other
+        else:
+            return list(self) == other
+
+    def clear(self):
+        try:
+            while True:
+                self.pop()
+        except IndexError:
+            pass
+
+    def new_item(self):
+        return self.__item_ctor()
+
+    def insert(self, idx, value):
+        if idx >= self._type.max_size:
+            raise IndexError("Index {0} too large (max size {1})".format(idx, self._type.max_size))
+        elif len(self) == self._type.max_size:
+            raise IndexError("Array already full (max size {0})".format(self._type.max_size))
+        if isinstance(self._type.value_type, dsdl.PrimitiveType):
+            new_item = self.__item_ctor()
+            new_item.value = value
+            self.__items.insert(idx, new_item)
+        else:
+            self.__items.insert(idx, value)
+
+    def _unpack(self, stream, tao):
+        if self._type.mode == dsdl.ArrayType.MODE_STATIC:
+            for _, last, i in enum_mark_last(range(self._type.max_size)):
+                stream = self.__items[i]._unpack(stream, tao and last)
+
+        elif tao and self._type.value_type.get_min_bitlen() >= 8:
+            del self[:]
+            while len(stream) >= 8:
+                new_item = self.__item_ctor()
+                stream = new_item._unpack(stream, False)
+                self.__items.append(new_item)
+            stream = ''
+
+        else:
+            del self[:]
+            count_width = array_len_bits_from_max_size(self._type.max_size)
+            count = int(be_from_le_bits(stream[0:count_width], count_width), 2)
+            stream = stream[count_width:]
+            for _, last, i in enum_mark_last(range(count)):
+                new_item = self.__item_ctor()
+                stream = new_item._unpack(stream, tao and last)
+                self.__items.append(new_item)
+
+        return stream
+
+    def _pack(self, tao):
+        self.__items = self.__items[:self._type.max_size]   # Constrain max len
+
+        if self._type.mode == dsdl.ArrayType.MODE_STATIC:
+            while len(self) < self._type.max_size:              # Constrain min len
+                self.__items.append(self.new_item())
+            return ''.join(i._pack(tao and last) for _, last, i in enum_mark_last(self.__items))
+
+        elif tao and self._type.value_type.get_min_bitlen() >= 8:
+            return ''.join(i._pack(False) for i in self.__items)
+
+        else:
+            count_width = array_len_bits_from_max_size(self._type.max_size)
+            count = le_from_be_bits(format(len(self), '0{0:1d}b'.format(count_width)), count_width)
+            return count + ''.join(i._pack(tao and last) for _, last, i in enum_mark_last(self.__items))
+
+    def from_bytes(self, value):
+        del self[:]
+        for byte in bytearray(value):
+            self.append(byte)
+
+    def to_bytes(self):
+        return bytes(bytearray(item.value for item in self.__items if item._bits))
+
+    def encode(self, value, errors='strict'):
+        if not self._type.is_string_like:
+            raise ValueError('encode() can be used only with string-like arrays')
+        del self[:]
+        value = bytearray(value, encoding="utf-8", errors=errors)
+        for byte in value:
+            self.append(byte)
+
+    def decode(self, encoding="utf-8"):
+        if not self._type.is_string_like:
+            raise ValueError('decode() can be used only with string-like arrays')
+        return bytearray(item.value for item in self.__items if item._bits).decode(encoding)
+
+
+# noinspection PyProtectedMember
+class CompoundValue(BaseValue):
+    def __init__(self, _dronecan_type, _mode=None, *args, **kwargs):
+        self.__dict__["_fields"] = collections.OrderedDict()
+        self.__dict__["_constants"] = {}
+        super(CompoundValue, self).__init__(_dronecan_type, *args, **kwargs)
+
+        if self._type.kind == dsdl.CompoundType.KIND_SERVICE:
+            if _mode == "request":
+                source_fields = self._type.request_fields
+                source_constants = self._type.request_constants
+                self._is_union = self._type.request_union
+            elif _mode == "response":
+                source_fields = self._type.response_fields
+                source_constants = self._type.response_constants
+                self._is_union = self._type.response_union
+            else:
+                raise ValueError("mode must be either 'request' or 'response' for service types")
+        else:
+            if _mode is not None:
+                raise ValueError("mode is not applicable for message types")
+            source_fields = self._type.fields
+            source_constants = self._type.constants
+            self._is_union = self._type.union
+
+        self._mode = _mode
+        self._union_field = None
+
+        for constant in source_constants:
+            self._constants[constant.name] = constant.value
+
+        for idx, field in enumerate(source_fields):
+            if isinstance(field.type, dsdl.VoidType):
+                self._fields["_void_{0}".format(idx)] = VoidValue(field.type)
+            elif isinstance(field.type, dsdl.PrimitiveType):
+                self._fields[field.name] = PrimitiveValue(field.type)
+            elif isinstance(field.type, dsdl.ArrayType):
+                self._fields[field.name] = ArrayValue(field.type)
+            elif isinstance(field.type, dsdl.CompoundType):
+                self._fields[field.name] = CompoundValue(field.type)
+
+        for name, value in kwargs.items():
+            if name.startswith('_'):
+                raise NameError('%r is not a valid field name' % name)
+            setattr(self, name, value)
+
+    def __repr__(self):
+        if self._is_union:
+            field = self._union_field or list(self._fields.keys())[0]
+            fields = "{0}={1!r}".format(field, self._fields[field])
+        else:
+            fields = ", ".join("{0}={1!r}".format(f, v) for f, v in self._fields.items() if not f.startswith("_void_"))
+        return "{0}({1})".format(self._type.full_name, fields)
+
+    def __copy__(self):
+        # http://stackoverflow.com/a/15774013/1007777
+        cls = self.__class__
+        result = cls.__new__(cls)
+        result.__dict__.update(self.__dict__)
+        return result
+
+    def __deepcopy__(self, memo):
+        # http://stackoverflow.com/a/15774013/1007777
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            # noinspection PyArgumentList
+            result.__dict__[k] = copy.deepcopy(v, memo)
+        return result
+
+    def __getattr__(self, attr):
+        if attr in self._constants:
+            return self._constants[attr]
+        elif attr in self._fields:
+            if self._is_union:
+                if self._union_field and self._union_field != attr:
+                    raise AttributeError(attr)
+                else:
+                    self._union_field = attr
+
+            if isinstance(self._fields[attr], PrimitiveValue):
+                return self._fields[attr].value
+            else:
+                return self._fields[attr]
+        else:
+            raise AttributeError(attr)
+
+    def __setattr__(self, attr, value):
+        if attr in self._constants:
+            raise AttributeError(attr + " is read-only")
+        elif attr in self._fields:
+            if self._is_union:
+                if self._union_field and self._union_field != attr:
+                    raise AttributeError(attr)
+                else:
+                    self._union_field = attr
+
+            # noinspection PyProtectedMember
+            attr_type = self._fields[attr]._type
+
+            if isinstance(attr_type, dsdl.PrimitiveType):
+                self._fields[attr].value = value
+
+            elif isinstance(attr_type, dsdl.CompoundType):
+                if not isinstance(value, CompoundValue):
+                    raise AttributeError('Invalid type of the value, expected CompoundValue, got %r' % type(value))
+                if attr_type.full_name != get_dronecan_data_type(value).full_name:
+                    raise AttributeError('Incompatible type of the value, expected %r, got %r' %
+                                         (attr_type.full_name, get_dronecan_data_type(value).full_name))
+                self._fields[attr] = copy.copy(value)
+
+            elif isinstance(attr_type, dsdl.ArrayType):
+                self._fields[attr].clear()
+                try:
+                    if isinstance(value, str):
+                        self._fields[attr].encode(value)
+                    else:
+                        for item in value:
+                            self._fields[attr].append(item)
+                except Exception as ex:
+                    # We should be using 'raise from' here, but unfortunately we have to be compatible with 2.7
+                    raise AttributeError('Array field could not be constructed from the provided value', ex)
+
+            else:
+                raise AttributeError(attr + " cannot be set directly")
+        else:
+            super(CompoundValue, self).__setattr__(attr, value)
+
+    def _unpack(self, stream, tao=True):
+        if self._is_union:
+            tag_len = union_tag_bits_from_num_elements(len(self._fields))
+            self._union_field = list(self._fields.keys())[int(stream[0:tag_len], 2)]
+            stream = self._fields[self._union_field]._unpack(stream[tag_len:], tao)
+        else:
+            for _, last, field in enum_mark_last(self._fields.values()):
+                stream = field._unpack(stream, tao and last)
+        return stream
+
+    def _pack(self, tao=True):
+        if self._is_union:
+            keys = list(self._fields.keys())
+            field = self._union_field or keys[0]
+            tag = keys.index(field)
+            tag_len = union_tag_bits_from_num_elements(len(self._fields))
+            return format(tag, '0' + str(tag_len) + 'b') + self._fields[field]._pack(tao)
+        else:
+            return ''.join(field._pack(tao and last) for _, last, field in enum_mark_last(self._fields.values()))
+
+
+class Frame(object):
+    def __init__(self, message_id, data, ts_monotonic=None, ts_real=None, canfd=False):  # @ReservedAssignment
+        self.message_id = message_id
+        self.bytes = bytearray(data)
+        self.ts_monotonic = ts_monotonic
+        self.ts_real = ts_real
+        self.canfd = canfd
+
+    @property
+    def transfer_key(self):
+        # The transfer is uniquely identified by the message ID and the 5-bit
+        # Transfer ID contained in the last byte of the frame payload.
+        return self.message_id, (self.bytes[-1] & 0x1F) if self.bytes else None
+
+    @property
+    def toggle(self):
+        return bool(self.bytes[-1] & 0x20) if self.bytes else False
+
+    @property
+    def end_of_transfer(self):
+        return bool(self.bytes[-1] & 0x40) if self.bytes else False
+
+    @property
+    def start_of_transfer(self):
+        return bool(self.bytes[-1] & 0x80) if self.bytes else False
+
+
+class TransferError(dronecan.UAVCANException):
+    pass
+
+
+def datalength_roundup(data_length):
+    # Number of data bytes 12  16  20  24  32  48  64
+    if (data_length <= 8):
+        return data_length
+    elif (data_length <= 12):
+        return 12
+    elif (data_length <= 16):
+        return 16
+    elif (data_length <= 20):
+        return 20
+    elif (data_length <= 24):
+        return 24
+    elif (data_length <= 32):
+        return 32
+    elif (data_length <= 48):
+        return 48
+    else:
+        return 64
+
+
+class Transfer(object):
+    DEFAULT_TRANSFER_PRIORITY = 31
+
+    def __init__(self,
+                 transfer_id=0,
+                 source_node_id=0,
+                 dest_node_id=None,
+                 payload=None,
+                 transfer_priority=None,
+                 request_not_response=False,
+                 service_not_message=False,
+                 discriminator=None,
+                 canfd=False):
+        self.transfer_priority = transfer_priority if transfer_priority is not None else self.DEFAULT_TRANSFER_PRIORITY
+        self.transfer_id = transfer_id
+        self.source_node_id = source_node_id
+        self.dest_node_id = dest_node_id
+        self.data_type_signature = 0
+        self.request_not_response = request_not_response
+        self.service_not_message = service_not_message
+        self.discriminator = discriminator
+        self.ts_monotonic = None
+        self.ts_real = None
+        self.canfd = canfd
+
+        if payload:
+            # noinspection PyProtectedMember
+            payload_bits = payload._pack(tao=not canfd)
+            if len(payload_bits) & 7:
+                payload_bits += "0" * (8 - (len(payload_bits) & 7))
+            self.payload = bytes_from_bits(payload_bits)
+            self.data_type_id = get_dronecan_data_type(payload).default_dtid
+            self.data_type_signature = get_dronecan_data_type(payload).get_data_type_signature()
+            self.data_type_crc = get_dronecan_data_type(payload).base_crc
+        else:
+            self.payload = None
+            self.data_type_id = None
+            self.data_type_signature = None
+            self.data_type_crc = None
+
+        self.is_complete = True if self.payload else False
+
+    def __repr__(self):
+        return "Transfer(id={0}, source_node_id={1}, dest_node_id={2}, transfer_priority={3}, payload={4!r})"\
+            .format(self.transfer_id, self.source_node_id, self.dest_node_id, self.transfer_priority, self.payload)
+
+    @property
+    def message_id(self):
+        # Common fields
+        id_ = (((self.transfer_priority & 0x1F) << 24) |
+               (int(self.service_not_message) << 7) |
+               (self.source_node_id or 0))
+
+        if self.service_not_message:
+            assert 0 <= self.data_type_id <= 0xFF
+            assert 1 <= self.dest_node_id <= 0x7F
+            # Service frame format
+            id_ |= self.data_type_id << 16
+            id_ |= int(self.request_not_response) << 15
+            id_ |= self.dest_node_id << 8
+        elif self.source_node_id == 0:
+            assert self.dest_node_id is None
+            assert self.discriminator is not None
+            # Anonymous message frame format
+            id_ |= self.discriminator << 10
+            id_ |= (self.data_type_id & 0x3) << 8
+        else:
+            assert 0 <= self.data_type_id <= 0xFFFF
+            # Message frame format
+            id_ |= self.data_type_id << 8
+
+        return id_
+
+    @message_id.setter
+    def message_id(self, value):
+        self.transfer_priority = (value >> 24) & 0x1F
+        self.service_not_message = bool(value & 0x80)
+        self.source_node_id = value & 0x7F
+
+        if self.service_not_message:
+            self.data_type_id = (value >> 16) & 0xFF
+            self.request_not_response = bool(value & 0x8000)
+            self.dest_node_id = (value >> 8) & 0x7F
+        elif self.source_node_id == 0:
+            self.discriminator = (value >> 10) & 0x3FFF
+            self.data_type_id = (value >> 8) & 0x3
+        else:
+            self.data_type_id = (value >> 8) & 0xFFFF
+
+    def to_frames(self):
+        out_frames = []
+        payload = self.payload
+        frame_max = 64 if self.canfd else 8
+
+        if self.canfd and len(payload) > 7:
+            # we are sending a CANFD message that needs padding to account for DLC granularity
+            total_len = len(payload) + 1
+            if total_len > frame_max:
+                # we will need more than one frame, so add crc length
+                total_len += 2
+            mod_len = total_len % (frame_max-1)
+            rounded_length = datalength_roundup(mod_len)
+            padlen = rounded_length - mod_len
+            payload += bytearray([0]*padlen)
+
+        remaining_payload = payload
+
+        # Prepend the transfer CRC to the payload if the transfer requires
+        # multiple frames
+        if len(remaining_payload) > frame_max-1:
+            crc = common.crc16_from_bytes(payload,
+                                          initial=self.data_type_crc)
+            remaining_payload = bytearray([crc & 0xFF, crc >> 8]) + remaining_payload
+
+        # Generate the frame sequence
+        tail = 0x20  # set toggle bit high so the first frame is emitted with it cleared
+        while True:
+            # Tail byte contains start-of-transfer, end-of-transfer, toggle, and Transfer ID
+            tail = ((0x80 if len(out_frames) == 0 else 0) |
+                    (0x40 if len(remaining_payload) <= (frame_max-1) else 0) |
+                    ((tail ^ 0x20) & 0x20) |
+                    (self.transfer_id & 0x1F))
+            this_data = remaining_payload[0:frame_max-1] + bchr(tail)
+            out_frames.append(Frame(message_id=self.message_id,data=this_data,canfd=self.canfd))
+            remaining_payload = remaining_payload[frame_max-1:]
+            if not remaining_payload:
+                break
+
+        return out_frames
+
+    def from_frames(self, frames):
+        # Initialize transfer timestamps from the first frame
+        self.ts_monotonic = frames[0].ts_monotonic
+        self.ts_real = frames[0].ts_real
+
+        # Validate the flags in the tail byte
+        expected_toggle = 0
+        expected_transfer_id = frames[0].bytes[-1] & 0x1F
+        for idx, f in enumerate(frames):
+            tail = f.bytes[-1]
+            if (tail & 0x1F) != expected_transfer_id:
+                raise TransferError("Transfer ID {0} incorrect, expected {1}".format(tail & 0x1F, expected_transfer_id))
+            elif idx == 0 and not (tail & 0x80):
+                raise TransferError("Start of transmission not set on frame 0")
+            elif idx > 0 and tail & 0x80:
+                raise TransferError("Start of transmission set unexpectedly on frame {0}".format(idx))
+            elif idx == len(frames) - 1 and not (tail & 0x40):
+                raise TransferError("End of transmission not set on last frame")
+            elif idx < len(frames) - 1 and (tail & 0x40):
+                raise TransferError("End of transmission set unexpectedly on frame {0}".format(idx))
+            elif (tail & 0x20) != expected_toggle:
+                raise TransferError("Toggle bit value {0} incorrect on frame {1}".format(tail & 0x20, idx))
+
+            expected_toggle ^= 0x20
+
+        self.transfer_id = expected_transfer_id
+        self.message_id = frames[0].message_id
+        payload_bytes = bytearray(b''.join(bytes(f.bytes[0:-1]) for f in frames))
+
+        # Find the data type
+        if self.service_not_message:
+            kind = dsdl.CompoundType.KIND_SERVICE
+        else:
+            kind = dsdl.CompoundType.KIND_MESSAGE
+        datatype = dronecan.DATATYPES.get((self.data_type_id, kind))
+        if not datatype:
+            raise TransferError("Unrecognised {0} type ID {1}"
+                                .format("service" if self.service_not_message else "message", self.data_type_id))
+
+        # For a multi-frame transfer, validate the CRC and frame indexes
+        if len(frames) > 1:
+            transfer_crc = payload_bytes[0] + (payload_bytes[1] << 8)
+            payload_bytes = payload_bytes[2:]
+            crc = common.crc16_from_bytes(payload_bytes, initial=datatype.base_crc)
+            if crc != transfer_crc:
+                raise TransferError("CRC mismatch: expected {0:x}, got {1:x} for payload {2!r} (DTID {3:d})"
+                                    .format(crc, transfer_crc, payload_bytes, self.data_type_id))
+
+        self.data_type_id = datatype.default_dtid
+        self.data_type_signature = datatype.get_data_type_signature()
+        self.data_type_crc = datatype.base_crc
+
+        if self.service_not_message:
+            self.payload = datatype(_mode="request" if self.request_not_response else "response")
+        else:
+            self.payload = datatype()
+        tao = True
+        for frame in frames:
+            if frame.canfd:    # we are in CANFD world can't use tao
+                tao = False
+                self.canfd = True
+        # noinspection PyProtectedMember
+        self.payload._unpack(bits_from_bytes(payload_bytes), tao)
+
+    @property
+    def key(self):
+        return self.message_id, self.transfer_id
+
+    def is_response_to(self, transfer):
+        if (transfer.service_not_message and self.service_not_message and
+                transfer.request_not_response and
+                not self.request_not_response and
+                transfer.dest_node_id == self.source_node_id and
+                transfer.source_node_id == self.dest_node_id and
+                transfer.data_type_id == self.data_type_id and
+                transfer.transfer_id == self.transfer_id):
+            return True
+        else:
+            return False
+
+
+class TransferManager(object):
+    def __init__(self):
+        self.active_transfers = {}
+        self.active_transfer_timestamps = {}
+
+    def receive_frame(self, frame):
+        result = None
+        key = frame.transfer_key
+        if key in self.active_transfers or frame.start_of_transfer:
+            # If the first frame was received, restart this transfer from scratch
+            if frame.start_of_transfer:
+                self.active_transfers[key] = []
+
+            self.active_transfers[key].append(frame)
+            self.active_transfer_timestamps[key] = time.monotonic()
+
+            # If the last frame of a transfer was received, return its frames
+            if frame.end_of_transfer:
+                result = self.active_transfers[key]
+                del self.active_transfers[key]
+                del self.active_transfer_timestamps[key]
+
+        return result
+
+    def remove_inactive_transfers(self, timeout=1.0):
+        t = time.monotonic()
+        transfer_keys = self.active_transfers.keys()
+        for key in transfer_keys:
+            if t - self.active_transfer_timestamps[key] > timeout:
+                del self.active_transfers[key]
+                del self.active_transfer_timestamps[key]
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          '''
+utility classes for working with DroneCAN
+'''
+
+import dronecan
+import time
+
+class DroneCANSerial(object):
+    '''emulation of a serial port over DroneCAN'''
+    def __init__(self, uri, target_node, target_serial_dev, lock_port=False, node=None, baudrate=230400, node_id=100, timeout=2.0):
+        """Constructor.
+
+        :param uri: DroneCAN URI
+        :param target_node: CAN node number hosting serial port
+        :param target_serial_dev: serial device number or -1 for automatic selection
+        :param lock_port: lock the serial port while in use
+        :param node: DroneCAN node, if None then one is created
+        :param baudrate: initial baud rate
+        :param node_id: local node id if node not supplied
+        :param timeout: timeout of read operations
+
+        """
+        self.buf = bytearray()
+        self.timeout = timeout
+        self.target_node = target_node
+        self.target_serial_dev = target_serial_dev
+        self.node_id = node_id
+        self.lock_port = lock_port
+        self.node = node
+        if node is None:
+            self.node = dronecan.make_node(uri, node_id=self.node_id)
+        self.handle = self.node.add_handler(dronecan.uavcan.tunnel.Targetted, self.handle_Targetted)
+        self.baudrate = baudrate
+        self.last_send = 0
+
+    def spin(self):
+        '''spin once to process packets'''
+        try:
+            while self.node.spin(0) > 0:
+                pass
+        except dronecan.transport.TransferError:
+            # ignore corrupt frames
+            pass
+
+    def __del__(self):
+        '''close port'''
+        self.close()
+
+    def close(self):
+        '''close port'''
+        self.handle.remove()
+        self.node = None
+
+    def handle_Targetted(self, msg):
+        if msg.transfer.source_node_id != self.target_node:
+            return
+        if msg.message.target_node != self.node.node_id:
+            return
+        self.buf.extend(msg.message.buffer)
+
+    def send_bytes(self, b):
+        '''send some bytes'''
+        n = len(b)
+        if n > 120:
+            n = 120
+        message = dronecan.uavcan.tunnel.Targetted()
+        message.protocol.protocol = 2
+        message.target_node = self.target_node
+        message.serial_id = self.target_serial_dev
+        message.options = message.OPTION_LOCK_PORT if self.lock_port else 0
+        message.baudrate = self.baudrate
+        message.buffer = bytearray(b[:n])
+        while True:
+            # implement writes as blocking
+            try:
+                self.spin()
+                self.node.broadcast(message)
+            except dronecan.driver.common.TxQueueFullError:
+                time.sleep(0.01)
+                continue
+            break
+        self.last_send = time.time()
+        return n
+
+    def write(self, b):
+        '''write some bytes'''
+        total = 0
+        while len(b) > 0:
+            n = self.send_bytes(b)
+            if n <= 0:
+                break
+            total += n
+            b = b[n:]
+        return total
+
+    def read(self, n):
+        '''read some bytes'''
+        # ensure we have recent packets
+        self.spin()
+        if time.time() - self.last_send > 0.5:
+            # keep connection alive
+            self.send_bytes(bytearray())
+        if len(self.buf) > 0:
+            if n > len(self.buf):
+                n = len(self.buf)
+            ret = self.buf[:n]
+            self.buf = self.buf[n:]
+            return ret
+        return bytearray()
+
+    def flushInput(self):
+        '''flush any pending input'''
+        self.buf = bytearray()
+
+    def setBaudrate(self, baudrate):
+        '''set baudrate'''
+        if self.baudrate == baudrate:
+            return
+        self.baudrate = baudrate
+        self.flushInput()
+
+    def flush(self):
+        '''ensure data is written'''
+        self.spin()
+                                                                                                                                                                                                                                                                                                     #
+# Copyright (C) 2014-2018  DroneCAN Development Team  <dronecan.org>
+#
+# This software is distributed under the terms of the MIT License.
+#
+# Author: Pavel Kirienko <pavel.kirienko@zubax.com>
+#         Ben Dyer <ben_dyer@mac.com>
+#         Andrew Tridgell
+#         David Buzz
+#
+
+__version__ = '1.0.25'
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #!/usr/bin/env python3
+'''
+example sending CANFD messages
+'''
+
+import dronecan, time, math
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='ESC throttle control example')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--dna-server", action='store_true', default=False, help="run DNA server")
+parser.add_argument("port", default=None, type=str, help="serial port")
+args = parser.parse_args()
+    
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+# Initializing a node monitor, so we can see what nodes are online
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+if args.dna_server:
+    # optionally start a DNA server
+    dynamic_node_id_allocator = dronecan.app.dynamic_node_id.CentralizedServer(node, node_monitor)
+
+def publish_message():
+    m = dronecan.uavcan.protocol.debug.LogMessage()
+    m.source = "X"
+    m.text = "Y"
+    node.broadcast(m, canfd=True)
+
+    m.source = "CANFDTest"
+    m.text = "ThisIsALongerTest"
+    node.broadcast(m, canfd=True)
+
+    m.source = "CANFDTestLong"
+    m.text = "ThisIsAVeryLongTest.MaryHadALittleLampWhosFleeceWasWhiteAsSnowAndEverywhereThatMaryWentThe"
+    node.broadcast(m, canfd=True)
+    
+# setup to a LogMessage at 1Hz
+node.periodic(1, publish_message)
+
+# Running the node until the application is terminated or until first error.
+try:
+    node.spin()
+except KeyboardInterrupt:
+    pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #!/usr/bin/env python3
+import dronecan
+import sys
+# progress bar
+from tqdm import tqdm
+
+if len(sys.argv) != 4:
+    print("Usage: python3 canlog2gps.py <messageName> <logfile> <outputfile>")
+    sys.exit(1)
+
+# Create a CAN bus instance
+global node
+print('Starting server as Node ID', 10)
+
+filename = sys.argv[2]
+out_file = open(sys.argv[3],'wb')
+node = dronecan.make_node("filein:"+filename, node_id=10, bitrate=1000000,speedup=-1)
+
+def handle_Data(msg):
+    # dump the message data to a file
+    out_file.write(msg.message.data.to_bytes())
+
+# message type by key name
+message_type = getattr(dronecan.ardupilot.gnss, sys.argv[1])
+node.add_handler(message_type, handle_Data)
+
+# progress bar
+pbar = tqdm(total=100)
+
+while True:
+    try:
+        node.spin(0.001)
+        # print(node.can_driver.stream_progress())
+        # show the progress of the stream
+        pbar.update(node.can_driver.stream_progress() - pbar.n)
+        if node.can_driver.end_of_stream():
+            print('End of stream')
+            out_file.flush()
+            out_file.close()
+            sys.exit(0)
+    except KeyboardInterrupt:
+        out_file.flush()
+        out_file.close()
+        sys.exit(0)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #!/usr/bin/env python3
+'''
+dump all messages in YAML format
+'''
+
+import dronecan, time, math
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='dump all DroneCAN messages')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--dna-server", action='store_true', default=False, help="run DNA server")
+parser.add_argument("port", default=None, type=str, help="serial port")
+args = parser.parse_args()
+    
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+# Initializing a node monitor, so we can see what nodes are online
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+if args.dna_server:
+    # optionally start a DNA server
+    dynamic_node_id_allocator = dronecan.app.dynamic_node_id.CentralizedServer(node, node_monitor)
+
+# callback for printing all messages in human-readable YAML format.
+node.add_handler(None, lambda msg: print(dronecan.to_yaml(msg)))
+
+# Running the node until the application is terminated or until first error.
+try:
+    node.spin()
+except KeyboardInterrupt:
+    pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #!/usr/bin/env python3
+
+import dronecan, time, math
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='ESC throttle control example')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--dna-server", action='store_true', default=False, help="run DNA server")
+parser.add_argument("--send-safety", action='store_true', default=False, help="send safety off messages")
+parser.add_argument("port", default=None, type=str, help="serial port")
+args = parser.parse_args()
+    
+
+# Publishing setpoint values from this function; it is invoked periodically from the node thread.
+def publish_throttle_setpoint():
+    if args.send_safety:
+        # optionally send safety off messages. These are needed for some ESCs
+        message = dronecan.ardupilot.indication.SafetyState()
+        message.status = message.STATUS_SAFETY_OFF
+        node.broadcast(message)
+        print(dronecan.to_yaml(message))
+
+    # Generating a sine wave
+    setpoint = int(512 * (math.sin(time.time()) + 2))
+    # Commanding ESC with indices 0, 1, 2, 3 only
+    commands = [setpoint, setpoint, setpoint, setpoint]
+    message = dronecan.uavcan.equipment.esc.RawCommand(cmd=commands)
+    node.broadcast(message)
+    # display the message on the console in human readable format
+    print(dronecan.to_yaml(message))
+
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+# Initializing a node monitor, so we can see what nodes are online
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+if args.dna_server:
+    # optionally start a DNA server
+    dynamic_node_id_allocator = dronecan.app.dynamic_node_id.CentralizedServer(node, node_monitor)
+
+# Waiting for at least one other node to appear online
+while len(node_monitor.get_all_node_id()) <= 1:
+    print('Waiting for other nodes to become online...')
+    node.spin(timeout=1)
+
+print("There are %u nodes online" % len(node_monitor.get_all_node_id()))
+
+# setup to publish ESC RawCommand at 20Hz
+node.periodic(0.05, publish_throttle_setpoint)
+
+# callback for printing ESC status message to stdout in human-readable YAML format.
+node.add_handler(dronecan.uavcan.equipment.esc.Status, lambda msg: print(dronecan.to_yaml(msg)))
+
+# Running the node until the application is terminated or until first error.
+try:
+    node.spin()
+except KeyboardInterrupt:
+    pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #!/usr/bin/env python3
+
+import dronecan, time
+from dronecan import uavcan
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='ESC enumeration example')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--dna-server", action='store_true', default=False, help="run DNA server")
+parser.add_argument("port", default=None, type=str, help="serial port")
+args = parser.parse_args()
+
+# Determining how many ESC nodes are present.
+# In real use cases though the number of ESC should be obtained from elsewhere, e.g. from control mixer settings.
+# There is a helper class in PyDroneCAN that allows one to automate what we're doing here,
+# but we're not using it for the purposes of greater clarity of what's going on on the protocol level.
+def detect_esc_nodes():
+    esc_nodes = set()
+    handle = node.add_handler(uavcan.equipment.esc.Status, lambda event: esc_nodes.add(event.transfer.source_node_id))
+    try:
+        node.spin(timeout=3)            # Collecting ESC status messages, thus determining which nodes are ESC
+    finally:
+        handle.remove()
+
+    return esc_nodes
+
+
+# Enumerating ESC.
+# In this example we're using blocking code for simplicity reasons,
+# but real applications will most likely resort either to asynchronous code (callback-based),
+# or implement the logic in a dedicated thread.
+# Conversion of the code from synchronous to asynchronous/multithreaded pertains to the domain of general
+# programming issues, so these questions are not covered in this demo.
+def enumerate_all_esc(esc_nodes, timeout=60):
+    begin_responses_succeeded = 0
+
+    def begin_response_checker(event):
+        nonlocal begin_responses_succeeded
+        if not event:
+            raise Exception('Request timed out')
+
+        if event.response.error != event.response.ERROR_OK:
+            raise Exception('Enumeration rejected\n' + dronecan.to_yaml(event))
+
+        begin_responses_succeeded += 1
+
+    overall_deadline = time.monotonic() + timeout
+
+    print('Starting enumeration on all nodes...')
+    begin_request = uavcan.protocol.enumeration.Begin.Request(timeout_sec=timeout)
+    for node_id in esc_nodes:
+        print('Sending enumeration begin request to', node_id)
+        node.request(begin_request, node_id, begin_response_checker)
+
+    while begin_responses_succeeded < len(esc_nodes):
+        node.spin(0.1)
+
+    print('Listening for indications...')
+    enumerated_nodes = []
+    next_index = 0
+    while set(enumerated_nodes) != esc_nodes:
+        received_indication = None
+
+        def indication_callback(event):
+            nonlocal received_indication
+            if event.transfer.source_node_id in enumerated_nodes:
+                print('Indication callback from node %d ignored - already enumerated' % event.transfer.source_node_id)
+            else:
+                print(dronecan.to_yaml(event))
+                received_indication = event
+
+        indication_handler = node.add_handler(uavcan.protocol.enumeration.Indication, indication_callback)
+        print('=== PROVIDE ENUMERATION FEEDBACK ON ESC INDEX %d NOW ===' % next_index)
+        print('=== e.g. turn the motor, press the button, etc, depending on your equipment ===')
+        try:
+            while received_indication is None:
+                node.spin(0.1)
+                if time.monotonic() > overall_deadline:
+                    raise Exception('Process timed out')
+        finally:
+            indication_handler.remove()
+
+        target_node_id = received_indication.transfer.source_node_id
+        print('Indication received from node', target_node_id)
+
+        print('Stopping enumeration on node', target_node_id)
+        begin_responses_succeeded = 0
+        node.request(uavcan.protocol.enumeration.Begin.Request(), target_node_id, begin_response_checker)
+        while begin_responses_succeeded < 1:
+            node.spin(0.1)
+
+        print('Setting config param %r to %r...' % (received_indication.message.parameter_name.decode(), next_index))
+        configuration_finished = False
+
+        def param_set_response(event):
+            if not event:
+                raise Exception('Request timed out')
+
+            assert event.response.name == received_indication.message.parameter_name
+            assert event.response.value.integer_value == next_index
+            print(dronecan.to_yaml(event))
+            node.request(uavcan.protocol.param.ExecuteOpcode.Request(
+                             opcode=uavcan.protocol.param.ExecuteOpcode.Request().OPCODE_SAVE),
+                         target_node_id,
+                         param_opcode_response)
+
+        def param_opcode_response(event):
+            nonlocal configuration_finished
+            if not event:
+                raise Exception('Request timed out')
+
+            print(dronecan.to_yaml(event))
+            if not event.response.ok:
+                raise Exception('Param opcode execution rejected\n' + dronecan.to_yaml(event))
+            else:
+                configuration_finished = True
+
+        node.request(uavcan.protocol.param.GetSet.Request(value=uavcan.protocol.param.Value(integer_value=next_index),
+                                                          name=received_indication.message.parameter_name),
+                     target_node_id,
+                     param_set_response)
+
+        while not configuration_finished:
+            node.spin(0.1)
+
+        print('Node', target_node_id, 'assigned ESC index', next_index)
+        next_index += 1
+        enumerated_nodes.append(target_node_id)
+        print('Enumerated so far:', enumerated_nodes)
+
+    return enumerated_nodes
+
+
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+# Initializing a node monitor
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+if args.dna_server:
+    # optionally start a DNA server
+    dynamic_node_id_allocator = dronecan.app.dynamic_node_id.CentralizedServer(node, node_monitor)
+
+# Waiting for at least one other node to appear online
+while len(node_monitor.get_all_node_id()) <= 1:
+    print('Waiting for other nodes to become online...')
+    node.spin(timeout=1)
+
+print("There are %u nodes online" % len(node_monitor.get_all_node_id()))
+
+print('Detecting ESC nodes...')
+esc_nodes = detect_esc_nodes()
+print('ESC nodes:', esc_nodes)
+
+enumerated_esc = enumerate_all_esc(esc_nodes)
+print('All ESC enumerated successfully; index order is as follows:', enumerated_esc)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #!/usr/bin/env python3
+
+import dronecan
+from argparse import ArgumentParser
+
+import time
+import sys
+import os
+import base64
+import zlib
+import struct
+from dronecan.introspect import value_to_constant_name, to_yaml
+
+# import logging
+# logging.basicConfig(level=logging.DEBUG)
+
+parser = ArgumentParser(description='dump all DroneCAN messages')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--target-node-id", default=-1, type=int, help="Target CAN node ID (-1 for auto)")
+parser.add_argument("--dna", action='store_true', default=False, help="run dynamic node allocation server")
+parser.add_argument("--port", default='/dev/ttyACM0', type=str, help="serial port")
+parser.add_argument("--fw", default='', required=True, type=str, help="app firmware path")
+
+args = parser.parse_args()
+
+firmware_path = os.path.abspath(args.fw)
+
+# Ensure it is readable
+try:
+    with open(firmware_path, 'rb') as f:
+        f.read(100)
+except Exception as ex:
+    print('Could not read file')
+    sys.exit(1)
+
+# map file path to a hash to keep it in a single packet
+file_hash = base64.b64encode(struct.pack("<I",zlib.crc32(bytearray(firmware_path,'utf-8'))))[:7].decode('utf-8')
+
+# Create the CAN Node
+global node
+print('Starting server as Node ID', args.node_id)
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+if args.dna:
+    dynamic_node_id_allocator = dronecan.app.dynamic_node_id.CentralizedServer(node, node_monitor)
+
+
+# Waiting for at least one other node to appear online
+print('Waiting for node to come online')
+while len(node_monitor.get_all_node_id()) < 1:
+    try:
+        node.spin(timeout=0.2)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except dronecan.transport.TransferError:
+        pass
+
+if args.target_node_id != -1:
+    target_node_id = args.target_node_id
+else:
+    target_node_id = int(list(node_monitor.get_all_node_id())[0])
+print("Target node: " + str(target_node_id))
+
+# Set up the file server
+file_server = dronecan.app.file_server.FileServer(node,
+                                                  path_map={file_hash:firmware_path})
+
+update_started = False
+update_complete = False
+start_time = None
+
+def on_node_status(e):
+    global update_started
+    global update_complete
+    global start_time
+
+    if e.transfer.source_node_id == target_node_id:
+        if e.message.mode == e.message.MODE_SOFTWARE_UPDATE:
+            if not update_started:
+                print('Performing update')
+                update_started = True;
+                start_time = time.time()
+                #request_update()
+        else:
+            if update_started:
+                elapsed = time.time() - start_time
+                print('Update complete in %.2f seconds' % elapsed)
+                update_complete = True;
+
+
+def on_response(e):
+    if e is not None:
+        print('Firmware update response:', to_yaml(e.response))
+        if e.response.error != e.response.ERROR_IN_PROGRESS:
+            # NOTE: the timing here is fickle, we can't be too early
+            # because we are trying to catch the bootloader
+            node.defer(4, request_update)
+
+
+def request_update():
+    global update_started
+
+    if not update_started:
+        print('REQUESTING UPDATE')
+        request = dronecan.uavcan.protocol.file.BeginFirmwareUpdate.Request(
+                    source_node_id=node.node_id,
+                    image_file_remote_path=dronecan.uavcan.protocol.file.Path(path=file_hash))
+        node.request(request, target_node_id, on_response, priority=30)
+
+
+node_status_handle = node.add_handler(dronecan.uavcan.protocol.NodeStatus, on_node_status)
+
+request_update()
+
+while not update_started or not update_complete:
+    try:
+        node.spin(0.1)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except dronecan.transport.TransferError:
+        pass
+
+node.close()
+                                                                                   #!/usr/bin/env python3
+
+import dronecan, time
+from dronecan import uavcan
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='Fix2 gap example')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--source-node-id", default=None, type=int, help="Source CAN node ID")
+parser.add_argument("--threshold", default=0.25, type=float, help="Threhold for showing gap")
+parser.add_argument("port", default=None, type=str, help="serial port")
+args = parser.parse_args()
+
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+# Initializing a node monitor
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+last_fix2 = {}
+lowpass = {}
+
+def handle_fix2(msg):
+    nodeid = msg.transfer.source_node_id
+    if args.source_node_id is not None and nodeid != args.source_node_id:
+        return
+    tstamp = msg.transfer.ts_real
+    if not nodeid in last_fix2:
+        last_fix2[nodeid] = tstamp
+        lowpass[nodeid] = 0.2
+        return
+    dt = tstamp - last_fix2[nodeid]
+    lowpass[nodeid] = 0.9 * lowpass[nodeid] + 0.1 * dt
+    last_fix2[nodeid] = tstamp
+    if dt > args.threshold:
+        print("gap[%u] %.3f avg=%.2fHz" % (nodeid, dt, 1.0/lowpass[nodeid]))
+
+# callback for printing ESC status message to stdout in human-readable YAML format.
+node.add_handler(dronecan.uavcan.equipment.gnss.Fix2, handle_fix2)
+
+while True:
+    try:
+        node.spin()
+    except Exception as ex:
+        print(ex)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #!/usr/bin/env python3
+
+'''
+loop calling GetNodeInfo on a node
+'''
+import dronecan, time
+from dronecan import uavcan
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='loop calling GetNodeInfo')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--target-node-id", default=101, type=int, help="target CAN node ID")
+parser.add_argument("--rate", default=1, type=float, help="request rate")
+parser.add_argument("--canfd", default=False, action="store_true", help="send as CANFD")
+parser.add_argument("port", default=None, type=str, help="CAN port")
+args = parser.parse_args()
+
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+last_req = time.time()
+
+def handle_node_info(msg):
+    print('CANFD=%d' % msg.transfer.canfd)
+    print(dronecan.to_yaml(msg))
+
+while True:
+    try:
+        node.spin(timeout=1.0/args.rate)
+        now = time.time()
+        if now - last_req > 1.0/args.rate:
+            req = uavcan.protocol.GetNodeInfo.Request(timeout_sec=0.5)
+            node.request(req, args.target_node_id, handle_node_info, canfd=args.canfd)
+
+    except Exception as ex:
+        print(ex)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #!/usr/bin/env python3
+'''
+decode RTCMStream or MovingBaselineData from a DroneCAN URI
+'''
+
+import dronecan, time
+from dronecan import uavcan
+from MAVProxy.modules.lib import rtcm3
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='Fix2 gap example')
+parser.add_argument("--bitrate", default=1000000, type=int, help="CAN bit rate")
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--moving-baseline", default=False, action='store_true', help="decode MovingBaselineData instead of RTCMStream")
+parser.add_argument("--stats", default=False, action='store_true', help="show statistics of each msg type")
+parser.add_argument("port", default=None, type=str, help="serial port")
+args = parser.parse_args()
+
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.port, node_id=args.node_id, bitrate=args.bitrate)
+
+# Initializing a node monitor
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+rtcm_file = open("rtcm.dat", "wb")
+decoder = rtcm3.RTCM3()
+last_time = {}
+deltas = {}
+counts = {}
+last_stats = 0
+lost_packets = 0
+
+def handle_RTCM(msg):
+    global lost_packets
+    global last_stats
+    global last_time
+    global deltas, counts
+    data = msg.message.data.to_bytes()
+    for b in data:
+        if decoder.read(chr(b)):
+            pkt_id = decoder.get_packet_ID()
+            pkt_len = len(decoder.get_packet())
+            key = (pkt_id,pkt_len)
+            if not key in counts:
+                counts[key] = 1
+            else:
+                counts[key] += 1
+            now = time.time()
+            if not key in last_time:
+                last_time[key] = now
+            else:
+                dt = now - last_time[key]
+                last_time[key] = now
+                if not key in deltas:
+                    deltas[key] = dt
+                else:
+                    deltas[key] = 0.9 * deltas[key] + 0.1 * dt
+            if args.stats:
+                if now - last_stats >= 2.0:
+                    last_stats = now
+                    print("\nLost packets %u" % lost_packets)
+                    total_len = 0
+                    for key in sorted(deltas.keys()):
+                        pkt_id, pkt_len = key
+                        if not key in counts:
+                            counts[key] = 0
+                            rate = 0.0
+                        else:
+                            rate = 1.0/deltas[key]
+                        print("%u len=%u %.1fHz count=%u" % (pkt_id, pkt_len, rate, counts[key]))
+                        if counts[key] > 0:
+                            total_len += pkt_len
+                    print("Total len %u" % total_len)
+                    for key in sorted(deltas.keys()):
+                        pkt_id, pkt_len = key
+                        if counts[key] == 0:
+                            deltas.pop(key)
+                            last_time.pop(key)
+                    counts = {}
+            else:
+                print("packet len %u ID %u" % (pkt_len, pkt_id))
+        elif len(decoder.pkt) == 0:
+            lost_packets += 1
+    rtcm_file.write(data)
+    rtcm_file.flush()
+
+# callback for printing ESC status message to stdout in human-readable YAML format.
+if args.moving_baseline:
+    node.add_handler(dronecan.ardupilot.gnss.MovingBaselineData, handle_RTCM)
+else:
+    node.add_handler(dronecan.uavcan.equipment.gnss.RTCMStream, handle_RTCM)
+
+while True:
+    try:
+        node.spin()
+    except Exception as ex:
+        pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #!/usr/bin/env python3
+
+import dronecan, time, math
+
+# get command line arguments
+from argparse import ArgumentParser
+parser = ArgumentParser(description='simulate DroneCAN battery')
+parser.add_argument("--node-id", default=100, type=int, help="CAN node ID")
+parser.add_argument("--debug", action='store_true', help="enable debug")
+parser.add_argument("--balance", action='store_true', help="simulate cell balance node")
+parser.add_argument("--battery-id", type=int, default=1, help="battery ID")
+parser.add_argument("--rate", type=float, default=10, help="broadcast rate Hz")
+parser.add_argument("--voltage", type=float, default=24.6, help="voltage")
+parser.add_argument("--num-cells", type=int, default=6, help="number of cells")
+parser.add_argument("uri", default=None, type=str, help="CAN URI")
+args = parser.parse_args()
+
+C_TO_KELVIN = 273.15
+
+def publish_BatteryInfo():
+    '''send BatteryInfo message'''
+    msg = dronecan.uavcan.equipment.power.BatteryInfo()
+    msg.battery_id = args.battery_id
+    msg.voltage = args.voltage
+    msg.current = 0.3
+    msg.temperature = 17+C_TO_KELVIN
+    msg.state_of_charge_pct = 0
+    msg.remaining_capacity_wh = 0
+    msg.full_charge_capacity_wh = 0
+    node.broadcast(msg)
+    if args.debug:
+        # display the message on the console in human readable format
+        print(dronecan.to_yaml(msg))
+
+def publish_BatteryInfoAux():
+    '''send BatteryInfoAux message'''
+    msg = dronecan.ardupilot.equipment.power.BatteryInfoAux()
+    msg.battery_id = args.battery_id
+    msg.voltage_cell = [0.0]*args.num_cells
+    for i in range(args.num_cells):
+        msg.voltage_cell[i] = args.voltage / args.num_cells
+    node.broadcast(msg)
+    if args.debug:
+        # display the message on the console in human readable format
+        print(dronecan.to_yaml(msg))
+        
+# Initializing a DroneCAN node instance.
+node = dronecan.make_node(args.uri, node_id=args.node_id, bitrate=1000000)
+
+# Initializing a node monitor, so we can see what nodes are online
+node_monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+# setup to publish battery info
+if args.balance:
+    node.periodic(1.0/args.rate, publish_BatteryInfoAux)
+else:
+    node.periodic(1.0/args.rate, publish_BatteryInfo)
+
+# Running the node until the application is terminated or until first error.
+try:
+    node.spin()
+except KeyboardInterrupt:
+    pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #!/bin/sh
+sudo rm -rf build uavcan.* dist*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #!/usr/bin/env python
+#
+# Copyright (C) 2014-2015  UAVCAN Development Team  <uavcan.org>
+#
+# This software is distributed under the terms of the MIT License.
+#
+# Author: Ben Dyer <ben_dyer@mac.com>
+#         Pavel Kirienko <pavel.kirienko@zubax.com>
+#
+
+import os
+import sys
+from setuptools import setup
+from io import open
+
+__version__ = None
+VERSION_FILE = os.path.join(os.path.dirname(__file__), 'dronecan', 'version.py')
+exec(open(VERSION_FILE).read())         # Adds __version__ to globals
+
+with open("README.md", "r", encoding = "utf-8") as fh:
+    long_description = fh.read()
+
+try:
+    if not os.path.exists('dronecan/dsdl_specs'):
+        os.symlink('../../DSDL', 'dronecan/dsdl_specs')
+    args = dict(
+        name='dronecan',
+        version=__version__,
+        description='Python implementation of the DroneCAN protocol stack',
+        long_description = long_description,
+        long_description_content_type = "text/markdown",
+        packages=[
+            'dronecan',
+            'dronecan.dsdl',
+            'dronecan.driver',
+            'dronecan.app',
+        ],
+        package_data={
+            'dronecan': [os.path.join(root[len('dronecan/'):], fname)
+                    for root, dirs, files in os.walk('dronecan/dsdl_specs', followlinks=True)
+                    for fname in files if fname.endswith('.uavcan')]
+        },
+        author='Pavel Kirienko, Ben Dyer',
+        author_email='uavcan@googlegroups.com',
+        url='https://dronecan.github.io',
+        license='MIT',
+        classifiers=[
+            'Development Status :: 3 - Alpha',
+            'Intended Audience :: Developers',
+            'Topic :: Software Development :: Libraries',
+            'License :: OSI Approved :: MIT License',
+            'Programming Language :: Python',
+        ],
+        keywords='',
+        scripts = [ 'tools/dronecan_bridge.py' ]
+    )
+    # ensure dsdl specs are not empty
+    if  len(args['package_data']['dronecan']) == 0:
+        raise Exception('DSDL specs empty or unavailable, please ensure ../DSDL is present relative to project root')
+
+    if sys.version_info[0] < 3:
+        args['install_requires'] = ['monotonic']
+
+    setup(**args)
+finally:
+    if os.path.islink('dronecan/dsdl_specs'):
+        os.unlink('dronecan/dsdl_specs')
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #
+# Copyright (C) 2014-2015  UAVCAN Development Team  <uavcan.org>
+# Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# This software is distributed under the terms of the MIT License.
+#
+# Define dsdl folder as module so python unittest autodiscover will
+# work correctly
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #
+# Base type for testing duplicate handling.
+#
+uint8 field0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #
+# Same definition as the base type to check that duplicates are
+# handled gracefully.
+#
+uint8 field0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #
+# Changing Type0's signature to check that this error is caught.
+#
+uint16 field0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #
+# Copyright (C) 2014-2015  UAVCAN Development Team  <uavcan.org>
+#
+# This software is distributed under the terms of the MIT License.
+#
+# Author: Ben Dyer <ben_dyer@mac.com>
+#         Pavel Kirienko <pavel.kirienko@zubax.com>
+#
+
+import os
+import unittest
+from dronecan.dsdl import common
+
+
+class TestCRC16FromBytes(unittest.TestCase):
+    def test_str(self):
+        self.assertEqual(common.crc16_from_bytes('123456789'), 0x29B1)
+
+    def test_bytes(self):
+        self.assertEqual(common.crc16_from_bytes(b'123456789'), 0x29B1)
+
+    def test_bytearray(self):
+        self.assertEqual(
+            common.crc16_from_bytes(bytearray('123456789', 'utf-8')),
+            0x29B1)
+
+
+class TestBytesFromCRC64(unittest.TestCase):
+    def test_zero(self):
+        self.assertEqual(common.bytes_from_crc64(0),
+                         b"\x00\x00\x00\x00\x00\x00\x00\x00")
+
+    def test_check_val(self):
+        self.assertEqual(common.bytes_from_crc64(0x62EC59E3F1A4F00A),
+                         b"\x0A\xF0\xA4\xF1\xE3\x59\xEC\x62")
+
+
+if __name__ == '__main__':
+    unittest.main()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           

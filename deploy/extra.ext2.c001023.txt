@@ -1,0 +1,1241 @@
+ter.rangefinder_alt_ok() && (copter.rangefinder_state.glitch_count == 0) && (copter.rangefinder_state.alt_cm > g2.pldp_range_finder_maximum_m * 100.0)) {
+                // range finder altitude is above maximum
+                place_start_time_ms = now_ms;
+                break;
+            }
+        }
+
+        // If we get here:
+        // 1. we have reached decent velocity
+        // 2. measured the thrust level required for decent
+        // 3. detected that our thrust requirements have reduced
+        // 4. rangefinder range has dropped below minimum if set
+        // 5. place_start_time_ms has been initialised
+
+        // payload touchdown must be detected for 0.5 seconds
+
+        if (now_ms - place_start_time_ms > placed_check_duration_ms) {
+            state = State::Release;
+            gcs().send_text(MAV_SEVERITY_INFO, "%s payload release thrust threshold: %f", prefix_str, static_cast<double>(g2.pldp_thrust_placed_fraction * descent_thrust_level));
+        }
+        break;
+
+    case State::Release:
+        // Reinitialise vertical position controller to remove discontinuity due to touch down of payload
+        pos_control->init_z_controller_no_descent();
+#if AP_GRIPPER_ENABLED == ENABLED
+        if (AP::gripper().valid()) {
+            gcs().send_text(MAV_SEVERITY_INFO, "%s Releasing the gripper", prefix_str);
+            AP::gripper().release();
+            state = State::Releasing;
+        } else {
+            state = State::Delay;
+        }
+#else
+        state = State::Delay;
+#endif
+        break;
+
+    case State::Releasing:
+#if AP_GRIPPER_ENABLED
+        if (AP::gripper().valid() && !AP::gripper().released()) {
+            break;
+        }
+#endif
+        state = State::Delay;
+        FALLTHROUGH;
+
+    case State::Delay:
+        // If we get here we have finished releasing the gripper
+        if (now_ms - place_start_time_ms < placed_check_duration_ms + g2.pldp_delay_s * 1000.0) {
+            break;
+        }
+        FALLTHROUGH;
+
+    case State::Ascent_Start:
+        state = State::Ascent;
+        FALLTHROUGH;
+
+    case State::Ascent: {
+        // Ascent complete when we are less than 10% of the stopping
+        // distance from the target altitude stopping distance from
+        // vel_threshold_fraction * max velocity
+        const float vel_threshold_fraction = 0.1;
+        const float stop_distance = 0.5 * sq(vel_threshold_fraction * copter.pos_control->get_max_speed_up_cms()) / copter.pos_control->get_max_accel_z_cmss();
+        bool reached_altitude = copter.pos_control->get_pos_target_z_cm() >= descent_start_altitude_cm - stop_distance;
+        if (reached_altitude) {
+            state = State::Done;
+        }
+        break;
+    }
+    case State::Done:
+        break;
+    default:
+        // this should never happen
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        break;
+    }
+
+    switch (state) {
+    case State::FlyToLocation:
+        // this should never happen
+        return copter.mode_auto.wp_run();
+    case State::Descent_Start:
+    case State::Descent:
+        copter.flightmode->land_run_horizontal_control();
+        // update altitude target and call position controller
+        pos_control->land_at_climb_rate_cm(-descent_speed_cms, true);
+        break;
+    case State::Release:
+    case State::Releasing:
+    case State::Delay:
+    case State::Ascent_Start:
+        copter.flightmode->land_run_horizontal_control();
+        // update altitude target and call position controller
+        pos_control->land_at_climb_rate_cm(0.0, false);
+        break;
+    case State::Ascent:
+    case State::Done:
+        float vel = 0.0;
+        copter.flightmode->land_run_horizontal_control();
+        pos_control->input_pos_vel_accel_z(descent_start_altitude_cm, vel, 0.0);
+        break;
+    }
+    pos_control->update_z_controller();
+}
+#endif
+
+// sets the target_loc's alt to the vehicle's current alt but does not change target_loc's frame
+// in the case of terrain altitudes either the terrain database or the rangefinder may be used
+// returns true on success, false on failure
+bool ModeAuto::shift_alt_to_current_alt(Location& target_loc) const
+{
+    // if terrain alt using rangefinder is being used then set alt to current rangefinder altitude
+    if ((target_loc.get_alt_frame() == Location::AltFrame::ABOVE_TERRAIN) &&
+        (wp_nav->get_terrain_source() == AC_WPNav::TerrainSource::TERRAIN_FROM_RANGEFINDER)) {
+        int32_t curr_rngfnd_alt_cm;
+        if (copter.get_rangefinder_height_interpolated_cm(curr_rngfnd_alt_cm)) {
+            // wp_nav is using rangefinder so use current rangefinder alt
+            target_loc.set_alt_cm(MAX(curr_rngfnd_alt_cm, 200), Location::AltFrame::ABOVE_TERRAIN);
+            return true;
+        }
+        return false;
+    }
+
+    // take copy of current location and change frame to match target
+    Location currloc = copter.current_loc;
+    if (!currloc.change_alt_frame(target_loc.get_alt_frame())) {
+        // this could fail due missing terrain database alt
+        return false;
+    }
+
+    // set target_loc's alt
+    target_loc.set_alt_cm(currloc.alt, currloc.get_alt_frame());
+    return true;
+}
+
+/********************************************************************************/
+// Nav (Must) commands
+/********************************************************************************/
+
+// do_takeoff - initiate takeoff navigation command
+void ModeAuto::do_takeoff(const AP_Mission::Mission_Command& cmd)
+{
+    // Set wp navigation target to safe altitude above current position
+    takeoff_start(cmd.content.location);
+}
+
+Location ModeAuto::loc_from_cmd(const AP_Mission::Mission_Command& cmd, const Location& default_loc) const
+{
+    Location ret(cmd.content.location);
+
+    // use current lat, lon if zero
+    if (ret.lat == 0 && ret.lng == 0) {
+        ret.lat = default_loc.lat;
+        ret.lng = default_loc.lng;
+    }
+    // use default altitude if not provided in cmd
+    if (ret.alt == 0) {
+        // set to default_loc's altitude but in command's alt frame
+        // note that this may use the terrain database
+        int32_t default_alt;
+        if (default_loc.get_alt_cm(ret.get_alt_frame(), default_alt)) {
+            ret.set_alt_cm(default_alt, ret.get_alt_frame());
+        } else {
+            // default to default_loc's altitude and frame
+            ret.set_alt_cm(default_loc.alt, default_loc.get_alt_frame());
+        }
+    }
+    return ret;
+}
+
+// do_nav_wp - initiate move to next waypoint
+void ModeAuto::do_nav_wp(const AP_Mission::Mission_Command& cmd)
+{
+    // calculate default location used when lat, lon or alt is zero
+    Location default_loc = copter.current_loc;
+    if (wp_nav->is_active() && wp_nav->reached_wp_destination()) {
+        if (!wp_nav->get_wp_destination_loc(default_loc)) {
+            // this should never happen
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        }
+    }
+
+    // get waypoint's location from command and send to wp_nav
+    const Location target_loc = loc_from_cmd(cmd, default_loc);
+
+    if (!wp_start(target_loc)) {
+        // failure to set next destination can only be because of missing terrain data
+        copter.failsafe_terrain_on_event();
+        return;
+    }
+
+    // this will be used to remember the time in millis after we reach or pass the WP.
+    loiter_time = 0;
+    // this is the delay, stored in seconds
+    loiter_time_max = cmd.p1;
+
+    // set next destination if necessary
+    if (!set_next_wp(cmd, target_loc)) {
+        // failure to set next destination can only be because of missing terrain data
+        copter.failsafe_terrain_on_event();
+        return;
+    }
+}
+
+// checks the next mission command and adds it as a destination if necessary
+// supports both straight line and spline waypoints
+// cmd should be the current command
+// default_loc should be the destination from the current_cmd but corrected for cases where user set lat, lon or alt to zero
+// returns true on success, false on failure which should only happen due to a failure to retrieve terrain data
+bool ModeAuto::set_next_wp(const AP_Mission::Mission_Command& current_cmd, const Location &default_loc)
+{
+    // do not add next wp if current command has a delay meaning the vehicle will stop at the destination
+    if (current_cmd.p1 > 0) {
+        return true;
+    }
+
+    // do not add next wp if there are no more navigation commands
+    AP_Mission::Mission_Command next_cmd;
+    if (!mission.get_next_nav_cmd(current_cmd.index+1, next_cmd)) {
+        return true;
+    }
+
+    // whether vehicle should stop at the target position depends upon the next command
+    switch (next_cmd.id) {
+    case MAV_CMD_NAV_WAYPOINT:
+    case MAV_CMD_NAV_LOITER_UNLIM:
+#if AP_MISSION_NAV_PAYLOAD_PLACE_ENABLED
+    case MAV_CMD_NAV_PAYLOAD_PLACE:
+#endif
+    case MAV_CMD_NAV_LOITER_TIME: {
+        const Location dest_loc = loc_from_cmd(current_cmd, default_loc);
+        const Location next_dest_loc = loc_from_cmd(next_cmd, dest_loc);
+        return wp_nav->set_wp_destination_next_loc(next_dest_loc);
+    }
+    case MAV_CMD_NAV_SPLINE_WAYPOINT: {
+        // get spline's location and next location from command and send to wp_nav
+        Location next_dest_loc, next_next_dest_loc;
+        bool next_next_dest_loc_is_spline;
+        get_spline_from_cmd(next_cmd, default_loc, next_dest_loc, next_next_dest_loc, next_next_dest_loc_is_spline);
+        return wp_nav->set_spline_destination_next_loc(next_dest_loc, next_next_dest_loc, next_next_dest_loc_is_spline);
+    }
+    case MAV_CMD_NAV_VTOL_LAND:
+    case MAV_CMD_NAV_LAND:
+        // stop because we may change between rel,abs and terrain alt types
+    case MAV_CMD_NAV_LOITER_TURNS:
+    case MAV_CMD_NAV_RETURN_TO_LAUNCH:
+    case MAV_CMD_NAV_VTOL_TAKEOFF:
+    case MAV_CMD_NAV_TAKEOFF:
+        // always stop for RTL and takeoff commands
+    default:
+        // for unsupported commands it is safer to stop
+        break;
+    }
+
+    return true;
+}
+
+// do_land - initiate landing procedure
+void ModeAuto::do_land(const AP_Mission::Mission_Command& cmd)
+{
+    // To-Do: check if we have already landed
+
+    // if location provided we fly to that location at current altitude
+    if (cmd.content.location.lat != 0 || cmd.content.location.lng != 0) {
+        // set state to fly to location
+        state = State::FlyToLocation;
+
+        // convert cmd to location class
+        Location target_loc(cmd.content.location);
+        if (!shift_alt_to_current_alt(target_loc)) {
+            // this can only fail due to missing terrain database alt or rangefinder alt
+            // use current alt-above-home and report error
+            target_loc.set_alt_cm(copter.current_loc.alt, Location::AltFrame::ABOVE_HOME);
+            LOGGER_WRITE_ERROR(LogErrorSubsystem::TERRAIN, LogErrorCode::MISSING_TERRAIN_DATA);
+            gcs().send_text(MAV_SEVERITY_CRITICAL, "Land: no terrain data, using alt-above-home");
+        }
+
+        if (!wp_start(target_loc)) {
+            // failure to set next destination can only be because of missing terrain data
+            copter.failsafe_terrain_on_event();
+            return;
+        }
+    } else {
+        // set landing state
+        state = State::Descending;
+
+        // initialise landing controller
+        land_start();
+    }
+}
+
+// do_loiter_unlimited - start loitering with no end conditions
+// note: caller should set yaw_mode
+void ModeAuto::do_loiter_unlimited(const AP_Mission::Mission_Command& cmd)
+{
+    // convert back to location
+    Location target_loc(cmd.content.location);
+
+    // use current location if not provided
+    if (target_loc.lat == 0 && target_loc.lng == 0) {
+        // To-Do: make this simpler
+        Vector3f temp_pos;
+        copter.wp_nav->get_wp_stopping_point_xy(temp_pos.xy());
+        const Location temp_loc(temp_pos, Location::AltFrame::ABOVE_ORIGIN);
+        target_loc.lat = temp_loc.lat;
+        target_loc.lng = temp_loc.lng;
+    }
+
+    // use current altitude if not provided
+    // To-Do: use z-axis stopping point instead of current alt
+    if (target_loc.alt == 0) {
+        // set to current altitude but in command's alt frame
+        int32_t curr_alt;
+        if (copter.current_loc.get_alt_cm(target_loc.get_alt_frame(),curr_alt)) {
+            target_loc.set_alt_cm(curr_alt, target_loc.get_alt_frame());
+        } else {
+            // default to current altitude as alt-above-home
+            target_loc.set_alt_cm(copter.current_loc.alt,
+                                  copter.current_loc.get_alt_frame());
+        }
+    }
+
+    // start way point navigator and provide it the desired location
+    if (!wp_start(target_loc)) {
+        // failure to set next destination can only be because of missing terrain data
+        copter.failsafe_terrain_on_event();
+        return;
+    }
+}
+
+// do_circle - initiate moving in a circle
+void ModeAuto::do_circle(const AP_Mission::Mission_Command& cmd)
+{
+    const Location circle_center = loc_from_cmd(cmd, copter.current_loc);
+
+    // calculate radius
+    uint16_t circle_radius_m = HIGHBYTE(cmd.p1); // circle radius held in high byte of p1
+    if (cmd.id == MAV_CMD_NAV_LOITER_TURNS &&
+        cmd.type_specific_bits & (1U << 0)) {
+        // special storage handling allows for larger radii
+        circle_radius_m *= 10;
+    }
+
+    // true if circle should be ccw
+    const bool circle_direction_ccw = cmd.content.location.loiter_ccw;
+
+    // move to edge of circle (verify_circle) will ensure we begin circling once we reach the edge
+    circle_movetoedge_start(circle_center, circle_radius_m, circle_direction_ccw);
+}
+
+// do_loiter_time - initiate loitering at a point for a given time period
+// note: caller should set yaw_mode
+void ModeAuto::do_loiter_time(const AP_Mission::Mission_Command& cmd)
+{
+    // re-use loiter unlimited
+    do_loiter_unlimited(cmd);
+
+    // setup loiter timer
+    loiter_time     = 0;
+    loiter_time_max = cmd.p1;     // units are (seconds)
+}
+
+// do_loiter_alt - initiate loitering at a point until a given altitude is reached
+// note: caller should set yaw_mode
+void ModeAuto::do_loiter_to_alt(const AP_Mission::Mission_Command& cmd)
+{
+    // re-use loiter unlimited
+    do_loiter_unlimited(cmd);
+
+    // if we aren't navigating to a location then we have to adjust
+    // altitude for current location
+    Location target_loc(cmd.content.location);
+    if (target_loc.lat == 0 && target_loc.lng == 0) {
+        target_loc.lat = copter.current_loc.lat;
+        target_loc.lng = copter.current_loc.lng;
+    }
+
+    if (!target_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, loiter_to_alt.alt)) {
+        loiter_to_alt.reached_destination_xy = true;
+        loiter_to_alt.reached_alt = true;
+        gcs().send_text(MAV_SEVERITY_INFO, "bad do_loiter_to_alt");
+        return;
+    }
+    loiter_to_alt.reached_destination_xy = false;
+    loiter_to_alt.loiter_start_done = false;
+    loiter_to_alt.reached_alt = false;
+    loiter_to_alt.alt_error_cm = 0;
+
+    // set vertical speed and acceleration limits
+    pos_control->set_max_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+    pos_control->set_correction_speed_accel_z(wp_nav->get_default_speed_down(), wp_nav->get_default_speed_up(), wp_nav->get_accel_z());
+
+    // set submode
+    set_submode(SubMode::LOITER_TO_ALT);
+}
+
+// do_spline_wp - initiate move to next waypoint
+void ModeAuto::do_spline_wp(const AP_Mission::Mission_Command& cmd)
+{
+    // calculate default location used when lat, lon or alt is zero
+    Location default_loc = copter.current_loc;
+    if (wp_nav->is_active() && wp_nav->reached_wp_destination()) {
+        if (!wp_nav->get_wp_destination_loc(default_loc)) {
+            // this should never happen
+            INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        }
+    }
+
+    // get spline's location and next location from command and send to wp_nav
+    Location dest_loc, next_dest_loc;
+    bool next_dest_loc_is_spline;
+    get_spline_from_cmd(cmd, default_loc, dest_loc, next_dest_loc, next_dest_loc_is_spline);
+    if (!wp_nav->set_spline_destination_loc(dest_loc, next_dest_loc, next_dest_loc_is_spline)) {
+        // failure to set destination can only be because of missing terrain data
+        copter.failsafe_terrain_on_event();
+        return;
+    }
+
+    // this will be used to remember the time in millis after we reach or pass the WP.
+    loiter_time = 0;
+    // this is the delay, stored in seconds
+    loiter_time_max = cmd.p1;
+
+    // set next destination if necessary
+    if (!set_next_wp(cmd, dest_loc)) {
+        // failure to set next destination can only be because of missing terrain data
+        copter.failsafe_terrain_on_event();
+        return;
+    }
+
+    // initialise yaw
+    // To-Do: reset the yaw only when the previous navigation command is not a WP.  this would allow removing the special check for ROI
+    if (auto_yaw.mode() != AutoYaw::Mode::ROI) {
+        auto_yaw.set_mode_to_default(false);
+    }
+
+    // set submode
+    set_submode(SubMode::WP);
+}
+
+// calculate locations required to build a spline curve from a mission command
+// dest_loc is populated from cmd's location using default_loc in cases where the lat and lon or altitude is zero
+// next_dest_loc and nest_dest_loc_is_spline is filled in with the following navigation command's location if it exists.  If it does not exist it is set to the dest_loc and false
+void ModeAuto::get_spline_from_cmd(const AP_Mission::Mission_Command& cmd, const Location& default_loc, Location& dest_loc, Location& next_dest_loc, bool& next_dest_loc_is_spline)
+{
+    dest_loc = loc_from_cmd(cmd, default_loc);
+
+    // if there is no delay at the end of this segment get next nav command
+    AP_Mission::Mission_Command temp_cmd;
+    if (cmd.p1 == 0 && mission.get_next_nav_cmd(cmd.index+1, temp_cmd)) {
+        next_dest_loc = loc_from_cmd(temp_cmd, dest_loc);
+        next_dest_loc_is_spline = temp_cmd.id == MAV_CMD_NAV_SPLINE_WAYPOINT;
+    } else {
+        next_dest_loc = dest_loc;
+        next_dest_loc_is_spline = false;
+    }
+}
+
+#if AC_NAV_GUIDED == ENABLED
+// do_nav_guided_enable - initiate accepting commands from external nav computer
+void ModeAuto::do_nav_guided_enable(const AP_Mission::Mission_Command& cmd)
+{
+    if (cmd.p1 > 0) {
+        // start guided within auto
+        nav_guided_start();
+    }
+}
+
+// do_guided_limits - pass guided limits to guided controller
+void ModeAuto::do_guided_limits(const AP_Mission::Mission_Command& cmd)
+{
+    copter.mode_guided.limit_set(
+        cmd.p1 * 1000, // convert seconds to ms
+        cmd.content.guided_limits.alt_min * 100.0f,    // convert meters to cm
+        cmd.content.guided_limits.alt_max * 100.0f,    // convert meters to cm
+        cmd.content.guided_limits.horiz_max * 100.0f); // convert meters to cm
+}
+#endif  // AC_NAV_GUIDED
+
+// do_nav_delay - Delay the next navigation command
+void ModeAuto::do_nav_delay(const AP_Mission::Mission_Command& cmd)
+{
+    nav_delay_time_start_ms = millis();
+
+    if (cmd.content.nav_delay.seconds > 0) {
+        // relative delay
+        nav_delay_time_max_ms = cmd.content.nav_delay.seconds * 1000; // convert seconds to milliseconds
+    } else {
+        // absolute delay to utc time
+#if AP_RTC_ENABLED
+        nav_delay_time_max_ms = AP::rtc().get_time_utc(cmd.content.nav_delay.hour_utc, cmd.content.nav_delay.min_utc, cmd.content.nav_delay.sec_utc, 0);
+#else
+        nav_delay_time_max_ms = 0;
+#endif
+    }
+    gcs().send_text(MAV_SEVERITY_INFO, "Delaying %u sec", (unsigned)(nav_delay_time_max_ms/1000));
+}
+
+#if AP_SCRIPTING_ENABLED
+// start accepting position, velocity and acceleration targets from lua scripts
+void ModeAuto::do_nav_script_time(const AP_Mission::Mission_Command& cmd)
+{
+    // call regular guided flight mode initialisation
+    if (copter.mode_guided.init(true)) {
+        nav_scripting.done = false;
+        nav_scripting.id++;
+        nav_scripting.start_ms = millis();
+        nav_scripting.command = cmd.content.nav_script_time.command;
+        nav_scripting.timeout_s = cmd.content.nav_script_time.timeout_s;
+        nav_scripting.arg1 = cmd.content.nav_script_time.arg1.get();
+        nav_scripting.arg2 = cmd.content.nav_script_time.arg2.get();
+        nav_scripting.arg3 = cmd.content.nav_script_time.arg3;
+        nav_scripting.arg4 = cmd.content.nav_script_time.arg4;
+        set_submode(SubMode::NAV_SCRIPT_TIME);
+    } else {
+        // for safety we set nav_scripting to done to protect against the mission getting stuck
+        nav_/*
+  support tables for STM32F1
+ */
+
+#if defined(STM32F1)
+#define STM32_UNKNOWN	0
+
+const mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,	"STM32F1xx" },
+};
+
+const mcu_rev_t silicon_revs[] = {
+};
+
+#endif // STM32F1
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+  support tables for STM32F3
+ */
+
+#if defined(STM32F3)
+#define STM32_UNKNOWN	0
+
+const mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,	"STM32F3xx" },
+};
+
+const mcu_rev_t silicon_revs[] = {
+};
+
+#endif // STM32F3
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+  support tables for STM32F4
+ */
+
+#if defined(STM32F4)
+/* magic numbers from reference manual */
+enum {
+    MCU_REV_STM32F4_REV_A = 0x1000,
+    MCU_REV_STM32F4_REV_Z = 0x1001,
+    MCU_REV_STM32F4_REV_Y = 0x1003,
+    MCU_REV_STM32F4_REV_1 = 0x1007,
+    MCU_REV_STM32F4_REV_3 = 0x2001
+};
+
+
+#define STM32_UNKNOWN	0
+#define STM32F40x_41x	0x413
+#define STM32F42x_43x	0x419
+#define STM32F42x_446xx	0x421
+
+// The default CPU ID  of STM32_UNKNOWN is 0 and is in offset 0
+// There for new silicon will result in STM32F4..,?
+const mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,	"STM32F???" },
+    { STM32F40x_41x, 	"STM32F40x" },
+    { STM32F42x_43x, 	"STM32F42x" },
+    { STM32F42x_446xx,	"STM32F446XX" },
+};
+
+const mcu_rev_t silicon_revs[] = {
+    {MCU_REV_STM32F4_REV_3, '3'}, /* Revision 3 */
+
+    {MCU_REV_STM32F4_REV_A, 'A'}, /* Revision A */
+    {MCU_REV_STM32F4_REV_Z, 'Z'}, /* Revision Z */
+    {MCU_REV_STM32F4_REV_Y, 'Y'}, /* Revision Y */
+    {MCU_REV_STM32F4_REV_1, '1'}, /* Revision 1 */
+};
+
+#endif // STM32F4
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+  MCU tables for STM32F7
+ */
+
+#if defined(STM32F7)
+
+#define STM32_UNKNOWN	0
+#define STM32F74x_75x	0x449
+#define STM32F76x_77x	0x451
+
+typedef enum mcu_rev_e {
+    MCU_REV_STM32F7_REV_A = 0x1000,
+    MCU_REV_STM32F7_REV_Z = 0x1001,
+} mcu_rev_e;
+
+// The default CPU ID  of STM32_UNKNOWN is 0 and is in offset 0
+// Before a rev is known it is set to ?
+// There for new silicon will result in STM32F4..,?
+mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,	"STM32F??????" },
+    { STM32F74x_75x, 	"STM32F7[4|5]x" },
+    { STM32F76x_77x, 	"STM32F7[6|7]x" },
+};
+
+const mcu_rev_t silicon_revs[] = {
+    {MCU_REV_STM32F7_REV_A, 'A'}, /* Revision A */
+    {MCU_REV_STM32F7_REV_Z, 'Z'}, /* Revision Z */
+};
+
+#endif // STM32F7
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+  MCU tables for STM32G4
+ */
+
+#if defined(STM32G4)
+
+#define STM32_UNKNOWN 0
+
+mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,     "STM32G4??" },
+};
+
+const mcu_rev_t silicon_revs[] = {
+};
+
+#endif // STM32G4
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+  MCU tables for STM32H7
+ */
+
+#if defined(STM32H7)
+
+#define STM32_UNKNOWN 0
+#define STM32_H743    0x450
+#define STM32_H730    0x483
+
+mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,     "STM32H7???"},
+    { STM32_H730,        "STM32H73x/72x"},
+    { STM32_H743,        "STM32H743/753/750"},
+};
+
+const mcu_rev_t silicon_revs[] = {
+    {0x1001, 'Z'},
+    {0x1003, 'Y'},
+    {0x2001, 'X'},
+    {0x2003, 'V'},
+};
+
+#endif // STM32H7
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+  MCU tables for STM32L4
+ */
+
+#if defined(STM32L4)
+
+#define STM32_UNKNOWN 0
+
+mcu_des_t mcu_descriptions[] = {
+    { STM32_UNKNOWN,     "STM32L4??" },
+};
+
+const mcu_rev_t silicon_revs[] = {
+};
+
+#endif // STM32L4
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          ÿşÿS k e t c h U p   M o d e l ÿşÿ
+{ 8 . 0 . 4 8 1 1 } %T>“bĞN€ÆçòU`ìÿşÿ æ#-Nÿÿ   CVersionMapÿşÿ	C A r c C u r v e    ÿşÿ
+C A t t r i b u t e     ÿşÿC A t t r i b u t e C o n t a i n e r     ÿşÿC A t t r i b u t e N a m e d    ÿşÿC B a c k g r o u n d I m a g e 
+   ÿşÿC C a m e r a    ÿşÿ
+C C o m p o n e n t    ÿşÿC C o m p o n e n t B e h a v i o r    ÿşÿC C o m p o n e n t D e f i n i t i o n 
+   ÿşÿC C o m p o n e n t I n s t a n c e    ÿşÿC C o n s t r u c t i o n G e o m e t r y     ÿşÿC C o n s t r u c t i o n L i n e    ÿşÿC C o n s t r u c t i o n P o i n t     ÿşÿC C u r v e    ÿşÿC D e f i n i t i o n L i s t     ÿşÿC D i b    ÿşÿ
+C D i m e n s i o n    ÿşÿC D i m e n s i o n L i n e a r    ÿşÿC D i m e n s i o n R a d i a l    ÿşÿC D i m e n s i o n S t y l e    ÿşÿC D r a w i n g E l e m e n t 	   ÿşÿC E d g e    ÿşÿC E d g e U s e    ÿşÿC E n t i t y    ÿşÿC F a c e    ÿşÿC F a c e T e x t u r e C o o r d s    ÿşÿC F o n t M a n a g e r     ÿşÿC G r o u p    ÿşÿC I m a g e    ÿşÿC L a y e r    ÿşÿC L a y e r M a n a g e r    ÿşÿC L o o p    ÿşÿ	C M a t e r i a l    ÿşÿC M a t e r i a l M a n a g e r    ÿşÿ	C P a g e L i s t    ÿşÿC P o l y l i n e 3 d     ÿşÿC R e l a t i o n s h i p     ÿşÿC R e l a t i o n s h i p M a p     ÿşÿC R e n d e r i n g O p t i o n s $   ÿşÿC S e c t i o n P l a n e    ÿşÿC S h a d o w I n f o    ÿşÿC S k F o n t    ÿşÿ	C S k e t c h C S     ÿşÿC S k e t c h U p M o d e l    ÿşÿC S k e t c h U p P a g e    ÿşÿ	C S k p S t y l e    ÿşÿC S k p S t y l e M a n a g e r    ÿşÿC T e x t 	   ÿşÿ
+C T e x t S t y l e    ÿşÿC T e x t u r e    ÿşÿ
+C T h u m b n a i l    ÿşÿC V e r t e x     ÿşÿ	C V i e w P a g e    ÿşÿ
+C W a t e r m a r k    ÿşÿC W a t e r m a r k M a n a g e r    ÿşÿE n d - O f - V e r s i o n - M a p        °     ÿÿ  CDib       ‰PNG
+
+   IHDR   €   Y   ö,,   sBIT|dˆ   	pHYs         b&2   BIDATx^íÁ   ‚ ÿ¯nH@                                           œ²Y [i¸´    IEND®B`‚             ÿşÿ       ÿşÿP r i n t O p t i o n s ÿşÿ ÿşÿP a g e O p t i o n s ÿşÿS h o w T r a n s i t i o n ÿşÿT r a n s i t i o n T i m e       ø?ÿşÿ ÿşÿS l i d e s h o w O p t i o n s ÿşÿL o o p S l i d e s h o w ÿşÿ	S l i d e T i m e       ğ?ÿşÿ ÿşÿU n i t s O p t i o n s ÿşÿL e n g t h P r e c i s i o n    ÿşÿL e n g t h F o r m a t     ÿşÿ
+L e n g t h U n i t    ÿşÿL e n g t h S n a p E n a b l e d ÿşÿL e n g t h S n a p L e n g t h       °?ÿşÿA n g l e P r e c i s i o n    ÿşÿA n g l e S n a p E n a b l e d ÿşÿ	S n a p A n g l e       .@ÿşÿS u p p r e s s U n i t s D i s p l a y  ÿşÿF o r c e I n c h D i s p l a y  ÿşÿ ÿşÿN a m e d O p t i o n s ÿşÿ ÿÿ   CAttributeContainer  ÿÿ  CAttributeNamed      ÿşÿM o d e l P r o p e r t i e s ÿşÿ	I s D y n a m i c  ÿşÿ       €       ‰PNG
+
+   IHDR   €   Y   ö,,   sBIT|dˆ   	pHYs         b&2   BIDATx^íÁ   ‚ ÿ¯nH@                                           œ²Y [i¸´    IEND®B`‚ÿÿ  CCamera®Îı’“•OÀÛvíñ
+ı?Yªj$Ö8@ez`V£AVÈ<5lÁF†>RŠÁ¯±/¡ÏtÔ?¥;± ×¿ƒr%Û˜Nî?š™™™™™¹?       @      >@ÍÅC5¥·6A                                 ÿşÿ                ğ?                                  ÿÿ ÿ€€€ÿ                           ááÈÿ€€Èÿ      è?      à?             ğ¿      ğ¿       Œ¥ÿÿ    ?“?ÿ  2   fnÿÀÀÀÿÿ  ÿ           ˆDçJWÖ?ÿ  ÿ      à?       ğ?š™™™™™é?       €  €      ÿşÿt e m p ÿşÿt e m p     ÿşÿ     €      ÿşÿG S U _ C o n t r i b u t o r s I n f o ÿşÿL a s t M o d i f i e d B y K e y 
+ÿşÿ ÿşÿ
+V e r s i o n K e y è  ÿşÿ                	   ÿÿ 	 CMaterial  ÿşÿP l a s t i c _ B l a c k _ S t 1   ÿÿşÿ                 €  ÿşÿM e t a l _ A l u m i n i u m 1   ÷ğğÿÿşÿ                 €  ÿşÿP l a s t i c   B e i g e 1   óïÑÿÿşÿ                 €  ÿşÿM e t a l   A l u m i n i u m 1   ÷ğğÿÿşÿ                 €  ÿşÿT r a n s p a r e n t   L i g h t   G r e y 1   GBBÿÿşÿ                 €  ÿşÿM e t a l   B l u e 1   e²ÿÿşÿ                 €  ÿşÿ[ C o l o r _ A 0 1 ]   ÿ  ÿÿşÿ               ğ? €  ÿşÿd a r k p l a s t i c " 1      ÿÿşÿ                 €  ÿşÿm a t e r i a l . 0 0 6 " 1      ÿÿşÿ                       ÿÿ  CLayer  ÿşÿL a y e r 0    ÿşÿL a y e r _ L a y e r 0  ÿTTÿÿşÿ               à?      	   ÿÿ
+  CComponentDefinition                       €  ÿşÿL a y e r 0    ÿşÿL a y e r _ L a y e r 0  ÿTTÿÿşÿ               à?          @,  ÿÿ  CEdge          ÿÿ   CVertex     „5À  @Kˆ1Àşÿÿ_Å^O@ €     ÀëÀõ¿   –/Àÿÿÿ_	†O@  €          "  €  ıÿÿ0À   –/Àşÿÿß7O@  €          $ !   ÿÿ  CFace         Ùôş‰ªÏ¿Q_Ô=—J›?ûîqaşî?÷ĞPîP~NÀ   ÿÿ  CLoop  ÿÿ  CEdgeUse    ) *€  #  ) *€  %  )    €           €     @N­ñ?  @Kˆ1ÀÿÿÿŸ% O@"   €          ! /   &€         ^c±÷«À¿+¨¾:Z}®¿lT‰~«ï?]"Ujè¿OÀ   (€  *€  .  2 *€   2 *€  0  2    €          /  €     T­ñ?   –/ÀÿÿÿŸõŸO@  €          7 "   &€         †8ã¢÷´¿ÑşØÆHíG?Åÿ¼yäï?«`Š>¹wOÀ   (€  *€  6  : *€  8  : *€  . :    €          $  €     `è•À  @Kˆ1Àÿÿÿ¿ÓN@  €          ? !   &€         öå¿¿vØ¿gÀ®.\j¨¿G…ÈÏ‡í?¾Éø¿ŞåMÀ   (€  *€  % B *€  >  B *€  @  B    €          ?  €      (hÀ   –/ÀÿÿÿŸíÄN@  €          G  €    @ÒÀ   –/Àşÿÿßë+N@  €          I ?   &€         $):sèà¿yYÃé÷‘?v×)ë?º]l†;‡KÀ   (€  *€  F  L *€  H  L *€  J  L    €          $ G   &€         îÒ˜¯<Ù¿Ò¸˜¿üR»À|dí?(!ã¸¤MÀ   (€  *€  P  R *€  F R *€  > R    €          I  €     Àê #À  @Kˆ1ÀşÿÿßÊmM@  €          W ?   &€         °Uê;}qã¿í ld°¿ÛŒı*Vé?3µ,}„¼JÀ   (€  *€  J Z *€  V  Z *€  X  Z    €          I  €     Àê #À   –/ÀşÿÿßÊmM@  €          _ W   &€         à8HâcÙä¿    èXˆ¼šß—Fè?Î5ÑQ®kIÀ   (€  *€  V b *€  ^  b *€  `  b    €           €     {?À  @ZBÀ   à‹MPÀ €     À]×ô¿   -!À   à`PÀ  €          h  €  ıÿÿ¿e0À   -!Àÿÿÿß7PÀ  €          j g   &€         ‹7´Íø5Ğ¿sC?šîæœ¿`¾E»zñî¿]ûRêOÀ   (€  *€  f  m *€  i  m *€  k  m    €           €      `™ó?  @ZBÀÿÿÿ<nPÀh   €          g r   &€         …ŸQ¬À¿ó9 šç­?1úO¬ï¿P” 2½+PÀ   (€  *€  q  u *€  f u *€  s  u    €          r  €     Àf™ó?   -!Àÿÿÿ"nPÀ  €          z h   &€         ÛX ƒ¤€µ¿¸ í›‹I¿…:Šãï¿ÑÉröXPÀ   (€  *€  y  } *€  {  } *€  q }    €          j  €  şÿÿÿãÀ  @ZBÀıÿÿ&ÛOÀ  €          ‚ g   &€         _£*‰uØ¿HZ·nhª?!x"Y†í¿¾`œä€NÀ   (€  *€  k … *€    … *€  ƒ  …    €          ‚  €     `C9À   -!ÀıÿÿCüOÀ  €          Š  €     @.¿À    -!Àşÿÿ¿÷dOÀ  €          Œ ‚   &€         °Ôy[rá¿ÆB°âú¿ƒÀî(ë¿D)ÎßpªLÀ   (€  *€  ‰   *€  ‹   *€        €          j Š   &€         Ÿam±Ó¨Ù¿’MŒvı¿˜?…Òœù&Ní¿]Çø4‘cNÀ   (€  *€  “  • *€  ‰ • *€   •    €          Œ  €     €hÃ"À  @ZBÀşÿÿ?ªNÀ  €          š ‚   &€         r3ë `qã¿glx<°?Z×ÎVé¿Å·;{KÀ   (€  *€    *€  ™   *€  ›      €          Œ  €     €hÃ"À   -!Àşÿÿ?ªNÀ  €          ¢ š   &€         ¢ğ%ıáä¿    ÜQ‰<¼_yİ1?è¿L,ËÍKJÀ   (€  *€  ™ ¥ *€  ¡  ¥ *€  £  ¥    €           €  ÿÿÿŸf¬rÀ   –/ÀıÿÿQ3@ €  ÿÿÿŸf¬rÀ   –/À   `WæÀ  &€                       ğ¿        ÿÿÿŸ–/À   (€   *€  ©  ­ *€  €          «  €  şÿÿ_kEOÀ   –/Àşÿÿ_WæÀ   ­ *€  €          ±  €  ÿÿÿ?B²OÀ   –/ÀÿÿÿŸQ‘ó¿   ­ *€  €          ´  €  ÿÿÿÿ{COÀ   –/ÀıÿÿQ3@   ­ *€  €          · ª    ­    ¹ ¶ ° ³ €           €      Xæ@   –/ÀÿÿÿŸf¬r@ €  ÿÿÿÿO3À   –/ÀÿÿÿŸf¬r@  &€                       ğ¿        ÿÿÿŸ–/À   (€   *€  €          7  €  ÿÿÿ_é¨@   –/ÀÿÿÿŸƒO@   ¾ *€  €          Á  €  şÿÿ¿å@   –/Àşÿÿßc,O@   ¾ *€  €          Ä »    ¾ *€  º  ¾ *€  €          ¼ $    ¾ *€  # ¾ *€  8 ¾    À Æ Ã É €           €     `™Ór@   –/À   `WæÀ €  ÿÿÿ_™Ór@   –/ÀÿÿÿQ3@  &€                       ğ¿        ÿÿÿŸ–/À   (€   *€  €           €     €(/P@   –/ÀÿÿÿQ3@ €  ÿÿÿ‹fP@   –/ÀÿÿÿŸQ‘ó¿   Ğ *€  €          Ô  €     @ 0P@   –/Àşÿÿ_WæÀ   Ğ *€  €          × Í    Ğ *€  Ì  Ğ *€  €          Î Ó    Ğ    Ü Ò Ö Ù €           €  ÿÿÿ_™Ór@    -!ÀÿÿÿQ3@ €     `™Ór@   -!Àşÿÿ_WæÀ  &€                       ğ?           -!@   (€   *€  €           €     àT7P@   -!Àşÿÿ_WæÀ €      <nP@   -!Àÿÿÿ¿]™ó¿   á *€  €          å  €     àT7P@   -!ÀÿÿÿQ3@   á *€  €          è Ş    á *€  İ  á *€  €          ß ä    á    í ã ç ê €           €      `™ó?    -!Àıÿÿ_â¢O@ €  ıÿÿÿO3À    -!Àşÿÿß5O@  €          ğ  €  ıÿÿÿO3À   -!À    f¬r@  €           €      Xæ@   -!Àşÿÿß5O@ï   €           €      Xæ@   -!À    f¬r@ô   &€                       ğ?           -!@   (€   *€  ó  ø *€  î  ø *€  ñ  ø *€  €          ò ö    ø *€  õ  ø    ı €           €    @â¢OÀ   -!Àÿÿÿ¿]™ó¿ €  ÿÿÿ¿5OÀ   -!À   `WæÀ  €           €  ÿÿÿŸf¬rÀ    -!À   `WæÀ  &€                       ğ?           -!@   (€   *€  €           €      f¬rÀ    -!ÀÿÿÿQ3@   *€  €           €     À5OÀ   -!ÀÿÿÿQ3@   *€  €              *€  ÿ  *€      
+€          z  €     ÿ@   -!À   à†`PÀ  &€                       ğ?           -!@   (€   *€  { *€   *€  €           €     àâä@   -!Àÿÿÿß7PÀ   *€  €           €      Xæ@   -!Àÿÿÿ_™ÓrÀ   *€  €           €  ÿÿÿÿO3À   -!Àÿÿÿ_™ÓrÀ   *€  €          j    *€  i     €          «   &€               ğ¿             À :    f¬rÀ   (€  *€  " $*€  © $*€  €          ª    $*€  $   (€           €  ÿÿÿÿO3À   –/ÀıÿÿQ3@ €  ıÿÿÿO3À    -!ÀÿÿÿQ3@  €          · +  &€              € º              ğ?   Q3À   (€   *€  €          ,   /*€  
+/*€  (/*€  ¹ /*€  - /*€  * /   1€          +ğ   €          ğ ,  &€               ğ¿             À :ÿÿÿÿO3À   (€  *€  7 :*€  8 :*€  *:   €          ¼ ò   &€         +rsÿÿÿï¿ßh¶Û³¿Ç-ûX´¾‚ññK`3À   (€   *€  ñ @*€  7@*€  €          +$    @*€  É @*€  > @   D&€              € º              ğ?   f¬rÀ   (€  *€  >H*€  º H*€  €          » ö    H*€  ı H   L€           €      Xæ@   –/ÀÿÿÿQ3@ €      Xæ@   -!ÀÿÿÿQ3@  €          Ä O  &€         ƒúˆÿÿÿï?Ë17ÖĞ¿F<NKt©¾ôâ!'|æÀ   (€   *€  €          Pô    S*€  õ S*€  LS*€  Æ S*€  Q S*€  N S   U€          è P  &€              € º              ğ?   Q3À   (€   *€  N]*€  €          OÓ    ]*€  Ü ]*€  €          Î Ş    ]*€  ê ]*€  [ ]   c`&€               ğ?             À º   `™ÓrÀ   (€  *€  cg*€  Ì g*€  €          Í ß    g*€  İ g   k€           €      Xæ@   –/À   `WæÀ €      Xæ@    -!Àşÿÿ_WæÀ  €          × n  &€              € :              ğ¿   `WæÀ   (€   *€  €          oä    r*€  í r*€  kr*€  Ù r*€  p r*€  m r   t€          o  &€         Aeÿÿÿï?}úüaà?4%	Ñ ­>f/d±zåÀ   (€   *€  m|*€  €          n €      Xæ@   –/À   àñ5PÀ   |*€  €          € €      Xæ@   –/À   `™ÓrÀ   |*€  €          ƒ   |*€  |*€  z |   …‚&€              € :              ğ¿  `™ÓrÀ   (€  *€  …‰*€  €          ƒ €     P3À   –/À   `™ÓrÀ   ‰*€  €             ‰*€  ‰   Œ€           €  ÿÿÿÿO3À   –/Àşÿÿ_WæÀ €  ÿÿÿÿO3À   -!À   `WæÀ  €           €  ÿÿÿÿO3À   –/Àÿÿÿ¿a;PÀ’  &€         Eeÿÿÿï¿Õç1F½ß?Ø~•­>®A|c•1À   (€   *€  €          “j    —*€   —*€  —*€  €          •   —*€  ” —*€  ‘ —   ™€          “  &€              € :              ğ¿   `WæÀ   (€   *€  ‘¢*€  €          ’±    ¢*€  ° ¢*€  "¢*€  ¢*€    ¢   ¥€          € €     `—Æó?   –/Àÿÿÿ‘oPÀ  €          «•  &€                       ğ¿        ÿÿÿŸ–/À   (€   *€  ®*€  Œ®*€  ‚®*€  ª ®*€  ¬ ®   €           €  ÿÿÿ_‡pMÀ   -!Àÿÿÿ¿hÃ"@ €      }sNÀ   -!Àşÿÿßqx@  €          ¶  €          ğ  €    @qxÀ   -!Àşÿÿ¿}sN@  €          ¹ €     €hÃ"À   -!Àşÿÿ‡pM@  &€                       ğ¿           -!À   (€  *€  º ½*€  €          »µ   ½*€  ´ ½*€  · ½*€  1½*€  8½*€  ¸ ½   À€          è  €     ­O@   -!Àşÿÿßqx@  €          Ç €  şÿÿ_ªN@    -!Àşÿÿ¿hÃ"@  &€                       ğ¿           -!À   (€  *€  È Ë*€  €          É €     €À©'@   -!Àşÿÿ‡pM@   Ë*€  €          Ï €  ÿÿÿŸ¢"@   -!Àşÿÿ¿}sN@   Ë*€  €          Òô    Ë*€  UË*€  [Ë*€  Æ Ë   ÑÔÎ&€                       ğ¿           -!À   (€  *€  tÙ*€  zÙ*€  €           €  ÿÿÿø† @    -!Àşÿÿ×ûOÀ   Ù*€  €          Ş €      ïE$@   -!Àşÿÿ¿÷dOÀ   Ù*€  €          á €     €À©'@   -!Àşÿÿ?ªNÀ   Ù*€  €          ä €  ÿÿÿ_ªN@    -!Àÿÿÿ?À©'À   Ù*€  €          ç €      ­O@   -!À   `¢"À   Ù*€  €          êä    Ù   éìàãİæ€           €  ÿÿÿFbP@   @ZBÀ   €Ö+ò?å   €          å  €  ÿÿÿFbP@  @ZBÀ    I¯À  €          ğî  &€          VI¥yÜï?lÓE²Ğ·?      ğº³#T;;PÀ   (€  *€  í ó*€  ï ó*€  ñ ó   €           €  ÿÿÿÿÍP@   @ZBÀÿÿÿš Àğ  €          ğä   €          ä ø  &€         |d¯Oî?íÛO®k¶¶?);µsñ¶Ó¿Ÿ oOÀ   (€  *€  ÷ ü*€  ù ü*€  ú ü   &€         ÑêòÜÃ[ï?ji`v8]»¿cÂ"c…Å¿ü"ëïLPÀ   (€  *€  ã *€  ù*€  ï   €          ê €  ÿÿÿ_ªN@   @ZBÀşÿÿ?À©'À  €          ø  €          øê  &€         ®HÏé?X‹`èc´?(vÛ¾D¾â¿<Ç¡ÓLÀ   (€  *€   
+*€   
+*€   
+   &€         Q;"s¶ì?µ'ºØ¨¿pÒ([Ü¿‰î}Ë¾™NÀ   (€  *€  ú*€  ì*€     €          ç  &€         çÔTîè?şÿÿÿÿÿ/»DÎ«êä¿Š‰¿7™KÀ   (€  *€   *€  *€  é   €          îè   &€         š²0ŞÃ[ï?p%ÑN8]»¿êVÂc…Å?“ß’2PÀ   (€  *€   *€  ç *€  í   €          è  €      ÎP@  @ZBÀ    †P@  €           Ç  &€         drs¶ì?a‡f¹Ø¨¿L¤¦F[Ü?ƒpd‘$NÀ   (€  *€   #*€  ! #*€  Æ#   €          î   &€         ©ácb¯Oî?i—ÉJl¶¶?;^¡rñ¶Ó?â›É<‡OÀ   (€  *€  )*€  )*€  ' )   €            €  şÿÿ_ªN@   @ZBÀÿÿÿ¿hÃ"@  €          .Ç  &€         c…¿3Ïé?˜CÔéc´?Z´’×D¾â?%¡ı*&WKÀ   (€  *€  - 1*€  / 1*€  !1   €          .É  &€         ‰X&óîè?        ¼+ÚÑêä?.Œ¦ĞÔJÀ   (€  *€  /7*€  5 7*€  È7   €           €  ÿÿÿÀ©'@   @ZBÀÿÿÿ?ªNÀ  &€         ÂÆ._ æ?      0»Õ°Ïm æ¿$&-½İIÀ   (€  *€  >*€  æ>*€  €          ä<   >*€  ; >   B€          r   €          r  €     €ml@  @ZBÀÿÿÿß‹MPÀ  €          F  &€         DjÈO¬À?¹ğô¤Sê­?ŒRòÈ¬ï¿ªö%'@PÀ   (€  *€  D I*€  E I*€  G I   €          á<  &€         ¢ğ%ıáä?      8»¼_yİ1?è¿â8çqKÀ   (€  *€  BO*€  ãO*€  M O   €           €  ÿÿÿÿÉs!@   @ZBÀşÿÿ&ÛOÀá  €          ŞT  &€         ‡Àw	Æ
+á?€¨§H}é¿F*„ë¿4üh® OMÀ   (€  *€  S W*€  àW*€  U W   €          T  &€         9[øP¨Ù?}ò<\Ó˜?ø]6µPNí¿í7Ü»]áNÀ   (€  *€  U]*€  İ]*€  [ ]   €          T<  &€         r3ë `qã?elx<°?Z×ÎVé¿¢NĞRÃKÀ   (€  *€  Mc*€  Sc*€  a c   €          FT  €          F  &€         _£*‰uØ?HZ·nhª?!x"Y†í¿ªcê
+å÷NÀ   (€  *€  g j*€  [j*€  h j   &€         ²mÿG|µ?Fäê–†I¿ÿuøãï¿³{Yp&fPÀ   (€  *€  Do*€  o*€  y o   &€         ±°î3Ğ?&‰C»—úœ¿¤¦–ºñî¿à>réúPÀ   (€  *€  ht*€  t*€  Gt   €           €  ÿÿÿ_‡pMÀ  @ZBÀşÿÿ?À©'Àš   &€         ÂÆ._ æ¿        Õ°Ïm æ¿oÆ3ïÿÿHÀ   (€  *€  £ {*€  €          ¢  €  ÿÿÿ_‡pMÀ   -!Àşÿÿ?À©'À   {*€  €          y   {*€  x {   ~€           €    @:‹OÀ  @ZBÀÿÿÿ,”À   €            €    @:‹OÀ   @ZBÀ   Àœõñ?  €          †„  &€         äF?İï¿?ËÒÛN·?      ğ:šC™d]?OÀ   (€  *€  ƒ ‰*€  … ‰*€  ‡ ‰   €           €     à‚ÑNÀ  @ZBÀşÿÿšX@†  €          †  €            &€         Õ½æ@…Oî¿¡]És'í¶?üÉ·ş³Ó?kı¦äMÀ   (€  *€   ’*€   ’*€   ’   &€         ª¦#pÛ[ï¿\+¹ØCV»¿òÎ>s…Å?|¡‹(İ1OÀ   (€  *€  —*€  —*€  …—   €          ¶ €  ÿÿÿ_‡pMÀ  @ZBÀÿÿÿ¿hÃ"@  €          œ  €          ¶  &€         ¼$M_Îé¿í)áeºD´?7áƒ´kÀâ?'=g%©YJÀ   (€  *€  ›  *€    *€       &€         â
+Şõx¶ì¿|GVĞ¨¿Ï¨; aÜ?&å«¿öLÀ   (€  *€  ¥*€  ·¥*€  ¥   €          µœ  &€         ŠX&óîè¿   `—ª—¼¼+ÚÑêä?X™ºPàIÀ   (€  *€  © «*€  ›«*€  ´«   €          „  &€         ÂænÛ[ï¿ïA DV»¿‘²,Os…Å¿WNø­–fOÀ   (€  *€  ¯ ±*€  ÿ ±*€  ƒ±   €           €     à‚ÑNÀ   @ZBÀÿÿÿŸ¤ À  €          ¶ €      ğzNÀ    -!Àÿÿÿ²s"À  €          ¸  &€         )¢Äì¿eŠÚ‹œÿ¦¿ª]šgáÛ¿&˜Ay‰MÀ   (€  *€  µ »*€  · »*€  ¹ »   €          „¶  &€         Ü'p;…Oî¿©Z'í¶?:$Œ×ş³Ó¿²Ve1ENÀ   (€  *€  µÁ*€  ¯Á*€  ¿ Á   €          ¶y  €          y¸  &€         ç|¤9Ğé¿»èˆ‡²i³?¥dvÉ«Áâ¿CUÁ¾KÀ   (€  *€  Å È*€  Æ È*€  ·È   €          ¸  &€         ŸºJf¤ é¿   `’°¼V£˜ÊÊøã¿˜»$í±±JÀ   (€  *€  ÆÎ*€  Î*€  Ì Î   €           €     €hÃ"À   @ZBÀÿÿÿ‡pM@œ  &€         Ğ°Ïm æ¿      0;ÇÆ._ æ?Óù›òB"HÀ   (€  *€  ©Õ*€  ÀÕ*€  €          »Ó   Õ*€  Ò Õ   Ù€           €  şÿÿšõñ¿   @ZBÀÿÿÿ_:‹O@ï   €          ï  €  ÿÿÿ?-”@   @ZBÀÿÿÿ_:‹O@  €          ŞÜ  &€                 @ËÒÛN·?åF?İï?©‚v„]?OÀ   (€  *€  Û á*€  İ á*€  ß á   €           €      ¥ @   @ZBÀÿÿÿÿ‚ÑN@Ş  €          Şô   €          ô æ  &€         ús¨ş³Ó?­Ò'í¶?øwD…Oî?Ö•‘1ENÀ   (€  *€  å ê*€  ç ê*€  è ê   &€         õÎ>s…Å?b+¹ØCV»¿«¦#pÛ[ï?’[Ñ–fOÀ   (€  *€  ó ï*€  çï*€  İï   €          Ò €     €À©'@  @ZBÀşÿÿ‡pM@  €          ôæ  €          æÒ  &€         E½ş·kÀâ?Î–¸D´?&èQ_Îé?÷³uBkKÀ   (€  *€  ó ø*€  õ ø*€  ö ø   &€         M-«aÜ?Y‡*YĞ¨¿:§Çìx¶ì?îJµZ€MÀ   (€  *€  èı*€  Ôı*€  öı   €          Ïô  &€         FÎ«êä?        èÔTîè?C˜æé¤JÀ   (€  *€   *€  ó*€  Ñ   €          Üğ   &€         ôÎ>s…Å¿]+¹ØCV»¿«¦#pÛ[ï?º¸àDİ1OÀ   (€  *€   	*€  î 	*€  Û	   €          ğ  €     à™XÀ  @ZBÀşÿÿÿ‚ÑN@  €          ¹  &€         n¿aÜ¿ÍÁš‡UĞ¨¿rí8ïx¶ì?É*J¹¿öLÀ   (€  *€   *€   *€  ¸   €          Ü  &€         !ÿÇş³Ó¿$-ÀÎ'í¶?ƒU=…Oî?3vC§äMÀ   (€  *€  *€  *€      €          Ó  €          Ó¹  &€         8¼›kÀâ¿ÖC«¹D´?-òia_Îé?))F©YJÀ   (€  *€   *€   *€     &€         FÎ«êä¿    —ª§¼çÔTîè?u¢,PàIÀ   (€  *€  #*€  Ù#*€  º#   €          .ô  &€         Ğ°Ïm æ?        ÇÆ._ æ?
+´$  IÀ   (€  *€  )*€  Î)*€  5)*€  ' )   &€                       ğ?          @ZB@   (€  *€  õ/*€  '/*€  -/*€  '/*€  ñ/*€  ÷/*€  /*€  ;/*€  a/*€  g/*€  E/*€  s /*€  ƒ /*€  › /*€  x/*€  Å/*€  ¿/*€  ‡/*€  /*€  /*€  Ò/*€  /*€  /*€  ß/*€  å/   &€                       ğ¿           -!À   (€  *€  ÌJ*€  ~J*€  ¡ J*€  ‹ J*€  “ J*€  ™J*€   J*€  ¹J   €           €  şÿÿßçMÀ   –/Àşÿÿÿ²´'À €  ÿÿÿœƒNÀ   –/À    à¨"À  €          U±   €          • €  şÿÿe¿À    –/Àıÿÿÿö³OÀ  €          X €     Àê #À   –/ÀşÿÿßÙ¬NÀ  &€                       ğ?        ÿÿÿŸ–/@   (€  *€  €          ZT   \*€  S \*€  V \*€  ¥\*€  ”\*€  W \*€  Y \   ^€          ×  €     qO@   –/ÀÿÿÿŸà¨"À  €          f €     à¼šN@   –/Àÿÿÿÿ²´'À  &€                       ğ?        ÿÿÿŸ–/@   (€  *€  g j*€  €          h €  ÿÿÿ?>l'@   –/ÀşÿÿßÙ¬NÀ   j*€  €          n €      "@   –/Àıÿÿ?Ÿ«OÀ   j*€  €          q€   j*€  j*€  pj*€  e j   msp€           €  ÿÿÿ?õo @   –/Àşÿÿ_cºN@ €  şÿÿ_*$@   –/ÀÿÿÿW%N@  €          y €  ÿÿÿ?>l'@   –/ÀşÿÿßÊmM@  &€                       ğ?        ÿÿÿŸ–/@   (€  *€  z }*€  €          { €    à¼šN@   –/Àşÿÿÿu¸"@   }*€  €           €    àôœO@   –/ÀşÿÿŸÑk@   }*€  €          „Ó    }*€  `}*€  Q}*€  €          Ä x   }*€  w }   Š€†ƒ€          ·  €       ‚NÀ   –/ÀşÿÿŸÑk@  €           €  şÿÿßçMÀ   –/Àÿÿÿÿu¸"@  €          _   &€                       ğ?        ÿÿÿŸ–/@   (€  *€  ^ ’*€  H ’*€  P ’*€  D’*€  -’*€  Œ ’*€   ’*€   ’   €           €    €WšOÀ  @Kˆ1Àşÿÿÿ@Ôñ?´   €          ´  €  ÿÿÿWšOÀ  @Kˆ1Àÿÿÿ¿ÛÀ  €          œ  &€         ­ÒÏ{Üï¿Ua\ª4Ğ·¿    8¼+×q $PÀ   (€  *€  › ¡*€   ¡*€  Ÿ ¡   €           €  şÿÿŸfáNÀ  @Kˆ1Àÿÿÿ À  €          ±   €          ± ¦  &€         ¾Tä~Oî¿ø§ìBvÈ¶¿”Óå¢Î¶Ó¿ØØG$EOÀ   (€  *€  ¥ ª*€  § ª*€  ¨ ª   &€         ˜vF¼]ï¿©ĞY@g»?v@º­TÅ¿Ö»Æ<ÌVNÀ   (€  *€  ³ ¯*€  §¯*€  ¯   €          U €  şÿÿßçMÀ  @Kˆ1Àşÿÿÿ²´'À  €          ´¦  €          ¦U  &€         »Š(Æ¶Ïé¿Wÿ"I~O´¿:ŒõCd¾â¿O‚²Ë öKÀ   (€  *€  ³ ¸*€  µ ¸*€  ¶ ¸   &€         Rã©aºì¿´Ì0@ó¨?ÏGãñãÜ¿ìeZ8ÒMÀ   (€  *€  ¨½*€  V½*€  ¶½   €          T´  &€         ï;.6ğïè¿        ¹1=¢ä¿êZDá³JÀ   (€  *€  Á Ã*€  ³Ã*€  SÃ   €          œ·   &€         åŠ|ÊYï¿±º–ÕõQ»?¨LÕÂ¶Å?r¡ÊåNÀ   (€  *€  Ç É*€  ¶ É*€  ›É   €          ·  €  ÿÿÿŸfáNÀ  @Kˆ1Àşÿÿ¿ :@  €          Î  &€         ïÚ¹ƒ²ì¿c•e%ò¼¨?	úñCÏ%Ü?DµÀÌé}LÀ   (€  *€  Í Ñ*€  Ï Ñ*€  ŒÑ   €          œÎ  &€         „"VëãOî¿¼šÒ1£¶¿Îå4·Ó?ºúáNÀ   (€  *€  Í×*€  Ç×*€  Õ ×   €          Î €  şÿÿßçMÀ  @Kˆ1Àÿÿÿÿu¸"@  €          Ü  &€         gò7pbÏé¿­õÙ‡x´¿n™z£'¾â?OabK<KÀ   (€  *€  Û ß*€  İ ß*€  Ïß   €          Ü  &€         —²qAìè¿   €´Ô—<'=Â5ä?Ü«È5éIÀ   (€  *€  İå*€  ã å*€  å   €          Z €     Àê #À  @Kˆ1ÀÿÿÿßÙ¬NÀ  &€         ½Æ._ æ¿        Ù°Ïm æ¿ŞËëÎIÀ   (€  *€  é ì*€  €          ê´   ì*€  Áì*€  ^ì   ï€           €  şÿÿÿåô¿   @Kˆ1À   À¤cPÀ«  €          « €  ÿÿÿ?A¹@   @Kˆ1À   À¤cPÀ  €          õó  &€            ápE<á];+p¾·¿³Ì'°Üï¿ˆòE¡¹PÀ   (€  *€  ò ø*€  ô ø*€  ö ø   €           €      1¢@  @Kˆ1Àÿÿÿ_,PÀõ  €          õ€  €          €ı  &€         k¸32Á·Ó?Á“^¨Ç;¶¿Ö	÷IùPî¿Î- ¦«,PÀ   (€  *€  ü *€  ş *€  ÿ    &€         Â²¿ñšÆ?ĞåZšÉ»?Jí¸(šPï¿1î<\»tOÀ   (€  *€  ª*€  ş*€  ô   €          q €  ÿÿÿ?>l'@  @Kˆ1ÀşÿÿßÙ¬NÀ  €          ı  €          ıq  &€         Á[¤Ÿ½â?Y@ŒE,Ò´¿ah¨	¥Îé¿Ã
+ M’áLÀ   (€  *€  
+ *€   *€      &€         Z­)¡ÛqÜ?8Ì¡!{.¨?@íÀA8 ì¿Q‹’Í÷NÀ   (€  *€  ÿ*€  s*€     €          n  &€         ysÈä?   P4˜<(Eö¹ãè¿X¸ÌêŠKÀ   (€  *€   *€  
+*€  p   €          ó•  &€         Áã¹>pÄ¿CÅöC?‡»?g)vÅfï¿Íülõ­ROÀ   (€  *€    *€  ¬ *€  ò    €          • €      ŠËÀ  @Kˆ1Àÿÿÿ_,PÀ  €          %X  &€         Ñ8'ø¸Û¿õ,yaqa©?¯1-eÌì¿”6Û€¦MÀ   (€  *€  $ (*€  & (*€  W(   €          ó%  &€         ~`*P¶Ó¿ÀCLÜ¾·¿h»“æÁNî¿’~êPÀ   (€  *€  $.*€  .*€  , .   €          %ê  €          êX  &€         üçq)ö¾â¿˜îtõí³¿0'ì|Ğé¿Ro"46LÀ   (€  *€  2 5*€  3 5*€  &5   &€         ´ —ˆä¿   €.Æ–¼É†iøè¿G9÷‚]èJÀ   (€  *€  3:*€  é:*€  Y:   €          h €     à¼šN@  @Kˆ1Àÿÿÿÿ²´'À  &€         ¥ÜP æ?       »ßšp| æ¿<óGñÌÔIÀ   (€  *€  > A*€  €          ?   A*€  A*€  mA   D€           €     à·ZP@  @Kˆ1Àÿÿÿßö¿ÀÔ   €          Ô  €     à·ZP@  @Kˆ1Àşÿÿ?ñ?  €          JH  &€         ²£:Aİï?5~’·¿    @„¼ö›322°PÀ   (€  *€  G M*€  I M*€  K M   €           €     `¸ûO@  @Kˆ1ÀşÿÿµB@J  €          JÓ   €          Ó R  &€         ²ã€ê¹Oî?›áœàÙ¶¿èù\ó ´Ó?vìŠæKïOÀ   (€  *€  Q V*€  S V*€  T V   &€         ¦ÒÈUäYï?ÏcyJ»?@İ0È¶Å?ªÃİR4OÀ   (€  *€  Ò [*€  S[*€  I[   €          „ €    à¼šN@  @Kˆ1Àşÿÿÿu¸"@  €          `R  €          R„  &€         Ö[s5Îé?À*ªàY´¿öqsMÀâ?‰ÑRœŠLÀ   (€  *€  _ d*€  a d*€  b d   &€         !“¹?ˆ²ì?´*!µ¨?9Dv\Ø%Ü?N íC±{MÀ   (€  *€  Ti*€  †i*€  bi   €          `  &€         ËÌÁ¨Bìè?      @;İÇü?4ä?0ùb~ÅJÀ   (€  *€  m o*€  _o*€  ƒo   €          H×   &€         o‡cşÑ]ï?Ë]ïa»?•ÁTÅ¿½Ò>‹MlOÀ   (€  *€  s u*€  Ö u*€  Gu   €          ×  €    `¸ûO@   @Kˆ1Àÿÿÿ_— À  €          zf  &€         Š÷¸´eºì?yäÈDiê¨?½£R·ñÜ¿pÂö åNÀ   (€  *€  y }*€  { }*€  e}   €          Hz  &€         Ao¾ıROî?Y¸å0~ÿ¶¿TÏ Ş³Ó¿°$P‰2)PÀ   (€  *€  yƒ*€  sƒ*€   ƒ   €          z?  €          ?f  &€         ´c£‰Îé?ëæÛÌ*0´¿$šì(ŠÀâ¿©sCOvØLÀ   (€  *€  ‡ Š*€  ˆ Š*€  {Š   &€         «Ìkñïè?      0»§½ ä¿ß”ƒUJKÀ   (€  *€  ˆ*€  >*€  g   €          { €  ÿÿÿ?>l'@  @Kˆ1ÀşÿÿßÊmM@  &€         Ì°Ïm æ?     @»ÌÆ._ æ?\®‡1óHÀ   (€  *€  “ –*€  €          ”`   –*€  m–*€  €–   ™€          Á /   €          /  €  ÿÿÿiñ@  @Kˆ1Àşÿÿ_Å^O@  €          Á   &€         “˜p¢¬À?Ú1„ ­¿ }EÓ¬ï?sÑßùßOÀ   (€  *€  œ ¡*€   ¡*€  Ÿ ¡   €          y”  &€         mn©ü—êä?   &[Š<¸şÅ7è?â^zJÀ   (€  *€  “§*€  z§*€  ¥ §   €           €  ÿÿÿ¿G6!@  @Kˆ1Àşÿÿ¿ÓN@y  €          x¬  &€         õv<A)á?Ö¤U!	£Š?
+h‰h†ë?h=eÈ		LÀ   (€  *€  « ¯*€  w¯*€  ­ ¯   €          Ä ¬  &€         «˜bUàÚ?Ÿs$ÅĞ“¿(	¢Rü6í?%‚0jöàMÀ   (€  *€  ­µ*€  Šµ*€  ³ µ   €          ¬”  &€         µà³ËGqã?ç-/†û2°¿i1ŒåUé?'‘	’iKÀ   (€  *€  ¥»*€  «»*€  ¹ »   €          ¬  €          Ä   &€         ³£ìgtØ?—}¬$¬¿RÏ Äú„í?Ä´dt_NÀ   (€  *€  ¿ Â*€  ³Â*€  À Â   &€         2î³)¶?Vú/dææG?ĞJ3ò=áï?ôZÀZŒOÀ   (€  *€  œÇ*€  À Ç*€  6 Ç   &€         ›q	«UĞ?fÔ³:<û?aèŸãî?Ô|S×«NÀ   (€  *€  ÀÌ*€  Ã Ì*€  ŸÌ   &€         Ñšp| æ¿      »´ÜP æ?$š3+HÀ   (€  *€  ãÑ*€  €          ÜW    Ñ*€  ` Ñ*€  Ñ   Ô&€                       ğ¿        ÿÿÿ?Kˆ1À   (€  *€  ÔØ*€  ÛØ*€  ÕØ*€  ŸØ*€  ¥Ø*€  µØ*€  ïØ*€  2Ø*€  ,Ø*€  öØ*€  üØ*€  Ø*€  DØ*€  ‡Ø*€  Ø*€  KØ*€  QØ*€  aØ*€  ™Ø*€  ¹Ø*€  ¿Ø*€  Ø*€  0 Ø*€  @ Ø*€  X Ø   €           €  ÿÿÿ¿1°<@   `bU@ÿÿÿ?\™ó¿ €  ÿÿÿ\P:@   `bU@   €cÊ(À  €          ô €     €\P:@  Àì¤U@   €cÊ(À  &€         Z¶—’ûLï?¡°Óœ/6>˜ måœÊ¿c 3çP<À   (€  *€  õ ø*€  €          ö €  ÿÿÿ¿1°<@  Àì¤U@ÿÿÿ\™ó¿   ø*€  €          üó   ø*€  ò ø   ûş€          ô €      ú™3@   `bU@şÿÿ¿X¢5À  €           €     ú™3@   Àì¤U@şÿÿ¿X¢5À  &€         TŒDwãé?     0»uù|#Ïâ¿døŞ»ü’<À   (€  *€   *€  €          ö   *€  õ*€       €           €  ÿÿÿSl#@  `bU@şÿÿX;À  €           €  ÿÿÿSl#@  Àì¤U@şÿÿX;À  &€         oäè à?      *»EÄG:y¶ë¿®=RøV‰<À   (€  *€   *€  €             *€  *€      €           €    €ñTú¿   `bU@şÿÿ?®‰<À  €           €     €ñTú¿  Àì¤U@şÿÿ?®‰<À  &€         D¦êQÂº?        w`ÆÓï¿ãX$Ÿ5<À   (€  *€   *€  €             *€  *€      €           €     Ào)À   `bU@şÿÿÿD9À  €          " €  ÿÿÿ¿o)À  Àì¤U@şÿÿÿD9À  &€         “¤üñÆÓ¿     0»ôÈgÈoî¿¨.€UN¦;À   (€  *€  # &*€  €          $   &*€  &*€  ! &   )€          " €    €Kş4À   `bU@şÿÿ?^1À  €          - €     €Kş4À  Àì¤U@şÿÿ?^1À  &€         èÕş'…iå¿      0»ĞŠ%×Çç¿ˆ Ë2.ô:À   (€  *€  . 1*€  €          /$   1*€  #1*€  , 1   4€          - €     €a£9À   `bU@şÿÿ_N½À  €          8 €  ÿÿÿa£9À  Àì¤U@şÿÿ_N½À  &€         ¸D‘XÅ;í¿      @»ØhT©ñÚ¿rş
+>:À   (€  *€  9 <*€  €          :/   <*€  .<*€  7 <   ?€          8 €     €a£9À   `bU@   ` ğ@  €          C €     €a£9À  Àì¤U@   ` ğ@  &€               ğ¿             À :   €a£9À   (€  *€  D G*€  €          E:   G*€  9G*€  B G   J€          C €     €Kş4À   `bU@ÿÿÿ?ÍÕ-@  €          N €  ÿÿÿKş4À  Àì¤U@ÿÿÿÍÕ-@  &€         İ€&QÅ;í¿PÆr'p³…¾\Ö¥ÊñÚ?éİ–ñ>9À   (€  *€  O R*€  €          PE   R*€  DR*€  M R   U€          N €     àk)À   `bU@ÿÿÿ_6@  €          Y €     àk)À  Àì¤U@ÿÿÿ_6@  &€         9õpt…iå¿»Iä*Ó“¾iÅµàÖÇç?Åá¡"9À   (€  *€  Z ]*€  €          [P   ]*€  O]*€  X ]   `€          Y €     €ñTú¿   `bU@şÿÿŸ‚:@  €          d €     €ñTú¿  Àì¤U@şÿÿŸ‚:@  &€         ‹êÆÓ¿       ;‚¨Téoî?¯ıÛŸÕQ9À   (€  *€  e h*€  €          f[   h*€  Zh*€  c h   k€          d €  ÿÿÿSl#@   `bU@   àìä8@  €          o €  ÿÿÿSl#@  Àì¤U@   àìä8@  &€         D¦êQÂº?        w`ÆÓï?T§
+ãÅ9À   (€  *€  p s*€  €          qf   s*€  es*€  n s   v€          o €  ÿÿÿÿù™3@   `bU@ÿÿÿ?-/3@  €          z €      ú™3@  Àì¤U@ÿÿÿ?-/3@  &€         $-¤¥ à?        #ay¶ë?Ëã1j:À   (€  *€  { ~*€  €          |q   ~*€  p~*€  y ~   €          z €  ÿÿÿ\P:@   `bU@şÿÿ_ä#@  €          … €  ÿÿÿ\P:@  Àì¤U@şÿÿ_ä#@  &€         ˜2Cyãé?        Ìrk½ Ïâ?ª¤DX";À   (€  *€  † ‰*€  €          ‡|   ‰*€  {‰*€  „ ‰   Œ€          …ó  &€         ŞÒ\SûLï?ÁHû² /6¾ÚéêœÊ?B|îÎ;À   (€  *€  ş‘*€  €          ü‡   ‘*€  †‘*€   ‘   ”&€                       ğ¿        ÿÿÿ_bU@   (€  *€  y˜*€  n˜*€  c˜*€  X˜*€  M˜*€  B˜*€  7˜*€  ,˜*€  !˜*€  ˜*€  ˜*€   ˜*€  ò˜*€  ˜*€  „˜   €           €      `™ó?   `bU@ÿÿÿ?\™ó¿o  &€                       ğ?        ÿÿÿ¿ì¤UÀ   (€  *€  4«*€  ?«*€  J«*€  U«*€  `«*€  k«*€  v«*€  «*€  Œ«*€  ”«*€  û«*€  «*€  «*€  «*€  )«   €          q €     `™ó?  Àì¤U@ÿÿÿ\™ó¿  €           €  ÿÿÿ¿1°<@   €µ+R@ÿÿÿ?\™ó¿ €     €\P:@   €µ+R@   €cÊ(À  €          ¿ €     €\P:@   à?ÅR@   €cÊ(À  &€         Z¶—’ûLï?¡°Óœ/6>˜ måœÊ¿¨ù3çP<À   (€  *€  À Ã*€  €          Á €     À1°<@   à?ÅR@ÿÿÿ\™ó¿   Ã*€  €          Ç¾   Ã*€  ½ Ã   ÆÉ€          ¿ €     ú™3@   €µ+R@ÿÿÿ¿X¢5À  €          Ì €     ú™3@   à?ÅR@ÿÿÿ¿X¢5À  &€         TŒDwãé?     0»uù|#Ïâ¿døŞ»ü’<À   (€  *€  Í Ğ*€  €          ÎÁ   Ğ*€  ÀĞ*€  Ë Ğ   Ó€          Ì €  ÿÿÿSl#@  €µ+R@şÿÿX;À  €          × €  ÿÿÿSl#@  à?ÅR@şÿÿX;À  &€         oäè à?      *»EÄG:y¶ë¿®=RøV‰<À   (€  *€  Ø Û*€  €          ÙÎ   Û*€  ÍÛ*€  Ö Û   Ş€          × €     €ñTú¿  €µ+R@ÿÿÿ?®‰<À  €          â €     €ñTú¿   à?ÅR@ÿÿÿ?®‰<À  &€         D¦êQÂº?        w`ÆÓï¿ãX$Ÿ5<À   (€  *€  ã æ*€  €          äÙ   æ*€  Øæ*€  á æ   é€          â €     Ào)À   €µ+R@ıÿÿÿD9À  €          í €     Ào)À   à?ÅR@ıÿÿÿD9À  &€         “¤üñÆÓ¿     0»ôÈgÈoî¿¨.€UN¦;À   (€  *€  î ñ*€  €          ïä   ñ*€  ãñ*€  ì ñ   ô€          í €     €Kş4À   €µ+R@şÿÿ?^1À  €          ø €     €Kş4À   à?ÅR@şÿÿ?^1À  &€         èÕş'…iå¿      0»ĞŠ%×Çç¿ˆ Ë2.ô:À   (€  *€  ù ü*€  €          úï   ü*€  îü*€  ÷ ü   ÿ€          ø €  ÿÿÿa£9À  €µ+R@şÿÿ_N½À  €           €  ÿÿÿa£9À   à?ÅR@şÿÿ_N½À  &€         ¸D‘XÅ;í¿      @»ØhT©ñÚ¿rş
+>:À   (€  *€   *€  €          ú   *€  ù*€      
+€           €     €a£9À  €µ+R@   ` ğ@  €           €  ÿÿÿa£9À   à?ÅR@   ` ğ@  &€               ğ¿             À :   €a£9À   (€  *€   *€  €             *€  *€      €           €     €Kş4À  €µ+R@ÿÿÿ?ÍÕ-@  €           €  ÿÿÿKş4À   à?ÅR@ıÿÿÍÕ-@  &€         İ€&QÅ;í¿PÆr'p³…¾\Ö¥ÊñÚ?/‰¶ñ>9À   (€  *€   *€  €             *€  *€       €           €     àk)À  €µ+R@   `6@  €          $ €     àk)À   à?ÅR@   `6@  &€         9õpt…iå¿»Iä*Ó“¾iÅµàÖÇç?ìŠš×"9À   (€  *€  % (*€  €          &   (*€  (*€  # (   +€          $ €     €ñTú¿   €µ+R@şÿÿŸ‚:@  €          / €  şÿÿñTú¿   à?ÅR@şÿÿŸ‚:@  &€         ‹êÆÓ¿       ;‚¨Téoî?¯ıÛŸÕQ9À   (€  *€  0 3*€  €          1&   3*€  %3*€  . 3   6€          / €  ÿÿÿSl#@  €µ+R@ÿÿÿßìä8@  €          : €  ÿÿÿSl#@   à?ÅR@ÿÿÿßìä8@  &€         D¦êQÂº?        w`ÆÓï?T§
+ãÅ9À   (€  *€  ; >*€  €          <1   >*€  0>*€  9 >   A€          : €      ú™3@  €µ+R@ÿÿÿ?-/3@  €          E €      ú™3@   à?ÅR@ÿÿÿ?-/3@  &€         $-¤¥ à?        #ay¶ë?Ëã1j:À   (€  *€  F I*€  €          G<   I*€  ;I*€  D I   L€          E €  ÿÿÿ\P:@  €µ+R@şÿÿ_ä#@  €          P €     €\P:@   à?ÅR@şÿÿ_ä#@  &€         ˜2Cyãé?        Ìrk½ Ïâ?ª¤DX";À   (€  *€  Q T*€  €          RG   T*€  FT*€  O T   W€          P¾  &€         ŞÒ\SûLï?ÁHû² /6¾ÚéêœÊ?*ƒíÎ;À   (€  *€  É\*€  €          ÇR   \*€  Q\*€  Z \   _&€                       ğ¿        ÿÿÿµ+R@   (€  *€  Dc*€  9c*€  .c*€  #c*€  c*€  c*€  c*€  ÷c*€  ìc*€  ác*€  Öc*€  Ëc*€  ½c*€  Zc*€  Oc   €           €     `™ó?   €µ+R@ÿÿÿ?\™ó¿:  &€                       ğ?        ÿÿÿß?ÅRÀ   (€  *€  ÿv*€  
+v*€  v*€   v*€  +v*€  6v*€  Av*€  Lv*€  Wv*€  _v*€  Æv*€  Óv*€  Şv*€  év*€  ôv   €          < €      `™ó?   à?ÅR@ÿÿÿ\™ó¿  €           €     €£“[À   ´ 1ÀÿÿÿßåQ@ €      Ì›[À  ÀU1ÀÿÿÿßåQ@  €          Š €      é WÀ   21ÀÿÿÿæQ@  €           €  ÿÿÿ™¨VÀ  `1ÀÿÿÿæQ@ €     Àé£UÀ   Ó1ÀÿÿÿæQ@  €           €     @m VÀ   }1ÀıÿÿæQ@  €           €     Àn‘VÀ  @^b1ÀÿÿÿæQ@‘  €           €     À\À   t1ÀıÿÿßåQ@ €      ½\À  `ô1ÀÿÿÿßåQ@  €           €  ÿÿÿÿY]À  `¸1ÀÿÿÿßåQ@•  €          – €     Àˆ,\À  àk1ÀÿÿÿßåQ@  €          š €      â7\À   Â1ÀÿÿÿßåQ@  €           €  ÿÿÿŞ\À  @ñ»3ÀıÿÿßåQ@ €      ãğ[À  `>ß3ÀÿÿÿßåQ@  €          Ÿ €     @è×[À   {ë3ÀÿÿÿßåQ@  €          ¡ €  ÿÿÿÿ™Á[À   ·á3ÀıÿÿßåQ@  €          £ €      I©[À  À¾3ÀÿÿÿßåQ@  €           €  ÿÿÿ_I+\À  €â?3ÀÿÿÿßåQ@ €  ÿÿÿ?8\À  @#ƒ3ÀıÿÿßåQ@  €          ¨  €           €     Àñ]À  @,jTÀ   çQ@˜  €           €     `>DWÀ  àªä2ÀÿÿÿæQ@ €  ÿÿÿŸ8WÀ   `í>3ÀıÿÿæQ@  &€         $õ14¢V>º •ƒ­l¾òÿÿÿÿÿï¿ğ£†–æQ@   (€   *€  €           €     àuñVÀ    6ÀÿÿÿæQ@ €      ïIWÀ   ÀÃL6À   æQ@   °*€  €          ´ €     @;œWÀ  À?Ä6ÀÿÿÿæQ@   °*€  €          · €     @èWÀ   à…7ÀÿÿÿæQ@   °*€  €          º €     @r'XÀ   €z†8À   æQ@   °*€  €          ½ €  ÿÿÿ¿eWXÀ  @A¼9ÀÿÿÿæQ@   °*€  €          À €     à“iXÀ  àøq:ÀÿÿÿæQ@   °*€  €          Ã €      %fYÀ  €ÜÏTÀÿÿÿßçQ@   °*€  €          Æ €  ÿÿÿßÌ‡YÀ  `4UÀÿÿÿßçQ@   °*€  €          É €      (¹YÀ   5YUÀÿÿÿßçQ@   °*€  €          Ì €     àîùYÀ   !ŒUÀÿÿÿßçQ@   °*€  €          Ï €  ÿÿÿ“EZÀ  €®UÀÿÿÿßçQ@   °*€  €          Ò €    À„‘ZÀ  ÀM¼UÀıÿÿßçQ@   °*€  €          Õ €  ÿÿÿŠ¡ZÀ  €½UÀıÿÿßçQ@   °*€  €          Ø €  ÿÿÿŸ
+Ä[À  €½UÀÿÿÿßçQ@   °*€  €          Û €  ÿÿÿÿÈ[À   ½UÀÿÿÿßçQ@   °*€  €          Ş €     €ıË[À   &½UÀÿÿÿßçQ@   °*€  €          á €  ÿÿÿßü\À   h³UÀ   çQ@   °*€  €          ä €      #g\À  À¡—UÀÿÿÿŸçQ@   °*€  €          ç €  ÿÿÿ¿²©\À  À”jUÀÿÿÿŸçQ@   °*€  €          ê €  ÿÿÿ0á\À  àJ-UÀÿÿÿŸçQ@   °*€  €          í €     €r]À   ÛãTÀÿÿÿŸçQ@   °*€  €          ğ €     €”]À   i’TÀ   çQ@   °*€  €          ó«   °*€  ª °*€  — °*€  ” °*€  ™ °*€  › °*€  €          œ €     à¬=\À   .#2ÀÿÿÿßåQ@   °*€  €          ı €      «=\À  `Í€2ÀÿÿÿßåQ@   °*€  €            €     €z7\À  `‘å2ÀÿÿÿßåQ@   °*€  €          §   °*€  ¦ °*€  © °*€   °*€    °*€  ¢ °*€  ¤ °*€  €          ¥ €     @)”[À   õ„3À  àåQ@   °*€  €           €      \ƒ[À  @è83ÀÿÿÿßåQ@   °*€  €           €  ÿÿÿ¿ x[À  €{á2ÀÿÿÿßåQ@   °*€  €           €  ÿÿÿ3r[À  `Î€2ÀıÿÿßåQ@   °*€  €           €  ÿÿÿ_4r[À   àÒ"2ÀÿÿÿßåQ@   °*€  €           €     €hx[À  à¾1À  àåQ@   °*€  €           €  ÿÿÿ_œ„[À   Ãc1ÀÿÿÿßåQ@   °*€  €           ‰   °*€  ˆ °*€  ‹ °*€  €          Œ €  ÿÿÿŸw(WÀ   r1ÀÿÿÿæQ@   °*€  €          ' €  ÿÿÿÿF9WÀ   €{i1ÀÿÿÿæQ@   °*€  €          * €  ÿÿÿÿ¥DWÀ   `çÀ1À   æQ@   °*€  €          - €  ÿÿÿvJWÀ   €’!2ÀÿÿÿæQ@   °*€  €          0 €     @uJWÀ  Àğ2ÀÿÿÿæQ@   °*€  €          3­   °*€  ¬ °*€  €          ® €      
+)WÀ   `Î3ÀÿÿÿæQ@   °*€  €          9 €      ¯WÀ   @¦º3ÀÿÿÿæQ@   °*€  €          < €      ²ıVÀ   üİ3ÀÿÿÿæQ@   °*€  €          ? €  ÿÿÿŸ´äVÀ   À>ê3ÀÿÿÿæQ@   °*€  €          B €     €tÎVÀ  €‡à3ÀÿÿÿæQ@   °*€  €          E €     @"¶VÀ  Àz½3ÀÿÿÿæQ@   °*€  €          H €     Àÿ VÀ   à×ƒ3ÀÿÿÿæQ@   °*€  €          K €     `0VÀ    Ğ73ÀÿÿÿæQ@   °*€  €          N €     `Ñ„VÀ   dà2ÀÿÿÿæQ@   °*€  €          Q €     à VÀ   ¹2À   æQ@   °*€  €          T €      VÀ   àZ!2ÀÿÿÿæQ@   °*€  €          W €      9…VÀ   À ¼1ÀÿÿÿæQ@   °*€  €          Z“   °*€  ’ °*€   °*€   °*€  €           €     `Î½UÀ  @V2À   æQ@   °*€  €          b €      éUÀ    ¾†3ÀıÿÿæQ@   °*€  €          e €     @y%VÀ   `L‘4ÀıÿÿæQ@   °*€  €          h €      coVÀ    t`5ÀıÿÿæQ@   °*€  €          k €      ĞÃVÀ  À§é5ÀÿÿÿæQ@   °*€  €          n €  ÿÿÿhëVÀ   €}6ÀÿÿÿæQ@   °*€  €          q³   °   8;>ApDm&"üÿaY\GJjMgPdSVÎËÑÈÔÅ×ÚİàõãòæïéìÂ¿),/2s²5¶¹¼€           €  ÿÿÿ?x¨XÀ   ÀrÈÀÿÿÿŸåQ@ €      h XÀ  ÀºúÀÿÿÿŸåQ@  €           €     à“¬UÀ  ÀgÂÀıÿÿŸåQ@u  €          v €  ÿÿÿ¿˜XÀüÿÿ¿{š
+À   åQ@  €           €     `½YÀ    êï¿ıÿÿŸåQ@ €  ÿÿÿßß'YÀ    !ó¿ÿÿÿŸåQ@  €           €  ÿÿÿ_ÄYÀ   @eÉÀ   åQ@ €      º]À   ÀcÑÀ  `åQ@  €           €     `r(YÀ   ÀnêÀÿÿÿŸåQ@  €           €     àp7YÀüÿÿ?fÓ
+ÀÿÿÿŸåQ@‚  €           €      ÕŸXÀ   É¯ó¿ÿÿÿŸåQ@ €  ÿÿÿ0´XÀ    M"ğ¿   åQ@  €          z €     À9„XÀ   ÀßÀÿÿÿŸåQ@  €          ‰ €      i~XÀ   ÀÃÙÀÿÿÿŸåQ@  €           €      ß¬UÀ   @ÿ¡ÀÿÿÿŸåQ@x  €          ‹ €     `j~XÀüÿÿ?ÒæÀıÿÿŸåQ@  €           €  ÿÿÿÿÊUÀ   À\‚ÀÿÿÿŸåQ@  €           €     ÀÊüUÀ    %ö¿ÿÿÿŸåQ@‘  €           €     @S>VÀ   `†íÚ¿ıÿÿŸåQ@“  €           €     €k…VÀ   @«Ï?ÿÿÿŸåQ@•  €           €  ÿÿÿØVÀ0  àŞ	æ?ÿÿÿŸåQ@—  €           €     `¡„XÀ    ‚ı¿   åQ@  €           €      Æ0WÀ  àòê?ÿÿÿŸåQ@™  €          › €      ×XÀ    Úİ÷¿ÿÿÿŸåQ@  €          Ÿ†  €          ‡ €     €-ËXÀ    İÙë¿ÿÿÿŸåQ@  €          ¢ €      +äXÀğÿÿ‡Qê¿ıÿÿŸåQ@  €           €      f‹[Àğÿÿßòê?ÿÿÿ_åQ@  €          ¤ €  ÿÿÿkúXÀ    qˆë¿ÿÿÿŸåQ@  €          ¨|  €          € €     Àn]À   ÀÓ°Àÿÿÿ_åQ@  &€         x9z)öT>|Íká X¾ıÿÿÿÿÿï¿>ïW”æQ@   (€   *€  €           €  ÿÿÿ¿Lí\À   ÀìcÀÿÿÿ_åQ@ €     À»\À    „æô¿ÿÿÿ_åQ@   ­*€  €          ± €      
+~\À   `¢Û¿ÿÿÿ_åQ@   ­*€  €          ´ €     `Š0\À    Õ Ò?ÿÿÿ_åQ@   ­*€  €          · €  ÿÿÿãÙ[Àğÿÿß¦ç?ıÿÿ_åQ@   ­*€  €          º¦   ­*€  ¥ ­*€  œ ­*€  ˜ ­*€  – ­*€  ” ­*€  ’ ­*€   ­*€  Œ ­*€  w ­*€  t ­*€  y ­*€  ˆ ­*€  Š ­*€   ­*€  š ­*€   ­*€    ­*€  … ­*€  ¡ ­*€  £ ­*€  § ­*€  © ­*€  { ­*€  €          } €  ÿÿÿ?¯8YÀøÿÿŸ¯Oø¿ıÿÿŸåQ@   ­*€  €          Ö €  ÿÿÿ?DYÀ    mÆı¿ÿÿÿŸåQ@   ­*€  €          Ù €  ÿÿÿ¿ŞIYÀ   ÀèÀıÿÿŸåQ@   ­*€  €          Ü €     €İIYÀ  @ÛÀÿÿÿŸåQ@   ­*€  €          ß €      ¦CYÀ   @RÀıÿÿŸåQ@   ­*€  €          â„   ­*€  ƒ ­*€   ­*€  ~ ­*€  ª ­*€  €          «°   ­   áäÕØ¼Û¹ê¯Ş³¶€           €      f‹[Àğÿÿßòê?şÿÿ¿ó(@ €  ÿÿÿãÙ[Àğÿÿß¦ç?şÿÿ¿ó(@  €           €  ÿÿÿÿF9WÀ   €{i1À    ô(@ €  ÿÿÿŸw(WÀ   r1Àşÿÿô(@  €           €  ÿÿÿŞ\À   @ñ»3Àşÿÿÿó(@ €  ÿÿÿ?8\À   @#ƒ3Àşÿÿÿó(@  €           €     €-ËXÀ    İÙë¿şÿÿßó(@ €     €0´XÀ    L"ğ¿şÿÿßó(@  €           €  ÿÿÿ?¯8YÀ    ¯Oø¿şÿÿßó(@ €  ÿÿÿßß'YÀ    !ó¿şÿÿßó(@  €           €     €£“[À   ´ 1Àşÿÿÿó(@ €  ÿÿÿ_œ„[À    Ãc1Àşÿÿÿó(@  €           €  ÿÿÿ?r'XÀ   €z†8Àşÿÿô(@ €     @èWÀ   à…7Àşÿÿô(@  &€         R<¯,QeV¾Å]ŠÔÂl>òÿÿÿÿÿï?]•HXô(À   (€   *€  €           €     €m]À   àYTÀşÿÿ¿ó(@ €  ÿÿÿs]À    fâÀşÿÿ¿ó(@   *€  €           €     Àñ]À  @,jTÀşÿÿßô(@   *€  €           €  ÿÿÿ”]À   i’TÀşÿÿßô(@   *€  €           €     €r]À   ÛãTÀşÿÿßô(@   *€  €           €  ÿÿÿ0á\À  àJ-UÀşÿÿßô(@   *€  €           €  ÿÿÿ¿²©\À  À”jUÀşÿÿßô(@   *€  €           €      #g\À  À¡—UÀşÿÿßô(@   *€  €           €  ÿÿÿßü\À   h³UÀşÿÿßô(@   *€  €           €  ÿÿÿıË[À   &½UÀşÿÿÿô(@   *€  €           €  ÿÿÿÿÈ[À   ½UÀşÿÿÿô(@   *€  €            €  ÿÿÿŸ
+Ä[À  €½UÀşÿÿÿô(@   *€  €          # €  ÿÿÿŠ¡ZÀ   €½UÀşÿÿÿô(@   *€  €          & €     À„‘ZÀ  ÀM¼UÀşÿÿÿô(@   *€  €          ) €  ÿÿÿ“EZÀ  €®UÀşÿÿÿô(@   *€  €          , €     àîùYÀ   !ŒUÀşÿÿÿô(@   *€  €          / €  ÿÿÿŸ(¹YÀ   5YUÀşÿÿÿô(@   *€  €          2 €  ÿÿÿßÌ‡YÀ  `4UÀşÿÿÿô(@   *€  €          5 €      %fYÀ  €ÜÏTÀşÿÿÿô(@   *€  €          8 €  ÿÿÿß“iXÀ  àøq:Àşÿÿô(@   *€  €          ; €  ÿÿÿ¿eWXÀ  @A¼9Àşÿÿô(@   *€  €          >ş   *€  ı *€  €          ÿ €     @;œWÀ  À?Ä6Àşÿÿô(@   *€  €          D €  ÿÿÿŸïIWÀ   ÀÃL6Àşÿÿô(@   *€  €          G €     àuñVÀ    6Àşÿÿô(@   *€  €          J €  ÿÿÿhëVÀ  €}6Àşÿÿô(@   *€  €          M €      ĞÃVÀ  À§é5Àşÿÿô(@   *€  €          P €  ÿÿÿŸcoVÀ    t`5Àşÿÿô(@   *€  €          S €  ÿÿÿ?y%VÀ   `L‘4Àşÿÿô(@   *€  €          V €      éUÀ    ¾†3Àşÿÿô(@   *€  €          Y €  ÿÿÿ_Î½UÀ  @V2Àşÿÿô(@   *€  €          \ €      ¸£UÀ  ÀÇ 1Àşÿÿô(@   *€  €          _ €      zUÀ   µk0Àşÿÿô(@   *€  €          b €     €¸œUÀ  `¡ª/Àşÿÿô(@   *€  €          e €     €¸œUÀ   fâÀşÿÿÿó(@   *€  €          h €      Ç UÀ  àqPÀşÿÿÿó(@   *€  €          k €  ÿÿÿß¬UÀ   Àş¡Àşÿÿßó(@   *€  €          n €  ÿÿÿÿÊUÀ   À\‚Àşÿÿßó(@   *€  €          q €     ÀÊüUÀ    %ö¿şÿÿßó(@   *€  €          t €     @S>VÀ   `‚íÚ¿şÿÿßó(@   *€  €          w €     €k…VÀ   @«Ï?şÿÿßó(@   *€  €          z €  ÿÿÿØVÀ0  àŞ	æ?   àó(@   *€  €          } €      Æ0WÀ  àòê?şÿÿßó(@   *€  €          €ì   *€  ë *€  €          í €     `Š0\À    Ù Ò?şÿÿ¿ó(@   *€  €          † €  ÿÿÿŸ
+~\À   `Û¿şÿÿ¿ó(@   *€  €          ‰ €  ÿÿÿ¿»\À    „æô¿şÿÿ¿ó(@   *€  €          Œ €  ÿÿÿ¿Lí\À   ÀìcÀşÿÿ¿ó(@   *€  €           €  ÿÿÿ¿n]À   ÀÓ°Àşÿÿ¿ó(@   *€  €          ’     (€   *€  €           €  ÿÿÿ_4r[À   àÒ"2Àşÿÿÿó(@ €  ÿÿÿ3r[À   `Î€2Àşÿÿÿó(@   •*€  €          ™ €  ÿÿÿ¿ x[À  `{á2Àşÿÿÿó(@   •*€  €          œ €  ÿÿÿŸ\ƒ[À   @è83Àşÿÿÿó(@   •*€  €          Ÿ €  ÿÿÿ?)”[À    õ„3Àşÿÿÿó(@   •*€  €          ¢ €      I©[À   À¾3Àşÿÿÿó(@   •*€  €          ¥ €  ÿÿÿÿ™Á[À   ·á3Àşÿÿÿó(@   •*€  €          ¨ €  ÿÿÿ?è×[À    {ë3Àşÿÿÿó(@   •*€  €          « €  ÿÿÿãğ[À  `>ß3Àşÿÿÿó(@   •*€  €          ®ò   •*€  ñ •*€  €          ó €     `I+\À  `â?3Àşÿÿÿó(@   •*€  €          ´ €  ÿÿÿz7\À  `‘å2Àşÿÿÿó(@   •*€  €          · €      «=\À  `Í€2Àşÿÿÿó(@   •*€  €          º €  ÿÿÿß¬=\À    .#2Àşÿÿÿó(@   •*€  €          ½ €  ÿÿÿâ7\À    Â1Àşÿÿÿó(@   •*€  €          À €  ÿÿÿ¿ˆ,\À   àk1Àşÿÿÿó(@   •*€  €          Ã €  ÿÿÿŸ½\À   `ô1Àşÿÿÿó(@   •*€  €          Æ €  şÿÿ¿\À    ?å0Àşÿÿÿó(@   •*€  €          É €  ÿÿÿŸMî[À    Â0Àşÿÿÿó(@   •*€  €          Ì €  ÿÿÿ_ö×[À   @I¸0Àşÿÿÿó(@   •*€  €          Ï €  ÿÿÿ?ú¾[À   àŠÄ0Àşÿÿÿó(@   •*€  €          Ò €  ÿÿÿ?ş§[À   àŞç0Àşÿÿÿó(@   •*€  €          Õû   •*€  ú •*€  €          ü €  ÿÿÿhx[À   à¾1Àşÿÿÿó(@   •*€  €          Û˜   •  (€   *€  €           €     `Ñ„VÀ   dà2Àşÿÿô(@ €     `0VÀ    Ğ73Àşÿÿô(@   Ş*€  €          â €  ÿÿÿ¿ÿ VÀ   à×ƒ3Àşÿÿô(@   Ş*€  €          å €     @"¶VÀ  Àz½3Àşÿÿô(@   Ş*€  €          è €     €tÎVÀ  €‡à3Àşÿÿô(@   Ş*€  €          ë €  ÿÿÿŸ´äVÀ   À>ê3Àşÿÿô(@   Ş*€  €          î €      ²ıVÀ   üİ3Àşÿÿô(@   Ş*€  €          ñ €      ¯WÀ    ¦º3Àşÿÿô(@   Ş*€  €          ô €  ÿÿÿ
+)WÀ   `Î3Àşÿÿô(@   Ş*€  €          ÷ €  ÿÿÿŸ8WÀ  `í>3Àşÿÿô(@   Ş*€  €          ú €     `>DWÀ  àªä2Àşÿÿô(@   Ş*€  €          ı €  ÿÿÿ?uJWÀ  Àğ2Àşÿÿô(@   Ş*€  €           	 €  ÿÿÿvJWÀ   €’!2Àşÿÿô(@   Ş*€  €          	 €  ÿÿÿÿ¥DWÀ   `çÀ1Àşÿÿô(@   Ş*€  €          	ï   Ş*€  î Ş*€  €          ğ €      UWÀ   ÀĞã0Àşÿÿô(@   Ş*€  €          	 €  ÿÿÿÿûVÀ    ÄÀ0Àşÿÿô(@   Ş*€  €          	 €  ÿÿÿ¿ÂäVÀ   À·0Àşÿÿô(@   Ş*€  €          	 €     @ÅËVÀ   €OÃ0Àşÿÿô(@   Ş*€  €          	 €  ÿÿÿ?È´VÀ   `¥æ0Àşÿÿô(@   Ş*€  €          	 €     @m VÀ   }1Àşÿÿô(@   Ş*€  €          	 €     Àn‘VÀ  @^b1Àşÿÿô(@   Ş*€  €          	 €      9…VÀ   À ¼1Àşÿÿô(@   Ş*€  €          !	 €  ÿÿÿVÀ  àZ!2À    ô(@   Ş*€  €          $	 €     à VÀ   ¹2Àşÿÿô(@   Ş*€  €          '	á   Ş  (€   *€  €           €  ÿÿÿÿäXÀ   àøÀşÿÿßó(@ €  ÿÿÿ_ıXÀ   @ÜËÀşÿÿßó(@   *	*€  €          .	 €     `YÀ   À,±Àşÿÿßó(@   *	*€  €          1	 €  ÿÿÿ_r(YÀüÿÿ¿nêÀşÿÿßó(@   *	*€  €          4	 €  ÿÿÿßp7YÀüÿÿ¿eÓ
+Àşÿÿßó(@   *	*€  €          7	 €  ÿÿÿŸ¦CYÀ   @RÀşÿÿßó(@   *	*€  €          :	 €     €İIYÀ  @ÛÀ   àó(@   *	*€  €          =	 €  ÿÿÿ¿ŞIYÀüÿÿ?èÀşÿÿßó(@   *	*€  €          @	 €  ÿÿÿ?DYÀ    mÆı¿şÿÿßó(@   *	*€  €          C	ø   *	*€  ÷ *	*€  €          ù €     `½YÀ   êï¿şÿÿßó(@   *	*€  €          I	 €  ÿÿÿkúXÀ    qˆë¿şÿÿßó(@   *	*€  €          L	 €  ÿÿÿÿ*äXÀğÿÿ‡Qê¿şÿÿßó(@   *	*€  €          O	õ   *	*€  ô *	*€  €          ö €  ÿÿÿŸÕŸXÀ    É¯ó¿şÿÿßó(@   *	*€  €          U	 €  ÿÿÿ×XÀ    Úİ÷¿şÿÿßó(@   *	*€  €          X	 €     `¡„XÀ    ‚ı¿şÿÿßó(@   *	*€  €          [	 €     `j~XÀüÿÿ?ÒæÀşÿÿßó(@   *	*€  €          ^	 €      i~XÀ   ÀÃÙÀşÿÿßó(@   *	*€  €          a	 €     À9„XÀ   ÀßÀşÿÿßó(@   *	*€  €          d	 €  ÿÿÿ¿˜XÀüÿÿ¿{š
+Àşÿÿßó(@   *	*€  €          g	 €  ÿÿÿÿg XÀ   ÀºúÀşÿÿßó(@   *	*€  €          j	 €     €ŠµXÀ  ÀÑÇÀşÿÿßó(@   *	*€  €          m	 €  ÿÿÿŸÜÍXÀ   @7àÀşÿÿßó(@   *	*€  €          p	-	   *	   §y	svH	K	‚N	Q	¿ÂÅÈË”‘‹Îˆ…ÑÔ×ª­°f				T	W	Z	jmp9	<	"
+³¶¹¼Úİ—c	ó?	B	E	%(+›@=¡¤			|ÿ]	`	RêOíği	l	o	:74.1LIFC		g	d 	a#	^&	[)	XàUäç6	öùür	,	0	3	€          ³J  &€         +Z¨ajÀ?™oeZ¼ï¿        F·¡£wV$À   (€  *€  Iu	*€  €          G´   u	*€  ²u	*€  s	 u	   x	&€         e’ÖÕ?İú®lî¿        ê¿*œø¤%@   (€  *€  F|	*€  €          D·   |	*€  ¶|	*€  x	|	   	&€         CUXƒ™8á?tÍg’øê¿         $³»¢?@   (€  *€  Cƒ	*€  €          ÿº   ƒ	*€  ¹ƒ	*€  	ƒ	   †	&€         Xß˜¥Âæ?7Vˆ~æ¿       »ÖÄF(½I@   (€  *€  ıŠ	*€  €          ş½   Š	*€  ¼Š	*€  †	Š	   	&€         …Æújü4ë?pJúE…Øà¿       »‡ğ/?ûNQ@   (€  *€  @‘	*€  €          >À   ‘	*€  ¿‘	*€  	‘	   ”	&€         2Fâ—µí?RÄ”MÇ×¿        {Óÿc5T@   (€  *€  =˜	*€  €          ;Ã   ˜	*€  Â˜	*€  ”	˜	   ›	€          8Æ  &€         }ƒ6 Mìï?­‰uø*¾±¿        î€Lş>åW@   (€  *€  Å 	*€  ›	 	*€  : 	*€  	  	   &€         ØØÑæ&í?k`¡ìdÚ¿        ªc}\M@   (€  *€  7¦	*€  €          5É   ¦	*€  È¦	*€  	¦	   ©	&€         &a¦0é?Ôw7¼ã¿        `o6U<@   (€  *€  4­	*€  €          2Ì   ­	*€  Ë­	*€  ©	­	   °	&€         uàúvåÆã?±ˆ™.(é¿       »¨æ‰;¸UÀ   (€  *€  1´	*€  €          /Ï   ´	*€  Î´	*€  °	´	   ·	&€         ±‚³å 8Ú?<Ñƒrÿ0í¿şÿÿÿÿÿ/»™²
+VBÀ   (€  *€  .»	*€  €          ,Ò   »	*€  Ñ»	*€  ·	»	   ¾	&€         ‚'ÿbˆÇ?V~U¸\tï¿        í
+…âÿzPÀ   (€  *€  +Â	*€  €          )Õ   Â	*€  ÔÂ	*€  ¾	Â	   Å	&€         5ª€)ú(¨?®a
+İßöï¿        2c(uTÀ   (€  *€  (É	*€  €          &Ø   É	*€  ×É	*€  Å	É	   Ì	€          #Û  &€                       ğ¿        ÿÿÿ½UÀ   (€  *€  ÚÑ	*€  Ì	Ñ	*€  %Ñ	*€  Ï	 Ñ	   &€         úz…PÀ2?Uí9§ÿï¿        1ôb"PUÀ   (€  *€  "×	*€  €           Ş   ×	*€  İ×	*€  Ï	×	   Ú	&€         >S´§m®|?VSé•Ìÿï¿       »ùmó-/‹UÀ   (€  *€  Ş	*€  €          á   Ş	*€  àŞ	*€  Ú	Ş	   á	&€         ²³“¾¿ŒÍ×(gÅï¿şÿÿÿÿÿ»qóeñæXÀ   (€  *€  å	*€  €          ä   å	*€  ãå	*€  á	å	   è	&€         .‡ÿ{ƒsÖ¿¥ğü‡f÷í¿        ÌöØí/^À   (€  *€  ì	*€  €          ç   ì	*€  æì	*€  è	ì	   ï	&€         â6ø¿ïá¿oKª!'€ê¿şÿÿÿÿÿ»¹|r¡æ`À   (€  *€  ó	*€  €          ê   ó	*€  éó	*€  ï	ó	   ö	&€         å$6Ü´¸ç¿Õ²PHzå¿       »dOº7™ÏaÀ   (€  *€  ú	*€  €          í   ú	*€  ìú	*€  ö	ú	   ı	&€         S£©Øq8ì¿ü4‰ÆP,Ş¿      »Á2ğ¹aÀ   (€  *€  
+*€  €          ğ   
+*€  ï
+*€  ı	
+   
+&€         ´-Õ»¤ï¿=:V´'·Î¿        €à§)J™`À   (€  *€  
+*€  €          ó   
+*€  ò
+*€  
+
+   
+&€         h B'åñï¿-Îá?®¿     àºª\”¨D^À   (€  *€  
+
+*€  €          «   
+*€  õ
+*€  
+
+   
+&€         àüÿÿï¿öû†ì¤¿ı©Y+`ú¿>bÙ×u]À   (€   *€  
+*€  €           €     €s]À    fâÀÿÿÿæQ@   
+*€  €          
+ €  ÿÿÿÿY]À  `¸1Àÿÿÿ_æQ@   
+*€  €          
+˜   
+*€  ª
+*€  
+
+   
+
+
+&€         ßš±”ëï¿V¤ş§R²?      ğ:´c()ô\À   (€  *€  #
+*€  €           €    €m]À   àYTÀÿÿÿæQ@  #
+*€  €          '
+
+   #
+*€  
+#
+   €          ’«  &€         š^ 7¾î¿ûé[æÂÑ?      ;ÍÑ‡lJ©[À   (€  *€  ª-
+*€  €          € €      º]À   ÀcÑÀÿÿÿæQ@   -
+*€  €          1
+’   -
+*€  +
+ -
+   0
+3
+€          1
+  &€         mëx	²Hï¿©æòhíÊ?7Í¹~ÄB?0ĞŠÈ67\À   (€  *€  3
+7
+*€  5
+ 7
+*€  ”7
+   €          1
+'
+  &
+&€         @‰†òJï¿3ÆÃÊ?   €'`<ˆÍôl9\À   (€  *€  ;
+ =
+*€  &
+ =
+*€  5
+=
+   )
+&€         =Ášeií¿¬Lî}Ø?        @ã²¬;~ZÀ   (€  *€  ‘B
+*€  €          °   B
+*€  êB
+*€  +
+B
+   E
+&€         „É,ÇY0ê¿	iî¶câ?        ¤´Šy_SWÀ   (€  *€  I
+*€  €          Œ±   I
+*€  ¯I
+*€  E
+I
+   L
+&€         ›rğõJ¾å¿S·Å¤mzç?W³ÌÀäM¾˜5eIHSÀ   (€  *€  ‹P
+*€  €          ‰´   P
+*€  ³P
+*€  L
+P
+   S
+&€         èñ¬NAà¿­©è±~ë?'ÆÖR`’¾À@µÅSÃLÀ   (€  *€  ˆW
+*€  €          †·   W
+*€  ¶W
+*€  S
+W
+   Z
+&€         ;çÔ&ŸkÓ¿îßäô½}î?¼N×+ÒS„¾…¬Ÿ ?AÀ   (€  *€  …^
+*€  €          íº   ^
+*€  ¹^
+*€  Z
+^
+   a
+&€         ˆÊØã¸¿¯¦?0Ùï?       ;z—Â'À   (€  *€  ëe
+*€  €          ì¦   e
+*€  ¼e
+*€  a
+e
+   h
+€          €  &€                       ğ?        Şÿÿßòê¿   (€  *€  ¥m
+*€  h
+m
+*€  ‚m
+*€  k
+ m
+   &€         ojæ?|*¼?æœ6DÎï?       ;yMcîó¼"@   (€  *€  s
+*€  €          }™   s
+*€  œs
+*€  k
+s
+   v
+&€         ß™T5d¸Ô?÷”ÿØÉFî?şÿÿÿÿÿ;Îb½˜î<@   (€  *€  |z
+*€  €          z—   z
+*€  ˜z
+*€  v
+z
+   }
+&€         }at~zà?Æ@wUnë?.¶ã°ŒI‚¾ÎpÌÈG@   (€  *€  y
+*€  €          w•   
+*€  –
+*€  }
+
+   „
+&€         SÃ•Ğ3íå?ªqM{¤Nç?Ê£W9ƒ¾æ·óJÊ¢N@   (€  *€  vˆ
+*€  €          t“   ˆ
+*€  ”ˆ
+*€  „
+ˆ
+   ‹
+&€         ¾ÇÁ£ê?Î`ûÿK×á?        é@$)rR@   (€  *€  s
+*€  €          q‘   
+*€  ’
+*€  ‹
+
+   ’
+&€         +½$™Bµí?ãàc¾÷È×?’H¯Ùœ¶o¾z“E‹wT@   (€  *€  p–
+*€  €          n   –
+*€  –
+*€  ’
+–
+   ™
+€           €    à“¬UÀ   ÀgÂÀıÿÿ_æQ@x  &€         ËÌßT»î?Œ›ÑÖÑ?¼?ş)hu¾À`ØU@   (€  *€  ŒŸ
+*€  ™
+Ÿ
+*€  €          n
+   Ÿ
+*€  œ
+ Ÿ
+   £
+€          n €     Ç UÀ  àqPÀÿÿÿ_æQ@  €          ¦
+
+  &€         sÂÉtnIï?gøäİ[ßÊ?Né’š#C?OVğÖÂbU@   (€  *€  £
+©
+*€  ¥
+ ©
+*€  §
+ ©
+   €          k¦
+  &€         êÜ,.Gï?áÛpÄ/	Ë?        õn^ÁaU@   (€  *€  m¯
+*€  ­
+ ¯
+*€  ¥
+¯
+   &€         n¿Gjëï?ÅæFŸ#²?      ğ:dé §U@   (€  *€  j´
+*€  €          h €    €¸œUÀ    fâÀıÿÿ_æQ@   ´
+*€  €          ¸
+¦
+   ´
+*€  ­
+´
+   ·
+º
+€           €    €¸œUÀ  `¡ª/ÀıÿÿŸæQ@¸
+  &€               ğ?             À º   €¸œU@   (€  *€  ·
+¿
+*€  g¿
+*€  €          e½
+   ¿
+*€  ¼
+ ¿
+   Ã
+&€         *>|å÷ï?”#Œéhâ§¿ëº|fâW>–šÕ&mgU@   (€  *€  dÆ
+*€  €          b €     zUÀ   Àµk0ÀıÿÿŸæQ@   Æ
+*€  €          Ê
+½
+   Æ
+*€  Ã
+Æ
+   É
+Ì
+&€         d7”Ö°ï?K1,pgÖÁ¿ÿŞe eÖq>Æ–ROÖT@   (€  *€  aÏ
+*€  €          _ €     ¸£UÀ  ÀÇ 1ÀÿÿÿŸæQ@   Ï
+*€  €          Ó
+Ê
+   Ï
+*€  É
+Ï
+   Ò
+Õ
+€          _ €    Àé£UÀ   Ó1ÀÿÿÿŸæQ@  €          Ø
+Ó
+  &€         øsMpï?ï¥y‘ŞÇ¿   Ğ¼VfoŸwT@   (€  *€  Ò
+Û
+*€  ×
+ Û
+*€  Ù
+ Û
+   €          \Ø
+  &€         ÃÌ0rı™î?Ä3V”¶Ò¿x(µ^n²L?Î¼sS@   (€  *€  ^á
+*€  ß
+ á
+*€  ×
+á
+   €          Ø
+  &€         Ø'"(ñ–î?§w?~ÊÒ¿        Hw:ˆñoS@   (€  *€  ß
+ç
+*€  €          \b   ç
+*€  aç
+*€  å
+ ç
+   ê
+&€         ›?ñÓë?¼“S™ß¿       »åH6‡Ã¤P@   (€  *€  [î
+*€  €          Ye   î
+*€  dî
+*€  ê
+î
+   ñ
+&€         š°´ñ´ç?ÚR~o~å¿       »UéŸšèI@   (€  *€  Xõ
+*€  €          Vh   õ
+*€  gõ
+*€  ñ
+õ
+   ø
+&€         l'öÀ\â?Õë‡î5ê¿        ÂXFãtş@@   (€  *€  Uü
+*€  €          Sk   ü
+*€  jü
+*€  ø
+ü
+   ÿ
+&€          ùÍØ?yá™…¥í¿şÿÿÿÿÿ/»F~h
+¾ò+@   (€  *€  R*€  €          Pn   *€  m*€  ÿ
+   &€         £TØ©(?Ì?¬“9”
+6ï¿        x‹Èyqô¿   (€  *€  O
+*€  €          Mq   
+*€  p
+*€  
+   &€         ¨Ş¨ªîÀâ?±l Ãíé¿      ;…ı	õîA@   (€  *€  s*€  *€  L*€  s	   €           €     ÀÂäVÀ   À·0ÀÿÿÿŸæQ@	  &€         Ê«†ù È»?ö"96Ïï¿       »Ş~€¹¶À   (€  *€  	*€  €          	 €      ûVÀ    ÄÀ0ÀıÿÿŸæQ@   *€  €             *€      &€         ó°Äòj±Õ?(§Vşî¿       »6\µÿÇÊ.@   (€  *€  	"*€  €          	 €     UWÀ   ÀĞã0ÀÿÿÿŸæQ@   "*€  €          &   "*€  "   %(€          	 €     é WÀ    21ÀÿÿÿŸæQ@  €          +&  &€         «¸¸Áà?âĞ×oCë¿        ÊÛx»éø@@   (€  *€  %.*€  * .*€  , .   €          ğ+  &€         gVö[Wâ?†ı0¢pê¿%Râ¨x¿¾bjõùC@   (€  *€  	4*€  2 4*€  *4   €          Œ+  &€         ‘ñ^C(ä?El}ñõè¿şÿÿÿÿÿ»³h°®NF@   (€  *€  2:*€  €          ğ'   :*€  &:*€  8 :   =&€         ï^¡øç?ëã]Ø2å¿        Å;ĞÈÅM@   (€  *€  îA*€  €          ï*   A*€  )A*€  =A   D&€         šù-v8cì?õUB§Šİ¿      »gz’È—R@   (€  *€  	H*€  €          	-   H*€  ,H*€  DH   K&€         ?Å!ş¸ï?\4š˜ñÍ¿        Á­û•š•U@   (€  *€  	O*€  €          	0   O*€  /O*€  KO   R&€         ßT€ôÿÿï?§0`ı¶ +?      `:5ïó³JW@   (€  *€  	V*€  €           	3   V*€  2V*€  RV   Y&€         NŒeï?½wÄşôªÎ?        ¦°Ç}w¸W@   (€  *€  ÿ]*€  €          ı­   ]*€  5]*€  Y]   `&€          7ÄÜ$ì?¡ÂTğ$uŞ?       ;lË˜“ôµV@   (€  *€  üd*€  €          ú®   d*€  ¬d*€  `d   g&€         oŸ¹ÇÒç?İ¤‹X]å?      0;^59Ñ’T@   (€  *€  ùk*€  €          ÷9   k*€  8k*€  gk   n&€         øù!^Qâ?1«î‰=ê?ÜæË$~‘¾êp}C¥AQ@   (€  *€  ör*€  €          ô<   r*€  ;r*€  nr   u&€         ô0v	õÖ?ĞòáÓŞí?d£Òàé“¾”®{¯9ÄI@   (€  *€  óy*€  €          ñ?   y*€  >y*€  uy   |&€         «é¥*<*¿?cvåÃï?şÿÿÿÿÿ;‚Uu6ê>@   (€  *€  ğ€*€  €          îB   €*€  A€*€  |€   ƒ€           €     @È´VÀ   `¥æ0ÀÿÿÿŸæQ@ €     €™¨VÀ  `1ÀÿÿÿŸæQ@  €          ˆ	  €          	‡  &€         ^ÍÍ'/óà¿WÓî#ë¿işaT„¿J[ºÊŞ3OÀ   (€  *€  † Œ*€  ‰ Œ*€  Š Œ   €          	‡  &€         ³”‹ªZQâ¿øyõ=ê¿       ;p§~îSvPÀ   (€  *€  	’*€   ’*€  Š’   &€         ‚òxg õÖ¿(‰ÕŞí¿       ;§º6y}-HÀ   (€  *€  	—*€  €          	 €    @ÅËVÀÿÿÿOÃ0ÀÿÿÿŸæQ@   —*€  €          ›‡   —*€  —   š&€         =±MŒ*¿¿nïªÃï¿şÿÿÿÿÿ»©U„)?½;À   (€  *€  	 *€   *€  €          ›    *€  š    ¤&€         ‡	îÇ»¿±)èÏï?      0;"àóD¸#@   (€  *€  í§*€  €          ëE   §*€  D§*€  ƒ§   ª&€         Ô&7c±Õ¿T‚òbî?       ;î³)q(À   (€  *€  ê®*€  €          èH   ®*€  G®*€  ª®   ±&€         u÷œm¢â¿3Üšpê?       ;[^ê+œnAÀ   (€  *€  çµ*€  €          åK   µ*€  Jµ*€  ±µ   ¸&€         G ê™}øç¿$5-k 3å?        ÌÖg½pKÀ   (€  *€  ä¼*€  €          âN   ¼*€  M¼*€  ¸¼   ¿&€         šù-v8cì¿õUB§Šİ?      ;qÀoÌQÀ   (€  *€  àÃ*€  €          áQ   Ã*€  PÃ*€  ¿Ã   Æ&€         7¤ÿµ¸ï¿
+IÛGñÍ?¸	ös¾!
+"HÊTÀ   (€  *€  )	Ê*€  €          '	T   Ê*€  SÊ*€  ÆÊ   Í&€         úP€ôÿÿï¿íÔ×–» +¿ªf¡ÊĞÒ=Æ"¬’?VÀ   (€  *€  &	Ñ*€  €          $	W   Ñ*€  VÑ*€  ÍÑ   Ô&€         NŒeï¿½wÄşôªÎ¿        LnÙşFíVÀ   (€  *€  #	Ø*€  €          !	Z   Ø*€  YØ*€  ÔØ   Û&€          7ÄÜ$ì¿¡ÂTğ$uŞ¿       »Ç[1»êUÀ   (€  *€   	ß*€  €          	“   ß*€  \ß*€  Ûß   â&€         t^ÎÌÒç¿©!2áR]å¿      0»&2¢´SÀ   (€  *€  	æ*€  €          	‘   æ*€  ’æ*€  âæ   é&€         gmÍàä¿_ˆYuäè¿        ²šFĞqŒQÀ   (€  *€  ‰í*€  €          ˆ   í*€  í*€  éí   ğ€           €     `ö×[À  @I¸0Àıÿÿ_æQ@Ï  &€         =ÆĞ¤í»?úÏÏï¿      0»$¾¼ÂöàÀ   (€  *€  Îö*€  €          Ì €      Mî[À   Â0Àÿÿÿ_æQ@   ö*€  €          úô   ö*€  ó ö   ùü&€         °n»z¦ÀÕ?}–ÎpOî¿        şÙæwb66@   (€  *€  Ëÿ*€  €          É €  ÿÿÿ¿\À   ?å0Àÿÿÿ_æQ@   ÿ*€  €          ú   ÿ*€  ùÿ   €          É €    À\À   t1Àıÿÿ_æQ@  €            &€         &jÄûÄà?¬4C…Aë¿    Î¾\¼TrfÆ-F@   (€  *€  *€   *€  	    €          Æ  &€         ŒïÜüœâ?ëxP.Zlê¿kHgş'*x¿x		˜-¨H@   (€  *€  È*€   *€     €          •  &€         )ùô{	ä?ÜCdŸóè¿       »õ°ÁÊ…L@   (€  *€  *€  €          Æ–   *€  ”*€      &€         
+nèQOıç?³Õ )Œ-å¿        8‘‘E=R@   (€  *€  Å*€  €          Ãš   *€  ™*€     !&€         ·bğÁfì?u[`‚|İ¿      »Äez…ÖÿV@   (€  *€  Â%*€  €          Àœ   %*€  ›%*€  !%   (&€         ä*æxï?É9ÓŒêÓÍ¿        K•½Ë#hZ@   (€  *€  ¿,*€  €          ½ı   ,*€  ü,*€  (,   /&€         6Qôÿÿï?ıĞ0h4X+?      p:3 gÔê=\@   (€  *€  ¼3*€  €          º    3*€  ÿ3*€  /3   6&€         4¸úÌ7ï?=â´{`Î?      ;ERš\‡\@   (€  *€  ¹:*€  €          ·   :*€  :*€  6:   =&€         #à„L(ì?ĞL—khŞ?÷ÑåàšE„¾ à87°[@   (€  *€  ¶A*€  €          ´§   A*€  A*€  =A   D&€         Jô·ÊÔç?/˜h[å?5·“uyŒ¾®W5wœ0X@   (€  *€  ³H*€  €          ó¨   H*€  ¦H*€  DH   K&€         s 8>ÅOâ?E!ªì(>ê?şÿÿÿÿÿ;b~T@   (€  *€  ñO*€  €          ò   O*€  ©O*€  KO   R&€         ÂD}ÉñÖ?¬^å®sßí?        %2EODOM@   (€  *€  °V*€  €          ®Ÿ   V*€  V*€  RV   Y&€         "x¾¿?§…Iø>Ãï?şÿÿÿÿÿ;æD.éÎ§@@   (€  *€  ­]*€  €          «¡   ]*€   ]*€  Y]   `€           €     @ş§[À  àŞç0Àÿÿÿ_æQ@ €     Ì›[À  ÀU1Àÿÿÿ_æQ@  €          eû  €          ûd  &€         ‡‰'Xvóà¿–Ù	Â#ë¿‡[ï©K„¿÷š.É£9RÀ   (€  *€  c i*€  f i*€  g i   €          Õd  &€         šå¢sQâ¿¿_@=ê¿       ;¬7xÀKSÀ   (€  *€  ×o*€  m o*€  go   &€         o>“mÏôÖ¿é†€ßŞí¿        ø‘8»KÀ   (€  *€  Ôt*€  €          Ò €     @ú¾[À   àŠÄ0À  `æQ@   t*€  €          xd   t*€  mt   wz&€         ›#‰~k)¿¿ÙŠkÃï¿        ¹‚n'>À   (€  *€  Ñ}*€  ó}*€  €          ôx   }*€  w}   &€         ºVâs{Ú»¿î \^Ïï?şÿÿÿÿÿ/;FJEÇG¼@   (€  *€  ª„*€  €          ¨£   „*€  ¢„*€  `„   ‡&€         äa×O×¸Õ¿¸³úf¸î?       »ò¸x+û2À   (€  *€  §‹*€  €          ¥¥   ‹*€  ¤‹*€  ‡‹   &€         +Fø	â¿İÆD÷‘nê?r˜Ãj
+Ÿ‘¾ø¨‰Ÿ…GÀ   (€  *€  ¤’*€  €          ¢   ’*€  ’*€  ’   •&€         ã©…åúç¿MÚ?H0å?JmÅÔ]@Œ¾Ûm‹oQÀ   (€  *€  ¡™*€  €          Ÿ   ™*€  ™*€  •™   œ&€         _œekòdì¿$Ô¡Ïwƒİ?ú…pÌø¬ƒ¾Òïo‹j2VÀ   (€  *€   *€  €          œ    *€   *€  œ    £&€         V@™ï¿.g!e{âÍ?vyÔPìs¾á«?‰›YÀ   (€  *€  ›§*€  €          ™   §*€  §*€  £§   ª&€         0hôÿÿï¿ÆfŸÿ7=+¿      `º?¨^rr[À   (€  *€  —®*€  €          ˜   ®*€  ®*€  ª®   ±&€          a9Sï¿.0+"è›Î¿      ;’hŠKê»[À   (€  *€  İµ*€  €          Û   µ*€  µ*€  ±µ   ¸&€         ‚´}¦˜&ì¿7›¸nŞ¿        Ú<ÙçoFZÀ   (€  *€  Ú¼*€  €          ü    ¼*€  ¼*€  ¸¼   ¿&€         Ë9¢şøÓç¿å’Ï\å¿        Œ’1EwdWÀ   (€  *€  úÃ*€  €          û‰   Ã*€  "Ã*€  ¿Ã   Æ&€         ïÔ2"ûä¿QØÙ_äè¿       »ê’  ©TÀ   (€  *€  fÊ*€  €          eŠ   Ê*€  ˆÊ*€  ÆÊ   Í€           €    `YÀ   À,±ÀıÿÿæQ@ €     `ÄYÀ  ÀdÉÀÿÿÿæQ@  €          Ò4	  €          4	Ñ  &€         QßO@Şà?¸M,öæ0ë?„xÓ™……¿òö×WÒL@   (€  *€  Ğ Ö*€  Ó Ö*€  Ô Ö   €          1	Ñ  &€         ²”‹ªZQâ?øyõ=ê?şÿÿÿQh¼ÄHuVÆHN@   (€  *€  3	Ü*€  Ú Ü*€  ÔÜ   &€         ©õ0v	õÖ?CôáÓŞí?       ;,aŞ=ÈC@   (€  *€  0	á*€  €          .	 €     `ıXÀ   @ÜËÀÿÿÿæQ@   á*€  €          åÑ   á*€  Úá   äç&€         ıøH‹*¿?Ì<â­Ãï?       ;ïÅ‰c0@   (€  *€  ,	ê*€  €          -	 €      äXÀ   àøÀÿÿÿæQ@   ê*€  €          îå   ê*€  äê   íğ€          ¤O	  &€         ÈŠ?È»?¦U:JÏï¿      0»Şõ%¿ù#@   (€  *€  N	ô*€  €          L	¨   ô*€  §ô*€  ò ô   ÷&€         ^VPsZ±Õ?ª7&÷î¿        à›N5)‡@@   (€  *€  K	û*€  €          I	|   û*€  ©û*€  ÷û   ş&€         ”+ûkâ?6Áú¿pê¿        )B‰èªÕK@   (€  *€  H	*€  €          ù}   *€  {*€  ş   &€         ï^¡øç?ëã]Ø2å¿        J&}H¤R@   (€  *€  ÷	*€  €          øÖ   	*€  Õ	*€  	   &€         šù-v8cì?õUB§Šİ¿      »Ê‘äîê2V@   (€  *€  E	*€  €          C	Ù   *€  Ø*€     &€         "pÑ¸ï?#†ñÍ¿›¢Nêöc>º¾æ&¿tX@   (€  *€  B	*€  €          @	Ü   *€  Û*€     &€         ìR€ôÿÿï?ÉJ¹ +?¨R$BÏÂ½‡.NæIY@   (€  *€  ?	*€  €          =	ß   *€  Ş*€     !&€         NŒeï?½wÄşôªÎ?        ÒÌ¤HµX@   (€  *€  <	%*€  €          :	â   %*€  á%*€  !%   (&€         ğl#rÛ$ì?Põå'uŞ?áÓY8Nt¾¨ËÇ¦¯“V@   (€  *€  9	,*€  €          7	„   ,*€  ä,*€  (,   /&€         Àğ.‰ËÒç?ÕCÎKT]å?Tõcßm||¾lxL=US@   (€  *€  6	3*€  €          4	‚   3*€  ƒ3*€  /3   6&€         ‘–³m-ä?voêxRôè?};À1¦ös¾×"tP@   (€  *€  Ó:*€  €          Ò   :*€  :*€  6:   =&€         [y|HÌÇ»¿sÕ^ŸÏï?şÿÿÿÿÿ/;ÜZ‹9À   (€  *€  r	A*€  €          p	 €      ÜÍXÀ  @7àÀÿÿÿæQ@   A*€  €          Eî   A*€  íA   DG&€         4g£¶s±Õ¿bújî?        ^\‚¥á=À   (€  *€  o	J*€  €          m	 €    €ŠµXÀ   ÀÑÇÀÿÿÿæQ@   J*€  €          NE   J*€  DJ   MP€          m	 €     @x¨XÀ  ÀrÈÀÿÿÿæQ@  €          SN  &€         8iÉ»¬à¿ ôßtèOë?şÿÿÿÿÿ;¥ê³ôHÀ   (€  *€  MV*€  R V*€  T V   €          j	S  &€         ²¬nâ¿š¦_{pê?;œÚ§HŸx¿.µüzü:JÀ   (€  *€  l	\*€  Z \*€  R\   €          uS  &€         µD÷ëÍòã¿€ƒ&¬ké?        Ÿ½î¥IMÀ   (€  *€  Zb*€  €          j	v   b*€  tb*€  ` b   e&€         ¤¬ ‘øç¿ŒÍÆé2å?        Æ0GÈ ÙQÀ   (€  *€  i	i*€  €          g	z   i*€  yi*€  ei   l&€         šù-v8cì¿õUB§Šİ?      ;¯Õ-ù‘gUÀ   (€  *€  f	p*€  €          d	‰   p*€  ˆp*€  lp   s&€         …î‰Ÿ¯ï¿)Ù\§ñÍ?       ;ğ.nCe©WÀ   (€  *€  c	w*€  €          a	‹   w*€  Šw*€  sw   z&€         úP€ôÿÿï¿œØ–» +¿      `º€d»íq~XÀ   (€  *€  `	~*€  €          ^	   ~*€  ~*€  z~   &€         2*T\ï¿kG4lŠ«Î¿        ı%`™êWÀ   (#NAME=latitude,longitude,absolute-altitude,heading
+OSRF0=37.4003371,-122.0800351,0,353
+OSRF0_PILOTSBOX=37.4003371,-122.0800351,2,270
+CMAC=-35.363261,149.165230,584,353
+CMAC2=-35.362889,149.165221,584,270
+CMAC_South=-35.363261,149.165230,584,173
+CMAC_PILOTSBOX=-35.362734,149.165300,586,270
+CMAC_PILOTSBOX2=-35.362749,149.165359,584,270
+Kingaroy=-26.583528,151.840440,444,169
+AVC=40.0713749,-105.2297889,1583.702759,246
+AVC_copter=40.072842,-105.230575,1586,0
+AVC_plane=40.072842,-105.230575,1586,80
+McMillan=35.718719,-120.769818,275,295
+McMillan_East=35.7168007,-120.7644466,275,295
+TomCarpark=26.048950,-80.254219,6,270
+Ballarat=-37.598705,143.881744,485,165
+CRAMS=-27.675284,152.519307,58,285 # Calvert Radio Aero Modeller's Society
+3DRBerkeley=37.872991,-122.302348,20,260
+BMAC=-35.226343,149.132122,588,301
+LGAT=37.889063,23.731863,21,330
+BHV=53.547767,8.626440,0,324
+QMAC=-35.363724,149.430011,740,312
+Karuizawa=36.323203,138.618215,926,0
+Dalby=-27.274439,151.290064,343,8.7
+RFRanch=37.118079,-2.773690,1297.88,180
+KSFO=37.619373,-122.376637,5.3,118
+NFSC=53.637561,9.929800,13,345
+Rotherham=53.275131,-1.19404,21,360
+LeeField=32.42553,-84.79109,75,260
+Sterling=38.982480,-77.439567,88,90
+EPIgijon=43.521902,-5.624310,22,0
+PerkinsField=36.163609,-78.806864,137,20
+KNUI=38.145322,-76.426652,7,70
+Range11=41.360461,-74.032838,220,180
+Flicker=39.018801,-104.893081,2158,180
+ElliottField=34.458281,-84.180209,450,130
+CobbCountyRC=34.013819,-84.724446,280,105
+GrupoSicoss=19.316518,-99.220255,0,0
+Garrawarra=-34.159752,150.967395,293,165
+Snarbyeidet=69.775839,19.548929,87,170
+Breivikeidet=69.624025,19.414047,55,235
+Hata=35.671497,140.083934,6,165
+TagusPark=38.740195,-9.301843,151,0
+Marcopter=44.806968,11.610389,0,90
+HMAS=-33.661500,150.841431,18,0
+RATBeach=33.810313,-118.393867,0,270
+Carstensz=-35.331302,149.132103,606,60
+Skyrocket=33.982069,-118.426372,11,134
+SkyViperFactory=23.021754,114.073139,13,0
+KazakoshiPark=36.321909,138.596021,932,0
+SKT=44.850687,-0.684029,45,0
+UChicago=41.7886079,-87.59871329999999,191,0
+Yachiyo=35.770481,140.107929,36,90
+Tyndall=30.0142232,-85.4984701,7,0
+Elvenes=68.871422,17.986690,17,256
+Kawachi=35.879129,140.339683,7,0
+SpringValley=-35.280252,149.005821,580.8,5
+SpringValley2=-35.28240059,149.00542037,582,10
+SpringValley3=-35.28240515,149.00716878,579,12.6
+SpringValley4=-35.2824768,149.0071759,594.99,0
+SpringValleyRoad=-35.28899126,149.00553365,603,162.7
+Pyramid=29.9764,31.1339,0,0
+AAMEastField=39.842288,-105.212928,1809,106
+HachinoheMine=40.4539496,141.5419051,56,270
+HighwayField=-33.950458,22.977709,240,300
+AAMWestField=39.842218,-105.219375,1814,90.5
+EliField=40.059488,-88.551314,206,37
+Goretovka=55.9689,37.1101,200,290
+Kris=22.74005960,120.30975281,21,0
+ARACE_copter=47.5211929,18.8082355,198,55
+ARACE_plane=47.5210876,18.8083948,198,55
+ARACE_hand=47.5211516,18.8081607,198,55
+NDRCC=33.24065965,-96.93759168,163.5,167
+Boquig=16.090473,120.361478,3,0
+Semisopochnoi=51.9634,179.756,120.0,90.0
+Unalga=51.578,-179.0483,42.0,270.0
+Rabi=-16.51273251,179.97642023,7.5,90
+KFC=34.8412920,136.2154873,196.36,338
+KawaguchiLake=35.4712023,138.7450261,965,90
+GrandCanyon=36.146,-113.89,1425.6,90
+YPG=32.976658,-114.266699,252.97,235
+Yuma=32.638083,-114.403104,95,0
+Williams=39.16124,-122.13187,23,0
+WilliamsVtol=39.1652640,-122.131755,23,180
+SCCMAS=37.1730398,-121.6815865,102,315
+ARPstrip_NZ=-43.6544343,172.5031829,0,156  #Strip in New Zealand
+ARPstrip_NZ_S=-43.6541316,172.5029844,0,156  #Strip in New Zealand, South takeoff
+ARPstrip_NZ_N=-43.6545022,172.5031883,0,336  #Strip in New Zealand, North takeoff
+CMAC_NZ_E=-43.47493266,172.318144,0,84  #Christchurch MAC, New Zealand, East takeoff
+CMAC_NZ_W=-43.47493266,172.318144,0,264  #Christchurch MAC, New Zealand, West takeoff
+OSPN=30.53202,-97.62892,199,7 #Old Settlers Park , Austin, TX, North takeof
+OSP=30.53202,-97.62892,199,187 #Old Settlers Park , Austin, TX, South takeof
+KalaupapaCliffs=21.16564233,-156.88680160,165.25,0
+Portmoak=56.191,-3.323271,164,270
+LakeGeorgeLookout=-35.10122092,149.37517574,708.12,90
+RF_AirStadium=36.893328,-2.720371,1434,0
+RF_BuenaVista=37.093686,-2.890969,2390,0
+RF_Castle=37.090662,-3.074557,2736,0
+RF_Garage=37.621798,-2.646596,788,0
+Madera=36.9287648,-119.8498046,82,290
+Peg=36.7099085,-119.4076592,141,289
+SFO_Bay=37.62561973,-122.33235387,0.0,0
+Egge=60.215720,10.324071,198,303
+Gundaroo=-35.02349196,149.26496411,576.8,0
+Kaga=36.3268982,136.3316638,44,0
+UCSB=34.413963,-119.848946,0,0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       from __future__ import print_function
+
+import emitter
+
+class HTMLEmitter(emitter.Emitter):
+    def preface(self):
+        return """<!-- Dynamically generated list of Logger Messages
+This page was generated using Tools/autotest/logger_metdata/parse.py
+
+DO NOT EDIT
+-->
+
+
+<h3 style="text-align: center">Onboard Message Log Messages</h3>
+<hr />
+
+<p>This is a list of log messages which may be present in logs produced and stored onboard ArduPilot vehicles.</p>
+
+<!-- add auto-generated table of contents with "Table of Contents Plus" plugin -->
+[toc exclude="Onboard Message Log Messages"]
+
+"""
+    def postface(self):
+        return ""
+
+    def start(self):
+        self.fh = open("LogMessages.html", mode='w')
+        print(self.preface(), file=self.fh)
+
+    def emit(self, doccos, enumerations):
+        self.start()
+        for docco in doccos:
+            print('    <h1>%s</h1>' % docco.name, file=self.fh)
+            if docco.url is not None:
+                print('        <a href="%s">More information</a>' % docco.url, file=self.fh)
+            if docco.description is not None:
+                print('        <h2>%s</h2>' %
+                      docco.description, file=self.fh)
+            print('        <table>', file=self.fh)
+            print("        <tr><th>FieldName</th><th>Units/Type</th><th>Description</th><tr>",
+                  file=self.fh)
+            for f in docco.fields_order:
+                if "description" in docco.fields[f]:
+                    fdesc = docco.fields[f]["description"]
+                else:
+                    fdesc = ""
+                if "units" in docco.fields[f] and docco.fields[f]["units"]!="":
+                    ftypeunits = docco.fields[f]["units"]
+                elif "fmt" in docco.fields[f] and "char" in docco.fields[f]["fmt"]:
+                    ftypeunits = docco.fields[f]["fmt"]
+                elif "bitmaskenum" in docco.fields[f]:
+                    ftypeunits = "bitmask"
+                elif "valueenum" in docco.fields[f]:
+                    ftypeunits = "enum"
+                else:
+                    ftypeunits = ""
+                print('        <tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (f, ftypeunits, fdesc),
+                      file=self.fh)
+            print('        </table>', file=self.fh)
+
+            print("", file=self.fh)
+        self.stop()
+
+    def stop(self):
+        print(self.postface(), file=self.fh)
+        self.fh.close()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            :020000040800F2
+:1000000000040020A10200087D10000881100008F3
+:10001000D510000881100008A9100008A3020008EC
+:10002000A3020008A3020008A30200080529000893
+:10003000A3020008A3020008A3020008A30200080C
+:10004000A3020008A3020008A3020008A3020008FC
+:10005000A3020008A30200083D3E0008693E000814
+:10006000953E0008C13E0008ED3E0008A3020008CE
+:10007000A3020008A3020008A3020008A3020008CC
+:10008000A3020008A3020008A3020008A3020008BC
+:10009000A3020008A3020008A3020008193F0008F9
+:1000A000A3020008A3020008A3020008A30200089C
+:1000B000B93A0008A3020008A3020008A30200083E
+:1000C000A3020008A3020008A3020008A30200087C
+:1000D000A3020008A3020008A3020008A30200086C
+:1000E000813F0008A3020008A3020008A302000841
+:1000F000A3020008A3020008A3020008A30200084C
+:10010000A3020008A3020008A3020008A30200083B
+:10011000A3020008A3020008A3020008A30200082B
+:10012000A3020008A3020008A3020008A30200081B
+:10013000A3020008A3020008A3020008A30200080B
+:10014000A3020008A3020008A3020008A3020008FB
+:10015000A3020008A3020008A3020008A3020008EB
+:10016000A3020008A3020008A3020008A3020008DB
+:10017000A30200083D340008A3020008A3020008FF
+:10018000A3020008A302000865110008A3020008EA
+:10019000A3020008A3020008A3020008A3020008AB
+:1001A000A3020008A3020008A3020008A30200089B
+:1001B000A3020008A3020008A3020008A30200088B
+:1001C000A3020008A3020008A3020008A30200087B
+:1001D000A302000829340008A3020008A3020008B3
+:1001E000A3020008A3020008A3020008A30200085B
+:1001F000A3020008A3020008A3020008A30200084B
+:10020000A3020008A3020008A3020008A30200083A
+:10021000A3020008A3020008A3020008A30200082A
+:10022000A3020008A3020008A3020008A30200081A
+:10023000A3020008A3020008A3020008A30200080A
+:10024000A3020008A3020008A3020008A3020008FA
+:10025000A3020008A3020008A3020008A3020008EA
+:10026000A3020008A3020008A3020008A3020008DA
+:10027000A3020008A3020008A3020008A3020008CA
+:10028000A3020008A3020008A3020008A3020008BA
+:10029000A3020008A3020008A3020008A3020008AA
+:1002A00002E000F000F8FEE772B6394880F30888F3
+:1002B000384880F3098838484EF60851CEF20001DC
+:1002C000086040F20000CCF200004EF63471CEF22D
+:1002D00000010860BFF34F8FBFF36F8F40F2000043
+:1002E000C0F2F0004EF68851CEF200010860BFF374
+:1002F0004F8FBFF36F8F4FF00000E1EE100A4EF604
+:100300003C71CEF200010860062080F31488BFF330
+:100310006F8F02F035FB03F04DFB4FF055301F4956
+:100320001B4A91423CBF41F8040BFAE71C49194AA9
+:1003300091423CBF41F8040BFAE71A491A4A1B4B99
+:100340009A423EBF51F8040B42F8040BF8E7002034
+:100350001749184A91423CBF41F8040BFAE702F0F2
+:1003600053FB03F09BFB144C144DAC4203DA54F8DE
+:10037000041B8847F9E700F03FF8114C114DAC42DF
+:1003800003DA54F8041B8847F9E702F03BBB00008E
+:1003900000040020002400200000000800000020CD
+:1003A00000040020E0430008002400204424002032
+:1003B0004824002060350020A0020008A0020008A8
+:1003C000A0020008A00200082DE9F04F2DED108AD0
+:1003D000C1F80CD0D0F80CD0BDEC108ABDE8F08F7D
+:1003E000002383F311882846A047002001F0E6FE91
+:1003F00001F096FE00DFFEE738B5204C6FF00D03EC
+:10040000002523700323A57063701E23E5702571FA
+:100410006571A571E57125726572A372E57200F0D0
+:1004200047FD20B10E2325726572A372E57202F0BA
+:100430002BFA044602F060FA0546D0B9104B9C42F4
+:1004400019D001339C4241F2883412BF0546002482
+:100450000125002002F022FA0DB100F0B7F800F0FB
+:10046000B3FD00F07DFC204600F070F900F0AEF81E
+:10047000F9E70024EDE70446EBE700BF482400203D
+:10048000010007B008B500F0E9FBA0F120035842D5
+:10049000584108BD054B07B51B88022101A8ADF8DE
+:1004A000043000F047FC03B05DF804FB884000080E
+:1004B000064991F8243033B100230822086A81F8F4
+:1004C000243000F071BC0120704700BF6824002078
+:1004D0002DE9F84F234C05468846174694F82430FA
+:1004E0008BBB2E46DFF87C90002F38D094F824A0E8
+:1004F000BAF1000F05D12022FF214846266200F004
+:1005000051FDCAF10805414604EB8A00BD4228BFEF
+:100510003D465FFA85FBAD00A7EB0B072A462E444C
+:1005200000F018FD94F82430A844FFB29B445FFA11
+:100530008BFBBBF1080F84F824B0D5D1FFF7B8FFCF
+:100540000028D1D108E0266A06EB8306B042C9D064
+:10055000FFF7AEFF0028C4D10020BDE8F88F0120CE
+:10056000BDE8F88F6824002010B5202383F311889C
+:100570001248C3680BB101F0A7FE0023104A4FF4E4
+:100580007A710E4801F064FE002383F311880D4C4C
+:10059000236813B12368013B2360636813B1636868
+:1005A000013B6360084B1B7833B9636823B90220B1
+:1005B00000F0BEFC3223636010BD00BF5424002055
+:1005C00069050008982500209024002

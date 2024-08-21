@@ -1,0 +1,2737 @@
+if  // AP_RCPROTOCOL_FDM_ENABLED
+#if AP_RCPROTOCOL_RADIO_ENABLED
+    backend[AP_RCProtocol::RADIO] = NEW_NOTHROW AP_RCProtocol_Radio(*this);
+#endif
+}
+
+AP_RCProtocol::~AP_RCProtocol()
+{
+    for (uint8_t i = 0; i < ARRAY_SIZE(backend); i++) {
+        if (backend[i] != nullptr) {
+            delete backend[i];
+            backend[i] = nullptr;
+        }
+    }
+}
+
+bool AP_RCProtocol::should_search(uint32_t now_ms) const
+{
+#if AP_RCPROTOCOL_FDM_ENABLED && AP_RCPROTOCOL_UDP_ENABLED
+    // force re-detection when FDM is active and active backend is UDP values
+    if (_detected_protocol == AP_RCProtocol::UDP &&
+        ((AP_RCProtocol_FDM*)backend[AP_RCProtocol::FDM])->active()) {
+        return true;
+    }
+#endif  // AP_RCPROTOCOL_FDM_ENABLED && AP_RCPROTOCOL_UDP_ENABLED
+#if AP_RC_CHANNEL_ENABLED && !APM_BUILD_TYPE(APM_BUILD_UNKNOWN)
+    if (_detected_protocol != AP_RCProtocol::NONE && !rc().option_is_enabled(RC_Channels::Option::MULTI_RECEIVER_SUPPORT)) {
+        return false;
+    }
+#else
+    // on IOMCU don't allow protocol to change once detected
+    if (_detected_protocol != AP_RCProtocol::NONE) {
+        return false;
+    }
+#endif
+    return (now_ms - _last_input_ms >= 200);
+}
+
+void AP_RCProtocol::process_pulse(uint32_t width_s0, uint32_t width_s1)
+{
+    uint32_t now = AP_HAL::millis();
+    bool searching = should_search(now);
+
+#if AP_RC_CHANNEL_ENABLED
+    rc_protocols_mask = rc().enabled_protocols();
+#endif
+
+    if (_detected_protocol != AP_RCProtocol::NONE &&
+        !protocol_enabled(_detected_protocol)) {
+        _detected_protocol = AP_RCProtocol::NONE;
+    }
+    
+    if (_detected_protocol != AP_RCProtocol::NONE && _detected_with_bytes && !searching) {
+        // we're using byte inputs, discard pulses
+        return;
+    }
+    // first try current protocol
+    if (_detected_protocol != AP_RCProtocol::NONE && !searching) {
+        backend[_detected_protocol]->process_pulse(width_s0, width_s1);
+        if (backend[_detected_protocol]->new_input()) {
+            _new_input = true;
+            _last_input_ms = now;
+        }
+        return;
+    }
+
+    // otherwise scan all protocols
+    for (uint8_t i = 0; i < ARRAY_SIZE(backend); i++) {
+        if (_disabled_for_pulses & (1U << i)) {
+            // this protocol is disabled for pulse input
+            continue;
+        }
+        if (backend[i] != nullptr) {
+            if (!protocol_enabled(rcprotocol_t(i))) {
+                continue;
+            }
+            const uint32_t frame_count = backend[i]->get_rc_frame_count();
+            const uint32_t input_count = backend[i]->get_rc_input_count();
+            backend[i]->process_pulse(width_s0, width_s1);
+            const uint32_t frame_count2 = backend[i]->get_rc_frame_count();
+            if (frame_count2 > frame_count) {
+                if (requires_3_frames((rcprotocol_t)i) && frame_count2 < 3) {
+                    continue;
+                }
+                _new_input = (input_count != backend[i]->get_rc_input_count());
+                _detected_protocol = (enum AP_RCProtocol::rcprotocol_t)i;
+                for (uint8_t j = 0; j < ARRAY_SIZE(backend); j++) {
+                    if (backend[j]) {
+                        backend[j]->reset_rc_frame_count();
+                    }
+                }
+                _last_input_ms = now;
+                _detected_with_bytes = false;
+                break;
+            }
+        }
+    }
+}
+
+/*
+  process an array of pulses. n must be even
+ */
+void AP_RCProtocol::process_pulse_list(const uint32_t *widths, uint16_t n, bool need_swap)
+{
+    if (n & 1) {
+        return;
+    }
+    while (n) {
+        uint32_t widths0 = widths[0];
+        uint32_t widths1 = widths[1];
+        if (need_swap) {
+            uint32_t tmp = widths1;
+            widths1 = widths0;
+            widths0 = tmp;
+        }
+        widths1 -= widths0;
+        process_pulse(widths0, widths1);
+        widths += 2;
+        n -= 2;
+    }
+}
+
+bool AP_RCProtocol::process_byte(uint8_t byte, uint32_t baudrate)
+{
+    uint32_t now = AP_HAL::millis();
+    bool searching = should_search(now);
+
+#if AP_RC_CHANNEL_ENABLED
+    rc_protocols_mask = rc().enabled_protocols();
+#endif
+
+    if (_detected_protocol != AP_RCProtocol::NONE &&
+        !protocol_enabled(_detected_protocol)) {
+        _detected_protocol = AP_RCProtocol::NONE;
+    }
+
+    if (_detected_protocol != AP_RCProtocol::NONE && !_detected_with_bytes && !searching) {
+        // we're using pulse inputs, discard bytes
+        return false;
+    }
+
+    // first try current protocol
+    if (_detected_protocol != AP_RCProtocol::NONE && !searching) {
+        backend[_detected_protocol]->process_byte(byte, baudrate);
+        if (backend[_detected_protocol]->new_input()) {
+            _new_input = true;
+            _last_input_ms = now;
+        }
+        return true;
+    }
+
+    // otherwise scan all protocols
+    for (uint8_t i = 0; i < ARRAY_SIZE(backend); i++) {
+        if (backend[i] != nullptr) {
+            if (!protocol_enabled(rcprotocol_t(i))) {
+                continue;
+            }
+            const uint32_t frame_count = backend[i]->get_rc_frame_count();
+            const uint32_t input_count = backend[i]->get_rc_input_count();
+            backend[i]->process_byte(byte, baudrate);
+            const uint32_t frame_count2 = backend[i]->get_rc_frame_count();
+            if (frame_count2 > frame_count) {
+                if (requires_3_frames((rcprotocol_t)i) && frame_count2 < 3) {
+                    continue;
+                }
+                _new_input = (input_count != backend[i]->get_rc_input_count());
+                _detected_protocol = (enum AP_RCProtocol::rcprotocol_t)i;
+                _last_input_ms = now;
+                _detected_with_bytes = true;
+                for (uint8_t j = 0; j < ARRAY_SIZE(backend); j++) {
+                    if (backend[j]) {
+                        backend[j]->reset_rc_frame_count();
+                    }
+                }
+                // stop decoding pulses to save CPU
+                hal.rcin->pulse_input_enable(false);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// handshake if nothing else has succeeded so far
+void AP_RCProtocol::process_handshake( uint32_t baudrate)
+{
+    // if we ever succeeded before then do not handshake
+    if (_detected_protocol != AP_RCProtocol::NONE || _last_input_ms > 0) {
+        return;
+    }
+
+    // otherwise handshake all protocols
+    for (uint8_t i = 0; i < ARRAY_SIZE(backend); i++) {
+        if (backend[i] != nullptr) {
+            backend[i]->process_handshake(baudrate);
+        }
+    }
+}
+
+/*
+  check for bytes from an additional uart. This is used to support RC
+  protocols from SERIALn_PROTOCOL
+ */
+void AP_RCProtocol::SerialConfig::apply_to_uart(AP_HAL::UARTDriver *uart) const
+{
+    uart->configure_parity(parity);
+    uart->set_stop_bits(stop_bits);
+    if (invert_rx) {
+        uart->set_options(uart->get_options() | AP_HAL::UARTDriver::OPTION_RXINV);
+    } else {
+        uart->set_options(uart->get_options() & ~AP_HAL::UARTDriver::OPTION_RXINV);
+    }
+    uart->begin(baud, 128, 128);
+}
+
+static const AP_RCProtocol::SerialConfig serial_configs[] {
+    // BAUD PRTY STOP INVERT-RX
+    // inverted and uninverted 115200 8N1:
+    { 115200,  0,   1, false  },
+    { 115200,  0,   1, true },
+    // SBUS settings, even parity, 2 stop bits:
+    { 100000,  2,   2, true },
+#if AP_RCPROTOCOL_FASTSBUS_ENABLED
+    // FastSBUS:
+    { 200000,  2,   2, true },
+#endif
+#if AP_RCPROTOCOL_CRSF_ENABLED || AP_RCPROTOCOL_GHST_ENABLED
+    // CrossFire:
+    { 416666,  0,   1, false },
+    // CRSFv3 can negotiate higher rates which are sticky on soft reboot
+    { 2000000, 0,   1, false },
+#endif
+};
+
+static_assert(ARRAY_SIZE(serial_configs) > 1, "must have at least one serial config");
+
+void AP_RCProtocol::check_added_uart(void)
+{
+    if (!added.uart) {
+        return;
+    }
+    uint32_t now = AP_HAL::millis();
+    bool searching = should_search(now);
+    if (!searching && !_detected_with_bytes) {
+        // not using this uart
+        return;
+    }
+    if (!added.opened) {
+        added.opened = true;
+        added.last_config_change_ms = AP_HAL::millis();
+        serial_configs[added.config_num].apply_to_uart(added.uart);
+    }
+#if AP_RC_CHANNEL_ENABLED
+    rc_protocols_mask = rc().enabled_protocols();
+#endif
+    const uint32_t current_baud = serial_configs[added.config_num].baud;
+    process_handshake(current_baud);
+
+    uint32_t n = added.uart->available();
+    n = MIN(n, 255U);
+    for (uint8_t i=0; i<n; i++) {
+        int16_t b = added.uart->read();
+        if (b >= 0) {
+            process_byte(uint8_t(b), current_baud);
+        }
+    }
+    if (searching) {
+        if (now - added.last_config_change_ms > 1000) {
+            // change configs if not detected once a second
+            added.config_num++;
+            if (added.config_num >= ARRAY_SIZE(serial_configs)) {
+                added.config_num = 0;
+            }
+            added.opened = false;
+        }
+    // power loss on CRSF requires re-bootstrap because the baudrate is reset to the default. The CRSF side will
+    // drop back down to 416k if it has received 200 incorrect characters (or none at all)
+    } else if (_detected_protocol != AP_RCProtocol::NONE
+        // protocols that want to be able to renegotiate should return false in is_rx_active()
+        && !backend[_detected_protocol]->is_rx_active()
+        && now - added.last_config_change_ms > 1000) {
+        added.opened = false;
+    }
+}
+
+void AP_RCProtocol::update()
+{
+    check_added_uart();
+}
+
+// explicitly investigate a backend for data, as opposed to feeding
+// the backend a byte (or pulse-train) at a time and having them make
+// an "add_input" callback):
+bool AP_RCProtocol::detect_async_protocol(rcprotocol_t protocol)
+{
+    auto *p = backend[protocol];
+    if (p == nullptr) {
+        // backend is not allocated?!
+        return false;
+    }
+
+    if (_detected_protocol == protocol) {
+        // we are using this protocol already, see if there is new
+        // data.  Caller will handle the case where we stop presenting
+        // data
+        return p->new_input();
+    }
+
+    // we are not the currently in-use protocol.
+    const uint32_t now = AP_HAL::millis();
+
+    // see if another backend is providing data:
+    if (!should_search(now)) {
+        // apparently, yes
+        return false;
+    }
+
+#if AP_RC_CHANNEL_ENABLED
+    rc_protocols_mask = rc().enabled_protocols();
+#endif
+
+    if (!protocol_enabled(protocol)) {
+        return false;
+    }
+
+    // nobody is providing data; can we provide data?
+    if (!p->new_input()) {
+        // we can't provide data
+        return false;
+    }
+
+    // we can provide data, change the detected protocol to be us:
+    _detected_protocol = protocol;
+    return true;
+}
+
+bool AP_RCProtocol::new_input()
+{
+    // if we have an extra UART from a SERIALn_PROTOCOL then check it for data
+    check_added_uart();
+
+    // run update function on backends
+    for (uint8_t i = 0; i < ARRAY_SIZE(backend); i++) {
+        if (backend[i] != nullptr) {
+            backend[i]->update();
+        }
+    }
+
+    // iterate through backends which don't do either of pulse or uart
+    // input, and thus won't update_new_input
+    const rcprotocol_t pollable[] {
+#if AP_RCPROTOCOL_DRONECAN_ENABLED
+        AP_RCProtocol::DRONECAN,
+#endif
+#if AP_RCPROTOCOL_MAVLINK_RADIO_ENABLED
+        AP_RCProtocol::MAVLINK_RADIO,
+#endif
+#if AP_RCPROTOCOL_JOYSTICK_SFML_ENABLED
+        AP_RCProtocol::JOYSTICK_SFML,
+#endif
+#if AP_RCPROTOCOL_UDP_ENABLED
+        AP_RCProtocol::UDP,
+#endif
+#if AP_RCPROTOCOL_FDM_ENABLED
+        AP_RCProtocol::FDM,
+#endif
+#if AP_RCPROTOCOL_RADIO_ENABLED
+        AP_RCProtocol::RADIO,
+#endif
+    };
+    for (const auto protocol : pollable) {
+        if (!detect_async_protocol(protocol)) {
+            continue;
+        }
+        _new_input = true;
+        _last_input_ms = AP_HAL::millis();
+        break;
+    }
+
+    bool ret = _new_input;
+    _new_input = false;
+    return ret;
+}
+
+uint8_t AP_RCProtocol::num_channels()
+{
+    if (_detected_protocol != AP_RCProtocol::NONE) {
+        return backend[_detected_protocol]->num_channels();
+    }
+    return 0;
+}
+
+uint16_t AP_RCProtocol::read(uint8_t chan)
+{
+    if (_detected_protocol != AP_RCProtocol::NONE) {
+        return backenSM_MAX_CHANNELS)) {
+        memcpy(last_values, v, sizeof(v));
+        if (nchan >= MIN_RCIN_CHANNELS) {
+            add_input(nchan, last_values, false);
+        }
+    }
+}
+
+// support byte input
+void AP_RCProtocol_DSM::process_byte(uint8_t b, uint32_t baudrate)
+{
+    if (baudrate != 115200) {
+        return;
+    }
+    _process_byte(AP_HAL::millis(), b);
+}
+
+#endif  // AP_RCPROTOCOL_DSM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_DSM_ENABLED
+
+#include "AP_RCProtocol_Backend.h"
+
+#include "SoftSerial.h"
+
+#define AP_DSM_MAX_CHANNELS 12
+
+class AP_RCProtocol_DSM : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_DSM(AP_RCProtocol &_frontend) : AP_RCProtocol_Backend(_frontend) {}
+    void process_pulse(uint32_t width_s0, uint32_t width_s1) override;
+    void process_byte(uint8_t byte, uint32_t baudrate) override;
+    void start_bind(void) override;
+    void update(void) override;
+
+private:
+    void _process_byte(uint32_t timestamp_ms, uint8_t byte);
+    void dsm_decode();
+    bool dsm_decode_channel(uint16_t raw, unsigned shift, unsigned *channel, unsigned *value);
+    void dsm_guess_format(bool reset, const uint8_t dsm_frame[16], unsigned frame_channels);
+    bool dsm_parse_byte(uint32_t frame_time_ms, uint8_t b, uint16_t *values,
+                        uint16_t *num_values, uint16_t max_channels);
+    bool dsm_decode(uint32_t frame_time_ms, const uint8_t dsm_frame[16],
+                    uint16_t *values, uint16_t *num_values, uint16_t max_values);
+
+    /**< Channel resolution, 0=unknown, 10=10 bit, 11=11 bit */
+    uint8_t channel_shift;
+
+    // format guessing state
+    uint32_t	cs10;
+    uint32_t	cs11;
+    uint32_t samples;
+
+    // bind state machine
+    enum {
+        BIND_STATE_NONE,
+        BIND_STATE1,
+        BIND_STATE2,
+        BIND_STATE3,
+        BIND_STATE4,
+    } bind_state;
+    uint32_t bind_last_ms;
+    uint32_t bind_mode_saved;
+
+    uint16_t last_values[AP_DSM_MAX_CHANNELS];
+
+    struct {
+        uint8_t buf[16];
+        uint8_t ofs;
+    } byte_input;
+
+    enum DSM_DECODE_STATE {
+        DSM_DECODE_STATE_DESYNC = 0,
+        DSM_DECODE_STATE_SYNC
+    } dsm_decode_state;
+
+    uint32_t last_frame_time_ms;
+    uint32_t last_rx_time_ms;
+    uint16_t chan_count;
+
+    SoftSerial ss{115200, SoftSerial::SERIAL_CONFIG_8N1};
+};
+
+#endif  // AP_RCPROTOCOL_DSM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_DRONECAN_ENABLED
+
+#include <AP_CANManager/AP_CANManager.h>
+#include <AP_DroneCAN/AP_DroneCAN.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+#include "AP_RCProtocol_DroneCAN.h"
+
+extern const AP_HAL::HAL& hal;
+
+#define LOG_TAG "RCInput"
+
+AP_RCProtocol_DroneCAN::Registry AP_RCProtocol_DroneCAN::registry;
+AP_RCProtocol_DroneCAN *AP_RCProtocol_DroneCAN::_singleton;
+
+void AP_RCProtocol_DroneCAN::subscribe_msgs(AP_DroneCAN* ap_dronecan)
+{
+    if (ap_dronecan == nullptr) {
+        return;
+    }
+
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_rcinput, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("rc_sub");
+    }
+}
+
+AP_RCProtocol_DroneCAN* AP_RCProtocol_DroneCAN::get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id)
+{
+    if (_singleton == nullptr) {
+        return nullptr;
+    }
+
+    if (ap_dronecan == nullptr) {
+        return nullptr;
+    }
+
+    for (auto &device : registry.detected_devices) {
+        if (device.driver == nullptr) {
+            continue;
+        }
+        if (device.ap_dronecan != ap_dronecan) {
+            continue;
+        }
+        if (device.node_id != node_id ) {
+            continue;
+        }
+        return device.driver;
+    }
+
+    // not found in registry; add it if possible.
+    for (auto &device : registry.detected_devices) {
+        if (device.ap_dronecan == nullptr) {
+            device.ap_dronecan = ap_dronecan;
+            device.node_id = node_id;
+            device.driver = _singleton;
+            return device.driver;
+        }
+    }
+
+    return nullptr;
+}
+
+void AP_RCProtocol_DroneCAN::handle_rcinput(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const dronecan_sensors_rc_RCInput &msg)
+{
+    AP_RCProtocol_DroneCAN* driver = get_dronecan_backend(ap_dronecan, transfer.source_node_id);
+    if (driver == nullptr) {
+        return;
+    }
+
+    auto &rcin = driver->rcin;
+    WITH_SEMAPHORE(rcin.sem);
+    rcin.quality = msg.quality;
+    rcin.status = msg.status;
+    rcin.num_channels = MIN(msg.rcin.len, ARRAY_SIZE(rcin.channels));
+    for (auto i=0; i<rcin.num_channels; i++) {
+        rcin.channels[i] = msg.rcin.data[i];
+    }
+
+    rcin.last_sample_time_ms = AP_HAL::millis();
+}
+
+void AP_RCProtocol_DroneCAN::update()
+{
+    {
+        WITH_SEMAPHORE(rcin.sem);
+        if (rcin.last_sample_time_ms == last_receive_ms) {
+            // no new data
+            return;
+        }
+        last_receive_ms = rcin.last_sample_time_ms;
+
+        add_input(
+            rcin.num_channels,
+            rcin.channels,
+            rcin.bits.FAILSAFE,
+            rcin.bits.QUALITY_VALID ? rcin.quality : 0,  // CHECK ME
+            0  // link quality
+            );
+    }
+}
+
+#endif // AP_RCPROTOCOL_DRONECAN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_DRONECAN_ENABLED
+
+#include "AP_RCProtocol_Backend.h"
+
+#include <AP_DroneCAN/AP_DroneCAN.h>
+
+#include <AP_Common/missing/endian.h>
+
+class AP_RCProtocol_DroneCAN : public AP_RCProtocol_Backend {
+public:
+
+    AP_RCProtocol_DroneCAN(AP_RCProtocol &_frontend) :
+        AP_RCProtocol_Backend(_frontend) {
+        _singleton = this;
+    }
+
+    static void subscribe_msgs(AP_DroneCAN* ap_dronecan);
+
+    void update() override;
+
+private:
+
+    static class AP_RCProtocol_DroneCAN *_singleton;
+
+    static void handle_rcinput(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const dronecan_sensors_rc_RCInput &msg);
+
+    static AP_RCProtocol_DroneCAN* get_dronecan_backend(AP_DroneCAN* ap_dronecan, uint8_t node_id);
+
+    struct {
+        uint8_t quality;
+        union {
+            uint16_t status;
+            struct {
+                uint8_t QUALITY_VALID : 1;
+                uint8_t FAILSAFE : 1;
+            } bits;
+        };
+        uint8_t num_channels;
+        uint16_t channels[MAX_RCIN_CHANNELS];
+
+        uint32_t last_sample_time_ms;
+        HAL_Semaphore sem;
+    } rcin;
+
+    // Module Detection Registry
+    static struct Registry {
+        struct DetectedDevice {
+            AP_DroneCAN* ap_dronecan;
+            uint8_t node_id;
+            AP_RCProtocol_DroneCAN *driver;
+        } detected_devices[1];
+        HAL_Semaphore sem;
+    } registry;
+
+    uint32_t last_receive_ms;
+};
+
+
+#endif  // AP_RCPROTOCOL_DRONECAN_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_FDM_ENABLED
+
+#include "AP_RCProtocol_FDM.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <SITL/SITL.h>
+
+extern const AP_HAL::HAL& hal;
+
+void AP_RCProtocol_FDM::update()
+{
+    const auto sitl = AP::sitl();
+    if (sitl == nullptr) {
+        return;
+    }
+
+    const auto &fdm = sitl->state;
+
+    // see if there's fresh input.  Until timestamps are worked out,
+    // just check for non-zero values:
+    if (fdm.rcin_chan_count == 0) {
+        return;
+    }
+
+    // simulate RC input at 50Hz
+    if (AP_HAL::millis() - last_input_ms < 20) {
+        return;
+    }
+
+    last_input_ms = AP_HAL::millis();
+
+    // scale from FDM 0-1 floats to PWM values
+    // these are the values that will be fed into the autopilot.
+    uint16_t pwm_input[16];
+    const uint8_t count = MIN(ARRAY_SIZE(pwm_input), fdm.rcin_chan_count);
+    for (uint8_t i=0; i<count; i++) {
+        pwm_input[i] = 1000 + fdm.rcin[i] * 1000;
+    }
+    add_input(
+        count,
+        pwm_input,
+        false,  // failsafe
+        0, // check me
+        0  // link quality
+        );
+}
+
+#endif // AP_RCPROTOCOL_FDM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_FDM_ENABLED
+
+#include "AP_RCProtocol_Backend.h"
+
+class AP_RCProtocol_FDM : public AP_RCProtocol_Backend {
+public:
+
+    using AP_RCProtocol_Backend::AP_RCProtocol_Backend;
+
+    void update() override;
+
+    bool active() const { return last_input_ms > 0; }
+
+private:
+
+    uint32_t last_input_ms;
+};
+
+
+#endif  // AP_RCPROTOCOL_FDM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  FRSky FPort implementation, with thanks to BetaFlight for
+  specification and code reference
+ */
+
+#include "AP_RCProtocol_FPort.h"
+
+#if AP_RCPROTOCOL_FPORT_ENABLED
+
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_Frsky_Telem/AP_Frsky_Telem.h>
+#include <RC_Channel/RC_Channel.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define FRAME_HEAD 0x7E
+#define FRAME_DLE  0x7D
+#define FRAME_XOR  0x20
+#define FRAME_LEN_CONTROL 0x19
+#define FRAME_LEN_DOWNLINK 0x08
+#define MIN_FRAME_SIZE 12
+#define MAX_CHANNELS 16
+
+#define FLAGS_FAILSAFE_BIT	3
+#define FLAGS_FRAMELOST_BIT	2
+
+#define CHAN_SCALE_FACTOR1 1000U
+#define CHAN_SCALE_FACTOR2 1600U
+#define CHAN_SCALE_OFFSET 875U
+
+#define FPORT_TYPE_CONTROL 0
+#define FPORT_TYPE_DOWNLINK 1
+#define FPORT_PRIM_NULL 0x00
+#define FPORT_PRIM_DATA 0x10
+#define FPORT_PRIM_READ 0x30
+#define FPORT_PRIM_WRITE 0x31
+
+#define MAX_FPORT_CONSECUTIVE_FRAMES 2
+
+struct PACKED FPort_Frame {
+    uint8_t header; // 0x7E
+    uint8_t len;    // 0x19 for control, 0x08 for downlink
+    uint8_t type;
+    union {
+        struct PACKED {
+            uint8_t data[22]; // 16 11-bit channels
+            uint8_t flags;
+            uint8_t rssi;
+            uint8_t crc;
+            uint8_t end;
+        } control;
+        struct PACKED {
+            uint8_t prim;
+            uint16_t appid;
+            uint8_t data[4];
+            uint8_t crc;
+            uint8_t end;
+        } downlink;
+    };
+};
+
+static_assert(sizeof(FPort_Frame) == FPORT_CONTROL_FRAME_SIZE, "FPort_Frame incorrect size");
+
+// constructor
+AP_RCProtocol_FPort::AP_RCProtocol_FPort(AP_RCProtocol &_frontend, bool _inverted) :
+    AP_RCProtocol_Backend(_frontend),
+    inverted(_inverted)
+{}
+
+// decode a full FPort control frame
+void AP_RCProtocol_FPort::decode_control(const FPort_Frame &frame)
+{
+    uint16_t values[MAX_CHANNELS];
+
+    decode_11bit_channels(frame.control.data, MAX_CHANNELS, values, CHAN_SCALE_FACTOR1, CHAN_SCALE_FACTOR2, CHAN_SCALE_OFFSET);
+
+    bool failsafe = ((frame.control.flags & (1 << FLAGS_FAILSAFE_BIT)) != 0);
+
+    // fport rssi 0-50, ardupilot rssi 0-255, scale factor 255/50=5.1
+    const uint8_t scaled_rssi = MIN(frame.control.rssi * 5.1f, 255);
+
+    add_input(MAX_CHANNELS, values, failsafe, scaled_rssi);
+}
+
+/*
+  decode a full FPort downlink frame
+*/
+void AP_RCProtocol_FPort::decode_downlink(const FPort_Frame &frame)
+{
+#if !APM_BUILD_TYPE(APM_BUILD_iofirmware) && AP_FRSKY_SPORT_TELEM_ENABLED
+    switch (frame.downlink.prim) {
+        case FPORT_PRIM_DATA:
+            // we've seen at least one 0x10 frame
+            rx_driven_frame_rate = true;
+            break;
+        case FPORT_PRIM_NULL:
+            if (rx_driven_frame_rate) {
+                return;
+            }
+            // with 0x00 and no rx control we have a constraint
+            // on max consecutive frames
+            if (consecutive_telemetry_frame_count >= MAX_FPORT_CONSECUTIVE_FRAMES) {
+                consecutive_telemetry_frame_count = 0;
+                return;
+            } else {
+                consecutive_telemetry_frame_count++;
+            }
+            break;
+        case FPORT_PRIM_READ:
+        case FPORT_PRIM_WRITE:
+#if HAL_WITH_FRSKY_TELEM_BIDIRECTIONAL        
+            AP_Frsky_Telem::set_telem_data(frame.downlink.prim, frame.downlink.appid, le32toh_ptr(frame.downlink.data));
+#endif //HAL_WITH_FRSKY_TELEM_BIDIRECTIONAL            
+            // do not respond to 0x30 and 0x31
+            return;
+    }
+
+    /*
+      if we are getting FPORT over a UART then we can ask the FrSky
+      telem library for some passthrough data to send back, enabling
+      telemetry on the receiver via the same uart pin as we use for
+      incoming RC frames
+     */
+
+    AP_HAL::UARTDriver *uart = get_UART();
+    if (!uart) {
+        return;
+    }
+
+    /*
+      get SPort data from FRSky_Telem or send a null frame.
+      We save the data to a variable so in case we're late we'll
+      send it in the next call, this prevents corruption of
+      status text messages
+     */
+    if (!telem_data.available) {
+        uint8_t packet_count;
+        if (!AP_Frsky_Telem::get_telem_data(&telem_data.packet, packet_count, 1)) {
+            // nothing to send, send a null frame
+            telem_data.packet.frame = 0x00;
+            telem_data.packet.appid = 0x00;
+            telem_data.packet.data = 0x00;
+        }
+        telem_data.available = true;
+    }
+    /*
+      check that we haven't been too slow in responding to the new
+      UART data. If we respond too late then we will corrupt the next
+      incoming control frame
+     */
+    uint64_t tend = uart->receive_time_constraint_us(1);
+    uint64_t now = AP_HAL::micros64();
+    uint64_t tdelay = now - tend;
+    if (tdelay > 2500) {
+        // we've been too slow in responding
+        return;
+    }
+    uint8_t buf[10];
+
+    buf[0] = 0x08;
+    buf[1] = 0x81;
+    buf[2] = telem_data.packet.frame;
+    buf[3] = telem_data.packet.appid & 0xFF;
+    buf[4] = telem_data.packet.appid >> 8;
+    memcpy(&buf[5], &telem_data.packet.data, 4);
+    buf[9] = crc_sum8_with_carry(&buf[0], 9);
+
+    // perform byte stuffing per FPort spec
+    uint8_t len = 0;
+    uint8_t buf2[sizeof(buf)*2+1];
+
+    if (rc().option_is_enabled(RC_Channels::Option::FPORT_PAD)) {
+        // this padding helps on some uarts that have hw pullups
+        buf2[len++] = 0xff;
+    }
+
+    for (uint8_t i=0; i<sizeof(buf); i++) {
+        uint8_t c = buf[i];
+        if (c == FRAME_DLE || buf[i] == FRAME_HEAD) {
+            buf2[len++] = FRAME_DLE;
+            buf2[len++] = c ^ FRAME_XOR;
+        } else {
+            buf2[len++] = c;
+        }
+    }
+    uart->write(buf2, len);
+    // get fresh telem_data in the next call
+    telem_data.available = false;
+#endif
+}
+
+/*
+  process a FPort input pulse of the given width
+ */
+void AP_RCProtocol_FPort::process_pulse(uint32_t width_s0, uint32_t width_s1)
+{
+    if (have_UART()) {
+        // if we can use a UART we would much prefer to, as it allows
+        // us to send SPORT data out
+        return;
+    }
+    uint32_t w0 = width_s0;
+    uint32_t w1 = width_s1;
+    if (inverted) {
+        w0 = saved_width;
+        w1 = width_s0;
+        saved_width = width_s1;
+    }
+    uint8_t b;
+    if (ss.process_pulse(w0, w1, b)) {
+        _process_byte(ss.get_byte_timestamp_us(), b);
+    }
+}
+
+// support byte input
+void AP_RCProtocol_FPort::_process_byte(uint32_t timestamp_us, uint8_t b)
+{
+    const bool have_frame_gap = (timestamp_us - byte_input.last_byte_us >= 2000U);
+
+    byte_input.last_byte_us = timestamp_us;
+
+    if (have_frame_gap) {
+        // if we have a frame gap then this must be the start of a new
+        // frame
+        byte_input.ofs = 0;
+        byte_input.got_DLE = false;
+    }
+    if (b != FRAME_HEAD && byte_input.ofs == 0) {
+        // definately not FPort, missing header byte
+        return;
+    }
+
+    // handle byte-stuffing decode
+    if (byte_input.got_DLE) {
+        b ^= FRAME_XOR;
+        byte_input.got_DLE = false;
+    } else if (b == FRAME_DLE) {
+        byte_input.got_DLE = true;
+        return;
+    }
+
+    byte_input.buf[byte_input.ofs++] = b;
+
+    const FPort_Frame *frame = (const FPort_Frame *)&byte_input.buf[0];
+
+    if (byte_input.ofs == 2) {
+        // check for valid lengths
+        if (frame->len != FRAME_LEN_CONTROL &&
+            frame->len != FRAME_LEN_DOWNLINK) {
+            // invalid, reset
+            goto reset;
+        }
+    }
+
+    if (byte_input.ofs == 3) {
+        // check for valid lengths
+        if ((frame->type == FPORT_TYPE_CONTROL && frame->len != FRAME_LEN_CONTROL) ||
+            (frame->type == FPORT_TYPE_DOWNLINK && frame->len != FRAME_LEN_DOWNLINK)) {
+            goto reset;
+        }
+        if (frame->type != FPORT_TYPE_CONTROL && frame->type != FPORT_TYPE_DOWNLINK) {
+            // invalid type
+            goto reset;
+        }
+    }
+
+    if (frame->type == FPORT_TYPE_CONTROL && byte_input.ofs == FRAME_LEN_CONTROL + 4) {
+        log_data(AP_RCProtocol::FPORT, timestamp_us, byte_input.buf, byte_input.ofs);
+        if (check_checksum()) {
+            decode_control(*frame);
+        }
+        goto reset;
+    } else if (frame->type == FPORT_TYPE_DOWNLINK && byte_input.ofs == FRAME_LEN_DOWNLINK + 4) {
+        log_data(AP_RCProtocol::FPORT, timestamp_us, byte_input.buf, byte_input.ofs);
+        if (check_checksum()) {
+            decode_downlink(*frame);
+        }
+        goto reset;
+    }
+    if (byte_input.ofs == sizeof(byte_input.buf)) {
+        goto reset;
+    }
+    return;
+
+reset:
+    byte_input.ofs = 0;
+    byte_input.got_DLE = false;
+}
+
+// check checksum byte
+bool AP_RCProtocol_FPort::check_checksum(void)
+{
+    const uint8_t len = byte_input.buf[1]+2;
+    return crc_sum8_with_carry(&byte_input.buf[1], len) == 0x00;
+}
+
+// support byte input
+void AP_RCProtocol_FPort::process_byte(uint8_t b, uint32_t baudrate)
+{
+    if (baudrate != 115200) {
+        return;
+    }
+    _process_byte(AP_HAL::micros(), b);
+}
+
+#endif  // AP_RCPROTOCOL_FPORT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_FPORT_ENABLED
+
+#include "AP_RCProtocol.h"
+#include "SoftSerial.h"
+#include <AP_Frsky_Telem/AP_Frsky_SPort.h>
+
+#define FPORT_CONTROL_FRAME_SIZE 29
+
+struct FPort_Frame;
+
+class AP_RCProtocol_FPort : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_FPort(AP_RCProtocol &_frontend, bool inverted);
+    void process_pulse(uint32_t width_s0, uint32_t width_s1) override;
+    void process_byte(uint8_t byte, uint32_t baudrate) override;
+
+private:
+    void decode_control(const FPort_Frame &frame);
+    void decode_downlink(const FPort_Frame &frame);
+    bool check_checksum(void);
+
+    void _process_byte(uint32_t timestamp_us, uint8_t byte);
+    SoftSerial ss{115200, SoftSerial::SERIAL_CONFIG_8N1};
+    uint32_t saved_width;
+
+    struct {
+        uint8_t buf[FPORT_CONTROL_FRAME_SIZE];
+        uint8_t ofs;
+        uint32_t last_byte_us;
+        bool got_DLE;
+    } byte_input;
+
+    const bool inverted;
+
+#if AP_FRSKY_SPORT_TELEM_ENABLED
+    struct {
+        bool available = false;
+        AP_Frsky_SPort::sport_packet_t packet;
+    } telem_data;
+#endif // AP_FRSKY_SPORT_TELEM_ENABLED
+
+    // receiver sends 0x10 when ready to receive telemetry frames (R-XSR)
+    bool rx_driven_frame_rate = false;
+
+    // if the receiver is not controlling frame rate apply a constraint on consecutive frames
+    uint8_t consecutive_telemetry_frame_count;
+};
+
+#endif  // AP_RCPROTOCOL_FPORT_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  FRSky FPort2 implementation, with thanks to FrSky for
+  specification
+ */
+
+#include "AP_RCProtocol_FPort2.h"
+
+#if AP_RCPROTOCOL_FPORT2_ENABLED
+
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_Frsky_Telem/AP_Frsky_Telem.h>
+#include <RC_Channel/RC_Channel.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+#include <stdio.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define FRAME_LEN_16 0x18
+#define FRAME_LEN_8  0x0D
+#define FRAME_LEN_24 0x23
+#define FRAME_LEN_DOWNLINK 0x08
+
+#define FRAME_TYPE_CHANNEL 0xFF
+#define FRAME_TYPE_FC 0x1B
+
+#define MAX_CHANNELS 24
+
+#define FLAGS_FAILSAFE_BIT	3
+#define FLAGS_FRAMELOST_BIT	2
+
+#define CHAN_SCALE_FACTOR1 1000U
+#define CHAN_SCALE_FACTOR2 1600U
+#define CHAN_SCALE_OFFSET 875U
+
+#define FPORT2_PRIM_NULL 0x00
+#define FPORT2_PRIM_READ 0x30
+#define FPORT2_PRIM_WRITE 0x31
+
+struct PACKED FPort2_Frame {
+    uint8_t len;
+    uint8_t type;
+    union {
+        uint8_t data[36];
+        struct PACKED {
+            uint8_t prim;
+            uint16_t appid;
+            uint8_t data[4];
+            uint8_t crc;
+        } downlink;
+    };
+};
+
+static_assert(sizeof(FPort2_Frame) == FPORT2_CONTROL_FRAME_SIZE, "FPort2_Frame incorrect size");
+
+// constructor
+AP_RCProtocol_FPort2::AP_RCProtocol_FPort2(AP_RCProtocol &_frontend, bool _inverted) :
+    AP_RCProtocol_Backend(_frontend),
+    inverted(_inverted)
+{}
+
+// decode a full FPort2 control frame
+void AP_RCProtocol_FPort2::decode_control(const FPort2_Frame &frame)
+{
+    uint16_t values[MAX_CHANNELS];
+
+    decode_11bit_channels(frame.data, chan_count, values, CHAN_SCALE_FACTOR1, CHAN_SCALE_FACTOR2, CHAN_SCALE_OFFSET);
+
+    const uint8_t b_flags = frame.data[byte_input.control_len-5];
+    const uint8_t b_rssi = frame.data[byte_input.control_len-4];
+
+    bool failsafe = ((b_flags & (1 << FLAGS_FAILSAFE_BIT)) != 0);
+
+    // fport2 rssi 0-50, ardupilot rssi 0-255, scale factor 255/50=5.1
+    const uint8_t scaled_rssi = MIN(b_rssi * 5.1f, 255);
+
+    add_input(chan_count, values, failsafe, scaled_rssi);
+}
+
+/*
+  decode a full FPort2 downlink frame
+*/
+void AP_RCProtocol_FPort2::decode_downlink(const FPort2_Frame &frame)
+{
+#if !APM_BUILD_TYPE(APM_BUILD_iofirmware)
+    /*
+      if we are getting FPORT2 over a UART then we can ask the FrSky
+      telem library for some passthrough data to send back, enabling
+      telemetry on the receiver via the same uart pin as we use for
+      incoming RC frames
+     */
+
+    AP_HAL::UARTDriver *uart = get_UART();
+    if (!uart) {
+        return;
+    }
+
+    // no telemetry for 24ch fport2, timing is too tight
+    if (chan_count > 16) {
+        return;
+    }
+
+#if HAL_WITH_FRSKY_TELEM_BIDIRECTIONAL
+    // 0x30,0x31 read/write frames
+    // allowed reply prim: 0x00,0x32
+    if (frame.downlink.prim == FPORT2_PRIM_READ || frame.downlink.prim == FPORT2_PRIM_WRITE) {
+        AP_Frsky_Telem::set_telem_data(frame.downlink.prim, frame.downlink.appid, le32toh_ptr(frame.downlink.data));
+    }
+#endif //HAL_WITH_FRSKY_TELEM_BIDIRECTIONAL
+
+    /*
+     we're only interested in "flight controller" requests i.e. 0x1B
+     Notes:
+     need to check how to handle multiple sensor IDs (we probably should respond to 0x1E as well)
+     with fport2 we need to account for the IDs we send sensor data from
+     if we respond to multiple sensors like we do for sport we need to make sure GPS data
+     is always sent with the same sensor ID or else OpenTX will see multiple sensor instances (one for each sensor we respond to)
+     (need to double check on OpenTX if fport2 carries sensor IDs up to the OpenTX sensor tables)
+    */
+    if (frame.type != FRAME_TYPE_FC) {
+        /*
+         get SPort data from FRSky_Telem
+         when we are not polled for data we prepare telemetry data for the next poll
+         we save the data to a variable so in case we're late we'll
+         send it in the next call, this prevents corruption of status text messages
+        */
+        if (!telem_data.available) {
+            uint8_t packet_count;
+            if (!AP_Frsky_Telem::get_telem_data(&telem_data.packet, packet_count, 1)) {
+                telem_data.packet.frame = 0x00;
+                telem_data.packet.appid = 0x00;
+                telem_data.packet.data = 0x00;
+            }
+            telem_data.available = true;
+        }
+        return;
+    }
+
+    /*
+      check that we haven't been too slow in responding to the new
+      UART data. If we respond too late then we will corrupt the next
+      incoming control frame.
+      16ch fport2: 4.5ms window before next control frame
+      specs require to release the bus at least 1.5ms before next control frame (uplink frame takes 0.851ms)
+     */
+    uint64_t tend = uart->receive_time_constraint_us(1);
+    uint64_t now = AP_HAL::micros64();
+    uint64_t tdelay = now - tend;
+    if (tdelay > 2500) {
+        // we've been too slow in responding
+        return;
+    }
+
+    // we initialize to a default null frame
+    uint8_t buf[10] {};
+
+    buf[0] = 0x08;
+    buf[1] = frame.type;
+    // do not consume telemetry data for invalid downlink frames, i.e. incoming prim == 0x00
+    if (frame.downlink.prim != FPORT2_PRIM_NULL) {
+        buf[2] = telem_data.packet.frame;
+        buf[3] = telem_data.packet.appid & 0xFF;
+        buf[4] = telem_data.packet.appid >> 8;
+        memcpy(&buf[5], &telem_data.packet.data, 4);
+        // get fresh telem_data in the next call
+        telem_data.available = false;
+    }
+    buf[9] = crc_sum8_with_carry(&buf[1], 8);
+    
+    uart->write(buf, sizeof(buf));
+#endif
+}
+
+/*
+  process a FPort2 input pulse of the given width
+ */
+void AP_RCProtocol_FPort2::process_pulse(uint32_t width_s0, uint32_t width_s1)
+{
+    if (have_UART()) {
+        // if we can use a UART we would much prefer to, as it allows
+        // us to send SPORT data out
+        return;
+    }
+    uint32_t w0 = width_s0;
+    uint32_t w1 = width_s1;
+    if (inverted) {
+        w0 = saved_width;
+        w1 = width_s0;
+        saved_width = width_s1;
+    }
+    uint8_t b;
+    if (ss.process_pulse(w0, w1, b)) {
+        _process_byte(ss.get_byte_timestamp_us(), b);
+    }
+}
+
+// support byte input
+void AP_RCProtocol_FPort2::_process_byte(uint32_t timestamp_us, uint8_t b)
+{
+    const bool have_frame_gap = (timestamp_us - byte_input.last_byte_us >= 2000U);
+
+    byte_input.last_byte_us = timestamp_us;
+
+    if (have_frame_gap) {
+        // if we have a frame gap then this must be the start of a new
+        // frame
+        byte_input.ofs = 0;
+    }
+
+    if (byte_input.ofs == 0) {
+        switch (b) {
+        case FRAME_LEN_8:
+            byte_input.control_len = 16;
+            chan_count = 8;
+            byte_input.is_downlink = false;
+            break;
+        case FRAME_LEN_16:
+            byte_input.control_len = 27;
+            chan_count = 16;
+            byte_input.is_downlink = false;
+            break;
+        case FRAME_LEN_24:
+            byte_input.control_len = 38;
+            chan_count = 24;
+            byte_input.is_downlink = false;
+            break;
+        case FRAME_LEN_DOWNLINK:
+            byte_input.control_len = 10;
+            byte_input.is_downlink = true;
+            break;
+        default:
+            // definately not FPort2, missing header byte
+            return;
+        }
+    }
+
+    if (byte_input.ofs == 1) {
+        if (!byte_input.is_downlink && b != FRAME_TYPE_CHANNEL) {
+            // not channel data
+            byte_input.ofs = 0;
+            return;
+        }
+    }
+
+    byte_input.buf[byte_input.ofs++] = b;
+
+    const FPort2_Frame *frame = (const FPort2_Frame *)&byte_input.buf[0];
+
+    if (byte_input.control_len > 2 && byte_input.ofs == byte_input.control_len) {
+        if (!byte_input.is_downlink) {
+            log_data(AP_RCProtocol::FPORT2, timestamp_us, byte_input.buf, byte_input.ofs);
+            if (check_checksum()) {
+                decode_control(*frame);
+            }
+        } else {
+            // downlink packet
+            if (check_checksum()) {
+                decode_downlink(*frame);
+            }
+        }
+        goto reset;
+    }
+    if (byte_input.ofs >= sizeof(byte_input.buf)) {
+        goto reset;
+    }
+    return;
+
+reset:
+    byte_input.ofs = 0;
+}
+
+// check checksum byte
+bool AP_RCProtocol_FPort2::check_checksum(void)
+{
+    return crc_sum8_with_carry(&byte_input.buf[1], byte_input.control_len-1) == 0;
+}
+
+// support byte input
+void AP_RCProtocol_FPort2::process_byte(uint8_t b, uint32_t baudrate)
+{
+    if (baudrate != 115200) {
+        return;
+    }
+    _process_byte(AP_HAL::micros(), b);
+}
+
+#endif  // AP_RCPROTOCOL_FPORT2_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_FPORT2_ENABLED
+
+#include "AP_RCProtocol.h"
+#include "SoftSerial.h"
+#include <AP_Frsky_Telem/AP_Frsky_SPort.h>
+
+#define FPORT2_CONTROL_FRAME_SIZE 38
+
+struct FPort2_Frame;
+
+class AP_RCProtocol_FPort2 : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_FPort2(AP_RCProtocol &_frontend, bool inverted);
+    void process_pulse(uint32_t width_s0, uint32_t width_s1) override;
+    void process_byte(uint8_t byte, uint32_t baudrate) override;
+
+private:
+    void decode_control(const FPort2_Frame &frame);
+    void decode_downlink(const FPort2_Frame &frame);
+    bool check_checksum(void);
+
+    void _process_byte(uint32_t timestamp_us, uint8_t byte);
+    SoftSerial ss{115200, SoftSerial::SERIAL_CONFIG_8N1};
+    uint32_t saved_width;
+
+    struct {
+        uint8_t buf[FPORT2_CONTROL_FRAME_SIZE];
+        uint8_t ofs;
+        uint32_t last_byte_us;
+        uint8_t control_len;
+        bool is_downlink;
+    } byte_input;
+
+    uint8_t chan_count;
+
+    const bool inverted;
+
+    struct {
+        bool available;
+        AP_Frsky_SPort::sport_packet_t packet;
+    } telem_data;
+};
+
+#endif  // AP_RCPROTOCOL_FPORT2_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  GHST protocol decoder based on betaflight implementation
+  Code by Andy Piper
+ */
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_GHST_ENABLED
+
+#define CRSF_BAUDRATE      416666U
+
+#include "AP_RCProtocol.h"
+#include "AP_RCProtocol_GHST.h"
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <AP_Math/crc.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_RCTelemetry/AP_GHST_Telem.h>
+#include <AP_SerialManager/AP_SerialManager.h>
+
+/*
+ * GHST protocol
+ *
+ * GHST protocol uses a single wire half duplex uart connection.
+ *
+ * 420000 baud
+ * not inverted
+ * 8 Bit
+ * 1 Stop bit
+ * Big endian
+ * Max frame size is 14 bytes
+ *
+ * Every frame has the structure:
+ * <Device address><Frame length><Type><Payload><CRC>
+ *
+ * Device address: (uint8_t)
+ * Frame length:   length in  bytes including Type (uint8_t)
+ * Type:           (uint8_t)
+ * CRC:            (uint8_t)
+ *
+ */
+
+extern const AP_HAL::HAL& hal;
+
+//#define GHST_DEBUG
+//#define GHST_DEBUG_CHARS
+#ifdef GHST_DEBUG
+# define debug(fmt, args...)	hal.console->printf("GHST: " fmt "\n", ##args)
+static const char* get_frame_type(uint8_t byte, uint8_t subtype = 0)
+{
+    switch(byte) {
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_HS4_5TO8:
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_HS4_12_5TO8:
+        return "RC5_8";
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_HS4_9TO12:
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_HS4_12_9TO12:
+        return "RC9_12";
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_HS4_13TO16:
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_HS4_12_13TO16:
+        return "RC13_16";
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_RSSI:
+    case AP_RCProtocol_GHST::GHST_UL_RC_CHANS_12_RSSI:
+        return "RSSI";
+    case AP_RCProtocol_GHST::GHST_UL_RC_VTX_CTRL:
+        return "VTX_CTRL";
+    case AP_RCProtocol_GHST::GHST_UL_VTX_SETUP:
+        return "VTX_SETUP";
+    }
+    return "UNKNOWN";
+}
+#else
+# define debug(fmt, args...)	do {} while(0)
+#endif
+
+#define GHST_MAX_FRAME_TIME_US       500U // 14 bytes @ 420k = ~450us
+#define GHST_FRAME_TIMEOUT_US      10000U // 10ms to account for scheduling delays
+#define GHST_INTER_FRAME_TIME_US    2000U // At fastest, frames are sent by the transmitter every 2 ms, 500 Hz
+#define GHST_HEADER_TYPE_LEN     (GHST_HEADER_LEN + 1)           // header length including type
+
+const uint16_t AP_RCProtocol_GHST::RF_MODE_RATES[RFMode::RF_MODE_MAX_MODES] = {
+    55, 160, 250, 19, 250, 500, 150, 250,
+};
+
+AP_RCProtocol_GHST* AP_RCProtocol_GHST::_singleton;
+
+AP_RCProtocol_GHST::AP_RCProtocol_GHST(AP_RCProtocol &_frontend) : AP_RCProtocol_Backend(_frontend)
+{
+#if !APM_BUILD_TYPE(APM_BUILD_UNKNOWN)
+    if (_singleton != nullptr) {
+        AP_HAL::panic("Duplicate GHST handler");
+    }
+
+    _singleton = this;
+#else
+    if (_singleton == nullptr) {
+        _singleton = this;
+    }
+#endif
+}
+
+AP_RCProtocol_GHST::~AP_RCProtocol_GHST() {
+    _singleton = nullptr;
+}
+
+// get the protocol string
+const char* AP_RCProtocol_GHST::get_protocol_string() const {
+    return "GHST";
+}
+
+// return the link rate as defined by the LinkStatistics
+uint16_t AP_RCProtocol_GHST::get_link_rate() const {
+    return RF_MODE_RATES[_link_status.rf_mode - GHST_RF_MODE_NORMAL];
+}
+
+void AP_RCProtocol_GHST::_process_byte(uint32_t timestamp_us, uint8_t byte)
+{
+    //debug("process_byte(0x%x)", byte);
+    // we took too long decoding, start again - the RX will only send complete frames so this is unlikely to fail,
+    // however thread scheduling can introduce longer delays even when the data has been received
+    if (_frame_ofs > 0 && (timestamp_us - _start_frame_time_us) > GHST_FRAME_TIMEOUT_US) {
+        _frame_ofs = 0;
+    }
+
+    // overflow check
+    if (_frame_ofs >= GHST_FRAMELEN_MAX) {
+        _frame_ofs = 0;
+    }
+
+    // start of a new frame
+    if (_frame_ofs == 0) {
+        _start_frame_time_us = timestamp_us;
+    }
+
+    add_to_buffer(_frame_ofs++, byte);
+
+    // need a header to get the length
+    if (_frame_ofs < GHST_HEADER_TYPE_LEN) {
+        return;
+    }
+
+    if (_frame.device_address != DeviceAddress::GHST_ADDRESS_FLIGHT_CONTROLLER) {
+        return;
+    }
+
+    // parse the length
+    if (_frame_ofs == GHST_HEADER_TYPE_LEN) {
+        _frame_crc = crc8_dvb_s2(0, _frame.type);
+        // check for garbage frame
+        if (_frame.length > GHST_FRAME_PAYLOAD_MAX) {
+            _frame_ofs = 0;
+        }
+        return;
+    }
+
+    // update crc
+    if (_frame_ofs < _frame.length + GHST_HEADER_LEN) {
+        _frame_crc = crc8_dvb_s2(_frame_crc, byte);
+    }
+
+    // overflow check
+    if (_frame_ofs > _frame.length + GHST_HEADER_LEN) {
+        _frame_ofs = 0;
+        return;
+    }
+
+    if (_frame.length < 2) {
+        // invalid length, we subtract 2 below
+        _frame_ofs = 0;
+        return;
+    }
+    
+    // decode whatever we got and expect
+    if (_frame_ofs == _frame.length + GHST_HEADER_LEN) {
+        log_data(AP_RCProtocol::GHST, timestamp_us, (const uint8_t*)&_frame, _frame_ofs - GHST_HEADER_LEN);
+
+        // we consumed the partial frame, reset
+        _frame_ofs = 0;
+
+        // bad CRC (payload start is +1 from frame start, so need to subtract that from frame length to get index)
+        if (_frame_crc != _frame.payload[_frame.length - 2]) {
+            return;
+        }
+
+        _last_frame_time_us = _last_rx_frame_time_us = timestamp_us;
+        // decode here
+        if (decode_ghost_packet()) {
+            _last_tx_frame_time_us = timestamp_us;  // we have received a frame from the transmitter
+            add_input(MAX_CHANNELS, _channels, false, _link_status.rssi, _link_status.link_quality);
+        }
+    }
+}
+
+void AP_RCProtocol_GHST::update(void)
+{
+}
+
+// write out a frame of any type
+bool AP_RCProtocol_GHST::write_frame(Frame* frame)
+{
+    AP_HAL::UARTDriver *uart = get_current_UART();
+
+    if (!uart) {
+        return false;
+    }
+
+    // check that we haven't been too slow in responding to the new UART data. If we respond too late then we will
+    // corrupt the next incoming control frame. incoming packets at max 126bits @500Hz @420k baud gives total budget of 2ms
+    // per packet of which we need 300us to receive a packet. outgoing packets are 126bits which require 300us to send
+    // leaving at most 1.4ms of delay that can be tolerated
+    uint64_t tend = uart->receive_time_constraint_us(1);
+    uint64_t now = AP_HAL::micros64();
+    uint64_t tdelay = now - tend;
+    if (tdelay > 1000) {
+        // we've been too slow in responding
+        return false;
+    }
+
+    // calculate crc
+    uint8_t crc = crc8_dvb_s2(0, frame->type);
+    for (uint8_t i = 0; i < frame->length - 2; i++) {
+        crc = crc8_dvb_s2(crc, frame->payload[i]);
+    }
+    frame->payload[frame->length - 2] = crc;
+
+    uart->write((uint8_t*)frame, frame->length + 2);
+    uart->flush();
+
+#ifdef GHST_DEBUG
+    hal.console->printf("GHST: writing %s:", get_frame_type(frame->type, frame->payload[0]));
+    for (uint8_t i = 0; i < frame->length + 2; i++) {
+        uint8_t val = ((uint8_t*)frame)[i];
+#ifdef GHST_DEBUG_CHARS
+        if (val >= 32 && val <= 126) {
+            hal.console->printf(" 0x%x '%c'", val, (char)val);
+        } else {
+#endif
+            hal.console->printf(" 0x%x", val);
+#ifdef GHST_DEBUG_CHARS
+        }
+#endif
+    }
+    hal.console->printf("\n");
+#endif
+    return true;
+}
+
+bool AP_RCProtocol_GHST::decode_ghost_packet()
+{
+#ifdef GHST_DEBUG
+    hal.console->printf("GHST: received %s:", get_frame_type(_frame.type));
+    uint8_t* fptr = (uint8_t*)&_frame;
+    for (uint8_t i = 0; i < _frame.length + 2; i++) {
+#ifdef GHST_DEBUG_CHARS
+        if (fptr[i] >= 32 && fptr[i] <= 126) {
+            hal.console->printf(" 0x%x '%c'", fptr[i], (char)fptr[i]);
+        } else {
+#endif
+            hal.console->printf(" 0x%x", fptr[i]);
+#ifdef GHST_DEBUG_CHARS
+        }
+#endif
+    }
+    hal.console->printf("\n");
+#endif
+
+    const RadioFrame* radio_frame = (const RadioFrame*)(&_frame.payload);
+    const Channels12Bit_4Chan* channels = &(radio_frame->channels);
+    const uint8_t* lowres_channels = radio_frame->lowres_channels;
+
+    // Scaling from Betaflight
+    // Scaling 12bit channels (8bit channels in brackets)
+    //      OpenTx          RC   PWM (BF)
+    // min  -1024        0(  0)     988us
+    // ctr      0     2048(128)    1500us
+    // max   1024     4096(256)    2012us
+    //
+
+    // Scaling legacy (nearly 10bit)
+    // derived from original SBus scaling, with slight correction for offset
+    // now symmetrical around OpenTx 0 value
+    // scaling is:
+    //      OpenTx         RC   PWM (BF)
+    // min  -1024     172( 22)     988us
+    // ctr      0     992(124)    1500us
+    // max   1024    1811(226)    2012us
+
+#define CHANNEL_RESCALE(x) (((5 * x) >> 2) - 430)
+#define CHANNEL_SCALE(x) (int32_t(x) / 4 + 988)
+#define CHANNEL_SCALE_LEGACY(x) CHANNEL_SCALE(CHANNEL_RESCALE(x))
+
+    // legacy scaling
+    if (_frame.type >= GHST_UL_RC_CHANS_HS4_5TO8 && _frame.type <= GHST_UL_RC_CHANS_RSSI) {
+        _channels[0] = CHANNEL_SCALE_LEGACY(channels->ch0);
+        _channels[1] = CHANNEL_SCALE_LEGACY(channels->ch1);
+        _channels[2] = CHANNEL_SCALE_LEGACY(channels->ch2);
+        _channels[3] = CHANNEL_SCALE_LEGACY(channels->ch3);
+    } else {
+        _channels[0] = CHANNEL_SCALE(channels->ch0);
+        _channels[1] = CHANNEL_SCALE(channels->ch1);
+        _channels[2] = CHANNEL_SCALE(channels->ch2);
+        _channels[3] = CHANNEL_SCALE(channels->ch3);
+    }
+
+#define CHANNEL_LR_RESCALE(x) (5 * x - 108)
+#define CHANNEL_LR_SCALE(x) (int32_t(x) * 2 + 988)
+#define CHANNEL_LR_SCALE_LEGACY(x) (CHANNEL_LR_RESCALE(x) + 988)
+
+    switch (_frame.type) {
+        case GHST_UL_RC_CHANS_HS4_5TO8:
+        case GHST_UL_RC_CHANS_HS4_9TO12:
+        case GHST_UL_RC_CHANS_HS4_13TO16: {
+            uint8_t offset = (_frame.type - GHST_UL_RC_CHANS_HS4_5TO8 + 1) * 4;
+            _channels[offset++] = CHANNEL_LR_SCALE_LEGACY(lowres_channels[0]);
+            _channels[offset++] = CHANNEL_LR_SCALE_LEGACY(lowres_channels[1]);
+            _channels[offset++] = CHANNEL_LR_SCALE_LEGACY(lowres_channels[2]);
+            _channels[offset++] = CHANNEL_LR_SCALE_LEGACY(lowres_channels[3]);
+            break;
+        }
+        case GHST_UL_RC_CHANS_HS4_12_5TO8:
+        case GHST_UL_RC_CHANS_HS4_12_9TO12:
+        case GHST_UL_RC_CHANS_HS4_12_13TO16: {
+            uint8_t offset = (_frame.type - GHST_UL_RC_CHANS_HS4_12_5TO8 + 1) * 4;
+            _channels[offset++] = CHANNEL_LR_SCALE(lowres_channels[0]);
+            _channels[offset++] = CHANNEL_LR_SCALE(lowres_channels[1]);
+            _channels[offset++] = CHANNEL_LR_SCALE(lowres_channels[2]);
+            _channels[offset++] = CHANNEL_LR_SCALE(lowres_channels[3]);
+            break;
+        }
+        case GHST_UL_RC_CHANS_RSSI:
+        case GHST_UL_RC_CHANS_12_RSSI:
+            process_link_stats_frame((uint8_t*)&_frame.payload);
+            break;
+
+        default:
+            break;
+    }
+
+#if AP_GHST_TELEM_ENABLED
+    if (AP_GHST_Telem::process_frame(FrameType(_frame.type), (uint8_t*)&_frame.payload)) {
+        process_telemetry();
+    }
+#endif
+
+    return true;
+}
+
+// send out telemetry
+bool AP_RCProtocol_GHST::process_telemetry(bool check_constraint)
+{
+
+    AP_HAL::UARTDriver *uart = get_current_UART();
+    if (!uart) {
+        return false;
+    }
+
+    if (!telem_available) {
+#if AP_GHST_TELEM_ENABLED
+        if (AP_GHST_Telem::get_telem_data(&_telemetry_frame, is_tx_active())) {
+            telem_available = true;
+        } else {
+            return false;
+        }
+#else
+        return false;
+#endif
+    }
+    if (!write_frame(&_telemetry_frame)) {
+        return false;
+    }
+
+    // get fresh telem_data in the next call
+    telem_available = false;
+
+    return true;
+}
+
+// process link statistics to get RSSI
+void AP_RCProtocol_GHST::process_link_stats_frame(const void* data)
+{
+    const LinkStatisticsFrame* link = (const LinkStatisticsFrame*)data;
+
+    uint8_t rssi_dbm;
+    rssi_dbm = link->rssi_dbm;
+    _link_status.link_quality = link->link_quality;
+    if (_use_lq_for_rssi) {
+        _link_status.rssi = derive_scaled_lq_value(link->link_quality);
+    } else{
+        // AP rssi: -1 for unknown, 0 for no link, 255 for maximum link
+        if (rssi_dbm < 50) {
+            _link_status.rssi = 255;
+        } else if (rssi_dbm > 120) {
+            _link_status.rssi = 0;
+        } else {
+            // this is an approximation recommended by Remo from TBS
+            _link_status.rssi = int16_t(roundf((1.0f - (rssi_dbm - 50.0f) / 70.0f) * 255.0f));
+        }
+    }
+
+    _link_status.rf_mode = link->protocol;
+}
+
+bool AP_RCProtocol_GHST::is_telemetry_supported() const
+{
+    return _link_status.rf_mode == AP_RCProtocol_GHST::GHST_RF_MODE_NORMAL
+           || _link_status.rf_mode == AP_RCProtocol_GHST::GHST_RF_MODE_RACE
+           || _link_status.rf_mode == AP_RCProtocol_GHST::GHST_RF_MODE_LR
+           || _link_status.rf_mode == AP_RCProtocol_GHST::GHST_RF_MODE_RACE250;
+}
+
+// process a byte provided by a uart
+void AP_RCProtocol_GHST::process_byte(uint8_t byte, uint32_t baudrate)
+{
+    // reject RC data if we have been configured for standalone mode
+    if (baudrate != CRSF_BAUDRATE && baudrate != GHST_BAUDRATE) {
+        return;
+    }
+    _process_byte(AP_HAL::micros(), byte);
+}
+
+// change the bootstrap baud rate to Ghost standard if configured
+void AP_RCProtocol_GHST::process_handshake(uint32_t baudrate)
+{
+    AP_HAL::UARTDriver *uart = get_current_UART();
+
+    // only change the baudrate if we are specifically bootstrapping Ghost
+    if (uart == nullptr
+        || baudrate != CRSF_BAUDRATE
+        || baudrate == GHST_BAUDRATE
+        || uart->get_baud_rate() == GHST_BAUDRATE
+        || !protocol_enabled(AP_RCProtocol::GHST)) {
+        return;
+    }
+#if AP_RCPROTOCOL_CRSF_ENABLED
+    if (protocol_enabled(AP_RCProtocol::CRSF)) {
+        // don't fight CRSF
+        return;
+    }
+#endif
+
+    uart->begin(GHST_BAUDRATE);
+}
+
+//returns uplink link quality on 0-255 scale
+int16_t AP_RCProtocol_GHST::derive_scaled_lq_value(uint8_t uplink_lq)
+{
+    return int16_t(roundf(constrain_float(uplink_lq*2.5f,0,255)));
+}
+
+namespace AP {
+    AP_RCProtocol_GHST* ghost() {
+        return AP_RCProtocol_GHST::get_singleton();
+    }
+};
+
+#endif  // AP_RCPROTOCOL_GHST_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_GHST_ENABLED
+
+#include "AP_RCProtocol.h"
+#include <AP_Math/AP_Math.h>
+#include <RC_Channel/RC_Channel.h>
+#include "SoftSerial.h"
+
+#define GHST_MAX_CHANNELS   16U      // Maximum number of channels from GHST datastream
+#define GHST_FRAMELEN_MAX   14U      // maximum possible framelength
+#define GHST_HEADER_LEN     2U       // header length
+#define GHST_FRAME_PAYLOAD_MAX (GHST_FRAMELEN_MAX - GHST_HEADER_LEN)     // maximum size of the frame length field in a packet
+#define GHST_BAUDRATE      420000U
+#define GHST_TX_TIMEOUT    500000U   // the period after which the transmitter is considered disconnected (matches copters failsafe)
+#define GHST_RX_TIMEOUT    150000U   // the period after which the receiver is considered disconnected (>ping frequency)
+
+class AP_RCProtocol_GHST : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_GHST(AP_RCProtocol &_frontend);
+    virtual ~AP_RCProtocol_GHST();
+    void process_byte(uint8_t byte, uint32_t baudrate) override;
+    void process_handshake(uint32_t baudrate) override;
+    void update(void) override;
+
+    // is the receiver active, used to detect power loss and baudrate changes
+    bool is_rx_active() const override {
+        return AP_HAL::micros() < _last_rx_frame_time_us + GHST_RX_TIMEOUT;
+    }
+
+    // is the transmitter active, used to adjust telemetry data
+    bool is_tx_active() const {
+        // this is the same as the Copter failsafe timeout
+        return AP_HAL::micros() < _last_tx_frame_time_us + GHST_TX_TIMEOUT;
+    }
+
+    // get singleton instance
+    static AP_RCProtocol_GHST* get_singleton() {
+        return _singleton;
+    }
+
+    enum FrameType {
+        GHST_UL_RC_CHANS_HS4_5TO8 = 0x10, // Control packet with 4 primary channels + CH5-8
+        GHST_UL_RC_CHANS_HS4_9TO12 = 0x11, // Control packet with 4 primary channels + CH9-12
+        GHST_UL_RC_CHANS_HS4_13TO16 = 0x12, // Control packet with 4 primary channels + CH13-16
+        GHST_UL_RC_CHANS_RSSI = 0x13, // Control packet with RSSI and LQ data
+        GHST_UL_RC_VTX_CTRL = 0x14, // Goggle/FC channel changing
+        // -> 0x1F reserved
+        GHST_UL_VTX_SETUP = 0x20, // vTx Setup w/o 4 primary channels (GECO Only)
+        GHST_UL_MSP_REQ = 0x21, // MSP frame, Request
+        GHST_UL_MSP_WRITE = 0x22, // MSP frame, Write
+
+        GHST_DL_PACK_STAT = 0x23, // Battery Status
+        GHST_DL_GPS_PRIMARY = 0x25, // Primary GPS Data
+        GHST_DL_GPS_SECONDARY = 0x26, // Secondary GPS Data
+        GHST_DL_MAGBARO = 0x27, // Magnetometer, Barometer (and Vario) Data
+        GHST_DL_MSP_RESP = 0x28, // MSP Response
+
+        GHST_UL_RC_CHANS_HS4_12_5TO8 = 0x30, // Control packet with 4 primary channels + CH5-8
+        GHST_UL_RC_CHANS_HS4_12_9TO12 = 0x31, // Control packet with 4 primary channels + CH9-12
+        GHST_UL_RC_CHANS_HS4_12_13TO16 = 0x32, // Control packet with 4 primary channels + CH13-16
+        GHST_UL_RC_CHANS_12_RSSI = 0x33, // Control packet with RSSI and LQ data
+        // 0x30 -> 0x3f - raw 12 bit packets
+    };
+
+    enum DeviceAddress {
+        GHST_ADDRESS_FLIGHT_CONTROLLER = 0x82,
+        GHST_ADDRESS_GOGGLES = 0x83,
+        GHST_ADDRESS_GHST_RECEIVER = 0x89,
+    };
+
+    struct Frame {
+        uint8_t device_address;
+        uint8_t length;
+        uint8_t type;
+        uint8_t payload[GHST_FRAME_PAYLOAD_MAX - 1]; // type is already accounted for
+    } PACKED;
+
+    struct Channels12Bit_4Chan {
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+#error "Only supported on little-endian architectures"
+#endif
+        uint32_t ch0 : 12;
+        uint32_t ch1 : 12;
+        uint32_t ch2 : 12;
+        uint32_t ch3 : 12;
+    } PACKED;
+
+    struct RadioFrame {
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+#error "Only supported on little-endian architectures"
+#endif
+        Channels12Bit_4Chan channels;   // high-res channels
+        uint8_t lowres_channels[4];     // low-res channels
+    } PACKED;
+
+    struct LinkStatisticsFrame {
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+#error "Only supported on little-endian architectures"
+#endif
+        Channels12Bit_4Chan channels;
+        uint8_t link_quality; // ( 0 - 100)
+        uint8_t rssi_dbm; // ( dBm * -1 )
+        uint8_t protocol : 5;
+        uint8_t telemetry : 1;
+        uint8_t alt_scale : 1;
+        uint8_t reserved : 1;
+        int8_t tx_power;
+    } PACKED;
+
+    enum RFMode {
+        GHST_RF_MODE_NORMAL = 5,    // 55Hz
+        GHST_RF_MODE_RACE = 6,      // 160Hz
+        GHST_RF_MODE_PURERACE = 7,  // 250Hz
+        GHST_RF_MODE_LR = 8,        // 19Hz
+        GHST_RF_MODE_RACE250 = 10,  // 250Hz
+        GHST_RF_MODE_RACE500 = 11,  // 500Hz
+        GHTS_RF_MODE_SOLID150 = 12, // 150Hz
+        GHST_RF_MODE_SOLID250 = 13, // 250Hz
+        RF_MODE_MAX_MODES,
+        RF_MODE_UNKNOWN,
+    };
+
+    struct LinkStatus {
+        int16_t rssi = -1;
+        int16_t link_quality = -1;
+        uint8_t rf_mode;
+    };
+
+    bool is_telemetry_supported() const;
+
+    // this will be used by AP_GHST_Telem to access link status data
+    // from within AP_RCProtocol_GHST thread so no need for cross-thread synch
+    const volatile LinkStatus& get_link_status() const {
+        return _link_status;
+    }
+
+    // return the link rate as defined by the LinkStatistics
+    uint16_t get_link_rate()  const;
+
+    // return the protocol string
+    const char* get_protocol_string() const;
+
+private:
+    struct Frame _frame;
+    struct Frame _telemetry_frame;
+    uint8_t _frame_ofs;
+    uint8_t _frame_crc;
+
+    const uint8_t MAX_CHANNELS = MIN((uint8_t)GHST_MAX_CHANNELS, (uint8_t)MAX_RCIN_CHANNELS);
+
+    static AP_RCProtocol_GHST* _singleton;
+
+    void _process_byte(uint32_t timestamp_us, uint8_t byte);
+    bool decode_ghost_packet();
+    bool process_telemetry(bool check_constraint = true);
+    void process_link_stats_frame(const void* data);
+    bool write_frame(Frame* frame);
+    AP_HAL::UARTDriver* get_current_UART() { return get_available_UART(); }
+
+    uint16_t _channels[GHST_MAX_CHANNELS];    /* buffer for extracted RC channel data as pulsewidth in microseconds */
+
+    void add_to_buffer(uint8_t index, uint8_t b) { ((uint8_t*)&_frame)[index] = b; }
+
+    uint32_t _last_frame_time_us;
+    uint32_t _last_tx_frame_time_us;
+    uint32_t _last_rx_frame_time_us;
+    uint32_t _start_frame_time_us;
+    bool telem_available;
+    bool _use_lq_for_rssi;
+    int16_t derive_scaled_lq_value(uint8_t uplink_lq);
+
+    volatile struct LinkStatus _link_status;
+
+    static const uint16_t RF_MODE_RATES[RFMode::RF_MODE_MAX_MODES];
+};
+
+namespace AP {
+    AP_RCProtocol_GHST* ghost();
+};
+
+#endif  // AP_RCPROTOCOL_GHST_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_IBUS_ENABLED
+
+#include "AP_RCProtocol_IBUS.h"
+
+// decode a full IBUS frame
+bool AP_RCProtocol_IBUS::ibus_decode(const uint8_t frame[IBUS_FRAME_SIZE], uint16_t *values, bool *ibus_failsafe)
+{
+    uint32_t chksum = 96;
+
+    /* check frame boundary markers to avoid out-of-sync cases */
+    if ((frame[0] != 0x20) || (frame[1] != 0x40)) {
+        return false;
+    }
+
+    /* use the decoder matrix to extract channel data */
+    for (uint8_t channel = 0, pick=2; channel < IBUS_INPUT_CHANNELS; channel++, pick+=2) {
+        values[channel]=frame[pick]|(frame[pick+1] & 0x0F)<<8;
+        chksum+=frame[pick]+frame[pick+1];
+    }
+
+    chksum += frame[IBUS_FRAME_SIZE-2]|frame[IBUS_FRAME_SIZE-1]<<8;
+
+    if (chksum!=0xFFFF) {
+        return false;
+    }
+
+    if ((frame[3]&0xF0) || (frame[9]&0xF0)) {
+        *ibus_failsafe = true;
+    } else {
+        *ibus_failsafe = false;
+    }
+
+    return true;
+}
+
+
+/*
+  process an IBUS input pulse of the given width
+ */
+void AP_RCProtocol_IBUS::process_pulse(uint32_t w0, uint32_t w1)
+{
+    uint8_t b;
+    if (ss.process_pulse(w0, w1, b)) {
+        _process_byte(ss.get_byte_timestamp_us(), b);
+    }
+}
+
+// support byte input
+void AP_RCProtocol_IBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
+{
+    const bool have_frame_gap = (timestamp_us - byte_input.last_byte_us >= 2000U);
+    byte_input.last_byte_us = timestamp_us;
+
+    if (have_frame_gap) {
+        // if we have a frame gap then this must be the start of a new
+        // frame
+        byte_input.ofs = 0;
+    }
+    if (b != 0x20 && byte_input.ofs == 0) {
+        // definately not IBUS, missing header byte
+        return;
+    }
+    if (byte_input.ofs == 0 && !have_frame_gap) {
+        // must have a frame gap before the start of a new IBUS frame
+        return;
+    }
+
+    byte_input.buf[byte_input.ofs++] = b;
+
+    if (byte_input.ofs == sizeof(byte_input.buf)) {
+        uint16_t values[IBUS_INPUT_CHANNELS];
+        bool ibus_failsafe = false;
+        log_data(AP_RCProtocol::IBUS, timestamp_us, byte_input.buf, byte_input.ofs);
+        if (ibus_decode(byte_input.buf, values, &ibus_failsafe)) {
+            add_input(IBUS_INPUT_CHANNELS, values, ibus_failsafe);
+        }
+        byte_input.ofs = 0;
+    }
+}
+
+// support byte input
+void AP_RCProtocol_IBUS::process_byte(uint8_t b, uint32_t baudrate)
+{
+    if (baudrate != 115200) {
+        return;
+    }
+    _process_byte(AP_HAL::micros(), b);
+}
+
+#endif  // AP_RCPROTOCOL_IBUS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_JOYSTICK_SFML_ENABLED
+
+#include "AP_RCProtocol_Backend.h"
+
+class AP_RCProtocol_Joystick_SFML : public AP_RCProtocol_Backend {
+public:
+
+    AP_RCProtocol_Joystick_SFML(AP_RCProtocol &_frontend) :
+        AP_RCProtocol_Backend(_frontend) {
+    }
+
+    void update() override;
+
+private:
+
+    uint32_t last_receive_ms;
+};
+
+
+#endif  // AP_RCPROTOCOL_JOYSTICK_SFML_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_MAVLINK_RADIO_ENABLED
+
+#include "AP_RCProtocol.h"
+
+
+class AP_RCProtocol_MAVLinkRadio : public AP_RCProtocol_Backend {
+public:
+
+    using AP_RCProtocol_Backend::AP_RCProtocol_Backend;
+
+    // update from mavlink messages
+    void update_radio_rc_channels(const mavlink_radio_rc_channels_t* packet) override;
+};
+
+#endif // AP_RCPROTOCOL_MAVLINK_RADIO_ENABLED
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_PPMSUM_ENABLED
+
+#include "AP_RCProtocol_Backend.h"
+
+class AP_RCProtocol_PPMSum : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_PPMSum(AP_RCProtocol &_frontend) : AP_RCProtocol_Backend(_frontend) {}
+    void process_pulse(uint32_t width_s0, uint32_t width_s1) override;
+private:
+    // state of ppm decoder
+    struct {
+        int8_t _channel_counter;
+        uint16_t _pulse_capt[MAX_RCIN_CHANNELS];
+    } ppm_state;
+};
+
+#endif  // AP_RCPROTOCOL_PPMSUM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_RADIO_ENABLED
+
+#include "AP_RCProtocol_Radio.h"
+#include <AP_Radio/AP_Radio.h>
+
+void AP_RCProtocol_Radio::update()
+{
+    auto *radio = AP_Radio::get_singleton();
+    if (radio == nullptr) {
+        return;
+    }
+    if (!init_done) {
+        radio->init();
+        init_done = true;
+    }
+
+    // allow the radio to handle mavlink on the main thread:
+    radio->update();
+
+    const uint32_t last_recv_us = radio->last_recv_us();
+    if (last_recv_us == last_input_us) {
+        // no new data
+        return;
+    }
+    last_input_us = last_recv_us;
+
+    const auto num_channels = radio->num_channels();
+    uint16_t rcin_values[MAX_RCIN_CHANNELS];
+    for (uint8_t i=0; i<num_channels; i++) {
+        rcin_values[i] = radio->read(i);
+    }
+
+    add_input(
+        num_channels,
+        rcin_values,
+        false,  // failsafe
+        0, // check me
+        0  // link quality
+        );
+}
+
+void AP_RCProtocol_Radio::start_bind()
+{
+    auto *radio = AP_Radio::get_singleton();
+    if (radio == nullptr) {
+        return;
+    }
+    radio->start_recv_bind();
+}
+
+#endif // AP_RCPROTOCOL_RADIO_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_SRXL2_ENABLED
+
+#include "AP_RCProtocol.h"
+#include "SoftSerial.h"
+
+#define SRXL2_MAX_CHANNELS 32U           /* Maximum number of channels from srxl2 datastream  */
+#define SRXL2_FRAMELEN_MAX   80U      /* maximum possible framelengh  */
+#define SRXL2_HEADER_LEN 3U
+
+class AP_RCProtocol_SRXL2 : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_SRXL2(AP_RCProtocol &_frontend);
+    virtual ~AP_RCProtocol_SRXL2();
+    void process_byte(uint8_t byte, uint32_t baudrate) override;
+    void process_handshake(uint32_t baudrate) override;
+    void start_bind(void) override;
+    void update(void) override;
+    // get singleton instance
+    static AP_RCProtocol_SRXL2* get_singleton() {
+        return _singleton;
+    }
+
+    void capture_scaled_input(const uint8_t *values_p, bool in_failsafe, int16_t rssi);
+    void send_on_uart(uint8_t* pBuffer, uint8_t length);
+    void change_baud_rate(uint32_t baudrate);
+
+private:
+
+    static AP_RCProtocol_SRXL2* _singleton;
+
+    void _process_byte(uint32_t timestamp_us, uint8_t byte);
+    void _bootstrap(uint8_t device_id);
+    bool is_bootstrapped() const { return _device_id != 0; }
+
+    uint8_t _buffer[SRXL2_FRAMELEN_MAX];       /* buffer for raw srxl frame data in correct order --> buffer[0]=byte0  buffer[1]=byte1  */
+    uint8_t _buflen;                          /* length in number of bytes of received srxl dataframe in buffer  */
+    uint32_t _last_run_ms;                    // last time the state machine was run
+    uint16_t _channels[SRXL2_MAX_CHANNELS < MAX_RCIN_CHANNELS ? SRXL2_MAX_CHANNELS : MAX_RCIN_CHANNELS];    /* buffer for extracted RC channel data as pulsewidth in microseconds */
+    bool _in_bootstrap_or_failsafe;         // controls whether we allow UART sends outside a receive time constraint
+    uint8_t _device_id;
+
+    enum {
+        STATE_IDLE,                          /* do nothing */
+        STATE_NEW,                           /* get header of frame + prepare for frame reception */
+        STATE_COLLECT                        /* collect RC channel data from frame */
+    };
+    uint8_t _frame_len_full;                 /* Length in number of bytes of full srxl datastream */
+    uint8_t _decode_state;           /* Current state of SRXL frame decoding */
+    uint8_t _decode_state_next;      /* State of frame decoding that will be applied when the next byte from dataframe drops in  */
+    bool _in_failsafe = false;
+    int16_t _new_rssi = -1;
+    uint32_t _last_handshake_ms;
+    uint32_t _handshake_start_ms;
+};
+
+#endif  // AP_RCPROTOCOL_SRXL2_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+ * This file is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This file is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Code by Andrew Tridgell and Siddharth Bharat Purohit
+ */
+
+#pragma once
+
+#include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_SUMD_ENABLED
+
+#include "AP_RCProtocol_Backend.h"
+#include "SoftSerial.h"
+
+#define SUMD_MAX_CHANNELS	32
+#define SUMD_FRAME_MAXLEN   40
+class AP_RCProtocol_SUMD : public AP_RCProtocol_Backend {
+public:
+    AP_RCProtocol_SUMD(AP_RCProtocol &_frontend) : AP_RCProtocol_Backend(_frontend) {}
+    void process_pulse(uint32_t width_s0, uint32_t width_s1) override;
+    void process_byte(uint8_t byte, uint32_t baudrate) override;
+
+private:
+    void _process_byte(uint32_t timestamp_us, uint8_t byte);
+
+    typedef struct {
+        uint8_t	status;							///< 0x01 valid and live SUMD data frame / 0x00 = SUMH / 0x81 = Failsafe
+        uint8_t	length;							///< Channels
+        uint8_t	sumd_data[(SUMD_MAX_CHANNELS+1) * 2];	///< ChannelData (High Byte/ Low Byte)
+        uint8_t	crc16_high;						///< High Byte of 16 Bit CRC
+    } ReceiverFcPacketHoTT;
+
+
+    enum SUMD_DECODE_STATE {
+        SUMD_DECODE_STATE_UNSYNCED = 0,
+        SUMD_DECODE_STATE_GOT_HEADER,
+        SUMD_DECODE_STATE_GOT_STATE,
+        SUMD_DECODE_STATE_GOT_LEN,
+        SUMD_DECODE_STATE_GOT_DATA,
+        SUMD_DECODE_STATE_GOT_CRC,
+    };
+
+    enum SUMD_DECODE_STATE _decode_state = SUMD_DECODE_STATE_UNSYNCED;
+    uint8_t _rxlen;
+    ReceiverFcPacketHoTT _rxpacket;
+    uint16_t 	_crc16;
+    uint32_t last_packet_us;
+
+    SoftSerial ss{115200, SoftSerial::SERIAL_CONFIG_8N1};
+};
+
+#endif  // AP_RCPROTOCOL_SUMD_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #include "AP_RCProtocol_config.h"
+
+#if AP_RCPROTOCOL_UDP_ENABLED
+
+#include "AP_RCProtocol_UDP.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <SITL/SITL.h>
+
+#if AP_RCPROTOCOL_FDM_ENABLED
+#include "AP_RCProtocol_FDM.h"
+#endif
+
+extern const AP_HAL::HAL& hal;
+
+void AP_RCProtocol_UDP::set_default_pwm_input_values()
+{
+    pwm_input[0] = 1500;
+    pwm_input[1] = 1500;
+    pwm_input[2] = 1000;
+    pwm_input[3] = 1500;
+    pwm_input[4] = 1800;
+    pwm_input[5] = 1000;
+    pwm_input[6] = 1000;
+    pwm_input[7] = 1800;
+
+#if APM_BUILD_TYPE(APM_BUILD_Rover)
+    // set correct default throttle for rover (allowing for reverse)
+    pwm_input[2] = 1500;
+#elif APM_BUILD_TYPE(APM_BUILD_ArduSub) || APM_BUILD_TYPE(APM_BUILD_Blimp)
+    for(uint8_t i = 0; i < 8; i++) {
+        pwm_input[i] = 1500;
+    }
+#endif
+
+    num_channels = 8;
+}
+
+bool AP_RCProtocol_UDP::init()
+{
+    const auto sitl = AP::sitl();
+    if (sitl == nullptr) {
+        return false;
+    }
+    if (!rc_in.reuseaddress()) {
+        return false;
+    }
+    if (!rc_in.bind("0.0.0.0", sitl->rcin_port)) {
+        return false;
+    }
+    if (!rc_in.set_blocking(false)) {
+        return false;
+    }
+    if (!rc_in.set_cloexec()) {
+        return false;
+    }
+
+    set_default_pwm_input_values();
+
+    return true;
+}
+
+void AP_RCProtocol_UDP::update()
+{
+#if AP_RCPROTOCOL_FDM_ENABLED
+    // yield to the FDM backend if it is getting data
+    if (fdm_backend->active()) {
+        return;
+    }
+#endif
+
+    if (!init_done) {
+        if (!init()) {
+            return;
+        }
+        init_done = true;
+    }
+
+    read_all_socket_input();
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    const auto sitl = AP::sitl();
+    if (sitl == nullptr) {
+        return;
+    }
+
+    if (sitl->rc_fail == SITL::SIM::SITL_RCFail_NoPulses) {
+        return;
+    }
+#endif
+
+    // simulate RC input at 50Hz
+    if (AP_HAL::millis() - last_input_ms < 20) {
+        return;
+    }
+    last_input_ms = AP_HAL::millis();
+
+    add_input(
+        num_channels,
+        pwm_input,
+        false,  // failsafe
+        0, // check me
+        0  // link quality
+        );
+}
+
+/*
+  check for a SITL RC input packet
+ */
+void AP_RCProtocol_UDP::read_all_socket_input(void)
+{
+    struct pwm_packet {
+        uint16_t pwm[16];
+    } pwm_pkt;
+    uint8_t pwm_pkt_num_channels = 0;
+
+    ssize_t receive_size = 1;  // lies!
+    uint16_t count = 0;
+    while (receive_size > 0) {
+        receive_size = rc_in.recv(&pwm_pkt, sizeof(pwm_pkt), 0);
+
+        switch (receive_size) {
+        case -1:
+            break;
+        case 8*2:
+        case 16*2:
+            pwm_pkt_num_channels = receive_size/2;
+            break;
+        default:
+            fprintf(stderr, "Malformed SITL RC input (%ld)", (long)receive_size);
+            return;
+        }
+        count++;
+    }
+
+    if (count > 100) {
+        ::fprintf(stderr, "Read %u rc inputs\n", count);
+    }
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    const auto sitl = AP::sitl();
+    if (sitl == nullptr) {
+        return;
+    }
+
+    // convert last packet received into pwm values
+    switch (sitl->rc_fail) {
+    case SITL::SIM::SITL_RCFail_Throttle950:
+        // discard anything we just read from the "receiver" and set
+        // values to bind values:
+        for (uint8_t i=0; i<ARRAY_SIZE(pwm_input); i++) {
+            pwm_input[i] = 1500;  // centre all inputs
+        }
+        pwm_input[2] = 950;  // reset throttle (assumed to be on channel 3...)
+        return;
+    case SITL::SIM::SITL_RCFail_NoPulses:
+        // see also code in ::update
+        return;
+    case SITL::SIM::SITL_RCFail_None:
+        break;
+    }
+#endif
+
+    if (pwm_pkt_num_channels == 0) {
+        return;
+    }
+    for (uint8_t i=0; i<pwm_pkt_num_channels; i++) {
+        // setup the pwm input for the RC channel inputs
+        const uint16_t pwm = pwm_pkt.pwm[i];
+        if (pwm == 0) {
+            // 0 means "ignore this value"
+            continue;
+        }
+        pwm_input[i] = pwm;
+    }
+    num_channels = pwm_pkt_num_channels;  // or ARRAY_SIZE(pwm_input)?
+}
+
+#endif // AP_RCPROTOCOL_UDP_ENABLED
+   name: StallTurnTest
+
+message: Straight1
+straight_roll 5 0
+
+message: StallTurn
+stall_turn 30 100 1 4
+
+message: Straight2
+straight_roll 5 0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      

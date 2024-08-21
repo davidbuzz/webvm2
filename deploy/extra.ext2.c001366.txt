@@ -1,0 +1,2815 @@
+sizeof(ua_type);
+    if (hal.util->get_persistent_param_by_name("DID_UAS_ID", id_str, id_len) &&
+        hal.util->get_persistent_param_by_name("DID_UAS_ID_TYPE", id_type, id_type_len) &&
+        hal.util->get_persistent_param_by_name("DID_UA_TYPE", ua_type, ua_type_len)) {
+        if (id_len && id_type_len && ua_type_len) {
+            _options.set_and_save(_options.get() & ~LockUASIDOnFirstBasicIDRx);
+            _options.notify();
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "OpenDroneID: Locked UAS_ID: %s", id_str);
+        }
+    } else {
+        id_len = 0;
+    }
+}
+
+void AP_OpenDroneID::set_basic_id() {
+    if (pkt_basic_id.id_type != MAV_ODID_ID_TYPE_NONE) {
+        return;
+    }
+    if (id_len > 0) {
+        // prepare basic id pkt
+        uint8_t val = gcs().sysid_this_mav();
+        pkt_basic_id.target_system = val;
+        pkt_basic_id.target_component = MAV_COMP_ID_ODID_TXRX_1;
+        pkt_basic_id.id_type = atoi(id_type);
+        pkt_basic_id.ua_type = atoi(ua_type);
+        char buffer[21];
+        snprintf(buffer, sizeof(buffer), "%s", id_str);
+        memcpy(pkt_basic_id.uas_id, buffer, sizeof(pkt_basic_id.uas_id));
+    }
+}
+
+void AP_OpenDroneID::get_persistent_params(ExpandingString &str) const
+{
+    if ((pkt_basic_id.id_type == MAV_ODID_ID_TYPE_SERIAL_NUMBER)
+        && (_options & LockUASIDOnFirstBasicIDRx)
+        && id_len == 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "OpenDroneID: ID is locked as %s", pkt_basic_id.uas_id);
+        str.printf("DID_UAS_ID=%s\nDID_UAS_ID_TYPE=%u\nDID_UA_TYPE=%u\n", pkt_basic_id.uas_id, pkt_basic_id.id_type, pkt_basic_id.ua_type);
+    }
+}
+
+// Perform the pre-arm checks and prevent arming if they are not satisifed
+// Except in the case of an in-flight reboot
+bool AP_OpenDroneID::pre_arm_check(char* failmsg, uint8_t failmsg_len)
+{
+    WITH_SEMAPHORE(_sem);
+
+    if (!option_enabled(Options::EnforceArming)) {
+        return true;
+    }
+
+    if (pkt_basic_id.id_type == MAV_ODID_ID_TYPE_NONE) {
+        strncpy(failmsg, "UA_TYPE required in BasicID", failmsg_len);
+        return false;
+    }
+
+    if (pkt_system.operator_latitude == 0 && pkt_system.operator_longitude == 0) {
+        strncpy(failmsg, "operator location must be set", failmsg_len);
+        return false;
+    }
+
+    const uint32_t max_age_ms = 3000;
+    const uint32_t now_ms = AP_HAL::millis();
+
+    if (last_arm_status_ms == 0 || now_ms - last_arm_status_ms > max_age_ms) {
+        strncpy(failmsg, "ARM_STATUS not available", failmsg_len);
+        return false;
+    }
+
+    if (last_system_ms == 0 ||
+        (now_ms - last_system_ms > max_age_ms &&
+         (now_ms - last_system_update_ms > max_age_ms))) {
+        strncpy(failmsg, "SYSTEM not available", failmsg_len);
+        return false;
+    }
+    
+    if (arm_status.status != MAV_ODID_ARM_STATUS_GOOD_TO_ARM) {
+        strncpy(failmsg, arm_status.error, failmsg_len);
+        return false;
+    }
+    
+    return true;
+}
+
+void AP_OpenDroneID::update()
+{
+    if (_enable == 0) {
+        return;
+    }
+
+    if ((pkt_basic_id.id_type == MAV_ODID_ID_TYPE_SERIAL_NUMBER)
+        && (_options & LockUASIDOnFirstBasicIDRx)
+        && id_len == 0
+        && !bootloader_flashed) {
+        hal.util->flash_bootloader();
+        // reset the basic id on next set_basic_id call
+        pkt_basic_id.id_type = MAV_ODID_ID_TYPE_NONE;
+        bootloader_flashed = true;
+    }
+
+    set_basic_id();
+
+    const bool armed = hal.util->get_soft_armed();
+    if (armed && !_was_armed) {
+        // use arm location as takeoff location
+        AP::ahrs().get_location(_takeoff_location);
+    }
+    _was_armed = armed;
+
+    send_dynamic_out();
+    send_static_out();
+#if HAL_ENABLE_DRONECAN_DRIVERS
+    uint8_t can_num_drivers = AP::can().get_num_drivers();
+    for (uint8_t i = 0; i < can_num_drivers; i++) {
+        AP_DroneCAN *dronecan = AP_DroneCAN::get_dronecan(i);
+        if (dronecan == nullptr) {
+            continue;
+        }
+        if (dronecan->get_driver_index()+1 != _can_driver) {
+            continue;
+        }
+        // send messages
+        dronecan_send(dronecan);
+    }
+#endif
+}
+
+// local payload space check which treats invalid channel as having space
+// needed to populate the message structures for the DroneCAN backend
+#define ODID_HAVE_PAYLOAD_SPACE(id) (_chan == MAV_CHAN_INVALID || HAVE_PAYLOAD_SPACE(_chan, id))
+
+void AP_OpenDroneID::send_dynamic_out()
+{
+    const uint32_t now = AP_HAL::millis();
+    if (now - _last_send_location_ms >= _mavlink_dynamic_period_ms &&
+        ODID_HAVE_PAYLOAD_SPACE(OPEN_DRONE_ID_LOCATION)) {
+        _last_send_location_ms = now;
+        send_location_message();
+    }
+
+    // operator location needs to be sent at the same rate as location for FAA compliance
+    if (now - _last_send_system_update_ms >= _mavlink_dynamic_period_ms &&
+        ODID_HAVE_PAYLOAD_SPACE(OPEN_DRONE_ID_SYSTEM_UPDATE)) {
+        _last_send_system_update_ms = now;
+        send_system_update_message();
+    }
+}
+
+void AP_OpenDroneID::send_static_out()
+{
+    const uint32_t now_ms = AP_HAL::millis();
+
+    // we need to notify user if we lost the transmitter
+    if (now_ms - last_arm_status_ms > 5000) {
+        if (now_ms - last_lost_tx_ms > 5000) {
+            last_lost_tx_ms = now_ms;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ODID: lost transmitter");
+        }
+    } else if (last_lost_tx_ms != 0) {
+        // we're OK again
+        last_lost_tx_ms = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ODID: transmitter OK");
+    }
+
+    // we need to notify user if we lost system msg with operator location
+    if (now_ms - last_system_ms > 5000 && now_ms - last_lost_operator_msg_ms > 5000) {
+        last_lost_operator_msg_ms = now_ms;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ODID: lost operator location");
+    }
+    
+    const uint32_t msg_spacing_ms = _mavlink_static_period_ms / 4;
+    if (now_ms - last_msg_send_ms >= msg_spacing_ms) {
+        // allow update of channel during setup, this makes it easy to debug with a GCS
+        _chan = mavlink_channel_t(gcs().get_channel_from_port_number(_mav_port));
+        bool sent_ok = false;
+        switch (next_msg_to_send) {
+        case NEXT_MSG_BASIC_ID:
+            if (ODID_HAVE_PAYLOAD_SPACE(OPEN_DRONE_ID_BASIC_ID)) {
+                send_basic_id_message();
+                sent_ok = true;
+            }
+            break;
+        case NEXT_MSG_SYSTEM:
+            if (ODID_HAVE_PAYLOAD_SPACE(OPEN_DRONE_ID_SYSTEM)) {
+                send_system_message();
+                sent_ok = true;
+            }
+            break;
+        case NEXT_MSG_SELF_ID:
+            if (ODID_HAVE_PAYLOAD_SPACE(OPEN_DRONE_ID_SELF_ID)) {
+                send_self_id_message();
+                sent_ok = true;
+            }
+            break;
+        case NEXT_MSG_OPERATOR_ID:
+            if (ODID_HAVE_PAYLOAD_SPACE(OPEN_DRONE_ID_OPERATOR_ID)) {
+                send_operator_id_message();
+                sent_ok = true;
+            }
+            break;
+        case NEXT_MSG_ENUM_END:
+            break;
+        }
+        if (sent_ok) {
+            last_msg_send_ms = now_ms;
+            next_msg_to_send = next_msg((uint8_t(next_msg_to_send) + 1) % uint8_t(NEXT_MSG_ENUM_END));
+        }
+    }
+}
+
+// The send_location_message
+// all open_drone_id send functions use data stored in the open drone id class.
+// This location send function is an exception. It uses live location data from the ArduPilot system.
+void AP_OpenDroneID::send_location_message()
+{
+    auto &ahrs = AP::ahrs();
+    const auto &barometer = AP::baro();
+    const auto &gps = AP::gps();
+
+    const AP_GPS::GPS_Status gps_status = gps.status();
+    const bool got_bad_gps_fix = (gps_status < AP_GPS::GPS_Status::GPS_OK_FIX_3D);
+    const bool armed = hal.util->get_soft_armed();
+
+    Location current_location;
+    if (!ahrs.get_location(current_location)) {
+        return;
+    }
+    uint8_t uav_status = hal.util->get_soft_armed()? MAV_ODID_STATUS_AIRBORNE : MAV_ODID_STATUS_GROUND;
+#if HAL_PARACHUTE_ENABLED
+    // set emergency status if chute is released
+    const auto *parachute = AP::parachute();
+    if (parachute != nullptr && parachute->released()) {
+        uav_status = MAV_ODID_STATUS_EMERGENCY;
+    }
+#endif
+    if (AP::vehicle()->is_crashed()) {
+        // if in crashed state also declare an emergency
+        uav_status = MAV_ODID_STATUS_EMERGENCY;
+    }
+
+    // if we are armed with no GPS fix and we haven't specifically
+    // allowed for non-GPS operation then declare an emergency
+    if (got_bad_gps_fix && armed && !option_enabled(Options::AllowNonGPSPosition)) {
+        uav_status = MAV_ODID_STATUS_EMERGENCY;
+    }
+
+    // if we are disarmed and falling at over 3m/s then declare an
+    // emergency. This covers cases such as deliberate crash with
+    // advanced failsafe and an unintended reboot or in-flight disarm
+    if (!got_bad_gps_fix && !armed && gps.velocity().z > 3.0) {
+        uav_status = MAV_ODID_STATUS_EMERGENCY;
+    }
+
+    // if we have watchdogged while armed then declare an emergency
+    if (hal.util->was_watchdog_armed()) {
+        uav_status = MAV_ODID_STATUS_EMERGENCY;
+    }
+
+    float direction = ODID_INV_DIR;
+    if (!got_bad_gps_fix) {
+        direction = wrap_360(degrees(ahrs.groundspeed_vector().angle())); // heading (degrees)
+    }
+
+    const float speed_horizontal = create_speed_horizontal(ahrs.groundspeed());
+
+    Vector3f velNED;
+    UNUSED_RESULT(ahrs.get_velocity_NED(velNED));
+    const float climb_rate = create_speed_vertical(-velNED.z); //make sure climb_rate is within Remote ID limit
+
+    int32_t latitude = 0;
+    int32_t longitude = 0;
+    if (current_location.check_latlng()) { //set location if they are valid
+        latitude = current_location.lat;
+        longitude = current_location.lng;
+    }
+
+    // altitude referenced against 1013.2mb
+    const float base_press_mbar = 1013.2;
+    const float altitude_barometric = create_altitude(barometer.get_altitude_difference(base_press_mbar*100, barometer.get_pressure()));
+
+    float altitude_geodetic = -1000;
+    int32_t alt_amsl_cm;
+    float undulation;
+    if (current_location.get_alt_cm(Location::AltFrame::ABSOLUTE, alt_amsl_cm)) {
+        altitude_geodetic = alt_amsl_cm * 0.01;
+    }
+    if (gps.get_undulation(undulation)) {
+        altitude_geodetic -= undulation;
+    }
+
+    // Compute the current height above the takeoff location
+    float height_above_takeoff = 0;     // height above takeoff (meters)
+    if (hal.util->get_soft_armed()) {
+        int32_t curr_alt_asml_cm;
+        int32_t takeoff_alt_asml_cm;
+        if (current_location.get_alt_cm(Location::AltFrame::ABSOLUTE, curr_alt_asml_cm) &&
+            _takeoff_location.get_alt_cm(Location::AltFrame::ABSOLUTE, takeoff_alt_asml_cm)) {
+            height_above_takeoff = (curr_alt_asml_cm - takeoff_alt_asml_cm) * 0.01;
+        }
+    }
+
+    // Accuracy
+
+    // If we have GPS 3D lock we presume that the accuracies of the system will track the GPS's reported accuracy
+    MAV_ODID_HOR_ACC horizontal_accuracy_mav = MAV_ODID_HOR_ACC_UNKNOWN;
+    MAV_ODID_VER_ACC vertical_accuracy_mav = MAV_ODID_VER_ACC_UNKNOWN;
+    MAV_ODID_SPEED_ACC speed_accuracy_mav = MAV_ODID_SPEED_ACC_UNKNOWN;
+    MAV_ODID_TIME_ACC timestamp_accuracy_mav = MAV_ODID_TIME_ACC_UNKNOWN;
+
+    float horizontal_accuracy;
+    if (gps.horizontal_accuracy(horizontal_accuracy)) {
+        horizontal_accuracy_mav = create_enum_horizontal_accuracy(horizontal_accuracy);
+    }
+
+    float vertical_accuracy;
+    if (gps.vertical_accuracy(vertical_accuracy)) {
+        vertical_accuracy_mav = create_enum_vertical_accuracy(vertical_accuracy);
+    }
+
+    float speed_accuracy;
+    if (gps.speed_accuracy(speed_accuracy)) {
+        speed_accuracy_mav = create_enum_speed_accuracy(speed_accuracy);
+    }
+
+    // if we have ever had GPS lock then we will have better than 1s
+    // accuracy, as we use system timer to propogate time
+    timestamp_accuracy_mav =  create_enum_timestamp_accuracy(1.0);
+
+    // Barometer altitude accuraacy will be highly dependent on the airframe and installation of the barometer in use
+    // thus ArduPilot cannot reasonably fill this in.
+    // Instead allow a manufacturer to use a parameter to fill this in
+    uint8_t barometer_accuracy = MAV_ODID_VER_ACC_UNKNOWN; //ahrs class does not provide accuracy readings
+    if (!is_equal(_baro_accuracy.get(), -1.0f)) {
+        barometer_accuracy = create_enum_vertical_accuracy(_baro_accuracy);
+    }
+
+    // Timestamp here is the number of seconds after into the current hour referenced to UTC time (up to one hour)
+
+    // FIX we need to only set this if w have a GPS lock is 2D good enough for that?
+    float timestamp = ODID_INV_TIMESTAMP;
+    if (!got_bad_gps_fix) {
+        uint32_t time_week_ms = gps.time_week_ms();
+        timestamp = float(time_week_ms % (3600 * 1000)) * 0.001;
+        timestamp = create_location_timestamp(timestamp);   //make sure timestamp is within Remote ID limit
+    }
+
+
+    {
+        WITH_SEMAPHORE(_sem);
+        // take semaphore so CAN gets a consistent packet
+        pkt_location = mavlink_open_drone_id_location_t{
+        latitude : latitude,
+        longitude : longitude,
+        altitude_barometric : altitude_barometric,
+        altitude_geodetic : altitude_geodetic,
+        height : height_above_takeoff,
+        timestamp : timestamp,
+        direction : uint16_t(direction * 100.0), // Heading (centi-degrees)
+        speed_horizontal : uint16_t(speed_horizontal * 100.0), // Ground speed (cm/s)
+        speed_vertical : int16_t(climb_rate * 100.0), // Climb rate (cm/s)
+        target_system : 0,
+        target_component : 0,
+        id_or_mac : {},
+        status : uint8_t(uav_status),
+        height_reference : MAV_ODID_HEIGHT_REF_OVER_TAKEOFF,           // height reference enum: Above takeoff location or above ground
+        horizontal_accuracy : uint8_t(horizontal_accuracy_mav),
+        vertical_accuracy : uint8_t(vertical_accuracy_mav),
+        barometer_accuracy : barometer_accuracy,
+        speed_accuracy : uint8_t(speed_accuracy_mav),
+        timestamp_accuracy : uint8_t(timestamp_accuracy_mav)
+        };
+        need_send_location = dronecan_send_all;
+    }
+
+    if (_chan != MAV_CHAN_INVALID) {
+        mavlink_msg_open_drone_id_location_send_struct(_chan, &pkt_location);
+    }
+}
+
+void AP_OpenDroneID::send_basic_id_message()
+{
+    // note that packet is filled in by the GCS
+    need_send_basic_id |= dronecan_send_all;
+    if (_chan != MAV_CHAN_INVALID) {
+        mavlink_msg_open_drone_id_basic_id_send_struct(_chan, &pkt_basic_id);
+    }
+}
+
+void AP_OpenDroneID::send_system_message()
+{
+    // note that packet is filled in by the GCS
+    need_send_system |= dronecan_send_all;
+    if (_chan != MAV_CHAN_INVALID) {
+        mavlink_msg_open_drone_id_system_send_struct(_chan, &pkt_system);
+    }
+}
+
+void AP_OpenDroneID::send_self_id_message()
+{
+    need_send_self_id |= dronecan_send_all;
+    if (_chan != MAV_CHAN_INVALID) {
+        mavlink_msg_open_drone_id_self_id_send_struct(_chan, &pkt_self_id);
+    }
+}
+
+void AP_OpenDroneID::send_system_update_message()
+{
+    need_send_system |= dronecan_send_all;
+    // note that packet is filled in by the GCS
+    if (_chan != MAV_CHAN_INVALID) {
+        const auto pkt_system_update = mavlink_open_drone_id_system_update_t {
+        operator_latitude : pkt_system.operator_latitude,
+        operator_longitude : pkt_system.operator_longitude,
+        operator_altitude_geo : pkt_system.operator_altitude_geo,
+        timestamp : pkt_system.timestamp,
+        target_system : pkt_system.target_system,
+        target_component : pkt_system.target_component,
+        };
+        mavlink_msg_open_drone_id_system_update_send_struct(_chan, &pkt_system_update);
+    }
+}
+
+void AP_OpenDroneID::send_operator_id_message()
+{
+    need_send_operator_id |= dronecan_send_all;
+    // note that packet is filled in by the GCS
+    if (_chan != MAV_CHAN_INVALID) {
+        mavlink_msg_open_drone_id_operator_id_send_struct(_chan, &pkt_operator_id);
+    }
+}
+
+/*
+* This converts a horizontal accuracy float value to the corresponding enum
+*
+* @param Accuracy The horizontal accuracy in meters
+* @return Enum value representing the accuracy
+*/
+MAV_ODID_HOR_ACC AP_OpenDroneID::create_enum_horizontal_accuracy(float accuracy) const
+{
+    // Out of bounds return UNKNOWN flag
+    if (accuracy < 0.0 || accuracy >= 18520.0) {
+        return MAV_ODID_HOR_ACC_UNKNOWN;
+    }
+
+    static const struct {
+        float accuracy;                 // Accuracy bound in meters
+        MAV_ODID_HOR_ACC mavoutput;     // mavlink enum output
+    } horiz_accuracy_table[] = {
+        { 1.0,    MAV_ODID_HOR_ACC_1_METER},
+        { 3.0,    MAV_ODID_HOR_ACC_3_METER},
+        {10.0,    MAV_ODID_HOR_ACC_10_METER},
+        {30.0,    MAV_ODID_HOR_ACC_30_METER},
+        {92.6,    MAV_ODID_HOR_ACC_0_05NM},
+        {185.2,   MAV_ODID_HOR_ACC_0_1NM},
+        {555.6,   MAV_ODID_HOR_ACC_0_3NM},
+        {926.0,   MAV_ODID_HOR_ACC_0_5NM},
+        {1852.0,  MAV_ODID_HOR_ACC_1NM},
+        {3704.0,  MAV_ODID_HOR_ACC_2NM},
+        {7408.0,  MAV_ODID_HOR_ACC_4NM},
+        {18520.0, MAV_ODID_HOR_ACC_10NM},
+    };
+
+    for (auto elem : horiz_accuracy_table) {
+        if (accuracy < elem.accuracy) {
+            return elem.mavoutput;
+        }
+    }
+
+    // Should not reach this
+    return MAV_ODID_HOR_ACC_UNKNOWN;
+}
+
+/**
+* This converts a vertical accuracy float value to the corresponding enum
+*
+* @param Accuracy The vertical accuracy in meters
+* @return Enum value representing the accuracy
+*/
+MAV_ODID_VER_ACC AP_OpenDroneID::create_enum_vertical_accuracy(float accuracy) const
+{
+    // Out of bounds return UNKNOWN flag
+    if (accuracy < 0.0 || accuracy >= 150.0) {
+        return MAV_ODID_VER_ACC_UNKNOWN;
+    }
+
+    static const struct {
+        float accuracy;                 // Accuracy bound in meters
+        MAV_ODID_VER_ACC mavoutput;     // mavlink enum output
+    } vertical_accuracy_table[] = {
+        { 1.0,  MAV_ODID_VER_ACC_1_METER},
+        { 3.0,  MAV_ODID_VER_ACC_3_METER},
+        {10.0,  MAV_ODID_VER_ACC_10_METER},
+        {25.0,  MAV_ODID_VER_ACC_25_METER},
+        {45.0,  MAV_ODID_VER_ACC_45_METER},
+        {150.0, MAV_ODID_VER_ACC_150_METER},
+    };
+
+    for (auto elem : vertical_accuracy_table) {
+        if (accuracy < elem.accuracy) {
+            return elem.mavoutput;
+        }
+    }
+
+    // Should not reach this
+    return MAV_ODID_VER_ACC_UNKNOWN;
+}
+
+/**
+* This converts a speed accuracy float value to the corresponding enum
+*
+* @param Accuracy The speed accuracy in m/s
+* @return Enum value representing the accuracy
+*/
+MAV_ODID_SPEED_ACC AP_OpenDroneID::create_enum_speed_accuracy(float accuracy) const
+{
+    // Out of bounds return UNKNOWN flag
+    if (accuracy < 0.0 || accuracy >= 10.0) {
+        return MAV_ODID_SPEED_ACC_UNKNOWN;
+    }
+
+    if (accuracy < 0.3) {
+        return MAV_ODID_SPEED_ACC_0_3_METERS_PER_SECOND;
+    } else if (accuracy < 1.0) {
+        return MAV_ODID_SPEED_ACC_1_METERS_PER_SECOND;
+    } else if (accuracy < 3.0) {
+        return MAV_ODID_SPEED_ACC_3_METERS_PER_SECOND;
+    } else if (accuracy < 10.0) {
+        return MAV_ODID_SPEED_ACC_10_METERS_PER_SECOND;
+    }
+
+    // Should not reach this
+    return MAV_ODID_SPEED_ACC_UNKNOWN;
+}
+
+/**
+* This converts a timestamp accuracy float value to the corresponding enum
+*
+* @param Accuracy The timestamp accuracy in seconds
+* @return Enum value representing the accuracy
+*/
+MAV_ODID_TIME_ACC AP_OpenDroneID::create_enum_timestamp_accuracy(float accuracy) const
+{
+    // Out of bounds return UNKNOWN flag
+    if (accuracy < 0.0 || accuracy >= 1.5) {
+        return MAV_ODID_TIME_ACC_UNKNOWN;
+    }
+
+    static const MAV_ODID_TIME_ACC mavoutput [15] = {
+        MAV_ODID_TIME_ACC_0_1_SECOND,
+        MAV_ODID_TIME_ACC_0_2_SECOND,
+        MAV_ODID_TIME_ACC_0_3_SECOND,
+        MAV_ODID_TIME_ACC_0_4_SECOND,
+        MAV_ODID_TIME_ACC_0_5_SECOND,
+        MAV_ODID_TIME_ACC_0_6_SECOND,
+        MAV_ODID_TIME_ACC_0_7_SECOND,
+        MAV_ODID_TIME_ACC_0_8_SECOND,
+        MAV_ODID_TIME_ACC_0_9_SECOND,
+        MAV_ODID_TIME_ACC_1_0_SECOND,
+        MAV_ODID_TIME_ACC_1_1_SECOND,
+        MAV_ODID_TIME_ACC_1_2_SECOND,
+        MAV_ODID_TIME_ACC_1_3_SECOND,
+        MAV_ODID_TIME_ACC_1_4_SECOND,
+        MAV_ODID_TIME_ACC_1_5_SECOND,
+    };
+
+    for (int8_t i = 1; i <= 15; i++) {
+        if (accuracy <= 0.1 * i) {
+            return mavoutput[i-1];
+        }
+    }
+
+    // Should not reach this
+    return MAV_ODID_TIME_ACC_UNKNOWN;
+}
+
+// make sure value is within limits of remote ID standard
+uint16_t AP_OpenDroneID::create_speed_horizontal(uint16_t speed) const
+{
+    if (speed > ODID_MAX_SPEED_H) { // constraint function can't be used, because out of range value is invalid
+        speed = ODID_INV_SPEED_H;
+    }
+
+    return speed;
+}
+
+// make sure value is within limits of remote ID standard
+int16_t AP_OpenDroneID::create_speed_vertical(int16_t speed) const
+{
+    if (speed > ODID_MAX_SPEED_V) { // constraint function can't be used, because out of range value is invalid
+        speed = ODID_INV_SPEED_V;
+    } else if (speed < ODID_MIN_SPEED_V) {
+        speed = ODID_INV_SPEED_V;
+    }
+
+    return speed;
+}
+
+// make sure value is within limits of remote ID standard
+float AP_OpenDroneID::create_altitude(float altitude) const
+{
+    if (altitude > ODID_MAX_ALT) { // constraint function can't be used, because out of range value is invalid
+        altitude = ODID_INV_ALT;
+    } else if (altitude < ODID_MIN_ALT) {
+        altitude = ODID_INV_ALT;
+    }
+
+    return altitude;
+}
+
+// make sure value is within limits of remote ID standard
+float AP_OpenDroneID::create_location_timestamp(float timestamp) const
+{
+    if (timestamp > ODID_MAX_TIMESTAMP) { // constraint function can't be used, because out of range value is invalid
+        timestamp = ODID_INV_TIMESTAMP;
+    } else if (timestamp < 0) {
+        timestamp = ODID_INV_TIMESTAMP;
+    }
+
+    return timestamp;
+}
+
+// handle a message from the GCS
+void AP_OpenDroneID::handle_msg(mavlink_channel_t chan, const mavlink_message_t &msg)
+{
+    if (!_initialised) {
+        return;
+    }
+    WITH_SEMAPHORE(_sem);
+
+    switch (msg.msgid) {
+    // only accept ARM_STATUS from the transmitter
+    case MAVLINK_MSG_ID_OPEN_DRONE_ID_ARM_STATUS: {
+        if (chan == _chan) {
+            mavlink_msg_open_drone_id_arm_status_decode(&msg, &arm_status);
+            last_arm_status_ms = AP_HAL::millis();
+        }
+        break;
+    }
+    // accept other messages from the GCS
+    case MAVLINK_MSG_ID_OPEN_DRONE_ID_OPERATOR_ID:
+        mavlink_msg_open_drone_id_operator_id_decode(&msg, &pkt_operator_id);
+        break;
+    case MAVLINK_MSG_ID_OPEN_DRONE_ID_SELF_ID:
+        mavlink_msg_open_drone_id_self_id_decode(&msg, &pkt_self_id);
+        break;
+    case MAVLINK_MSG_ID_OPEN_DRONE_ID_BASIC_ID:
+        if (id_len == 0) {
+            mavlink_msg_open_drone_id_basic_id_decode(&msg, &pkt_basic_id);
+        }
+        break;
+    case MAVLINK_MSG_ID_OPEN_DRONE_ID_SYSTEM:
+        mavlink_msg_open_drone_id_system_decode(&msg, &pkt_system);
+        last_system_ms = AP_HAL::millis();
+        break;
+    case MAVLINK_MSG_ID_OPEN_DRONE_ID_SYSTEM_UPDATE: {
+        mavlink_open_drone_id_system_update_t pkt_system_update;
+        mavlink_msg_open_drone_id_system_update_decode(&msg, &pkt_system_update);
+        pkt_system.operator_latitude = pkt_system_update.operator_latitude;
+        pkt_system.operator_longitude = pkt_system_update.operator_longitude;
+        pkt_system.operator_altitude_geo = pkt_system_update.operator_altitude_geo;
+        pkt_system.timestamp = pkt_system_update.timestamp;
+        last_system_update_ms = AP_HAL::millis();
+        if (last_system_ms != 0) {
+            // we can only mark system as updated if we have the other
+            // information already
+            last_system_ms = last_system_update_ms;
+        }
+        break;
+    }
+    }
+}
+
+// singleton instance
+AP_OpenDroneID *AP_OpenDroneID::_singleton;
+
+namespace AP
+{
+
+AP_OpenDroneID &opendroneid()
+{
+    return *AP_OpenDroneID::get_singleton();
+}
+
+}
+#endif //AP_OPENDRONEID_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #pragma once
+
+#include <AP_Math/AP_Math.h>
+#include <AP_Logger/AP_Logger_config.h>
+
+#define AP_OPTICALFLOW_CAL_MAX_SAMPLES 50  // number of samples required before calibration begins
+
+class AP_OpticalFlow_Calibrator {
+public:
+    AP_OpticalFlow_Calibrator() {};
+
+    // start or stop the calibration
+    void start();
+    void stop();
+
+    // update the state machine and calculate scaling
+    // returns true if new scaling values have been found
+    bool update();
+
+    // get final scaling values
+    // scaling values used during sample collection should be multiplied by these scalars
+    Vector2f get_scalars();
+
+private:
+
+    // single sample for a single axis
+    struct sample_t {
+        float flow_rate;
+        float body_rate;
+        float los_pred;
+    };
+
+    // attempt to add a new sample to the buffer
+    void add_sample(uint32_t timestamp_ms, const Vector2f& flow_rate, const Vector2f& body_rate, const Vector2f& los_pred);
+
+    // returns true once the sample buffer is full
+    bool sample_buffers_full() const;
+
+    // run calibration algorithm for both axis
+    // returns true on success and updates _cal_data[0,1].best_scale and best_scale_fitness
+    bool run_calibration();
+
+    // Run fitting algorithm for all samples of the given axis
+    // returns a scalar and fitness (lower numbers mean a better result) in the arguments provided
+    bool calc_scalars(uint8_t axis, float& scalar, float& fitness);
+
+    // calculate a single sample's residual given a scalar parameter
+    float calc_sample_residual(const sample_t& sample, float scalar) const;
+
+    // calculate the scalar that minimises the residual for a single sample
+    // returns true on success and populates the best_scalar argument
+    bool calc_sample_best_scalar(const sample_t& sample, float& best_scalar) const;
+
+    // calculate mean squared residual for all samples of a single axis (0 or 1) given a scalar parameter
+    float calc_mean_squared_residuals(uint8_t axis, float scalar) const;
+
+#if HAL_LOGGING_ENABLED
+    // log a sample
+    void log_sample(uint8_t axis, uint8_t sample_num, float flow_rate, float body_rate, float los_pred);
+#endif
+
+    // calibration states
+    enum class CalState {
+        NOT_STARTED = 0,
+        RUNNING,            // collecting samples
+        READY_TO_CALIBRATE, // ready to calibrate (may wait until vehicle is disarmed)
+        SUCCESS,
+        FAILED
+    } _cal_state;
+
+    // local variables
+    uint32_t _start_time_ms;                                // time the calibration was started
+    struct {
+        sample_t samples[AP_OPTICALFLOW_CAL_MAX_SAMPLES];   // buffer of sensor samples
+        uint8_t num_samples;                                // number of samples in samples buffer
+        float best_scalar;                                  // best scaling value found so far
+        float best_scalar_fitness;                          // fitness (rms of error) of best scaling value
+    } _cal_data[2];                                         // x and y axis
+    uint32_t _last_sample_timestamp_ms;                     // system time of last sample's timestamp, used to ignore duplicates
+    uint32_t _last_report_ms;                               // system time of last status report
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #include "AP_OpticalFlow_HereFlow.h"
+
+#if AP_OPTICALFLOW_HEREFLOW_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+
+#include <AP_CANManager/AP_CANManager.h>
+#include <AP_DroneCAN/AP_DroneCAN.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+extern const AP_HAL::HAL& hal;
+
+uint8_t AP_OpticalFlow_HereFlow::_node_id = 0;
+AP_OpticalFlow_HereFlow* AP_OpticalFlow_HereFlow::_driver = nullptr;
+AP_DroneCAN* AP_OpticalFlow_HereFlow::_ap_dronecan = nullptr;
+/*
+  constructor - registers instance at top Flow driver
+ */
+AP_OpticalFlow_HereFlow::AP_OpticalFlow_HereFlow(AP_OpticalFlow &flow) :
+    OpticalFlow_backend(flow)
+{
+    if (_driver) {
+        AP_HAL::panic("Only one instance of Flow supported!");
+    }
+    _driver = this;
+}
+
+//links the HereFlow messages to the backend
+void AP_OpticalFlow_HereFlow::subscribe_msgs(AP_DroneCAN* ap_dronecan)
+{
+    if (ap_dronecan == nullptr) {
+        return;
+    }
+
+    if (Canard::allocate_sub_arg_callback(ap_dronecan, &handle_measurement, ap_dronecan->get_driver_index()) == nullptr) {
+        AP_BoardConfig::allocation_error("measurement_sub");
+    }
+}
+
+//updates driver states based on received HereFlow messages
+void AP_OpticalFlow_HereFlow::handle_measurement(AP_DroneCAN *ap_dronecan, const CanardRxTransfer& transfer, const com_hex_equipment_flow_Measurement &msg)
+{
+    if (_driver == nullptr) {
+        return;
+    }
+    //protect from data coming from duplicate sensors,
+    //as we only handle one Here Flow at a time as of now
+    if (_ap_dronecan == nullptr) {
+        _ap_dronecan = ap_dronecan;
+        _node_id = transfer.source_node_id;
+    }
+
+    if (_ap_dronecan == ap_dronecan && _node_id == transfer.source_node_id) {
+        WITH_SEMAPHORE(_driver->_sem);
+        _driver->new_data = true;
+        _driver->flow_integral = Vector2f(msg.flow_integral[0], msg.flow_integral[1]);
+        _driver->rate_gyro_integral = Vector2f(msg.rate_gyro_integral[0], msg.rate_gyro_integral[1]);
+        _driver->integral_time = msg.integration_interval;
+        _driver->surface_quality = msg.quality;
+    }
+}
+
+void AP_OpticalFlow_HereFlow::update()
+{
+    _push_state();
+}
+
+// Read the sensor
+void AP_OpticalFlow_HereFlow::_push_state(void)
+{
+    WITH_SEMAPHORE(_sem);
+    if (!new_data) {
+        return;
+    }
+    struct AP_OpticalFlow::OpticalFlow_state state;
+    const Vector2f flowScaler = _flowScaler();
+    //setup scaling based on parameters
+    float flowScaleFactorX = 1.0f + 0.001f * flowScaler.x;
+    float flowScaleFactorY = 1.0f + 0.001f * flowScaler.y;
+    float integralToRate = 1.0f / integral_time;
+    //Convert to Raw Flow measurement to Flow Rate measurement
+    state.flowRate = Vector2f{
+        flow_integral.x * flowScaleFactorX,
+        flow_integral.y * flowScaleFactorY
+    } * integralToRate;
+    state.bodyRate = rate_gyro_integral * integralToRate;
+    state.surface_quality = surface_quality;
+    _applyYaw(state.flowRate);
+    _applyYaw(state.bodyRate);
+    // hal.console->printf("DRV: %u %f %f\n", state.surface_quality, flowRate.length(), bodyRate.length());
+    _update_frontend(state);
+    new_data = false;
+}
+
+#endif // AP_OPTICALFLOW_HEREFLOW_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #pragma once
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_MAV_ENABLED
+
+#include "AP_OpticalFlow_Backend.h"
+#include <AP_HAL/utility/OwnPtr.h>
+
+class AP_OpticalFlow_MAV : public OpticalFlow_backend
+{
+public:
+    /// constructor
+    using OpticalFlow_backend::OpticalFlow_backend;
+
+    // initialise the sensor
+    void init() override {}
+
+    // read latest values from sensor and fill in x,y and totals.
+    void update(void) override;
+
+    // get update from mavlink
+    void handle_msg(const mavlink_message_t &msg) override;
+
+    // detect if the sensor is available
+    static AP_OpticalFlow_MAV *detect(AP_OpticalFlow &_frontend);
+
+private:
+
+    uint64_t prev_frame_us;             // system time of last message when update was last called
+    uint64_t latest_frame_us;           // system time of most recent messages processed
+    Vector2l flow_sum;                  // sum of sensor's flow_x and flow_y values since last call to update
+    uint16_t quality_sum;               // sum of sensor's quality values since last call to update
+    uint16_t count;                     // number of sensor readings since last call to update
+    uint8_t sensor_id;                  // sensor_id received in latest mavlink message
+    Vector2f gyro_sum;                  // sum of gyro sensor values since last frame from flow sensor
+    uint16_t gyro_sum_count;            // number of gyro sensor values in sum
+};
+
+#endif  // AP_OPTICALFLOW_MAV_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include "AP_OpticalFlow_MSP.h"
+
+#if HAL_MSP_OPTICALFLOW_ENABLED
+
+#define OPTFLOW_MSP_TIMEOUT_SEC 0.5f // 2Hz
+
+extern const AP_HAL::HAL& hal;
+
+using namespace MSP;
+
+// detect the device
+AP_OpticalFlow_MSP *AP_OpticalFlow_MSP::detect(AP_OpticalFlow &_frontend)
+{
+    // we assume msp messages will be sent into this driver
+    return NEW_NOTHROW AP_OpticalFlow_MSP(_frontend);
+}
+
+// read latest values from sensor and fill in x,y and totals.
+void AP_OpticalFlow_MSP::update(void)
+{
+    // record gyro values as long as they are being used
+    // the sanity check of dt below ensures old gyro values are not used
+    if (gyro_sum_count < 1000) {
+        const Vector3f& gyro = AP::ahrs().get_gyro();
+        gyro_sum.x += gyro.x;
+        gyro_sum.y += gyro.y;
+        gyro_sum_count++;
+    }
+
+    // return without updating state if no readings
+    if (count == 0) {
+        return;
+    }
+
+    struct AP_OpticalFlow::OpticalFlow_state state {};
+
+    state.surface_quality = quality_sum / count;
+
+    // calculate dt
+    const float dt = (latest_frame_us - prev_frame_us) * 1.0e-6;
+    prev_frame_us = latest_frame_us;
+
+    // sanity check dt
+    if (is_positive(dt) && (dt < OPTFLOW_MSP_TIMEOUT_SEC)) {
+        // calculate flow values
+        const float flow_scale_factor_x = 1.0f + 0.001f * _flowScaler().x;
+        const float flow_scale_factor_y = 1.0f + 0.001f * _flowScaler().y;
+
+        // copy flow rates to state structure
+        state.flowRate = { ((float)flow_sum.x / count) * flow_scale_factor_x * dt,
+                           ((float)flow_sum.y / count) * flow_scale_factor_y * dt};
+
+        // copy average body rate to state structure
+        state.bodyRate = { gyro_sum.x / gyro_sum_count, gyro_sum.y / gyro_sum_count };
+
+        // invert flow vector to align it with default sensor orientation (required on matek 3901)
+        state.flowRate *= -1;
+
+        // we only apply yaw to flowRate as body rate comes from AHRS
+        _applyYaw(state.flowRate);
+    } else {
+        // first frame received in some time so cannot calculate flow values
+        state.flowRate.zero();
+        state.bodyRate.zero();
+    }
+
+    _update_frontend(state);
+
+    // reset local buffers
+    flow_sum.zero();
+    quality_sum = 0;
+    count = 0;
+
+    // reset gyro sum
+    gyro_sum.zero();
+    gyro_sum_count = 0;
+}
+
+// handle OPTICAL_FLOW msp messages
+void AP_OpticalFlow_MSP::handle_msp(const MSP::msp_opflow_data_message_t &pkt)
+{
+    // record time message was received
+    // ToDo: add jitter correction
+    latest_frame_us = AP_HAL::micros64();
+
+    // add sensor values to sum
+    flow_sum.x += pkt.motion_x;
+    flow_sum.y += pkt.motion_y;
+    quality_sum += (int)pkt.quality * 100 / 255;
+    count++;
+}
+
+#endif // HAL_MSP_OPTICALFLOW_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+#include "AP_OpticalFlow.h"
+#include <AP_HAL/utility/OwnPtr.h>
+
+#if HAL_MSP_OPTICALFLOW_ENABLED
+
+class AP_OpticalFlow_MSP : public OpticalFlow_backend
+{
+public:
+    /// constructor
+    using OpticalFlow_backend::OpticalFlow_backend;
+
+    // initialise the sensor
+    void init() override {}
+
+    // read latest values from sensor and fill in x,y and totals.
+    void update(void) override;
+
+    // get update from msp
+    void handle_msp(const MSP::msp_opflow_data_message_t &pkt) override;
+
+    // detect if the sensor is available
+    static AP_OpticalFlow_MSP *detect(AP_OpticalFlow &_frontend);
+
+private:
+
+    uint64_t prev_frame_us;             // system time of last message when update was last called
+    uint64_t latest_frame_us;           // system time of most recent messages processed
+    Vector2l flow_sum;                  // sum of sensor's flow_x and flow_y values since last call to update
+    uint16_t quality_sum;               // sum of sensor's quality values since last call to update
+    uint16_t count;                     // number of sensor readings since last call to update
+    Vector2f gyro_sum;                  // sum of gyro sensor values since last frame from flow sensor
+    uint16_t gyro_sum_count;            // number of gyro sensor values in sum
+};
+
+#endif // HAL_MSP_OPTICALFLOW_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_ONBOARD_ENABLED
+
+#include "AP_OpticalFlow_Onboard.h"
+
+#include <AP_HAL/AP_HAL.h>
+
+#ifndef OPTICALFLOW_ONBOARD_DEBUG
+#define OPTICALFLOW_ONBOARD_DEBUG 0
+#endif
+
+#define OPTICALFLOW_ONBOARD_ID 1
+extern const AP_HAL::HAL& hal;
+
+void AP_OpticalFlow_Onboard::init(void)
+{
+    /* register callback to get gyro data */
+    hal.opticalflow->init();
+}
+
+void AP_OpticalFlow_Onboard::update()
+{
+    AP_HAL::OpticalFlow::Data_Frame data_frame;
+    // read at maximum 10Hz
+    uint32_t now = AP_HAL::millis();
+    if (now - _last_read_ms < 100) {
+        return;
+    }
+    _last_read_ms = now;
+
+    if (!hal.opticalflow->read(data_frame)) {
+        return;
+    }
+
+    struct AP_OpticalFlow::OpticalFlow_state state;
+    state.surface_quality = data_frame.quality;
+    if (data_frame.delta_time > 0) {
+        const Vector2f flowScaler = _flowScaler();
+        float flowScaleFactorX = 1.0f + 0.001f * flowScaler.x;
+        float flowScaleFactorY = 1.0f + 0.001f * flowScaler.y;
+
+        // delta_time is in microseconds and flow is in milliradians
+        // per second, so multiply by 1000
+        state.flowRate.x = flowScaleFactorX * 1000.0f /
+                           float(data_frame.delta_time) *
+                           data_frame.pixel_flow_x_integral;
+
+        state.flowRate.y = flowScaleFactorY * 1000.0f /
+                           float(data_frame.delta_time) *
+                           data_frame.pixel_flow_y_integral;
+
+        // delta_time is in microseconds so multiply to get back to seconds
+        state.bodyRate.x = 1000000.0f / float(data_frame.delta_time) *
+                           data_frame.gyro_x_integral;
+
+        state.bodyRate.y = 1000000.0f / float(data_frame.delta_time) *
+                           data_frame.gyro_y_integral;
+
+        _applyYaw(state.flowRate);
+    } else {
+        state.flowRate.zero();
+        state.bodyRate.zero();
+    }
+
+    // copy results to front end
+    _update_frontend(state);
+
+#if OPTICALFLOW_ONBOARD_DEBUG
+    hal.console->printf("FLOW_ONBOARD qual:%u FlowRateX:%4.2f Y:%4.2f"
+                        "BodyRateX:%4.2f Y:%4.2f, delta_time = %u\n",
+                        (unsigned)state.surface_quality,
+                        (double)state.flowRate.x,
+                        (double)state.flowRate.y,
+                        (double)state.bodyRate.x,
+                        (double)state.bodyRate.y,
+                        data_frame.delta_time);
+#endif
+}
+
+#endif  // AP_OPTICALFLOW_ONBOARD_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_ONBOARD_ENABLED
+
+#include <AP_OpticalFlow/AP_OpticalFlow_Backend.h>
+
+#include "AP_OpticalFlow.h"
+
+class AP_OpticalFlow_Onboard : public OpticalFlow_backend
+{
+public:
+
+    using OpticalFlow_backend::OpticalFlow_backend;
+
+    void init(void) override;
+    void update(void) override;
+private:
+    uint32_t _last_read_ms;
+};
+
+#endif  // AP_OPTICALFLOW_ONBOARD_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  driver for PX4Flow optical flow sensor
+ */
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_PX4FLOW_ENABLED
+
+#include "AP_OpticalFlow_PX4Flow.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/crc.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_HAL/I2CDevice.h>
+#include <utility>
+#include "AP_OpticalFlow.h"
+#include <stdio.h>
+#include <AP_BoardConfig/AP_BoardConfig.h>
+
+extern const AP_HAL::HAL& hal;
+
+#define PX4FLOW_BASE_I2C_ADDR   0x42
+#define PX4FLOW_INIT_RETRIES    10      // attempt to initialise the sensor up to 10 times at startup
+
+
+// detect the device
+AP_OpticalFlow_PX4Flow *AP_OpticalFlow_PX4Flow::detect(AP_OpticalFlow &_frontend)
+{
+    AP_OpticalFlow_PX4Flow *sensor = NEW_NOTHROW AP_OpticalFlow_PX4Flow(_frontend);
+    if (!sensor) {
+        return nullptr;
+    }
+    if (!sensor->setup_sensor()) {
+        delete sensor;
+        return nullptr;
+    }
+    return sensor;
+}
+
+/*
+  look for the sensor on different buses
+ */
+bool AP_OpticalFlow_PX4Flow::scan_buses(void)
+{
+    bool success = false;
+    uint8_t retry_attempt = 0;
+
+    while (!success && retry_attempt < PX4FLOW_INIT_RETRIES) {
+        bool all_external = (AP_BoardConfig::get_board_type() == AP_BoardConfig::PX4_BOARD_PIXHAWK2);
+        uint32_t bus_mask = all_external? hal.i2c_mgr->get_bus_mask() : hal.i2c_mgr->get_bus_mask_external();
+        FOREACH_I2C_MASK(bus, bus_mask) {
+    #ifdef HAL_OPTFLOW_PX4FLOW_I2C_BUS
+            // only one bus from HAL
+            if (bus != HAL_OPTFLOW_PX4FLOW_I2C_BUS) {
+                continue;
+            }
+    #endif
+            AP_HAL::OwnPtr<AP_HAL::Device> tdev = hal.i2c_mgr->get_device(bus, PX4FLOW_BASE_I2C_ADDR + get_address());
+            if (!tdev) {
+                continue;
+            }
+            WITH_SEMAPHORE(tdev->get_semaphore());
+
+            struct i2c_integral_frame frame;
+            success = tdev->read_registers(REG_INTEGRAL_FRAME, (uint8_t *)&frame, sizeof(frame));
+            if (success) {
+                printf("Found PX4Flow on bus %u\n", unsigned(bus));
+                dev = std::move(tdev);
+                break;
+            }
+        }
+        retry_attempt++;
+        if (!success) {
+            hal.scheduler->delay(10);
+        }
+    }
+    return success;
+}
+
+// setup the device
+bool AP_OpticalFlow_PX4Flow::setup_sensor(void)
+{
+    if (!scan_buses()) {
+        return false;
+    }
+    // read at 10Hz
+    dev->register_periodic_callback(100000, FUNCTOR_BIND_MEMBER(&AP_OpticalFlow_PX4Flow::timer, void));
+    return true;
+}
+
+
+// update - read latest values from sensor and fill in x,y and totals.
+void AP_OpticalFlow_PX4Flow::update(void)
+{
+}
+
+// timer to read sensor
+void AP_OpticalFlow_PX4Flow::timer(void)
+{
+    struct i2c_integral_frame frame;
+    if (!dev->read_registers(REG_INTEGRAL_FRAME, (uint8_t *)&frame, sizeof(frame))) {
+        return;
+    }
+    struct AP_OpticalFlow::OpticalFlow_state state {};
+
+    if (frame.integration_timespan > 0) {
+        const Vector2f flowScaler = _flowScaler();
+        float flowScaleFactorX = 1.0f + 0.001f * flowScaler.x;
+        float flowScaleFactorY = 1.0f + 0.001f * flowScaler.y;
+        float integralToRate = 1.0e6 / frame.integration_timespan;
+        
+        state.surface_quality = frame.qual;
+        state.flowRate = Vector2f(frame.pixel_flow_x_integral * flowScaleFactorX,
+                                  frame.pixel_flow_y_integral * flowScaleFactorY) * 1.0e-4 * integralToRate;
+        state.bodyRate = Vector2f(frame.gyro_x_rate_integral, frame.gyro_y_rate_integral) * 1.0e-4 * integralToRate;
+        
+        _applyYaw(state.flowRate);
+        _applyYaw(state.bodyRate);
+    }
+
+    _update_frontend(state);
+}
+
+#endif  // AP_OPTICALFLOW_PX4FLOW_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #pragma once
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_PX4FLOW_ENABLED
+
+#include "AP_OpticalFlow_Backend.h"
+#include <AP_HAL/utility/OwnPtr.h>
+
+class AP_OpticalFlow_PX4Flow : public OpticalFlow_backend
+{
+public:
+    /// constructor
+    using OpticalFlow_backend::OpticalFlow_backend;
+
+    CLASS_NO_COPY(AP_OpticalFlow_PX4Flow);
+
+    // init - initialise the sensor
+    void init() override {}
+
+    // update - read latest values from sensor and fill in x,y and totals.
+    void update(void) override;
+
+    // detect if the sensor is available
+    static AP_OpticalFlow_PX4Flow *detect(AP_OpticalFlow &_frontend);
+
+private:
+    AP_HAL::OwnPtr<AP_HAL::Device> dev;
+
+    static const uint8_t REG_INTEGRAL_FRAME = 0x16;
+    
+    // I2C data on register REG_INTEGRAL_FRAME
+    struct PACKED i2c_integral_frame {
+        uint16_t frame_count_since_last_readout;
+        int16_t pixel_flow_x_integral;
+        int16_t pixel_flow_y_integral;
+        int16_t gyro_x_rate_integral;
+        int16_t gyro_y_rate_integral;
+        int16_t gyro_z_rate_integral;
+        uint32_t integration_timespan;
+        uint32_t sonar_timestamp;
+        uint16_t ground_distance;
+        int16_t gyro_temperature;
+        uint8_t qual;
+    };
+    
+    // scan I2C bus addresses and buses
+    bool scan_buses(void);
+
+    // setup sensor
+    bool setup_sensor(void);
+
+    void timer(void);
+};
+
+#endif  // AP_OPTICALFLOW_PX4FLOW_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  driver for Pixart PMW3900DH optical flow sensor
+
+
+  NOTE: This sensor does not use traditional SPI register access. The
+  timing for register reads and writes is critical
+ */
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_PIXART_ENABLED
+
+#include "AP_OpticalFlow_Pixart.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/crc.h>
+#include <AP_AHRS/AP_AHRS.h>
+#include <utility>
+#include "AP_OpticalFlow.h"
+#include "AP_OpticalFlow_Pixart_SROM.h"
+#include <stdio.h>
+
+#define debug(fmt, args ...)  do {printf(fmt, ## args); } while(0)
+
+extern const AP_HAL::HAL& hal;
+
+#define PIXART_REG_PRODUCT_ID  0x00
+#define PIXART_REG_REVISION_ID 0x01
+#define PIXART_REG_MOTION      0x02
+#define PIXART_REG_DELTA_X_L   0x03
+#define PIXART_REG_DELTA_X_H   0x04
+#define PIXART_REG_DELTA_Y_L   0x05
+#define PIXART_REG_DELTA_Y_H   0x06
+#define PIXART_REG_SQUAL       0x07
+#define PIXART_REG_RAWDATA_SUM 0x08
+#define PIXART_REG_RAWDATA_MAX 0x09
+#define PIXART_REG_RAWDATA_MIN 0x0A
+#define PIXART_REG_SHUTTER_LOW 0x0B
+#define PIXART_REG_SHUTTER_HI  0x0C
+#define PIXART_REG_CONFIG1     0x0F
+#define PIXART_REG_CONFIG2     0x10
+#define PIXART_REG_FRAME_CAP   0x12
+#define PIXART_REG_SROM_EN     0x13
+#define PIXART_REG_RUN_DS      0x14
+#define PIXART_REG_REST1_RATE  0x15
+#define PIXART_REG_REST1_DS    0x16
+#define PIXART_REG_REST2_RATE  0x17
+#define PIXART_REG_REST2_DS    0x18
+#define PIXART_REG_REST3_RATE  0x19
+#define PIXART_REG_OBS         0x24
+#define PIXART_REG_DOUT_L      0x25
+#define PIXART_REG_DOUT_H      0x26
+#define PIXART_REG_RAW_GRAB    0x29
+#define PIXART_REG_SROM_ID     0x2A
+#define PIXART_REG_POWER_RST   0x3A
+#define PIXART_REG_SHUTDOWN    0x3B
+#define PIXART_REG_INV_PROD_ID 0x3F
+#define PIXART_REG_INV_PROD_ID2 0x5F // for 3901
+#define PIXART_REG_MOT_BURST   0x50
+#define PIXART_REG_MOT_BURST2  0x16
+#define PIXART_REG_SROM_BURST  0x62
+#define PIXART_REG_RAW_BURST   0x64
+
+// writing to registers needs this flag
+#define PIXART_WRITE_FLAG      0x80
+
+// timings in microseconds
+#define PIXART_Tsrad           300
+
+// correct result for SROM CRC
+#define PIXART_SROM_CRC_RESULT 0xBEEF
+
+// constructor
+AP_OpticalFlow_Pixart::AP_OpticalFlow_Pixart(const char *devname, AP_OpticalFlow &_frontend) :
+    OpticalFlow_backend(_frontend)
+{
+    _dev = std::move(hal.spi->get_device(devname));
+}
+
+// detect the device
+AP_OpticalFlow_Pixart *AP_OpticalFlow_Pixart::detect(const char *devname, AP_OpticalFlow &_frontend)
+{
+    AP_OpticalFlow_Pixart *sensor = NEW_NOTHROW AP_OpticalFlow_Pixart(devname, _frontend);
+    if (!sensor) {
+        return nullptr;
+    }
+    if (!sensor->setup_sensor()) {
+        delete sensor;
+        return nullptr;
+    }
+    return sensor;
+}
+
+// setup the device
+bool AP_OpticalFlow_Pixart::setup_sensor(void)
+{
+    if (!_dev) {
+        return false;
+    }
+    WITH_SEMAPHORE(_dev->get_semaphore());
+
+    // power-up sequence
+    reg_write(PIXART_REG_POWER_RST, 0x5A);
+    hal.scheduler->delay(50);
+
+    // check product ID
+    uint8_t id1 = reg_read(PIXART_REG_PRODUCT_ID);
+    uint8_t id2;
+    if (id1 == 0x3f) {
+        id2 = reg_read(PIXART_REG_INV_PROD_ID);
+    } else {
+        id2 = reg_read(PIXART_REG_INV_PROD_ID2);
+    }
+    debug("id1=0x%02x id2=0x%02x ~id1=0x%02x\n", id1, id2, uint8_t(~id1));
+    if (id1 == 0x3F && id2 == uint8_t(~id1)) {
+        model = PIXART_3900;
+    } else if (id1 == 0x49 && id2 == uint8_t(~id1)) {
+        model = PIXART_3901;
+    } else {
+        debug("Not a recognised device\n");
+        return false;
+    }
+
+    if (model == PIXART_3900) {
+        srom_download();
+
+        const uint8_t id = reg_read(PIXART_REG_SROM_ID);
+        if (id != srom_id) {
+            debug("Pixart: bad SROM ID: 0x%02x\n", id);
+            return false;
+        }
+
+        reg_write(PIXART_REG_SROM_EN, 0x15);
+        hal.scheduler->delay(10);
+
+        const uint16_t crc = reg_read16u(PIXART_REG_DOUT_L);
+        if (crc != 0xBEEF) {
+            debug("Pixart: bad SROM CRC: 0x%04x\n", crc);
+            return false;
+        }
+    }
+
+    if (model == PIXART_3900) {
+        load_configuration(init_data_3900, ARRAY_SIZE(init_data_3900));
+    } else {
+        load_configuration(init_data_3901_1, ARRAY_SIZE(init_data_3901_1));
+        hal.scheduler->delay(100);
+        load_configuration(init_data_3901_2, ARRAY_SIZE(init_data_3901_2));
+    }
+
+    hal.scheduler->delay(50);
+
+    debug("Pixart %s ready\n", model==PIXART_3900?"3900":"3901");
+
+    integral.last_frame_us = AP_HAL::micros();
+
+    _dev->register_periodic_callback(2000, FUNCTOR_BIND_MEMBER(&AP_OpticalFlow_Pixart::timer, void));
+    return true;
+}
+
+// write an 8 bit register
+void AP_OpticalFlow_Pixart::reg_write(uint8_t reg, uint8_t value)
+{
+    _dev->set_chip_select(true);
+    reg |= PIXART_WRITE_FLAG;
+    _dev->transfer(&reg, 1, nullptr, 0);
+    hal.scheduler->delay_microseconds(PIXART_Tsrad);
+    _dev->transfer(&value, 1, nullptr, 0);
+    _dev->set_chip_select(false);
+    hal.scheduler->delay_microseconds(120);
+}
+
+// read from an 8 bit register
+uint8_t AP_OpticalFlow_Pixart::reg_read(uint8_t reg)
+{
+    uint8_t v = 0;
+    _dev->set_chip_select(true);
+    _dev->transfer(&reg, 1, nullptr, 0);
+    hal.scheduler->delay_microseconds(35);
+    _dev->transfer(nullptr, 0, &v, 1);
+    _dev->set_chip_select(false);
+    hal.scheduler->delay_microseconds(200);
+    return v;
+}
+
+// read from a 16 bit unsigned register
+uint16_t AP_OpticalFlow_Pixart::reg_read16u(uint8_t reg)
+{
+    uint16_t low = reg_read(reg);
+    uint16_t high = reg_read(reg+1);
+    return low | (high<<8);
+}
+
+// read from a 16 bit signed register
+int16_t AP_OpticalFlow_Pixart::reg_read16s(uint8_t reg)
+{
+    return (int16_t)reg_read16u(reg);
+}
+
+void AP_OpticalFlow_Pixart::srom_download(void)
+{
+    reg_write(0x39, 0x02);
+    hal.scheduler->delay(1);
+    reg_write(PIXART_REG_SROM_EN, 0x1D);
+    hal.scheduler->delay(10);
+    reg_write(PIXART_REG_SROM_EN, 0x18);
+
+    if (!_dev->set_chip_select(true)) {
+        debug("Failed to force CS\n");
+    }
+    hal.scheduler->delay_microseconds(1);
+    uint8_t reg = PIXART_REG_SROM_BURST | PIXART_WRITE_FLAG;
+    _dev->transfer(&reg, 1, nullptr, 0);
+
+    for (uint16_t i = 0; i < ARRAY_SIZE(srom_data); i++) {
+        hal.scheduler->delay_microseconds(15);
+        _dev->transfer(&srom_data[i], 1, nullptr, 0);
+    }
+
+    hal.scheduler->delay_microseconds(125);
+    if (!_dev->set_chip_select(false)) {
+        debug("Failed to force CS off\n");
+    }
+    hal.scheduler->delay_microseconds(160);
+}
+
+void AP_OpticalFlow_Pixart::load_configuration(const RegData *init_data, uint16_t n)
+{
+    for (uint16_t i = 0; i < n; i++) {
+        // writing a config register can fail - retry up to 5 times
+        for (uint8_t tries=0; tries<5; tries++) {
+            reg_write(init_data[i].reg, init_data[i].value);
+            uint8_t v = reg_read(init_data[i].reg);
+            if (v == init_data[i].value) {
+                break;
+            }
+            //debug("reg[%u:%02x] 0x%02x 0x%02x\n", (unsigned)i, (unsigned)init_data[i].reg, (unsigned)init_data[i].value, (unsigned)v);
+        }
+    }
+}
+
+void AP_OpticalFlow_Pixart::motion_burst(void)
+{
+    uint8_t *b = (uint8_t *)&burst;
+
+    burst.delta_x = 0;
+    burst.delta_y = 0;
+
+    _dev->set_chip_select(true);
+    uint8_t reg = model==PIXART_3900?PIXART_REG_MOT_BURST:PIXART_REG_MOT_BURST2;
+
+    _dev->transfer(&reg, 1, nullptr, 0);
+    hal.scheduler->delay_microseconds(150);
+
+    for (uint8_t i=0; i<sizeof(burst); i++) {
+        _dev->transfer(nullptr, 0, &b[i], 1);
+        if (i == 0 && (burst.motion & 0x80) == 0) {
+            // no motion, save some bus bandwidth
+            _dev->set_chip_select(false);
+            return;
+        }
+    }
+    _dev->set_chip_select(false);
+}
+
+void AP_OpticalFlow_Pixart::timer(void)
+{
+    if (AP_HAL::micros() - last_burst_us < 500) {
+        return;
+    }
+    motion_burst();
+    last_burst_us = AP_HAL::micros();
+
+    uint32_t dt_us = last_burst_us - integral.last_frame_us;
+    float dt = dt_us * 1.0e-6;
+#if AP_AHRS_ENABLED
+    const Vector3f &gyro = AP::ahrs().get_gyro();
+#else
+    const Vector3f &gyro = AP::ins().get_gyro();
+#endif
+
+    {
+        WITH_SEMAPHORE(_sem);
+
+        integral.sum.x += burst.delta_x;
+        integral.sum.y += burst.delta_y;
+        integral.sum_us += dt_us;
+        integral.last_frame_us = last_burst_us;
+        integral.gyro += Vector2f(gyro.x, gyro.y) * dt;
+    }
+
+#if 0
+    static uint32_t last_print_ms;
+    static int fd = -1;
+    if (fd == -1) {
+        fd = open("/dev/ttyACM0", O_WRONLY);
+    }
+    // used for debugging
+    static int32_t sum_x;
+    static int32_t sum_y;
+    sum_x += burst.delta_x;
+    sum_y += burst.delta_y;
+
+    uint32_t now = AP_HAL::millis();
+    if (now - last_print_ms >= 100 && (sum_x != 0 || sum_y != 0)) {
+        last_print_ms = now;
+        dprintf(fd, "Motion: %d %d obs:0x%02x squal:%u rds:%u maxr:%u minr:%u sup:%u slow:%u\n",
+               (int)sum_x, (int)sum_y, (unsigned)burst.squal, (unsigned)burst.rawdata_sum, (unsigned)burst.max_raw,
+               (unsigned)burst.max_raw, (unsigned)burst.min_raw, (unsigned)burst.shutter_upper, (unsigned)burst.shutter_lower);
+        sum_x = sum_y = 0;
+    }
+#endif
+}
+
+// update - read latest values from sensor and fill in x,y and totals.
+void AP_OpticalFlow_Pixart::update(void)
+{
+    uint32_t now = AP_HAL::millis();
+    if (now - last_update_ms < 100) {
+        return;
+    }
+    last_update_ms = now;
+
+    struct AP_OpticalFlow::OpticalFlow_state state;
+    state.surface_quality = burst.squal;
+
+    if (integral.sum_us > 0) {
+        WITH_SEMAPHORE(_sem);
+
+        const Vector2f flowScaler = _flowScaler();
+        float flowScaleFactorX = 1.0f + 0.001f * flowScaler.x;
+        float flowScaleFactorY = 1.0f + 0.001f * flowScaler.y;
+        float dt = integral.sum_us * 1.0e-6;
+
+        state.flowRate = Vector2f(integral.sum.x * flowScaleFactorX,
+                                  integral.sum.y * flowScaleFactorY);
+        state.flowRate *= flow_pixel_scaling / dt;
+
+        // we only apply yaw to flowRate as body rate comes from AHRS
+        _applyYaw(state.flowRate);
+
+        state.bodyRate = integral.gyro / dt;
+
+        integral.sum.zero();
+        integral.sum_us = 0;
+        integral.gyro.zero();
+    } else {
+        state.flowRate.zero();
+        state.bodyRate.zero();
+    }
+
+    // copy results to front end
+    _update_frontend(state);
+}
+
+#endif  // AP_OPTICALFLOW_PIXART_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #pragma once
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_PIXART_ENABLED
+
+#include "AP_OpticalFlow_Backend.h"
+
+#include <AP_HAL/utility/OwnPtr.h>
+
+class AP_OpticalFlow_Pixart : public OpticalFlow_backend
+{
+public:
+    /// constructor
+    AP_OpticalFlow_Pixart(const char *devname, AP_OpticalFlow &_frontend);
+
+    // init - initialise the sensor
+    void init() override {}
+
+    // update - read latest values from sensor and fill in x,y and totals.
+    void update(void) override;
+
+    // detect if the sensor is available
+    static AP_OpticalFlow_Pixart *detect(const char *devname, AP_OpticalFlow &_frontend);
+
+private:
+    AP_HAL::OwnPtr<AP_HAL::SPIDevice> _dev;
+
+    enum {
+        PIXART_3900=0,
+        PIXART_3901=1
+    } model;
+    
+    struct RegData {
+        uint8_t reg;
+        uint8_t value;
+    };
+
+    struct PACKED MotionBurst {
+        uint8_t motion;
+        uint8_t observation;
+        int16_t delta_x;
+        int16_t delta_y;
+        uint8_t squal;
+        uint8_t rawdata_sum;
+        uint8_t max_raw;
+        uint8_t min_raw;
+        uint8_t shutter_upper;
+        uint8_t shutter_lower;
+    } burst;
+
+    struct {
+        Vector2l sum;
+        uint32_t last_frame_us;
+        uint32_t sum_us;
+        Vector2f gyro;
+    } integral;
+    
+    static const uint8_t srom_data[];
+    static const uint8_t srom_id;
+    static const RegData init_data_3900[];
+    static const RegData init_data_3901_1[];
+    static const RegData init_data_3901_2[];
+    const float flow_pixel_scaling = 1.26e-3;
+
+    // setup sensor
+    bool setup_sensor(void);
+    
+    void reg_write(uint8_t reg, uint8_t value);
+    uint8_t reg_read(uint8_t reg);
+    int16_t reg_read16s(uint8_t reg);
+    uint16_t reg_read16u(uint8_t reg);
+
+    void srom_download(void);
+    void load_configuration(const RegData *init_data, uint16_t n);
+
+    void timer(void);
+    void motion_burst(void);
+
+    uint32_t last_burst_us;
+    uint32_t last_update_ms;
+};
+
+#endif  // AP_OPTICALFLOW_PIXART_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+  SROM for Pixart flow, converted from data supplied by Pixart (thanks to Fish for conversion)
+ */
+
+const uint8_t AP_OpticalFlow_Pixart::srom_id = 0xED;
+
+// SROM data for 3900
+const uint8_t AP_OpticalFlow_Pixart::srom_data[] =
+{
+    0x03, 0xed, 0xb5, 0x32, 0x26, 0xfc, 0x1e, 0xbe, 0xd8, 0x1d, 0xb8, 0xd3, 0x05, 0x88, 0x73, 0x45,
+    0x08, 0x92, 0xa6, 0xce, 0x1e, 0xba, 0xfe, 0x71, 0x5f, 0x1d, 0xb8, 0xf2, 0x66, 0x2f, 0xdc, 0x1b,
+    0x95, 0xa8, 0xb3, 0xe4, 0x2b, 0xb5, 0xe8, 0x52, 0x26, 0xce, 0xff, 0x5d, 0x38, 0xf2, 0x66, 0x4e,
+    0xff, 0x5d, 0x38, 0xd3, 0x05, 0x6f, 0x31, 0xe0, 0x42, 0x06, 0x8e, 0x7f, 0x7c, 0x5b, 0x34, 0xcb,
+    0xf5, 0x68, 0x52, 0x26, 0xce, 0xff, 0x7c, 0x7a, 0x76, 0x6e, 0x3f, 0xdd, 0x19, 0xb3, 0xc3, 0x06,
+    0x8a, 0x96, 0x8f, 0x9c, 0x9b, 0x95, 0x81, 0x90, 0x83, 0x84, 0x6a, 0x54, 0x0b, 0x75, 0x49, 0x10,
+    0x83, 0x60, 0x41, 0x18, 0x8c, 0x61, 0x34, 0xfe, 0x68, 0xe6, 0xa1, 0x61, 0x44, 0x81, 0x7d, 0xc3,
+    0xc7, 0xcf, 0x96, 0x11, 0x65, 0x14, 0x2d, 0xa7, 0xe1, 0x91, 0xe6, 0xfa, 0x99, 0x04, 0x65, 0x1d,
+    0x57, 0x98, 0x7c, 0xce, 0x9a, 0xe2, 0x41, 0xd5, 0x0e, 0x3b, 0x51, 0xed, 0x0f, 0x55, 0x45, 0xc0,
+    0xbc, 0x32, 0x00, 0xcb, 0x3e, 0x84, 0xba, 0x7a, 0x59, 0x84, 0x04, 0x5f, 0xf2, 0xf3, 0x8b, 0x20,
+    0x2d, 0x6c, 0xb5, 0x88, 0x9c, 0x4c, 0x4c, 0x70, 0x45, 0x13, 0x8a, 0x9a, 0x93, 0x64, 0x2b, 0xf5,
+    0xa8, 0x7d, 0x63, 0x78, 0xcc, 0xd0, 0xa6, 0x6e, 0x54, 0xff, 0xc9, 0x67, 0x40, 0xe0, 0x4c, 0xdd,
+    0x48, 0x58, 0xff, 0xb6, 0x80, 0x95, 0xb5, 0xc3, 0x2b, 0x19, 0x2b, 0x8c, 0x19, 0x66, 0x1a, 0xc6,
+    0xac, 0x2e, 0x4a, 0x9f, 0xcc, 0x1e, 0xe6, 0xed, 0x36, 0x2d, 0x63, 0xb4, 0x9b, 0xb9, 0xbf, 0xd9,
+    0x22, 0xde, 0xaf, 0xcc, 0xde, 0x02, 0xa3, 0xf7, 0x9a, 0xa5, 0x27, 0x64, 0x19, 0x82, 0x16, 0xdc,
+    0xf5, 0x21, 0x93, 0x54, 0xdf, 0x4e, 0x4d, 0x99, 0xac, 0x89, 0x55, 0x3b, 0xb1, 0x73, 0x56, 0x7e,
+    0xed, 0x28, 0x46, 0x5d, 0xc6, 0xe7, 0x1f, 0x7f, 0x4c, 0x68, 0x4d, 0x71, 0xf3, 0xa4, 0x5f, 0x41,
+    0x9b, 0xe9, 0x23, 0xed, 0x1b, 0xa5, 0xc4, 0x6c, 0x35, 0xb2, 0xfa, 0x82, 0x1e, 0x28, 0xab, 0xf1,
+    0x53, 0xb7, 0x4f, 0xf1, 0x00, 0x77, 0xe4, 0x3a, 0x34, 0xe7, 0x4f, 0xfe, 0xbb, 0x84, 0x08, 0x79,
+    0x3d, 0x39, 0x90, 0xd2, 0x85, 0x83, 0x0b, 0x76, 0x8a, 0xc7, 0x8e, 0x96, 0xc6, 0x88, 0xbe, 0xfa,
+    0x2e, 0x5c, 0x28, 0x2b, 0xa4, 0x69, 0x59, 0xff, 0x07, 0x5f, 0x68, 0x85, 0xd0, 0xe6, 0x1c, 0x88,
+    0x2f, 0xe5, 0x10, 0xe0, 0x55, 0x1b, 0xc4, 0xaa, 0x91, 0x2d, 0x69, 0xd2, 0x13, 0x91, 0xb1, 0x40,
+    0x25, 0x87, 0xbd, 0x5b, 0x00, 0x75, 0x6c, 0x86, 0x09, 0xb8, 0x78, 0x70, 0xc1, 0x13, 0x1b, 0x5d,
+    0xca, 0x47, 0x8e, 0x6f, 0x25, 0x25, 0x53, 0x54, 0x8a, 0x5f, 0x8c, 0x6f, 0x0a, 0xd8, 0xa7, 0xad,
+    0xac, 0xc8, 0x73, 0x59, 0xc0, 0x5a, 0x75, 0x95, 0xe8, 0xe6, 0x9b, 0xa8, 0xc0, 0x7a, 0x68, 0x15,
+    0xf6, 0x2e, 0x1e, 0xff, 0x57, 0xf9, 0xe4, 0xfc, 0xf4, 0xff, 0x8f, 0xb1, 0xc5, 0xf6, 0x22, 0xf6,
+    0xba, 0xb2, 0xd5, 0x88, 0x7e, 0x8f, 0x93, 0x56, 0x32, 0x7c, 0x2d, 0xa0, 0xc1, 0x3f, 0x96, 0x24,
+    0xf0, 0x75, 0xe7, 0x17, 0x8d, 0x98, 0x19, 0x8c, 0x0b, 0xfa, 0xd4, 0x98, 0x3e, 0x2f, 0x59, 0xf5,
+    0x03, 0x23, 0x4b, 0xa0, 0xbe, 0xca, 0x3b, 0xcd, 0x39, 0xf1, 0x75, 0x4d, 0x2b, 0x17, 0x58, 0x2b,
+    0x55, 0x15, 0x53, 0x1b, 0x1e, 0xed, 0xce, 0xb2, 0x32, 0x5d, 0x30, 0x12, 0x37, 0xe7, 0xad, 0x59,
+    0x2c, 0x61, 0x35, 0x3f, 0x13, 0xd4, 0x8a, 0x4a, 0x8c, 0x0e, 0xec, 0xfd, 0xbf, 0xc1, 0xa0, 0x87,
+    0x24, 0x2a, 0x95, 0xf2, 0x5b, 0x14, 0xa6, 0xca, 0x96, 0x36, 0x07, 0x5e, 0x49, 0x3a, 0x54, 0x0f,
+    0x4e, 0xcd, 0xb8, 0xf8, 0xa7, 0xb9, 0xf9, 0xd4, 0x83, 0x64, 0x7e, 0x70, 0xea, 0xa6, 0x1b, 0x3a,
+    0xcb, 0xb1, 0xee, 0xdf, 0x53, 0x69, 0x13, 0x33, 0x94, 0xeb, 0x08, 0x39, 0x61, 0xe0, 0x68, 0x17,
+    0x58, 0xe9, 0x91, 0xb0, 0x40, 0x3b, 0x38, 0x08, 0x46, 0x0a, 0xaf, 0x7e, 0xb4, 0xc4, 0x7a, 0xb4,
+    0xcc, 0x09, 0xe0, 0xe1, 0x46, 0x7a, 0x8c, 0x4e, 0xaf, 0x1b, 0x04, 0x7b, 0x64, 0x10, 0x83, 0xa1,
+    0xf3, 0xf5, 0x49, 0x9b, 0x77, 0xcd, 0xff, 0xb0, 0x4b, 0x86, 0x0c, 0x89, 0x4a, 0x13, 0x22, 0x0a,
+    0x1e, 0x2c, 0x78, 0xa7, 0x9e, 0x0f, 0x7a, 0x2c, 0x78, 0x85, 0xcc, 0xcb, 0xf7, 0x78, 0x41, 0x26,
+    0x5f, 0x9d, 0x22, 0x19, 0x71, 0xcf, 0x9a, 0x59, 0x4b, 0xe4, 0x7a, 0x5f, 0x61, 0xc2, 0xf7, 0xc1,
+    0xd4, 0x62, 0x91, 0x7b, 0x5d, 0xc5, 0x05, 0xe1, 0x40, 0x35, 0xa0, 0x24, 0x73, 0x4d, 0xf3, 0x37,
+    0xa1, 0xba, 0xd8, 0xa9, 0x0c, 0x21, 0xb6, 0xb7, 0xa9, 0xfe, 0x57, 0xf6, 0xbd, 0xcc, 0xa2, 0x42,
+    0x65, 0x0f, 0xc4, 0xb1, 0x03, 0xd0, 0xfb, 0xd3, 0xa2, 0xd8, 0x7b, 0x2e, 0x4c, 0x0f, 0x05, 0x2b,
+    0x5a, 0x01, 0xf8, 0x28, 0x30, 0x17, 0x75, 0xc3, 0x9a, 0xb8, 0xba, 0x4d, 0xea, 0x83, 0x3c, 0x20,
+    0x7c, 0x5d, 0x60, 0xf9, 0xd3, 0x91, 0x79, 0x8a, 0x78, 0xd1, 0x24, 0x4a, 0xec, 0x29, 0x64, 0xe5,
+    0xb3, 0xb9, 0xd9, 0x6b, 0xc1, 0x5c, 0x77, 0x03, 0x27, 0xac, 0x50, 0xff, 0xa2, 0x97, 0xee, 0x3a,
+    0x14, 0xb3, 0x46, 0xad, 0xeb, 0xb5, 0x6c, 0x01, 0x15, 0x34, 0xc6, 0x40, 0x80, 0x6d, 0xcc, 0xa6,
+    0x31, 0x71, 0xa2, 0xc5, 0xe6, 0x97, 0x8e, 0x3d, 0x0b, 0x54, 0x89, 0x50, 0xdf, 0xa5, 0x10, 0xe7,
+    0xf1, 0xa6, 0x44, 0xd6, 0x1e, 0x34, 0x1c, 0x8d, 0xcf, 0xfb, 0xc5, 0xeb, 0x93, 0x11, 0x7f, 0x51,
+    0x4d, 0x05, 0x5b, 0xc7, 0xb9, 0x50, 0x1f, 0x47, 0x52, 0xe8, 0xf3, 0x80, 0x3d, 0xcf, 0x31, 0x81,
+    0xb3, 0xb5, 0x48, 0xce, 0x84, 0xd4, 0xe4, 0xea, 0x70, 0x3c, 0xce, 0x14, 0x5a, 0x21, 0xca, 0xd7,
+    0x4b, 0xdc, 0x2a, 0x11, 0x10, 0x72, 0x57, 0x36, 0xdf, 0x39, 0xc3, 0xf6, 0xce, 0x0c, 0xca, 0x3a,
+    0xaf, 0x9f, 0xaf, 0xf4, 0x3b, 0x65, 0xc9, 0xe1, 0x14, 0xf3, 0xf6, 0xcc, 0x28, 0xfb, 0x27, 0x9d,
+    0xf9, 0x7b, 0x16, 0x46, 0x3c, 0x6f, 0xa0, 0x6c, 0xce, 0xcc, 0x60, 0xc6, 0x8f, 0x71, 0x0c, 0xb2,
+    0xb7, 0xaf, 0x0f, 0x18, 0xbb, 0x65, 0xe8, 0x5c, 0x73, 0x4c, 0x8b, 0xd7, 0x1e, 0xbd, 0x3d, 0xfc,
+    0x66, 0xb2, 0x2f, 0x00, 0x8b, 0x5f, 0xd8, 0xf3, 0xc1, 0x68, 0xb2, 0x1a, 0x7f, 0x28, 0xbb, 0x37,
+    0x96, 0x97, 0x45, 0xe1, 0xd1, 0x18, 0xc8, 0xaf, 0xd5, 0xa3, 0x20, 0x7f, 0xc0, 0x6a, 0xb6, 0x12,
+    0x2f, 0x29, 0xb9, 0x39, 0xdc, 0x18, 0x3a, 0xd8, 0xd7, 0x30, 0x4a, 0xca, 0xaf, 0xb1, 0x18, 0x36,
+    0x1b, 0xf5, 0x51, 0xb2, 0x97, 0xed, 0x3b, 0x21, 0x7b, 0x87, 0xfb, 0xa9, 0x7d, 0x3c, 0xe8, 0x9f,
+    0x11, 0xd5, 0x48, 0xf1, 0x1b, 0x2b, 0x5b, 0xff, 0x3b, 0x79, 0xe6, 0x0f, 0x7f, 0x07, 0x53, 0x8a,
+    0x9d, 0x2a, 0x05, 0xfd, 0xfc, 0x46, 0x0a, 0x44, 0xd9, 0x90, 0x86, 0x61, 0x58, 0x66, 0x1f, 0xfd,
+    0x5d, 0xd5, 0x31, 0xb6, 0xee, 0x81, 0xdf, 0x9a, 0x89, 0x8c, 0x19, 0xc6, 0xcf, 0x27, 0x9a, 0x1a,
+    0x16, 0x8b, 0x6c, 0x19, 0x19, 0x9e, 0x6e, 0x1f, 0xb8, 0xa4, 0x34, 0x6a, 0x53, 0x9f, 0x1c, 0xbf,
+    0x37, 0xf2, 0x17, 0x67, 0xb5, 0x88, 0x77, 0x1b, 0x2b, 0x35, 0xcc, 0x61, 0xc1, 0xe5, 0xa0, 0xfd,
+    0xe8, 0xb8, 0xf9, 0x72, 0xa4, 0xb6, 0xce, 0x00, 0x32, 0xe7, 0xdc, 0x5d, 0x63, 0xb6, 0xf3, 0xb9,
+    0xf1, 0xb2, 0x05, 0xb2, 0x54, 0xd7, 0x92, 0xc6, 0xfb, 0x9b, 0xce, 0xcd, 0xea, 0xf6, 0x0e, 0x88,
+    0xb9, 0xab, 0x07, 0x5e, 0x7d, 0x18, 0x6a, 0x61, 0xfa, 0xc4, 0xdb, 0xb2, 0xa6, 0x4e, 0x44, 0xbb,
+    0xbf, 0xe3, 0xf0, 0x14, 0x56, 0x55, 0xb6, 0x28, 0x0e, 0xcc, 0xe6, 0x9b, 0x42, 0xfa, 0x0c, 0x46,
+    0xe2, 0x24, 0xaa, 0xcd, 0xc5, 0xd2, 0xd1, 0xbd, 0x98, 0x51, 0x5a, 0xaa, 0x5b, 0x96, 0xef, 0x66,
+    0x7d, 0xbc, 0x6c, 0xa6, 0xcf, 0xbf, 0xa7, 0x31, 0x2d, 0xba, 0xd6, 0x54, 0xd8, 0x15, 0x5f, 0xa1,
+    0xa0, 0xe1, 0x3a, 0x0b, 0x99, 0x12, 0x67, 0xb3, 0x86, 0x4c, 0x80, 0x7c, 0x79, 0xa4, 0x4b, 0xc3,
+    0x88, 0xad, 0xf3, 0x38, 0x75, 0x90, 0x60, 0xc9, 0xa3, 0xb9, 0x57, 0x46, 0x3c, 0xd7, 0xa4, 0x2e,
+    0xc0, 0x85, 0x95, 0xe0, 0x45, 0x02, 0x61, 0xa8, 0x31, 0xb2, 0x40, 0x9b, 0x07, 0x0d, 0x51, 0xb1,
+    0x31, 0x62, 0x2b, 0xd4, 0x89, 0x96, 0x4b, 0xf3, 0x0c, 0x0a, 0x70, 0xf3, 0x55, 0x38, 0x89, 0x71,
+    0x24, 0xf9, 0x16, 0x09, 0x38, 0x94, 0x6c, 0xbb, 0x57, 0x0a, 0x01, 0x69, 0xa2, 0x87, 0x87, 0x9f,
+    0xe4, 0xe9, 0x36, 0x1c, 0xbf, 0x5b, 0x89, 0x3a, 0xc3, 0xa2, 0xce, 0x9f, 0xbb, 0x58, 0xb6, 0x68,
+    0xaa, 0xee, 0xa8, 0xb5, 0x10, 0x61, 0xd8, 0x4c, 0xfd, 0xe4, 0xcb, 0xa7, 0xea, 0xf0, 0x5d, 0x37,
+    0x4c, 0xdd, 0x9b, 0xbb, 0x65, 0xca, 0xe3, 0xb1, 0x75, 0x58, 0x73, 0x6e, 0x6b, 0xd5, 0x31, 0x70,
+    0x32, 0x46, 0x0c, 0x6e, 0xc4, 0xf9, 0x07, 0x70, 0x2e, 0xfb, 0x47, 0xe0, 0xce, 0x8a, 0xd7, 0x2e,
+    0xc4, 0xd5, 0x86, 0x63, 0x2c, 0xb6, 0x19, 0xb1, 0xc3, 0x7f, 0x82, 0x16, 0x0e, 0xa4, 0x70, 0x4c,
+    0xa1, 0x32, 0xb2, 0x83, 0xb8, 0xd7, 0x3e, 0x0c, 0x1b, 0x90, 0x4d, 0x00, 0xf7, 0x1c, 0xfb, 0x51,
+    0xec, 0xa2, 0x90, 0xc3, 0x3a, 0xa9, 0x76, 0x70, 0xbe, 0xbd, 0xaf, 0x1d, 0xc3, 0x33, 0x48, 0xb2,
+    0xe2, 0xdf, 0x7f, 0xd5, 0x06, 0x5e, 0x5e, 0x3a, 0xa0, 0x1d, 0x19, 0xb5, 0x53, 0x65, 0x4d, 0xf2,
+    0x78, 0x1c, 0x1a, 0x8d, 0x20, 0xec, 0xab, 0xb4, 0xee, 0x29, 0x2e, 0x5e, 0x1a, 0x0d, 0x38, 0xf6,
+    0x86, 0xd0, 0x4c, 0xba, 0xca, 0x81, 0xae, 0xae, 0x5f, 0x01, 0x3b, 0x60, 0x24, 0x05, 0x4a, 0xc2,
+    0xa6, 0x99, 0x3c, 0xe4, 0x40, 0xbf, 0x7b, 0x8c, 0x58, 0xb9, 0xa2, 0xda, 0x91, 0xeb, 0x47, 0x61,
+    0x29, 0x55, 0x57, 0x8a, 0x6a, 0xff, 0x5a, 0xdd, 0xbe, 0x37, 0xee, 0x4c, 0x9d, 0x00, 0xf1, 0xc2,
+    0xde, 0x63, 0xc2, 0x6e, 0xce, 0xd9, 0x80, 0x73, 0x74, 0xf0, 0x62, 0x63, 0x16, 0x29, 0xb7, 0x44,
+    0xac, 0xfd, 0xf8, 0xd0, 0xc9, 0xdb, 0xdd, 0xeb, 0x34, 0xc0, 0x11, 0xf8, 0xd0, 0xc9, 0x3e, 0x1a,
+    0x11, 0x3c, 0x50, 0x17, 0x6b, 0x3d, 0x39, 0xf9, 0xc0, 0xf2, 0x05, 0x0f, 0x48, 0xb2, 0xe0, 0x0d,
+    0x3d, 0x5f, 0xc4, 0xec, 0x50, 0x85, 0x70, 0xa1, 0x58, 0x4c, 0xfd, 0xc5, 0x89, 0x23, 0xc3, 0xc3,
+    0x5a, 0x58, 0x73, 0x43, 0xc4, 0x45, 0x78, 0xb0, 0xf7, 0xba, 0x63, 0x55, 0x6c, 0x5a, 0xe2, 0xc7,
+    0xca, 0xd9, 0x95, 0x0f, 0x64, 0xaf, 0x73, 0xe2, 0xdf, 0xde, 0xe6, 0x11, 0x87, 0xf1, 0xc0, 0xb1,
+    0xe7, 0xea, 0x69, 0x3e, 0x3f, 0xfa, 0xf6, 0x61, 0x40, 0x33, 0x25, 0x8f, 0x20, 0xb2, 0x45, 0x1c,
+    0x6e, 0x0f, 0x1e, 0x8a, 0x40, 0x97, 0xfd, 0xdd, 0x8e, 0x8f, 0x1d, 0x53, 0x23, 0x8a, 0xe3, 0xc8,
+    0x48, 0xc0, 0xa1, 0xeb, 0xad, 0xa2, 0x96, 0x2e, 0x17, 0x2e, 0x5d, 0xdd, 0x58, 0xb3, 0x06, 0xfd,
+    0xab, 0x85, 0x17, 0x2c, 0xa8, 0xa0, 0x73, 0x20, 0x90, 0x11, 0x04, 0x1d, 0x3d, 0xa1, 0x73, 0x87,
+    0x89, 0xa3, 0x56, 0x66, 0x3b, 0xe0, 0xf1, 0xa3, 0x5e, 0x4f, 0x99, 0x78, 0xb7, 0xd9, 0x88, 0xa9,
+    0x63, 0x3d, 0x1e, 0xe3, 0x89, 0xfc, 0x3e, 0xec, 0xdd, 0xfb, 0x62, 0x92, 0xad, 0x6c, 0x41, 0xc2,
+    0x23, 0xf1, 0x88, 0x27, 0x64, 0x71, 0xb1, 0xbe, 0xf9, 0x4c, 0xd7, 0x21, 0xe5, 0x1a, 0x50, 0xe1,
+    0x16, 0x99, 0xbf, 0x6b, 0x4b, 0xd6, 0x0b, 0x82, 0xaa, 0x61, 0x5d, 0x84, 0xb0, 0xde, 0x77, 0x1b,
+    0x4a, 0x96, 0x8b, 0x79, 0xed, 0xf2, 0x91, 0xd1, 0x69, 0x6e, 0xfd, 0x7d, 0x9e, 0x8b, 0x6e, 0xfc,
+    0xfd, 0x6c, 0x80, 0x30, 0x41, 0x01, 0x6e, 0x8a, 0x4b, 0xd7, 0xf6, 0xc4, 0xee, 0x9f, 0x94, 0xbc,
+    0xe9, 0xa4, 0x3c, 0x13, 0xb4, 0xe9, 0x92, 0x51, 0x90, 0x09, 0x19, 0x33, 0x8e, 0x58, 0x6d, 0x7b,
+    0xc4, 0x0e, 0x4c, 0xdc, 0x1b, 0xfb, 0xe4, 0x2a, 0xda, 0x45, 0xeb, 0x37, 0x2c, 0xb8, 0xf3, 0xb3,
+    0x47, 0x0f, 0x97, 0x99, 0x4a, 0xb4, 0x4c, 0x4e, 0xc4, 0x99, 0xf2, 0x68, 0xa2, 0x12, 0x5a, 0x08,
+    0xa4, 0x25, 0x7c, 0xfa, 0xa4, 0xbd, 0x4d, 0xa3, 0xcd, 0x4c, 0x83, 0x5d, 0x7d, 0xbb, 0x31, 0x5e,
+    0x28, 0x05, 0x94, 0xaa, 0xd6, 0x0f, 0x9c, 0xba, 0xd7, 0x0d, 0x9c, 0x81, 0x42, 0xc5, 0x56, 0x5d,
+    0x05, 0x5b, 0xa7, 0xc1, 0xff, 0xad, 0x88, 0x45, 0x84, 0x4c, 0x6e, 0x84, 0x0c, 0xa1, 0x40, 0x06,
+    0x5c, 0x22, 0x25, 0xbe, 0xac, 0x88, 0xb7, 0xfe, 0xae, 0xb0, 0x89, 0x44, 0xde, 0x7f, 0x59, 0xbb,
+    0x60, 0x6b, 0xc8, 0x3d, 0x1c, 0xc6, 0xc5, 0x35, 0x48, 0x4d, 0x76, 0x6e, 0x80, 0x99, 0xcc, 0x60,
+    0xdb, 0x0b, 0xa6, 0xbf, 0x90, 0x72, 0xe7, 0x48, 0xfa, 0xf2, 0xef, 0x0d, 0x7a, 0x4c, 0x2f, 0xdb,
+    0xb2, 0xb4, 0x79, 0xd0, 0x3e, 0x85, 0x6d, 0xda, 0xd2, 0x17, 0x3f, 0x3f, 0xc6, 0x57, 0x45, 0xef,
+    0x17, 0x7f, 0x33, 0x78, 0xd1, 0x11, 0x2d, 0x3d, 0x84, 0x64, 0xd7, 0x8f, 0x5c, 0x9d, 0xf1, 0xa2,
+    0xf3, 0xa5, 0x9f, 0x51, 0x1f, 0xd2, 0x85, 0x9d, 0x7e, 0xc0, 0x49, 0xcd, 0xa4, 0x68, 0xd8, 0x2d,
+    0x78, 0x97, 0x21, 0xbd, 0x46, 0xca, 0xb7, 0x30, 0x6c, 0xcf, 0xcf, 0x24, 0x2f, 0x08, 0x13, 0x8c,
+    0x2a, 0x26, 0x6d, 0x81, 0x0b, 0x15, 0xbf, 0x70, 0x5d, 0x37, 0x4f, 0x08, 0x77, 0xd2, 0x8c, 0x66,
+    0xf2, 0xa4, 0xcd, 0x1b, 0x35, 0x2c, 0x57, 0x30, 0x3d, 0x3c, 0x7a, 0xaa, 0x18, 0x06, 0x7c, 0x63,
+    0xa1, 0x81, 0xbd, 0x00, 0x46, 0xbb, 0xf6, 0x3e, 0x3c, 0xd4, 0xf9, 0xf5, 0x80, 0xe0, 0x87, 0x63,
+    0x19, 0xae, 0x59, 0xf2, 0xcf, 0xbf, 0xf5, 0x96, 0x4e, 0xbf, 0x3b, 0xec, 0x96, 0xf3, 0x68, 0x4e,
+    0x30, 0x41, 0x0f, 0x6e, 0xfa, 0x9e, 0xcc, 0xe1, 0xd1, 0x7d, 0x66, 0xe8, 0xa9, 0x0b, 0x37, 0xda,
+    0xf4, 0x74, 0x55, 0x88, 0x1e, 0x81, 0x09, 0x83, 0xd5, 0x69, 0x76, 0xc2, 0x58, 0x1f, 0x6f, 0x41,
+    0x68, 0xb5, 0xbb, 0x1c, 0xed, 0xb2, 0x2f, 0xdc, 0xaa, 0x76, 0x69, 0xf3, 0x6b, 0x24, 0x4b, 0x33,
+    0x6b, 0x6b, 0x79, 0x42, 0x3a, 0x9e, 0x19, 0xe3, 0xac, 0x8d, 0x72, 0xce, 0xff, 0xec, 0xfa, 0x51,
+    0x81, 0xae, 0xae, 0x5d, 0xcc, 0x79, 0x04, 0xe3, 0x5f, 0xeb, 0xa4, 0xef, 0xaf, 0x6a, 0xf4, 0xbd,
+    0xbe, 0x3b, 0x63, 0xf9, 0xb4, 0xc6, 0xd9, 0xbc, 0x11, 0x07, 0x2e, 0x4b, 0x80, 0xea, 0xc7, 0xef,
+    0x79, 0x72, 0x87, 0x1d, 0x5c, 0x79, 0xa5, 0x5c, 0x92, 0xf7, 0xae, 0xb8, 0x72, 0x95, 0x9f, 0x28,
+    0x79, 0x64, 0xa4, 0x3e, 0x03, 0x66, 0x58, 0x92, 0xb8, 0xdb, 0xbf, 0x08, 0xb6, 0x1a, 0x68, 0xc7,
+    0xfe, 0x4b, 0x0a, 0xcd, 0x62, 0xc2, 0x34, 0x8a, 0x66, 0x0f, 0xd4, 0xeb, 0xe1, 0x08, 0x71, 0x23,
+    0x8e, 0xea, 0xb1, 0x68, 0x39, 0xb3, 0x45, 0xeb, 0x8d, 0x7d, 0x42, 0xb7, 0x3a, 0xb2, 0xd5, 0x5b,
+    0x81, 0xf5, 0x65, 0x01, 0x4b, 0x36, 0xcb, 0xc6, 0x7d, 0x73, 0x74, 0x67, 0x2c, 0x17, 0x04, 0x5c,
+    0xd3, 0x20, 0xd1, 0xba, 0x91, 0xe5, 0xd7, 0x09, 0x42, 0x81, 0x70, 0x93, 0x4f, 0x78, 0xa6, 0xbd,
+    0x14, 0x02, 0x3c, 0x1b, 0x70, 0x70, 0x04, 0x1b, 0xd1, 0xa8, 0x31, 0x23, 0x70, 0x41, 0x74, 0x03,
+    0x84, 0x5e, 0xa3, 0xfb, 0x64, 0x5a, 0xa0, 0x16, 0x9e, 0x27, 0x92, 0x9b, 0x4c, 0x72, 0xa7, 0x0a,
+    0x7f, 0x03, 0x9b, 0x7c, 0xfb, 0x90, 0x6c, 0x25, 0xb3, 0x63, 0x5e, 0x40, 0x32, 0x3a, 0x21, 0xfd,
+    0x32, 0xb0, 0x4b, 0x86, 0x26, 0x3f, 0x53, 0x96, 0x3e, 0xec, 0x34, 0x90, 0xb1, 0x71, 0xc5, 0x3d,
+    0x73, 0x0b, 0x37, 0xe3, 0xa6, 0x9f, 0x1f, 0x8a, 0x54, 0x7f, 0x15, 0xbc, 0xe3, 0x12, 0xcb, 0x45,
+    0xab, 0xa1, 0x04, 0xbb, 0x35, 0xef, 0xe0, 0x32, 0x24, 0xdf, 0x1b, 0xe4, 0xea, 0x10, 0x1c, 0x19,
+    0xe4, 0x89, 0xf0, 0x72, 0x56, 0x73, 0x01, 0xbb, 0x33, 0x54, 0xad, 0x85, 0x45, 0x64, 0x6f, 0x6f,
+    0x90, 0xf6, 0xd1, 0x77, 0x02, 0x5f, 0x60, 0x9d, 0x83, 0x81, 0xfa, 0xce, 0x08, 0xe8, 0x26, 0xcc,
+    0x21, 0x64, 0x3c, 0x1c, 0xe7, 0xa0, 0x8f, 0xb9, 0xc3, 0x13, 0xf4, 0xa5, 0xac, 0xcb, 0xad, 0x65,
+    0x54, 0x33, 0xed, 0xc9, 0xea, 0xa1, 0xa3, 0x07, 0xea, 0x77, 0xbe, 0x3e, 0x8e, 0xb7, 0x14, 0xbf,
+    0x1f, 0xc8, 0x5a, 0x8f, 0xdd, 0x70, 0x12, 0x3d, 0x82, 0x16, 0xff, 0xea, 0x86, 0xbe, 0x2c, 0x30,
+    0xa3, 0x89, 0x53, 0x75, 0xf0, 0xfe, 0x43, 0xfc, 0x12, 0x67, 0x9d, 0x35, 0x0b, 0x6f, 0x3f, 0x3f,
+    0x71, 0x4b, 0x5d, 0xc0, 0xb6, 0x2c, 0x52, 0xa7, 0x6f, 0x19, 0x0b, 0xcb, 0xf9, 0x87, 0xe7, 0xce,
+    0x9b, 0x5b, 0xf6, 0xb9, 0x5b, 0x4f, 0xcd, 0xbd, 0x4f, 0x31, 0xc2, 0xc5, 0x85, 0x53, 0x3f, 0x99,
+    0xd9, 0xc8, 0x26, 0xed, 0x2c, 0x73, 0xdd, 0xa9, 0x55, 0x71, 0xfb, 0xf4, 0x1e, 0x9c, 0xde, 0xa4,
+    0xb1, 0x26, 0x44, 0x68, 0x17, 0x43, 0x0c, 0x0c, 0xb4, 0x20, 0xa4, 0x0c, 0x02, 0x97, 0x75, 0x24,
+    0xdb, 0xec, 0x54, 0x7b, 0xa5, 0xd4, 0x11, 0x64, 0xc8, 0xff, 0x56, 0x0d, 0xec, 0x36, 0xa7, 0x0d,
+    0xa8, 0x67, 0x4c, 0xd7, 0xba, 0xd8, 0x09, 0x15, 0x2a, 0xbb, 0xde, 0x1d, 0xed, 0x34, 0xc2, 0x26,
+    0xfe, 0x2a, 0xd4, 0x02, 0x73, 0xf8, 0x30, 0x15, 0xe5, 0xc1, 0x40, 0x87, 0x83, 0xd8, 0xa5, 0x05,
+    0x5e, 0x75, 0xca, 0xc1, 0x46, 0x1b, 0xd8, 0x31, 0x32, 0x11, 0x5b, 0x80, 0x70, 0x75, 0xb5, 0x1e,
+    0x76, 0xbd, 0x0f, 0xd3, 0x15, 0x3e, 0xcb, 0x05, 0x16, 0x08, 0xf0, 0x94, 0x05, 0xbd, 0x42, 0xb1,
+    0x2c, 0xcf, 0x60, 0xd2, 0xe3, 0x58, 0x2b, 0x9d, 0x79, 0x9b, 0x45, 0xe3, 0x30, 0xf7, 0x42, 0x80,
+    0x68, 0x18, 0xb2, 0xc4, 0x09, 0xad, 0x53, 0x87, 0x9c, 0x65, 0xa4, 0xd7, 0x37, 0x1a, 0xd7, 0xa1,
+    0x77, 0x25, 0x54, 0x64, 0x85, 0xc5, 0xb8, 0x26, 0xeb, 0x06, 0x69, 0x43, 0x7c, 0x6b, 0x25, 0xbf,
+    0xbe, 0x56, 0x4a, 0xe5, 0x1a, 0x02, 0x36, 0xfa, 0x18, 0xba, 0xff, 0x2e, 0x56, 0x19, 0xf1, 0x69,
+    0xe0, 0x53, 0xc0, 0xd8, 0xf7, 0xc6, 0x78, 0x1b, 0x76, 0x4e, 0x55, 0x6e, 0x37, 0xbb, 0xa7, 0xe5,
+    0x0a, 0xf5, 0x79, 0x79, 0x11, 0x2f, 0x85, 0x9b, 0x9c, 0xdb, 0x91, 0xbd, 0xf6, 0x45, 0xd9, 0x02,
+    0x04, 0x64, 0x4d, 0xf1, 0xb3, 0x65, 0xe0, 0xd2, 0x34, 0xf9, 0xea, 0x8a, 0xee, 0x9c, 0x25, 0x9c,
+    0x05, 0xd7, 0x39, 0x7a, 0x54, 0xdc, 0x94, 0x77, 0xc0, 0xd4, 0x67, 0x61, 0x6b, 0xb1, 0x8a, 0x64,
+    0x64, 0x01, 0x07, 0x0e, 0x28, 0x7c, 0x1f, 0x01, 0x37, 0x40, 0x0a, 0xc4, 0x88, 0x26, 0xdc, 0xeb,
+    0x80, 0x23, 0x99, 0xca, 0x3e, 0x0b, 0x68, 0xbb, 0xe8, 0x0b, 0x77, 0xf3, 0x11, 0x1f, 0x23, 0x91,
+    0x7d, 0x85, 0xc0, 0x2b, 0xc5, 0x9c, 0x14, 0x5c, 0x25, 0x83, 0xbb, 0x0e, 0x29, 0xfa, 0x0f, 0x85,
+    0x5f, 0xc8, 0xb9, 0x07, 0x53, 0xf2, 0x60, 0xcb, 0xc3, 0xb2, 0x25, 0xa6, 0x35, 0x88, 0xfc, 0x55,
+    0xaf, 0xc6, 0x68, 0x19, 0xa4, 0x30, 0x65, 0xb2, 0xb5, 0x7b, 0xae, 0x7d, 0x1b, 0x4f, 0xca, 0x21,
+    0x1f, 0x46, 0xfb, 0x42, 0x6e, 0xfd, 0xd9, 0xc6, 0x81, 0x61, 0x75, 0xbe, 0x52, 0x0d, 0x3f, 0x58,
+    0xa8, 0x71, 0x6c, 0xce, 0x1d, 0x0f, 0x1e, 0xb3, 0x33, 0xf0, 0x7e, 0xb5, 0xbe, 0x05, 0x7a, 0x2a,
+    0xa8, 0x71, 0xb4, 0x2f, 0x9f, 0x1b, 0x30, 0xe1, 0x27, 0x29, 0xf2, 0xac, 0x19, 0x1e, 0x05, 0xe8,
+    0xbc, 0xd5, 0x89, 0xf3, 0x9f, 0x4b, 0x23, 0x3a, 0x2d, 0x0c, 0xac, 0x93, 0xc7, 0xad, 0xee, 0xd1,
+    0x44, 0x77, 0xba, 0x3b, 0xd8, 0x7a, 0xd2, 0x9d, 0xfa, 0x5d, 0xa0, 0xa0, 0x54, 0x68, 0x38, 0x08,
+    0xc6, 0xd2, 0xed, 0x0e, 0x65, 0x3a, 0xcb, 0x6a, 0xf5, 0xbc, 0x5e, 0x3d, 0x7e, 0xdb, 0x16, 0x28,
+    0x37, 0xef, 0x88, 0x31, 0xd3, 0x0d, 0xcc, 0x03, 0x40, 0xa3, 0x42, 0x2b, 0x5c, 0xa8, 0x50, 0x11,
+    0x99, 0xc0, 0xa1, 0xa8, 0x9d, 0x38, 0x07, 0x44, 0xef, 0xd7, 0xda, 0x14, 0x0f, 0xcf, 0x0e, 0x6e,
+    0xfc, 0x0a, 0xa6, 0xd2, 0x34, 0xa9, 0x82, 0x96, 0x1e, 0xc0, 0xe6, 0xa4, 0x5e, 0x6a, 0x5e, 0xfc,
+    0xae, 0x5f, 0x03, 0xcc, 0xd1, 0xf5, 0xcb, 0xae, 0x85, 0xcf, 0x47, 0x5d, 0x4a, 0x4f, 0x40, 0x22,
+    0xf3, 0xa6, 0xd8, 0x16, 0x09, 0x19, 0xe2, 0x84, 0xa3, 0x50, 0x75, 0x14, 0x0e, 0x01, 0x57, 0x01,
+    0xc1, 0xef, 0xd0, 0x60, 0x35, 0x49, 0x13, 0x67, 0xe5, 0xbd, 0xd3, 0xb0, 0x41, 0x72, 0x8d, 0xac,
+    0x8b, 0x16, 0xb8, 0x32, 0xf2, 0xc0, 0x79, 0x52, 0x4c, 0x84, 0x29, 0xa2, 0x0c, 0x0e, 0x37, 0x1b,
+    0xad, 0x3d, 0x0d, 0x1a, 0xa6, 0x02, 0xd2, 0x5e, 0x9b, 0xd1, 0x20, 0xa3, 0xc4, 0xeb, 0x54, 0x2a,
+    0xb7, 0xcd, 0xf9, 0x70, 0x62, 0x46, 0xef, 0x5c, 0x3a, 0xd7, 0x2c, 0xda, 0x17, 0x8d, 0x79, 0x51,
+    0x20, 0xc2, 0xe7, 0x4c, 0x1a, 0x97, 0xac, 0xda, 0x17, 0x8d, 0x98, 0x93, 0xa4, 0xca, 0x16, 0x8f,
+    0x9c, 0xba, 0xf6, 0x4f, 0x1c, 0xba, 0xd7, 0x2c, 0xda, 0x36, 0xee, 0x3f, 0xdd, 0x19, 0x91, 0xa0,
+    0xa3, 0xa5, 0xc8, 0x12, 0x87, 0x8c, 0x9a, 0xb6, 0xcf, 0xfd, 0x78, 0x53, 0x24, 0xca, 0x16, 0xae,
+    0xbf, 0xfc, 0x5b, 0x34, 0xcb, 0xf5, 0x68, 0x33, 0xc5, 0xe9, 0x50, 0x22, 0xc6, 0x0e, 0x7f, 0x5d,
+    0x38, 0xf2, 0x66, 0x2f, 0xbd, 0xd9, 0x11, 0xa0, 0xa3, 0xa5, 0xa9, 0xb1, 0xe0, 0x23, 0xa5, 0xa9,
+    0xb1, 0xc1, 0xe1, 0x21, 0xa1, 0xc0, 0x02, 0x67, 0x2d, 0xb9, 0xd1, 0x20, 0xc2, 0x06, 0x6f, 0x3d,
+    0xd9, 0x30, 0xc3, 0x04, 0x6b, 0x35, 0xc9, 0xf1, 0x60, 0x23, 0xc4, 0xeb, 0x35, 0xc9, 0x10, 0xa2,
+    0xa7, 0xcc, 0xfb, 0x55, 0x28, 0xd2, 0x26, 0xaf, 0xbd, 0xf8, 0x72, 0x47, 0xed, 0x39, 0xd1, 0x20,
+    0xa3, 0xc4, 0xeb, 0x35, 0xe8, 0x52, 0x26, 0xaf, 0xdc, 0x3a, 0xf6, 0x4f, 0xfd, 0x59, 0x30, 0xe2,
+    0x46, 0x0e, 0x7f, 0x5d, 0x19, 0x91, 0x81, 0x61, 0x21, 0xc0, 0xe3, 0x25, 0xa9, 0xb1, 0xe0, 0x42,
+    0x06, 0x6f, 0x3d, 0xf8, 0x72, 0x47, 0x0c, 0x7b, 0x74, 0x4b, 0x14, 0x8b, 0x75, 0x49, 0x10, 0x83,
+    0x84, 0x6b, 0x54, 0x0b, 0x94, 0x8b, 0x94, 0xaa, 0xb7, 0xec, 0xa2, 0xc7, 0x77, 0xd9,
+};
+
+
+/*
+  initialisation data (register config) for 3900
+ */
+const AP_OpticalFlow_Pixart::RegData AP_OpticalFlow_Pixart::init_data_3900[] =
+{
+   { 0x30, 0x44 },
+
+   { 0x31, 0xe9 },
+   { 0x32, 0x82 },
+   { 0x33, 0xdf },
+
+   { 0x31, 0xea },
+   { 0x32, 0x82 },
+   { 0x33, 0xff },
+
+   { 0x31, 0xeb },
+   { 0x32, 0x82 },
+   { 0x33, 0xdf },
+
+   { 0x31, 0xec },
+   { 0x32, 0x82 },
+   { 0x33, 0xff },
+
+   { 0x31, 0xed },
+   { 0x32, 0x82 },
+   { 0x33, 0xdf },
+
+   { 0x31, 0xee },
+   { 0x32, 0x82 },
+   { 0x33, 0xff },
+
+
+   { 0x31, 0xdd },
+   { 0x32, 0x82 },
+   { 0x33, 0xfe },
+
+   { 0x31, 0xde },
+   { 0x32, 0x82 },
+   { 0x33, 0x0b },
+
+   { 0x31, 0xdf },
+   { 0x32, 0x82 },
+   { 0x33, 0xfe },
+
+   { 0x31, 0xe0 },
+   { 0x32, 0x82 },
+   { 0x33, 0x0b },
+
+   { 0x31, 0xe1 },
+   { 0x32, 0x82 },
+   { 0x33, 0xfe },
+
+   { 0x31, 0xe2 },
+   { 0x32, 0x82 },
+   { 0x33, 0x0b },
+
+   { 0x47, 0x00 },
+   { 0x10, 0x08 },
+
+   { 0x0f, 0x28 },
+   { 0x2b, 0x08 },
+   { 0x2c, 0x10 },
+   { 0x2e, 0x1f },
+
+   { 0x49, 0x40 },
+   { 0x4a, 0x60 },
+   { 0x4b, 0x3F },
+
+   { 0x10, 0x08 },
+   { 0x30, 0x00 },
+
+   { 0x45, 0x8b },
+   { 0x46, 0x02 },
+   { 0x53, 0x07 },
+   { 0x52, 0x10 },
+};
+
+// init data for 3901
+const AP_OpticalFlow_Pixart::RegData AP_OpticalFlow_Pixart::init_data_3901_1[] =
+{
+    { 0x7F, 0x00 },
+    { 0x61, 0xAD },
+    { 0x7F, 0x03 },
+    { 0x40, 0x00 },
+    { 0x7F, 0x05 },
+    { 0x41, 0xB3 },
+    { 0x43, 0xF1 },
+    { 0x45, 0x14 },
+    { 0x5B, 0x32 },
+    { 0x5F, 0x34 },
+    { 0x7B, 0x08 },
+    { 0x7F, 0x06 },
+    { 0x44, 0x1B },
+    { 0x40, 0xBF },
+    { 0x4E, 0x3F },
+    { 0x7F, 0x08 },
+    { 0x65, 0x20 },
+    { 0x6A, 0x18 },
+    { 0x7F, 0x09 },
+    { 0x4F, 0xAF },
+    { 0x5F, 0x40 },
+    { 0x48, 0x80 },
+    { 0x49, 0x80 },
+    { 0x57, 0x77 },
+    { 0x60, 0x78 },
+    { 0x61, 0x78 },
+    { 0x62, 0x08 },
+    { 0x63, 0x50 },
+    { 0x7F, 0x0A },
+    { 0x45, 0x60 },
+    { 0x7F, 0x00 },
+    { 0x4D, 0x11 },
+    { 0x55, 0x80 },
+    { 0x74, 0x1F },
+    { 0x75, 0x1F },
+    { 0x4A, 0x78 },
+    { 0x4B, 0x78 },
+    { 0x44, 0x08 },
+    { 0x45, 0x50 },
+    { 0x64, 0xFF },
+    { 0x65, 0x1F },
+    { 0x7F, 0x14 },
+    { 0x65, 0x60 },
+    { 0x66, 0x08 },
+    { 0x63, 0x78 },
+    { 0x7F, 0x15 },
+    { 0x48, 0x58 },
+    { 0x7F, 0x07 },
+    { 0x41, 0x0D },
+    { 0x43, 0x14 },
+    { 0x4B, 0x0E },
+    { 0x45, 0x0F },
+    { 0x44, 0x42 },
+    { 0x4C, 0x80 },
+    { 0x7F, 0x10 },
+    { 0x5B, 0x02 },
+    { 0x7F, 0x07 },
+    { 0x40, 0x41 },
+    { 0x70, 0x00 }
+};
+
+
+// Delay 100 ms before resuming the below register writes
+const AP_OpticalFlow_Pixart::RegData AP_OpticalFlow_Pixart::init_data_3901_2[] =
+{
+    { 0x32, 0x44 },
+    { 0x7F, 0x07 },
+    { 0x40, 0x40 },
+    { 0x7F, 0x06 },
+    { 0x62, 0xF0 },
+    { 0x63, 0x00 },
+    { 0x7F, 0x0D },
+    { 0x48, 0xC0 },
+    { 0x6F, 0xD5 },
+    { 0x7F, 0x00 },
+    { 0x5B, 0xA0 },
+    { 0x4E, 0xA8 },
+    { 0x5A, 0x50 },
+    { 0x40, 0x80 },
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * AP_OpticalFlow_SITL.cpp - SITL emulation of optical flow sensor.
+ */
+
+#include "AP_OpticalFlow_SITL.h"
+
+#if AP_OPTICALFLOW_SITL_ENABLED
+
+#include <AP_HAL/AP_HAL.h>
+#include <SITL/SITL.h>
+
+void AP_OpticalFlow_SITL::update(void)
+{
+    auto *_sitl = AP::sitl();
+
+    if (!_sitl->flow_enable) {
+        return;
+    }
+
+    // update at the requested rate
+    uint32_t now = AP_HAL::millis();
+    if (now - last_flow_ms < 1000*(1.0f/_sitl->flow_rate)) {
+        return;
+    }
+    last_flow_ms = now;
+
+    Vector3f gyro(radians(_sitl->state.rollRate), 
+                  radians(_sitl->state.pitchRate), 
+                  radians(_sitl->state.yawRate));
+
+    AP_OpticalFlow::OpticalFlow_state state;
+
+    // NED velocity vector in m/s
+    Vector3f velocity(_sitl->state.speedN,
+                      _sitl->state.speedE,
+                      _sitl->state.speedD);
+
+    // a rotation matrix following DCM conventions
+    Matrix3f rotmat;
+    rotmat.from_euler(radians(_sitl->state.rollDeg),
+                      radians(_sitl->state.pitchDeg),
+                      radians(_sitl->state.yawDeg));
+
+
+    state.surface_quality = 51;
+
+    // sensor position offset in body frame
+    Vector3f posRelSensorBF = _sitl->optflow_pos_offset;
+
+    // estimate range to centre of image
+    float range;
+    if (rotmat.c.z > 0.05f && _sitl->state.height_agl > 0) {
+        Vector3f relPosSensorEF = rotmat * posRelSensorBF;
+        range = (_sitl->state.height_agl - relPosSensorEF.z) / rotmat.c.z;
+    } else {
+        range = 1e38f;
+    }
+
+    // Calculate relative velocity in sensor frame assuming no misalignment between sensor and vehicle body axes
+    Vector3f relVelSensor = rotmat.mul_transpose(velocity);
+
+    // correct relative velocity for rotation rates and sensor offset
+    relVelSensor += gyro % posRelSensorBF;
+
+    // scaling based on parameters
+    const Vector2f flowScaler = _flowScaler();
+    const float flowScaleFactorX = 1.0f + 0.001f * flowScaler.x;
+    const float flowScaleFactorY = 1.0f + 0.001f * flowScaler.y;
+
+    // Divide velocity by range and add body rates to get predicted sensed angular
+    // optical rates relative to X and Y sensor axes assuming no misalignment or scale
+    // factor error. Note - these are instantaneous values. The sensor sums these values across the interval from the last
+    // poll to provide a delta angle across the interface
+    state.flowRate.x = (-relVelSensor.y/range + gyro.x + _sitl->flow_noise * rand_float()) * flowScaleFactorX;
+    state.flowRate.y =  (relVelSensor.x/range + gyro.y + _sitl->flow_noise * rand_float()) * flowScaleFactorY;
+
+    // The flow sensors body rates are assumed to be the same as the vehicle body rates (ie no misalignment)
+    // Note - these are instantaneous values. The sensor sums these values across the interval from the last
+    // poll to provide a delta angle across the interface.
+    state.bodyRate = Vector2f(gyro.x, gyro.y);
+
+    optflow_data[next_optflow_index++] = state;
+    if (next_optflow_index >= optflow_delay+1) {
+        next_optflow_index = 0;
+    }
+
+    state = optflow_data[next_optflow_index];
+
+    if (_sitl->flow_delay != optflow_delay) {
+        // cope with updates to the delay control
+        if (_sitl->flow_delay > 0 &&
+            (uint8_t)(_sitl->flow_delay) > ARRAY_SIZE(optflow_data)) {
+            _sitl->flow_delay.set(ARRAY_SIZE(optflow_data));
+        }
+        optflow_delay = _sitl->flow_delay;
+        for (uint8_t i=0; i<optflow_delay; i++) {
+            optflow_data[i] = state;
+        }
+    }
+
+    _applyYaw(state.flowRate);
+    
+    // copy results to front end
+    _update_frontend(state);
+}
+
+#endif  // AP_OPTICALFLOW_SITL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #pragma once
+
+#include "AP_OpticalFlow_config.h"
+
+#if AP_OPTICALFLOW_SITL_ENABLED
+
+#include "AP_OpticalFlow.h"
+
+class AP_OpticalFlow_SITL : public OpticalFlow_backend
+{
+public:
+    /// constructor
+    using OpticalFlow_backend::OpticalFlow_backend;
+
+    // update - read latest values from sensor and fill in x,y and totals.
+    void update(void) override;
+
+private:
+
+    uint32_t last_flow_ms;
+
+    uint8_t next_optflow_index;
+    uint8_t optflow_delay;
+    AP_OpticalFlow::OpticalFlow_state optflow_data[20];
+};
+
+#endif  // AP_OPTICALFLOW_SITL_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      os::HIGH);
+}
+
+bool RC_Channel::do_aux_function_camera_zoom(const AuxSwitchPos ch_flag)
+{
+    AP_Camera *camera = AP::camera();
+    if (camera == nullptr) {
+        return false;
+    }
+    int8_t zoom_step = 0;   // zoom out = -1, hold = 0, zoom in = 1
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        zoom_step = 1;  // zoom in
+        break;
+    case AuxSwitchPos::MIDDLE:
+        zoom_step = 0;  // zoom hold
+        break;
+    case AuxSwitchPos::LOW:
+        zoom_step = -1; // zoom out
+        break;
+    }
+    return camera->set_zoom(ZoomType::RATE, zoom_step);
+}
+
+bool RC_Channel::do_aux_function_camera_manual_focus(const AuxSwitchPos ch_flag)
+{
+    AP_Camera *camera = AP::camera();
+    if (camera == nullptr) {
+        return false;
+    }
+    int8_t focus_step = 0;  // focus in = -1, focus hold = 0, focus out = 1
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        // wide shot, focus out
+        focus_step = 1;
+        break;
+    case AuxSwitchPos::MIDDLE:
+        focus_step = 0;
+        break;
+    case AuxSwitchPos::LOW:
+        // close shot, focus in
+        focus_step = -1;
+        break;
+    }
+    return camera->set_focus(FocusType::RATE, focus_step) == SetFocusResult::ACCEPTED;
+}
+
+bool RC_Channel::do_aux_function_camera_auto_focus(const AuxSwitchPos ch_flag)
+{
+    if (ch_flag == AuxSwitchPos::HIGH) {
+        AP_Camera *camera = AP::camera();
+        if (camera == nullptr) {
+            return false;
+        }
+        return camera->set_focus(FocusType::AUTO, 0) == SetFocusResult::ACCEPTED;
+    }
+    return false;
+}
+
+bool RC_Channel::do_aux_function_camera_image_tracking(const AuxSwitchPos ch_flag)
+{
+    AP_Camera *camera = AP::camera();
+    if (camera == nullptr) {
+        return false;
+    }
+    // High position enables tracking a POINT in middle of image
+    // Low or Mediums disables tracking.  (0.5,0.5) is still passed in but ignored
+    return camera->set_tracking(ch_flag == AuxSwitchPos::HIGH ? TrackingType::TRK_POINT : TrackingType::TRK_NONE, Vector2f{0.5, 0.5}, Vector2f{});
+}
+
+bool RC_Channel::do_aux_function_camera_lens(const AuxSwitchPos ch_flag)
+{
+#if AP_CAMERA_SET_CAMERA_SOURCE_ENABLED
+    AP_Camera *camera = AP::camera();
+    if (camera == nullptr) {
+        return false;
+    }
+    // Low selects lens 0 (default), Mediums selects lens1, High selects lens2
+    return camera->set_lens((uint8_t)ch_flag);
+#else
+    return false;
+#endif // AP_CAMERA_SET_CAMERA_SOURCE_ENABLED
+}
+#endif // AP_CAMERA_ENABLED
+
+#if HAL_RUNCAM_ENABLED
+void RC_Channel::do_aux_function_runcam_control(const AuxSwitchPos ch_flag)
+{
+    AP_RunCam *runcam = AP::runcam();
+    if (runcam == nullptr) {
+        return;
+    }
+
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        runcam->start_recording();
+        break;
+    case AuxSwitchPos::MIDDLE:
+        runcam->osd_option();
+        break;
+    case AuxSwitchPos::LOW:
+        runcam->stop_recording();
+        break;
+    }
+}
+
+void RC_Channel::do_aux_function_runcam_osd_control(const AuxSwitchPos ch_flag)
+{
+    AP_RunCam *runcam = AP::runcam();
+    if (runcam == nullptr) {
+        return;
+    }
+
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        runcam->enter_osd();
+        break;
+    case AuxSwitchPos::MIDDLE:
+    case AuxSwitchPos::LOW:
+        runcam->exit_osd();
+        break;
+    }
+}
+#endif
+
+#if AP_FENCE_ENABLED
+// enable or disable the fence
+void RC_Channel::do_aux_function_fence(const AuxSwitchPos ch_flag)
+{
+    AC_Fence *fence = AP::fence();
+    if (fence == nullptr) {
+        return;
+    }
+
+    fence->enable_configured(ch_flag == AuxSwitchPos::HIGH);
+}
+#endif
+
+#if AP_MISSION_ENABLED
+void RC_Channel::do_aux_function_clear_wp(const AuxSwitchPos ch_flag)
+{
+    if (ch_flag == AuxSwitchPos::HIGH) {
+        AP_Mission *mission = AP::mission();
+        if (mission == nullptr) {
+            return;
+        }
+        mission->clear();
+    }
+}
+#endif  // AP_MISSION_ENABLED
+
+#if AP_SERVORELAYEVENTS_ENABLED && AP_RELAY_ENABLED
+void RC_Channel::do_aux_function_relay(const uint8_t relay, bool val)
+{
+    AP_ServoRelayEvents *servorelayevents = AP::servorelayevents();
+    if (servorelayevents == nullptr) {
+        return;
+    }
+    servorelayevents->do_set_relay(relay, val);
+}
+#endif
+
+#if HAL_GENERATOR_ENABLED
+void RC_Channel::do_aux_function_generator(const AuxSwitchPos ch_flag)
+{
+    AP_Generator *generator = AP::generator();
+    if (generator == nullptr) {
+        return;
+    }
+
+    switch (ch_flag) {
+    case AuxSwitchPos::LOW:
+        generator->stop();
+        break;
+    case AuxSwitchPos::MIDDLE:
+        generator->idle();
+        break;
+    case AuxSwitchPos::HIGH:
+        generator->run();
+        break;
+    }
+}
+#endif
+
+#if HAL_SPRAYER_ENABLED
+void RC_Channel::do_aux_function_sprayer(const AuxSwitchPos ch_flag)
+{
+    AC_Sprayer *sprayer = AP::sprayer();
+    if (sprayer == nullptr) {
+        return;
+    }
+    sprayer->run(ch_flag == AuxSwitchPos::HIGH);
+    // if we are disarmed the pilot must want to test the pump
+    sprayer->test_pump((ch_flag == AuxSwitchPos::HIGH) && !hal.util->get_soft_armed());
+}
+#endif // HAL_SPRAYER_ENABLED
+
+#if AP_GRIPPER_ENABLED
+void RC_Channel::do_aux_function_gripper(const AuxSwitchPos ch_flag)
+{
+    AP_Gripper &gripper = AP::gripper();
+
+    switch (ch_flag) {
+    case AuxSwitchPos::LOW:
+        gripper.release();
+        break;
+    case AuxSwitchPos::MIDDLE:
+        // nothing
+        break;
+    case AuxSwitchPos::HIGH:
+        gripper.grab();
+        break;
+    }
+}
+#endif  // AP_GRIPPER_ENABLED
+
+void RC_Channel::do_aux_function_lost_vehicle_sound(const AuxSwitchPos ch_flag)
+{
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        AP_Notify::flags.vehicle_lost = true;
+        break;
+    case AuxSwitchPos::MIDDLE:
+        // nothing
+        break;
+    case AuxSwitchPos::LOW:
+        AP_Notify::flags.vehicle_lost = false;
+        break;
+    }
+}
+
+void RC_Channel::do_aux_function_rc_override_enable(const AuxSwitchPos ch_flag)
+{
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH: {
+        rc().set_gcs_overrides_enabled(true);
+        break;
+    }
+    case AuxSwitchPos::MIDDLE:
+        // nothing
+        break;
+    case AuxSwitchPos::LOW: {
+        rc().set_gcs_overrides_enabled(false);
+        break;
+    }
+    }
+}
+
+#if AP_MISSION_ENABLED
+void RC_Channel::do_aux_function_mission_reset(const AuxSwitchPos ch_flag)
+{
+    if (ch_flag != AuxSwitchPos::HIGH) {
+        return;
+    }
+    AP_Mission *mission = AP::mission();
+    if (mission == nullptr) {
+        return;
+    }
+    mission->reset();
+}
+#endif
+
+void RC_Channel::do_aux_function_fft_notch_tune(const AuxSwitchPos ch_flag)
+{
+#if HAL_GYROFFT_ENABLED
+    AP_GyroFFT *fft = AP::fft();
+    if (fft == nullptr) {
+        return;
+    }
+
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        fft->start_notch_tune();
+        break;
+    case AuxSwitchPos::MIDDLE:
+    case AuxSwitchPos::LOW:
+        fft->stop_notch_tune();
+        break;
+    }
+#endif
+}
+
+/**
+ * Perform the RETRACT_MOUNT 1/2 process.
+ * 
+ * @param [in] ch_flag  Position of the switch. HIGH, MIDDLE and LOW.
+ * @param [in] instance 0: RETRACT MOUNT 1 <br>
+ *                      1: RETRACT MOUNT 2
+*/
+#if HAL_MOUNT_ENABLED
+void RC_Channel::do_aux_function_retract_mount(const AuxSwitchPos ch_flag, const uint8_t instance)
+{
+    AP_Mount *mount = AP::mount();
+    if (mount == nullptr) {
+        return;
+    }
+    switch (ch_flag) {
+    case AuxSwitchPos::HIGH:
+        mount->set_mode(instance,MAV_MOUNT_MODE_RETRACT);
+        break;
+    case AuxSwitchPos::MIDDLE:
+        // nothing
+        break;
+    case AuxSwitchPos::LOW:
+        mount->set_mode_to_default(instance);
+        break;
+    }
+}
+#endif  // HAL_MOUNT_ENABLED
+
+bool RC_Channel::run_aux_function(AUX_FUNC ch_option, AuxSwitchPos pos, AuxFuncTriggerSource source)
+{
+#if AP_SCRIPTING_ENABLED
+    rc().set_aux_cached(ch_option, pos);
+#endif
+    const bool ret = do_aux_function(ch_option, pos);
+
+#if HAL_LOGGING_ENABLED
+    // @LoggerMessage: AUXF
+    // @Description: Auxiliary function invocation information
+    // @Field: TimeUS: Time since system startup
+    // @Field: function: ID of triggered function
+    // @FieldValueEnum: function: RC_Channel::AUX_FUNC
+    // @Field: pos: switch position when function triggered
+    // @FieldValueEnum: pos: RC_Channel::AuxSwitchPos
+    // @Field: source: source of auxiliary function invocation
+    // @FieldValueEnum: source: RC_Channel::AuxFuncTriggerSource
+    // @Field: result: true if function was successful
+    AP::logger().Write(
+        "AUXF",
+        "TimeUS,function,pos,source,result",
+        "s#---",
+        "F----",
+        "QHBBB",
+        AP_HAL::micros64(),
+        uint16_t(ch_option),
+        uint8_t(pos),
+        uint8_t(source),
+        uint8_t(ret)
+    );
+#endif
+
+    return ret;
+}
+
+bool RC_Channel::do_aux_function(const AUX_FUNC ch_option, const AuxSwitchPos ch_flag)
+{
+    switch (ch_option) {
+#if AP_FENCE_ENABLED
+    case AUX_FUNC::FENCE:
+        do_aux_function_fence(ch_flag);
+        break;
+#endif
+
+#if AP_GRIPPER_ENABLED
+    case AUX_FUNC::GRIPPER:
+        do_aux_function_gripper(ch_flag);
+        break;
+#endif
+
+    case AUX_FUNC::RC_OVERRIDE_ENABLE:
+        // Allow or disallow RC_Override
+        do_aux_function_rc_override_enable(ch_flag);
+        break;
+
+    case AUX_FUNC::AVOID_PROXIMITY:
+        do_aux_function_avoid_proximity(ch_flag);
+        break;
+
+#if AP_SERVORELAYEVENTS_ENABLED && AP_RELAY_ENABLED
+    case AUX_FUNC::RELAY:
+        do_aux_function_relay(0, ch_flag == AuxSwitchPos::HIGH);
+        break;
+    case AUX_FUNC::RELAY2:
+        do_aux_function_relay(1, ch_flag == AuxSwitchPos::HIGH);
+        break;
+    case AUX_FUNC::RELAY3:
+        do_aux_function_relay(2, ch_flag == AuxSwitchPos::HIGH);
+        break;
+    case AUX_FUNC::RELAY4:
+        do_aux_function_relay(3, ch_flag == AuxSwitchPos::HIGH);
+        break;
+    case AUX_FUNC::RELAY5:
+        do_aux_function_relay(4, ch_flag == AuxSwitchPos::HIGH);
+        break;
+    case AUX_FUNC::RELAY6:
+        do_aux_function_relay(5, ch_flag == AuxSwitchPos::HIGH);
+        break;
+#endif  // AP_SERVORELAYEVENTS_ENABLED && AP_RELAY_ENABLED
+
+#if HAL_RUNCAM_ENABLED
+    case AUX_FUNC::RUNCAM_CONTROL:
+        do_aux_function_runcam_control(ch_flag);
+        break;
+
+    case AUX_FUNC::RUNCAM_OSD_CONTROL:
+        do_aux_function_runcam_osd_control(ch_flag);
+        break;
+#endif
+
+    case AUX_FUNC::CLEAR_WP:
+        do_aux_function_clear_wp(ch_flag);
+        break;
+    case AUX_FUNC::MISSION_RESET:
+        do_aux_function_mission_reset(ch_flag);
+        break;
+
+#if HAL_ADSB_ENABLED
+    case AUX_FUNC::AVOID_ADSB:
+        do_aux_function_avoid_adsb(ch_flag);
+        break;
+#endif
+
+    case AUX_FUNC::FFT_NOTCH_TUNE:
+        do_aux_function_fft_notch_tune(ch_flag);
+        break;
+
+#if HAL_GENERATOR_ENABLED
+    case AUX_FUNC::GENERATOR:
+        do_aux_function_generator(ch_flag);
+        break;
+#endif
+
+#if AP_BATTERY_ENABLED
+    case AUX_FUNC::BATTERY_MPPT_ENABLE:
+        if (ch_flag != AuxSwitchPos::MIDDLE) {
+            AP::battery().MPPT_set_powered_state_to_all(ch_flag == AuxSwitchPos::HIGH);
+        }
+        break;
+#endif
+
+#if HAL_SPRAYER_ENABLED
+    case AUX_FUNC::SPRAYER:
+        do_aux_function_sprayer(ch_flag);
+        break;
+#endif
+
+    case AUX_FUNC::LOST_VEHICLE_SOUND:
+        do_aux_function_lost_vehicle_sound(ch_flag);
+        break;
+
+    case AUX_FUNC::ARMDISARM:
+        do_aux_function_armdisarm(ch_flag);
+        break;
+
+    case AUX_FUNC::DISARM:
+        if (ch_flag == AuxSwitchPos::HIGH) {
+            AP::arming().disarm(AP_Arming::Method::AUXSWITCH);
+        }
+        break;
+
+    case AUX_FUNC::COMPASS_LEARN:
+        if (ch_flag == AuxSwitchPos::HIGH) {
+            Compass &compass = AP::compass();
+            compass.set_learn_type(Compass::LEARN_INFLIGHT, false);
+        }
+        break;
+
+#if AP_LANDINGGEAR_ENABLED
+    case AUX_FUNC::LANDING_GEAR: {
+        AP_LandingGear *lg = AP_LandingGear::get_singleton();
+        if (lg == nullptr) {
+            break;
+        }
+        switch (ch_flag) {
+        case AuxSwitchPos::LOW:
+            lg->set_position(AP_LandingGear::LandingGear_Deploy);
+            break;
+        case AuxSwitchPos::MIDDLE:
+            // nothing
+            break;
+        case AuxSwitchPos::HIGH:
+            lg->set_position(AP_LandingGear::LandingGear_Retr

@@ -1,0 +1,2353 @@
+/*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef HAL_DEBUG_BUILD
+#define AP_INLINE_VECTOR_OPS
+#pragma GCC optimize("O2")
+#endif
+
+#include "HarmonicNotchFilter.h"
+#include <GCS_MAVLink/GCS.h>
+#include <AP_Logger/AP_Logger.h>
+
+#define HNF_MAX_FILTERS HAL_HNF_MAX_FILTERS // must be even for double-notch filters
+
+/*
+  optional logging for SITL only of all notch frequencies
+ */
+#ifndef NOTCH_DEBUG_LOGGING
+#define NOTCH_DEBUG_LOGGING 0
+#endif
+
+#if NOTCH_DEBUG_LOGGING
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <stdio.h>
+#endif
+
+/*
+  cutoff proportion of sample rate above which we do not use the notch
+ */
+#define HARMONIC_NYQUIST_CUTOFF 0.48f
+
+/*
+  point at which the harmonic notch goes to zero attenuation
+ */
+#define NOTCHFILTER_ATTENUATION_CUTOFF 0.25
+
+
+// table of user settable parameters
+const AP_Param::GroupInfo HarmonicNotchFilterParams::var_info[] = {
+
+    // @Param: ENABLE
+    // @DisplayName: Harmonic Notch Filter enable
+    // @Description: Harmonic Notch Filter enable
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO_FLAGS("ENABLE", 1, HarmonicNotchFilterParams, _enable, 0, AP_PARAM_FLAG_ENABLE),
+
+    // @Param: FREQ
+    // @DisplayName: Harmonic Notch Filter base frequency
+    // @Description: Harmonic Notch Filter base center frequency in Hz. This is the center frequency for static notches, the center frequency for Throttle based notches at the reference thrust value, and the minimum limit of center frequency variation for all other notch types. This should always be set lower than half the backend gyro rate (which is typically 1Khz). 
+    // @Range: 10 495
+    // @Units: Hz
+    // @User: Advanced
+    AP_GROUPINFO("FREQ", 2, HarmonicNotchFilterParams, _center_freq_hz, 80),
+
+    // @Param: BW
+    // @DisplayName: Harmonic Notch Filter bandwidth
+    // @Description: Harmonic Notch Filter bandwidth in Hz. This is typically set to half the base frequency. The ratio of base frequency to bandwidth determines the notch quality factor and is fixed across harmonics.
+    // @Range: 5 250
+    // @Units: Hz
+    // @User: Advanced
+    AP_GROUPINFO("BW", 3, HarmonicNotchFilterParams, _bandwidth_hz, 40),
+
+    // @Param: ATT
+    // @DisplayName: Harmonic Notch Filter attenuation
+    // @Description: Harmonic Notch Filter attenuation in dB. Values greater than 40dB will typically produce a hard notch rather than a modest attenuation of motor noise.
+    // @Range: 5 50
+    // @Units: dB
+    // @User: Advanced
+    AP_GROUPINFO("ATT", 4, HarmonicNotchFilterParams, _attenuation_dB, 40),
+
+    // @Param: HMNCS
+    // @DisplayName: Harmonic Notch Filter harmonics
+    // @Description: Bitmask of harmonic frequencies to apply Harmonic Notch Filter to. This option takes effect on the next reboot. A value of 0 disables this filter. The first harmonic refers to the base frequency.
+    // @Bitmask: 0:  1st harmonic
+    // @Bitmask: 1:  2nd harmonic
+    // @Bitmask: 2:  3rd harmonic
+    // @Bitmask: 3:  4th harmonic
+    // @Bitmask: 4:  5th harmonic
+    // @Bitmask: 5:  6th harmonic
+    // @Bitmask: 6:  7th harmonic
+    // @Bitmask: 7:  8th harmonic
+    // @Bitmask: 8:  9th harmonic
+    // @Bitmask: 9:  10th harmonic
+    // @Bitmask: 10: 11th harmonic
+    // @Bitmask: 11: 12th harmonic
+    // @Bitmask: 12: 13th harmonic
+    // @Bitmask: 13: 14th harmonic
+    // @Bitmask: 14: 15th harmonic
+    // @Bitmask: 15: 16th harmonic
+    // @User: Advanced
+    // @RebootRequired: True
+    AP_GROUPINFO("HMNCS", 5, HarmonicNotchFilterParams, _harmonics, 3),
+
+    // @Param: REF
+    // @DisplayName: Harmonic Notch Filter reference value
+    // @Description: A reference value of zero disables dynamic updates on the Harmonic Notch Filter and a positive value enables dynamic updates on the Harmonic Notch Filter.  For throttle-based scaling, this parameter is the reference value associated with the specified frequency to facilitate frequency scaling of the Harmonic Notch Filter. For RPM and ESC telemetry based tracking, this parameter is set to 1 to enable the Harmonic Notch Filter using the RPM sensor or ESC telemetry set to measure rotor speed.  The sensor data is converted to Hz automatically for use in the Harmonic Notch Filter.  This reference value may also be used to scale the sensor data, if required.  For example, rpm sensor data is required to measure heli motor RPM. Therefore the reference value can be used to scale the RPM sensor to the rotor RPM.
+    // @User: Advanced
+    // @Range: 0.0 1.0
+    // @RebootRequired: True
+    AP_GROUPINFO("REF", 6, HarmonicNotchFilterParams, _reference, 0),
+
+    // @Param: MODE
+    // @DisplayName: Harmonic Notch Filter dynamic frequency tracking mode
+    // @Description: Harmonic Notch Filter dynamic frequency tracking mode. Dynamic updates can be throttle, RPM sensor, ESC telemetry or dynamic FFT based. Throttle-based harmonic notch cannot be used on fixed wing only planes. It can for Copters, QuaadPlane(while in VTOL modes), and Rovers.
+    // @Range: 0 5
+    // @Values: 0:Fixed,1:Throttle,2:RPM Sensor,3:ESC Telemetry,4:Dynamic FFT,5:Second RPM Sensor
+    // @User: Advanced
+    AP_GROUPINFO("MODE", 7, HarmonicNotchFilterParams, _tracking_mode, int8_t(HarmonicNotchDynamicMode::UpdateThrottle)),
+
+    // @Param: OPTS
+    // @DisplayName: Harmonic Notch Filter options
+    // @Description: Harmonic Notch Filter options. Triple and double-notches can provide deeper attenuation across a wider bandwidth with reduced latency than single notches and are suitable for larger aircraft. Multi-Source attaches a harmonic notch to each detected noise frequency instead of simply being multiples of the base frequency, in the case of FFT it will attach notches to each of three detected noise peaks, in the case of ESC it will attach notches to each of four motor RPM values. Loop rate update changes the notch center frequency at the scheduler loop rate rather than at the default of 200Hz. If both double and triple notches are specified only double notches will take effect.
+    // @Bitmask: 0:Double notch,1:Multi-Source,2:Update at loop rate,3:EnableOnAllIMUs,4:Triple notch, 5:Use min freq on RPM source failure
+    // @User: Advanced
+    // @RebootRequired: True
+    AP_GROUPINFO("OPTS", 8, HarmonicNotchFilterParams, _options, 0),
+
+    // @Param: FM_RAT
+    // @DisplayName: Throttle notch min freqency ratio
+    // @Description: The minimum ratio below the configured frequency to take throttle based notch filters when flying at a throttle level below the reference throttle. Note that lower frequency notch filters will have more phase lag. If you want throttle based notch filtering to be effective at a throttle up to 30% below the configured notch frequency then set this parameter to 0.7. The default of 1.0 means the notch will not go below the frequency in the FREQ parameter.
+    // @Range: 0.1 1.0
+    // @User: Advanced
+    AP_GROUPINFO("FM_RAT", 9, HarmonicNotchFilterParams, _freq_min_ratio, 1.0),
+    
+    AP_GROUPEND
+};
+
+/*
+  destroy all of the associated notch filters
+ */
+template <class T>
+HarmonicNotchFilter<T>::~HarmonicNotchFilter() {
+    delete[] _filters;
+    _num_filters = 0;
+    _num_enabled_filters = 0;
+}
+
+/*
+  initialise the associated filters with the provided shaping constraints
+  the constraints are used to determine attenuation (A) and quality (Q) factors for the filter
+ */
+template <class T>
+void HarmonicNotchFilter<T>::init(float sample_freq_hz, HarmonicNotchFilterParams &_params)
+{
+    // keep a copy of the params object
+    params = &_params;
+
+    // sanity check the input
+    if (_filters == nullptr || is_zero(sample_freq_hz) || isnan(sample_freq_hz)) {
+        return;
+    }
+
+    _sample_freq_hz = sample_freq_hz;
+
+    const float bandwidth_hz = params->bandwidth_hz();
+    const float attenuation_dB = params->attenuation_dB();
+    float center_freq_hz = params->center_freq_hz();
+
+    const float nyquist_limit = sample_freq_hz * HARMONIC_NYQUIST_CUTOFF;
+    const float bandwidth_limit = bandwidth_hz * 0.52f;
+
+    // remember the lowest frequency we will have a notch enabled at
+    _minimum_freq = center_freq_hz * params->freq_min_ratio();
+
+    /*
+      adjust the fundamental center frequency we use for the initial
+      calculation of A and Q to be in the allowable range
+    */
+    center_freq_hz = constrain_float(center_freq_hz, bandwidth_limit, nyquist_limit);
+
+    // Calculate spread required to achieve an equivalent single notch using two notches with Bandwidth/2
+    _notch_spread = bandwidth_hz / (32 * center_freq_hz);
+
+    // position the individual notches so that the attenuation is no worse than a single notch
+    // calculate attenuation and quality from the shaping constraints
+    NotchFilter<T>::calculate_A_and_Q(center_freq_hz, bandwidth_hz / _composite_notches, attenuation_dB, _A, _Q);
+
+    _initialised = true;
+}
+
+/*
+  allocate a collection of, at most HNF_MAX_FILTERS, notch filters to be managed by this harmonic notch filter
+ */
+template <class T>
+void HarmonicNotchFilter<T>::allocate_filters(uint8_t num_notches, uint32_t harmonics, uint8_t composite_notches)
+{
+    _composite_notches = MIN(composite_notches, 3);
+    _num_harmonics = __builtin_popcount(harmonics);
+    _num_filters = _num_harmonics * num_notches * _composite_notches;
+    _harmonics = harmonics;
+
+    if (_num_filters > 0) {
+        _filters = NEW_NOTHROW NotchFilter<T>[_num_filters];
+        if (_filters == nullptr) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Failed to allocate %u bytes for notch filter", (unsigned int)(_num_filters * sizeof(NotchFilter<T>)));
+            _num_filters = 0;
+        }
+    }
+}
+
+/*
+  expand the number of filters at runtime, allowing for RPM sources such as lua scripts
+ */
+template <class T>
+void HarmonicNotchFilter<T>::expand_filter_count(uint16_t total_notches)
+{
+    if (total_notches <= _num_filters) {
+        // enough already
+        return;
+    }
+    if (_alloc_has_failed) {
+        // we've failed to allocate before, don't try again
+        return;
+    }
+    /*
+      note that we rely on the semaphore in
+      AP_InertialSensor_Backend.cpp to make this thread safe
+     */
+    auto filters = NEW_NOTHROW NotchFilter<T>[total_notches];
+    if (filters == nullptr) {
+        _alloc_has_failed = true;
+        return;
+    }
+    memcpy(filters, _filters, sizeof(filters[0])*_num_filters);
+    auto _old_filters = _filters;
+    _filters = filters;
+    _num_filters = total_notches;
+    delete[] _old_filters;
+}
+
+/*
+  set the center frequency of a single notch harmonic
+
+  The spread_mul is the frequency multiplier from the spread of the
+  double or triple notch. The harmonic_mul is the multiplier for the
+  frequency for this harmonic
+ */
+template <class T>
+void HarmonicNotchFilter<T>::set_center_frequency(uint16_t idx, float notch_center, float spread_mul, uint8_t harmonic_mul)
+{
+    const float nyquist_limit = _sample_freq_hz * HARMONIC_NYQUIST_CUTOFF;
+    auto &notch = _filters[idx];
+
+    // scale the notch with the harmonic multiplier
+    notch_center *= harmonic_mul;
+
+    /* disable the filter if its center frequency is above the nyquist
+       frequency
+
+       NOTE: should this be notch_center*spread_mul ? As it is here we
+       do sometimes run the upper notch in a double or triple notch at
+       higher than the nyquist.
+    */
+    if (notch_center >= nyquist_limit) {
+        notch.disable();
+        return;
+    }
+
+    // the minimum frequency for a harmonic is the base minimum
+    float harmonic_min_freq = _minimum_freq;
+
+    // we can adjust the attenuation at low frequencies
+    float A = _A;
+
+    // on some vehicles we want to treat zero or very low frequency as
+    // the minimum frequency, on others we want to disable the
+    // notch for low frequencies
+    const bool treat_low_freq_as_min = params->hasOption(HarmonicNotchFilterParams::Options::TreatLowAsMin);
+
+    if (treat_low_freq_as_min) {
+        /*
+          when we are treating low as min we don't want to collapse
+          the harmonics down to low frequencies
+         */
+        harmonic_min_freq *= harmonic_mul;
+    } else {
+        /*
+          disable if the notch is less than 25% of the min frequency
+        */
+        const float disable_freq = harmonic_min_freq * NOTCHFILTER_ATTENUATION_CUTOFF;
+        if (notch_center < disable_freq) {
+            notch.disable();
+            return;
+        }
+
+        if (notch_center < harmonic_min_freq) {
+            /*
+              scale the attenuation so that we fade out the notch as
+              we get further below the min frequency. The attenuation
+              factor A goes to 1.0 (which means no attenuation)
+              Scaling the attenuation in this way means we don't get a
+              glitch at the disable point
+             */
+            A = linear_interpolate(A, 1.0, notch_center, harmonic_min_freq, disable_freq);
+        }
+    }
+
+    // don't let the notch go below the min frequency
+    notch_center = MAX(notch_center, harmonic_min_freq);
+
+    /* adjust notch center for spread for double and triple notch.
+       This adjustment is applied last to maintain the symmetry of the
+       double and triple notches
+    */
+    notch_center *= spread_mul;
+
+    notch.init_with_A_and_Q(_sample_freq_hz, notch_center, A, _Q);
+}
+
+/*
+  update the underlying filters' center frequency using the current attenuation and quality
+  this function is cheaper than init() because A & Q do not need to be recalculated
+ */
+template <class T>
+void HarmonicNotchFilter<T>::update(float center_freq_hz)
+{
+    update(1, &center_freq_hz);
+}
+
+/*
+  update the underlying filters' center frequency using the current attenuation and quality
+  this function is cheaper than init() because A & Q do not need to be recalculated
+ */
+template <class T>
+void HarmonicNotchFilter<T>::update(uint8_t num_centers, const float center_freq_hz[])
+{
+    if (!_initialised) {
+        return;
+    }
+
+    // adjust the frequencies to be in the allowable range
+    const float nyquist_limit = _sample_freq_hz * HARMONIC_NYQUIST_CUTOFF;
+
+    const uint16_t total_notches = num_centers * _num_harmonics * _composite_notches;
+    if (total_notches > _num_filters) {
+        // alloc realloc of filters
+        expand_filter_count(total_notches);
+    }
+
+    _num_enabled_filters = 0;
+
+    // update all of the filters using the new center frequencies and existing A & Q
+    for (uint16_t i = 0; i < num_centers * HNF_MAX_HARMONICS && _num_enabled_filters < _num_filters; i++) {
+        const uint8_t harmonic_n = i / num_centers;
+        const uint8_t center_n = i % num_centers;
+        // the filters are ordered by center and then harmonic so
+        // f1h1, f2h1, f3h1, f4h1, f1h2, f2h2, etc
+        if (!((1U<<harmonic_n) & _harmonics)) {
+            continue;
+        }
+
+        const float notch_center = constrain_float(center_freq_hz[center_n], 0.0f, nyquist_limit);
+        const uint8_t harmonic_mul = (harmonic_n+1);
+        if (_composite_notches != 2) {
+            set_center_frequency(_num_enabled_filters++, notch_center, 1.0, harmonic_mul);
+        }
+        if (_composite_notches > 1) {
+            set_center_frequency(_num_enabled_filters++, notch_center, 1.0 - _notch_spread, harmonic_mul);
+            set_center_frequency(_num_enabled_filters++, notch_center, 1.0 + _notch_spread, harmonic_mul);
+        }
+    }
+}
+
+/*
+  apply a sample to each of the underlying filters in turn and return the output
+ */
+template <class T>
+T HarmonicNotchFilter<T>::apply(const T &sample)
+{
+    if (!_initialised) {
+        return sample;
+    }
+
+#if NOTCH_DEBUG_LOGGING
+    static int dfd = -1;
+    if (dfd == -1) {
+        dfd = ::open("notch.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    }
+#endif
+
+    T output = sample;
+    for (uint16_t i = 0; i < _num_enabled_filters; i++) {
+#if NOTCH_DEBUG_LOGGING
+        if (!_filters[i].initialised) {
+            ::dprintf(dfd, "------- ");
+        } else {
+            ::dprintf(dfd, "%.4f ", _filters[i]._center_freq_hz);
+        }
+#endif
+        output = _filters[i].apply(output);
+    }
+#if NOTCH_DEBUG_LOGGING
+    if (_num_enabled_filters > 0) {
+        ::dprintf(dfd, "\n");
+    }
+#endif
+    return output;
+}
+
+/*
+  reset all of the underlying filters
+ */
+template <class T>
+void HarmonicNotchFilter<T>::reset()
+{
+    if (!_initialised) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < _num_filters; i++) {
+        _filters[i].reset();
+    }
+}
+
+#if HAL_LOGGING_ENABLED
+// @LoggerMessage: FCN
+// @Description: Filter Center Message - per motor
+// @Field: TimeUS: microseconds since system startup
+// @Field: I: instance
+// @Field: NF: total number of active harmonic notches
+// @Field: CF1: First harmonic centre frequency for motor 1
+// @Field: CF2: First harmonic centre frequency for motor 2
+// @Field: CF3: First harmonic centre frequency for motor 3
+// @Field: CF4: First harmonic centre frequency for motor 4
+// @Field: CF5: First harmonic centre frequency for motor 5
+// @Field: CF6: First harmonic centre frequency for motor 6
+// @Field: HF1: Second harmonic centre frequency for motor 1
+// @Field: HF2: Second harmonic centre frequency for motor 2
+// @Field: HF3: Second harmonic centre frequency for motor 3
+// @Field: HF4: Second harmonic centre frequency for motor 4
+// @Field: HF5: Second harmonic centre frequency for motor 5
+// @Field: HF6: Second harmonic centre frequency for motor 6
+
+// @LoggerMessage: FCNS
+// @Description: Filter Center Message
+// @Field: TimeUS: microseconds since system startup
+// @Field: I: instance
+// @Field: CF: notch centre frequency
+// @Field: HF: 2nd harmonic frequency
+
+/*
+  log center frequencies of 1st and 2nd harmonic of a harmonic notch
+  instance for up to 6 frequency sources
+
+  the instance number passed in corresponds to the harmonic notch
+  instance in AP_InertialSensor
+ */
+template <class T>
+void HarmonicNotchFilter<T>::log_notch_centers(uint8_t instance, uint64_t now_us) const
+{
+     /*
+      for composite notches we only log the first entry. For triple
+      and single notch this is the center. For double notch it is the
+      lower frequency
+    */
+    const uint16_t filters_per_source = _composite_notches * _num_harmonics;
+    if (_num_filters == 0 || filters_per_source == 0) {
+        return;
+    }
+    const uint8_t num_sources = MIN(6, _num_filters / filters_per_source);
+    float centers[6] {};
+    float first_harmonic[6] {};
+
+    for (uint8_t i=0; i<num_sources; i++) {
+        /*
+          note the ordering of the filters from update() above:
+            f1h1, f2h1, f3h1, f4h1, f1h2, f2h2, f3h2, f4h2 etc
+         */
+        centers[i] = _filters[i*_composite_notches].logging_frequency();
+        first_harmonic[i] = _filters[num_sources*_composite_notches + i*_composite_notches].logging_frequency();
+    }
+
+    if (num_sources > 1) {
+        AP::logger().WriteStreaming(
+            "FCN", "TimeUS,I,NF,CF1,CF2,CF3,CF4,CF5,CF6,HF1,HF2,HF3,HF4,HF5,HF6", "s#-zzzzzzzzzzzz", "F--------------", "QBHffffffffffff",
+            now_us,
+            instance,
+            _num_filters,
+            centers[0], centers[1], centers[2], centers[3], centers[4], centers[5],
+            first_harmonic[0], first_harmonic[1], first_harmonic[2], first_harmonic[3], first_harmonic[4], first_harmonic[5]);
+    } else {
+        // log single center frequency
+        AP::logger().WriteStreaming(
+            "FCNS", "TimeUS,I,CF,HF", "s#zz", "F---", "QBff",
+            now_us,
+            instance,
+            centers[0],
+            first_harmonic[0]);
+    }
+}
+#endif // HAL_LOGGING_ENABLED
+
+/*
+  create parameters for the harmonic notch filter and initialise defaults
+ */
+HarmonicNotchFilterParams::HarmonicNotchFilterParams(void)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+}
+
+void HarmonicNotchFilterParams::init()
+{
+    _harmonics.convert_bitmask_parameter_width(AP_PARAM_INT8);
+}
+
+/*
+  save changed parameters
+ */
+void HarmonicNotchFilterParams::save_params()
+{
+    _enable.save();
+    _center_freq_hz.save();
+    _bandwidth_hz.save();
+    _attenuation_dB.save();
+    _harmonics.save();
+    _reference.save();
+    _freq_min_ratio.save();
+}
+
+/* 
+  instantiate template classes
+ */
+template class HarmonicNotchFilter<Vector3f>;
+template class HarmonicNotchFilter<float>;
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <AP_Math/AP_Math.h>
+#include <cmath>
+#include <AP_Param/AP_Param.h>
+#include "NotchFilter.h"
+
+#define HNF_MAX_HARMONICS 16
+
+class HarmonicNotchFilterParams;
+
+/*
+  a filter that manages a set of notch filters targetted at a fundamental center frequency
+  and multiples of that fundamental frequency
+ */
+template <class T>
+class HarmonicNotchFilter {
+public:
+    ~HarmonicNotchFilter();
+    // allocate a bank of notch filters for this harmonic notch filter
+    void allocate_filters(uint8_t num_notches, uint32_t harmonics, uint8_t composite_notches);
+    // expand filter bank with new filters
+    void expand_filter_count(uint16_t total_notches);
+    // initialize the underlying filters using the provided filter parameters
+    void init(float sample_freq_hz, HarmonicNotchFilterParams &params);
+    // update the underlying filters' center frequencies using center_freq_hz as the fundamental
+    void update(float center_freq_hz);
+    // update all of the underlying center frequencies individually
+    void update(uint8_t num_centers, const float center_freq_hz[]);
+
+    /*
+      set center frequency of one notch.
+      spread_mul is a scale factor for spreading of double or triple notch
+      harmonic_mul is the multiplier for harmonics, 1 is for the fundamental
+    */
+    void set_center_frequency(uint16_t idx, float center_freq_hz, float spread_mul, uint8_t harmonic_mul);
+
+    // apply a sample to each of the underlying filters in turn
+    T apply(const T &sample);
+    // reset each of the underlying filters
+    void reset();
+
+    /*
+      log notch center frequencies and first harmonic
+     */
+    void log_notch_centers(uint8_t instance, uint64_t now_us) const;
+
+private:
+    // underlying bank of notch filters
+    NotchFilter<T>*  _filters;
+    // sample frequency for each filter
+    float _sample_freq_hz;
+    // base double notch bandwidth for each filter
+    float _notch_spread;
+    // attenuation for each filter
+    float _A;
+    // quality factor of each filter
+    float _Q;
+    // a bitmask of the harmonics to use
+    uint32_t _harmonics;
+    // number of notches that make up a composite notch
+    uint8_t _composite_notches;
+    // number of allocated filters
+    uint16_t _num_filters;
+    // pre-calculated number of harmonics
+    uint8_t _num_harmonics;
+    // number of enabled filters
+    uint16_t _num_enabled_filters;
+    bool _initialised;
+
+    // have we failed to expand filters?
+    bool _alloc_has_failed;
+
+    // minimum frequency (from INS_HNTCH_FREQ * INS_HNTCH_FM_RAT)
+    float _minimum_freq;
+
+    // pointer to params object for this filter
+    HarmonicNotchFilterParams *params;
+};
+
+// Harmonic notch update mode
+enum class HarmonicNotchDynamicMode {
+    Fixed           = 0,
+    UpdateThrottle  = 1,
+    UpdateRPM       = 2,
+    UpdateBLHeli    = 3,
+    UpdateGyroFFT   = 4,
+    UpdateRPM2      = 5,
+};
+
+/*
+  harmonic notch filter configuration parameters
+ */
+class HarmonicNotchFilterParams : public NotchFilterParams {
+public:
+    enum class Options {
+        DoubleNotch = 1<<0,
+        DynamicHarmonic = 1<<1,
+        LoopRateUpdate = 1<<2,
+        EnableOnAllIMUs = 1<<3,
+        TripleNotch = 1<<4,
+        TreatLowAsMin = 1<<5,
+    };
+
+    HarmonicNotchFilterParams(void);
+
+    void init();
+
+    // set the fundamental center frequency of the harmonic notch
+    void set_center_freq_hz(float center_freq) { _center_freq_hz.set(center_freq); }
+
+    // set the bandwidth of the harmonic notch
+    void set_bandwidth_hz(float bandwidth_hz) { _bandwidth_hz.set(bandwidth_hz); }
+
+    // set the attenuation of the harmonic notch
+    void set_attenuation(float attenuation_dB) { _attenuation_dB.set(attenuation_dB); }
+    
+    // harmonics enabled on the harmonic notch
+    uint32_t harmonics(void) const { return _harmonics; }
+
+    // set the harmonics value
+    void set_harmonics(uint32_t hmncs) { _harmonics.set(hmncs); }
+
+    // has the user set the harmonics value
+    void set_default_harmonics(uint32_t hmncs) { _harmonics.set_default(hmncs); }
+
+    // reference value of the harmonic notch
+    float reference(void) const { return _reference; }
+    void set_reference(float ref) { _reference.set(ref); }
+
+    // notch options
+    bool hasOption(Options option) const { return _options & uint16_t(option); }
+    // notch dynamic tracking mode
+    HarmonicNotchDynamicMode tracking_mode(void) const { return HarmonicNotchDynamicMode(_tracking_mode.get()); }
+    static const struct AP_Param::GroupInfo var_info[];
+
+    // return minimum frequency ratio for throttle notch
+    float freq_min_ratio(void) const {
+        return _freq_min_ratio;
+    }
+    void set_freq_min_ratio(float ratio) { _freq_min_ratio.set(ratio); }
+
+    // set options flags
+    void set_options(uint16_t options) { _options.set(options); }
+
+    // save parameters
+    void save_params();
+
+    // return the number of composite notches given the options
+    uint8_t num_composite_notches(void) const {
+        return hasOption(Options::DoubleNotch) ? 2 : hasOption(Options::TripleNotch) ? 3: 1;
+    }
+
+private:
+    // configured notch harmonics
+    AP_Int32 _harmonics;
+    // notch reference value
+    AP_Float _reference;
+    // notch dynamic tracking mode
+    AP_Int8 _tracking_mode;
+    // notch options
+    AP_Int16 _options;
+
+    // minimum frequency ratio for throttle based notches
+    AP_Float _freq_min_ratio;
+};
+
+typedef HarmonicNotchFilter<Vector3f> HarmonicNotchFilterVector3f;
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             //
+/// @file LowPassFilter.cpp
+/// @brief  A class to implement a low pass filter
+
+#ifndef HAL_DEBUG_BUILD
+#define AP_INLINE_VECTOR_OPS
+#pragma GCC optimize("O2")
+#endif
+#include "LowPassFilter.h"
+#include <AP_InternalError/AP_InternalError.h>
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// DigitalLPF, base class
+////////////////////////////////////////////////////////////////////////////////////////////
+
+template <class T>
+DigitalLPF<T>::DigitalLPF() {
+  // built in initialization
+  output = T();
+}
+
+// add a new raw value to the filter, retrieve the filtered result
+template <class T>
+T DigitalLPF<T>::_apply(const T &sample, const float &alpha) {
+    output += (sample - output) * alpha;
+    if (!initialised) {
+        initialised = true;
+        output = sample;
+    }
+    return output;
+}
+
+// get latest filtered value from filter (equal to the value returned by latest call to apply method)
+template <class T>
+const T &DigitalLPF<T>::get() const {
+    return output;
+}
+
+// Reset filter to given value
+template <class T>
+void DigitalLPF<T>::reset(const T &value) { 
+    output = value;
+    initialised = true;
+}
+
+// Set reset flag such that the filter will be reset to the next value applied
+template <class T>
+void DigitalLPF<T>::reset() {
+    initialised = false;
+}
+
+template class DigitalLPF<float>;
+template class DigitalLPF<Vector2f>;
+template class DigitalLPF<Vector3f>;
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// Low pass filter with constant time step
+////////////////////////////////////////////////////////////////////////////////////////////
+
+// constructor
+template <class T>
+LowPassFilterConstDt<T>::LowPassFilterConstDt(const float &sample_freq, const float &new_cutoff_freq)
+{
+    set_cutoff_frequency(sample_freq, new_cutoff_freq);
+}
+
+// change parameters
+template <class T>
+void LowPassFilterConstDt<T>::set_cutoff_frequency(const float &sample_freq, const float &new_cutoff_freq) {
+    cutoff_freq = new_cutoff_freq;
+
+    if (sample_freq <= 0) {
+        alpha = 1;
+    } else {
+        alpha = calc_lowpass_alpha_dt(1.0/sample_freq, cutoff_freq);
+    }
+}
+
+// return the cutoff frequency
+template <class T>
+float LowPassFilterConstDt<T>::get_cutoff_freq(void) const {
+    return cutoff_freq;
+}
+
+// add a new raw value to the filter, retrieve the filtered result
+template <class T>
+T LowPassFilterConstDt<T>::apply(const T &sample) {
+    return this->_apply(sample, alpha);
+}
+
+template class LowPassFilterConstDt<float>;
+template class LowPassFilterConstDt<Vector2f>;
+template class LowPassFilterConstDt<Vector3f>;
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// Low pass filter with variable time step
+////////////////////////////////////////////////////////////////////////////////////////////
+
+template <class T>
+LowPassFilter<T>::LowPassFilter(const float &new_cutoff_freq)
+{
+    set_cutoff_frequency(new_cutoff_freq);
+}
+
+// change parameters
+template <class T>
+void LowPassFilter<T>::set_cutoff_frequency(const float &new_cutoff_freq) {
+    cutoff_freq = new_cutoff_freq;
+}
+
+// return the cutoff frequency
+template <class T>
+float LowPassFilter<T>::get_cutoff_freq() const {
+    return cutoff_freq;
+}
+
+// add a new raw value to the filter, retrieve the filtered result
+template <class T>
+T LowPassFilter<T>::apply(const T &sample, const float &dt) {
+    if (is_negative(cutoff_freq) || is_negative(dt)) {
+        INTERNAL_ERROR(AP_InternalError::error_t::invalid_arg_or_result);
+        this->reset(sample);
+        return this->get();
+    }
+    if (is_zero(cutoff_freq)) {
+        this->reset(sample);
+        return this->get();
+    }
+    if (is_zero(dt)) {
+        return this->get();
+    }
+    const float rc = 1.0f/(M_2PI*cutoff_freq);
+    const float alpha = constrain_float(dt/(dt+rc), 0.0f, 1.0f);
+    return this->_apply(sample, alpha);
+}
+
+/* 
+ * Make an instances
+ * Otherwise we have to move the constructor implementations to the header file :P
+ */
+template class LowPassFilter<float>;
+template class LowPassFilter<Vector2f>;
+template class LowPassFilter<Vector3f>;
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+//
+/// @file	LowPassFilter.h
+/// @brief	A class to implement a low pass filter.
+
+/*
+  Two classes are provided:
+
+   LowPassFilter: providing dt on every sample, and calling apply like this:
+
+      // call once
+      filter.set_cutoff_frequency(frequency_hz);
+
+      // then on each sample
+      output = filter.apply(sample, dt);
+
+   LowPassFilterConstDt: providing a sample freq and cutoff_freq once at start
+
+      // call once
+      filter.set_cutoff_frequency(sample_freq, frequency_hz);
+
+      // then on each sample
+      output = filter.apply(sample);
+
+  The second approach is more CPU efficient as it doesn't have to
+  recalculate alpha each time, but it assumes that dt is constant
+ */
+
+#pragma once
+
+#include <AP_Math/AP_Math.h>
+
+// DigitalLPF implements the filter math
+template <class T>
+class DigitalLPF {
+public:
+
+    // constructor
+    DigitalLPF();
+
+    CLASS_NO_COPY(DigitalLPF);
+
+    // get latest filtered value from filter (equal to the value returned by latest call to apply method)
+    const T &get() const;
+
+    // Reset filter to given value
+    void reset(const T &value);
+
+    // Set reset flag such that the filter will be reset to the next value applied
+    void reset();
+
+protected:
+    // add a new raw value to the filter, retrieve the filtered result
+    T _apply(const T &sample, const float &alpha);
+
+private:
+    T output;
+    bool initialised;
+};
+
+// Low pass filter with constant time step
+template <class T>
+class LowPassFilterConstDt : public DigitalLPF<T> {
+public:
+
+    // constructors
+    LowPassFilterConstDt() {};
+    LowPassFilterConstDt(const float &sample_freq, const float &cutoff_freq);
+
+    CLASS_NO_COPY(LowPassFilterConstDt);
+
+    // change parameters
+    void set_cutoff_frequency(const float &sample_freq, const float &cutoff_freq);
+
+    // return the cutoff frequency
+    float get_cutoff_freq() const;
+
+    // add a new raw value to the filter, retrieve the filtered result
+    T apply(const T &sample);
+
+private:
+    float cutoff_freq;
+    float alpha;
+};
+
+typedef LowPassFilterConstDt<float>    LowPassFilterConstDtFloat;
+typedef LowPassFilterConstDt<Vector2f> LowPassFilterConstDtVector2f;
+typedef LowPassFilterConstDt<Vector3f> LowPassFilterConstDtVector3f;
+
+// Low pass filter with variable time step
+template <class T>
+class LowPassFilter : public DigitalLPF<T> {
+public:
+
+    // constructors
+    LowPassFilter() {};
+    LowPassFilter(const float &cutoff_freq);
+
+    CLASS_NO_COPY(LowPassFilter);
+
+    // change parameters
+    void set_cutoff_frequency(const float &cutoff_freq);
+
+    // return the cutoff frequency
+    float get_cutoff_freq() const;
+
+    // add a new raw value to the filter, retrieve the filtered result
+    T apply(const T &sample, const float &dt);
+
+private:
+    float cutoff_freq;
+};
+
+// typedefs for compatibility
+typedef LowPassFilter<float>    LowPassFilterFloat;
+typedef LowPassFilter<Vector2f> LowPassFilterVector2f;
+typedef LowPassFilter<Vector3f> LowPassFilterVector3f;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #ifndef HAL_DEBUG_BUILD
+#define AP_INLINE_VECTOR_OPS
+#pragma GCC optimize("O2")
+#endif
+#include "LowPassFilter2p.h"
+
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// DigitalBiquadFilter
+////////////////////////////////////////////////////////////////////////////////////////////
+
+template <class T>
+DigitalBiquadFilter<T>::DigitalBiquadFilter() {
+  _delay_element_1 = T();
+  _delay_element_2 = T();
+}
+
+template <class T>
+T DigitalBiquadFilter<T>::apply(const T &sample, const struct biquad_params &params) {
+    if(!is_positive(params.cutoff_freq) || !is_positive(params.sample_freq)) {
+        return sample;
+    }
+
+    if (!initialised) {
+        reset(sample, params);
+    }
+
+    T delay_element_0 = sample - _delay_element_1 * params.a1 - _delay_element_2 * params.a2;
+    T output = delay_element_0 * params.b0 + _delay_element_1 * params.b1 + _delay_element_2 * params.b2;
+
+    _delay_element_2 = _delay_element_1;
+    _delay_element_1 = delay_element_0;
+
+    return output;
+}
+
+template <class T>
+void DigitalBiquadFilter<T>::reset() { 
+    initialised = false;
+}
+
+template <class T>
+void DigitalBiquadFilter<T>::reset(const T &value, const struct biquad_params &params) {
+    _delay_element_1 = _delay_element_2 = value * (1.0 / (1 + params.a1 + params.a2));
+    initialised = true;
+}
+
+template <class T>
+void DigitalBiquadFilter<T>::compute_params(float sample_freq, float cutoff_freq, biquad_params &ret) {
+    // Keep well under Nyquist limit
+    ret.cutoff_freq = MIN(cutoff_freq, sample_freq * 0.4);
+    ret.sample_freq = sample_freq;
+    if (!is_positive(ret.cutoff_freq)) {
+        // zero cutoff means pass-thru
+        return;
+    }
+
+    float fr = ret.sample_freq / ret.cutoff_freq;
+    float ohm = tanf(M_PI/fr);
+    float c = 1.0f+2.0f*cosf(M_PI/4.0f)*ohm + ohm*ohm;
+
+    ret.b0 = ohm*ohm/c;
+    ret.b1 = 2.0f*ret.b0;
+    ret.b2 = ret.b0;
+    ret.a1 = 2.0f*(ohm*ohm-1.0f)/c;
+    ret.a2 = (1.0f-2.0f*cosf(M_PI/4.0f)*ohm+ohm*ohm)/c;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// LowPassFilter2p
+////////////////////////////////////////////////////////////////////////////////////////////
+
+template <class T>
+LowPassFilter2p<T>::LowPassFilter2p() { 
+    memset(&_params, 0, sizeof(_params) ); 
+}
+
+// constructor
+template <class T>
+LowPassFilter2p<T>::LowPassFilter2p(float sample_freq, float cutoff_freq) {
+    // set initial parameters
+    set_cutoff_frequency(sample_freq, cutoff_freq);
+}
+
+// change parameters
+template <class T>
+void LowPassFilter2p<T>::set_cutoff_frequency(float sample_freq, float cutoff_freq) {
+    DigitalBiquadFilter<T>::compute_params(sample_freq, cutoff_freq, _params);
+}
+
+// return the cutoff frequency
+template <class T>
+float LowPassFilter2p<T>::get_cutoff_freq(void) const {
+    return _params.cutoff_freq;
+}
+
+template <class T>
+float LowPassFilter2p<T>::get_sample_freq(void) const {
+    return _params.sample_freq;
+}
+
+template <class T>
+T LowPassFilter2p<T>::apply(const T &sample) {
+    return _filter.apply(sample, _params);
+}
+
+template <class T>
+void LowPassFilter2p<T>::reset(void) {
+    return _filter.reset();
+}
+
+template <class T>
+void LowPassFilter2p<T>::reset(const T &value) {
+    return _filter.reset(value, _params);
+}
+
+/* 
+ * Make an instances
+ * Otherwise we have to move the constructor implementations to the header file :P
+ */
+template class LowPassFilter2p<int>;
+template class LowPassFilter2p<long>;
+template class LowPassFilter2p<float>;
+template class LowPassFilter2p<Vector2f>;
+template class LowPassFilter2p<Vector3f>;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include <AP_Math/AP_Math.h>
+#include <cmath>
+#include <inttypes.h>
+
+
+/// @file   LowPassFilter2p.h
+/// @brief  A class to implement a second order low pass filter
+/// @authors: Leonard Hall <LeonardTHall@gmail.com>, template implmentation: Daniel Frenzel <dgdanielf@gmail.com>
+template <class T>
+class DigitalBiquadFilter {
+public:
+    struct biquad_params {
+        float cutoff_freq;
+        float sample_freq;
+        float a1;
+        float a2;
+        float b0;
+        float b1;
+        float b2;
+    };
+
+    CLASS_NO_COPY(DigitalBiquadFilter);
+
+    DigitalBiquadFilter();
+
+    T apply(const T &sample, const struct biquad_params &params);
+    void reset();
+    void reset(const T &value, const struct biquad_params &params);
+    static void compute_params(float sample_freq, float cutoff_freq, biquad_params &ret);
+    
+private:
+    T _delay_element_1;
+    T _delay_element_2;
+    bool initialised;
+};
+
+template <class T>
+class LowPassFilter2p {
+public:
+    LowPassFilter2p();
+    // constructor
+    LowPassFilter2p(float sample_freq, float cutoff_freq);
+    // change parameters
+    void set_cutoff_frequency(float sample_freq, float cutoff_freq);
+    // return the cutoff frequency
+    float get_cutoff_freq(void) const;
+    float get_sample_freq(void) const;
+    T apply(const T &sample);
+    void reset(void);
+    void reset(const T &value);
+
+    CLASS_NO_COPY(LowPassFilter2p);
+
+protected:
+    struct DigitalBiquadFilter<T>::biquad_params _params;
+    
+private:
+    DigitalBiquadFilter<T> _filter;
+};
+
+// Uncomment this, if you decide to remove the instantiations in the implementation file
+/*
+template <class T>
+LowPassFilter2p<T>::LowPassFilter2p() { 
+    memset(&_params, 0, sizeof(_params) ); 
+}
+
+// constructor
+template <class T>
+LowPassFilter2p<T>::LowPassFilter2p(float sample_freq, float cutoff_freq) {
+    // set initial parameters
+    set_cutoff_frequency(sample_freq, cutoff_freq);
+}
+*/
+
+typedef LowPassFilter2p<int>      LowPassFilter2pInt;
+typedef LowPassFilter2p<long>     LowPassFilter2pLong;
+typedef LowPassFilter2p<float>    LowPassFilter2pFloat;
+typedef LowPassFilter2p<Vector2f> LowPassFilter2pVector2f;
+typedef LowPassFilter2p<Vector3f> LowPassFilter2pVector3f;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "ModeFilter.h"
+
+// Constructor
+template <class T, uint8_t FILTER_SIZE>
+ModeFilter<T,FILTER_SIZE>::ModeFilter(uint8_t return_element) :
+    FilterWithBuffer<T,FILTER_SIZE>(),
+    _return_element(return_element),
+    drop_high_sample(true)
+{
+    // ensure we have a valid return_nth_element value.  if not, revert to median
+    if ( _return_element >= FILTER_SIZE ) {
+        _return_element = FILTER_SIZE / 2;
+    }
+}
+
+// Public Methods //////////////////////////////////////////////////////////////
+
+template <class T, uint8_t FILTER_SIZE>
+T ModeFilter<T,FILTER_SIZE>::apply(T sample)
+{
+    // insert the new items into the samples buffer
+    isort(sample, drop_high_sample);
+
+    // next time drop from the other end of the sample buffer
+    drop_high_sample = !drop_high_sample;
+
+    // return results
+    if (FilterWithBuffer<T,FILTER_SIZE>::sample_index < FILTER_SIZE ) {
+        // middle sample if buffer is not yet full
+        return _output = FilterWithBuffer<T,FILTER_SIZE>::samples[(FilterWithBuffer<T,FILTER_SIZE>::sample_index / 2)];
+    } else {
+        // return element specified by user in constructor
+        return _output = FilterWithBuffer<T,FILTER_SIZE>::samples[_return_element];
+    }
+}
+
+//
+// insertion sort - takes a new sample and pushes it into the sample array
+//                  drops either the highest or lowest sample depending on the 'drop_high_sample' parameter
+//
+template <class T, uint8_t FILTER_SIZE>
+void ModeFilter<T,FILTER_SIZE>::isort(T new_sample, bool drop_high)
+{
+    int8_t        i;
+
+    // if the buffer isn't full simply increase the #items in the buffer (i.e. sample_index)
+    // the rest is the same as dropping the high sample
+    if ( FilterWithBuffer<T,FILTER_SIZE>::sample_index < FILTER_SIZE ) {
+        FilterWithBuffer<T,FILTER_SIZE>::sample_index++;
+        drop_high = true;
+    }
+
+    if ( drop_high ) {     // drop highest sample from the buffer to make room for our new sample
+
+        // start from top. Note: sample_index always points to the next open space so we start from sample_index-1
+        i = FilterWithBuffer<T,FILTER_SIZE>::sample_index-1;
+
+        // if the next element is higher than our new sample, push it up one position
+        while (i > 0 && FilterWithBuffer<T,FILTER_SIZE>::samples[i-1] > new_sample) {
+            FilterWithBuffer<T,FILTER_SIZE>::samples[i] = FilterWithBuffer<T,FILTER_SIZE>::samples[i-1];
+            i--;
+        }
+
+        // add our new sample to the buffer
+        FilterWithBuffer<T,FILTER_SIZE>::samples[i] = new_sample;
+
+    } else {    // drop lowest sample from the buffer to make room for our new sample
+
+        // start from the bottom
+        i = 0;
+
+        // if the element is lower than our new sample, push it down one position
+        while ( i < FilterWithBuffer<T,FILTER_SIZE>::sample_index-1 && FilterWithBuffer<T,FILTER_SIZE>::samples[i+1] < new_sample ) {
+            FilterWithBuffer<T,FILTER_SIZE>::samples[i] = FilterWithBuffer<T,FILTER_SIZE>::samples[i+1];
+            i++;
+        }
+
+        // add our new sample to the buffer
+        FilterWithBuffer<T,FILTER_SIZE>::samples[i] = new_sample;
+    }
+}
+
+// instantiate required implementations
+template class ModeFilter<float,5>;
+template class ModeFilter<int16_t,3>;
+template class ModeFilter<int16_t,5>;
+                                                                                                                                                /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+//
+/// @file	ModeFilter.h
+/// @brief	A class to apply a mode filter which is basically picking the median value from the last x samples
+///         the filter size (i.e buffer size) should always be an odd number
+#pragma once
+
+#include <inttypes.h>
+#include "FilterClass.h"
+#include "FilterWithBuffer.h"
+
+template <class T, uint8_t FILTER_SIZE>
+class ModeFilter : public FilterWithBuffer<T,FILTER_SIZE>
+{
+public:
+    ModeFilter(uint8_t return_element);
+
+    // apply - Add a new raw value to the filter, retrieve the filtered result
+    virtual T        apply(T sample) override;
+
+    // get - get latest filtered value from filter (equal to the value returned by latest call to apply method)
+    virtual T        get() const {
+        return _output;
+    }
+
+private:
+    // private methods
+    uint8_t         _return_element;
+    T               _output;
+    void            isort(T sample, bool drop_high_sample);
+    bool            drop_high_sample; // switch to determine whether to drop the highest or lowest sample when new value arrives
+};
+
+// Typedef for convenience
+typedef ModeFilter<int8_t,3> ModeFilterInt8_Size3;
+typedef ModeFilter<int8_t,4> ModeFilterInt8_Size4;
+typedef ModeFilter<int8_t,5> ModeFilterInt8_Size5;
+typedef ModeFilter<int8_t,6> ModeFilterInt8_Size6;
+typedef ModeFilter<int8_t,7> ModeFilterInt8_Size7;
+typedef ModeFilter<uint8_t,3> ModeFilterUInt8_Size3;
+typedef ModeFilter<uint8_t,4> ModeFilterUInt8_Size4;
+typedef ModeFilter<uint8_t,5> ModeFilterUInt8_Size5;
+typedef ModeFilter<uint8_t,6> ModeFilterUInt8_Size6;
+typedef ModeFilter<uint8_t,7> ModeFilterUInt8_Size7;
+typedef ModeFilter<int16_t,3> ModeFilterInt16_Size3;
+typedef ModeFilter<int16_t,4> ModeFilterInt16_Size4;
+typedef ModeFilter<int16_t,5> ModeFilterInt16_Size5;
+typedef ModeFilter<int16_t,6> ModeFilterInt16_Size6;
+typedef ModeFilter<int16_t,7> ModeFilterInt16_Size7;
+typedef ModeFilter<uint16_t,3> ModeFilterUInt16_Size3;
+typedef ModeFilter<uint16_t,4> ModeFilterUInt16_Size4;
+typedef ModeFilter<uint16_t,5> ModeFilterUInt16_Size5;
+typedef ModeFilter<uint16_t,6> ModeFilterUInt16_Size6;
+typedef ModeFilter<uint16_t,7> ModeFilterUInt16_Size7;
+typedef ModeFilter<float,3> ModeFilterFloat_Size3;
+typedef ModeFilter<float,4> ModeFilterFloat_Size4;
+typedef ModeFilter<float,5> ModeFilterFloat_Size5;
+typedef ModeFilter<float,6> ModeFilterFloat_Size6;
+typedef ModeFilter<float,7> ModeFilterFloat_Size7;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef HAL_DEBUG_BUILD
+#define AP_INLINE_VECTOR_OPS
+#pragma GCC optimize("O2")
+#endif
+
+#include "NotchFilter.h"
+#include <AP_Logger/AP_Logger.h>
+
+const static float NOTCH_MAX_SLEW       = 0.05f;
+const static float NOTCH_MAX_SLEW_LOWER = 1.0f - NOTCH_MAX_SLEW;
+const static float NOTCH_MAX_SLEW_UPPER = 1.0f / NOTCH_MAX_SLEW_LOWER;
+
+/*
+   calculate the attenuation and quality factors of the filter
+ */
+template <class T>
+void NotchFilter<T>::calculate_A_and_Q(float center_freq_hz, float bandwidth_hz, float attenuation_dB, float& A, float& Q) {
+    A = powf(10, -attenuation_dB / 40.0f);
+    if (center_freq_hz > 0.5 * bandwidth_hz) {
+        const float octaves = log2f(center_freq_hz / (center_freq_hz - bandwidth_hz / 2.0f)) * 2.0f;
+        Q = sqrtf(powf(2, octaves)) / (powf(2, octaves) - 1.0f);
+    } else {
+        Q = 0.0;
+    }
+}
+
+/*
+  initialise filter
+ */
+template <class T>
+void NotchFilter<T>::init(float sample_freq_hz, float center_freq_hz, float bandwidth_hz, float attenuation_dB)
+{
+    // check center frequency is in the allowable range
+    initialised = false;
+    if ((center_freq_hz > 0.5 * bandwidth_hz) && (center_freq_hz < 0.5 * sample_freq_hz)) {
+        float A, Q;
+        calculate_A_and_Q(center_freq_hz, bandwidth_hz, attenuation_dB, A, Q);
+        init_with_A_and_Q(sample_freq_hz, center_freq_hz, A, Q);
+    }
+}
+
+template <class T>
+void NotchFilter<T>::init_with_A_and_Q(float sample_freq_hz, float center_freq_hz, float A, float Q)
+{
+    // don't update if no updates required
+    if (initialised &&
+        is_equal(center_freq_hz, _center_freq_hz) &&
+        is_equal(sample_freq_hz, _sample_freq_hz) &&
+        is_equal(A, _A)) {
+        return;
+    }
+
+    float new_center_freq = center_freq_hz;
+
+    // constrain the new center frequency by a percentage of the old frequency
+    if (initialised && !need_reset && !is_zero(_center_freq_hz)) {
+        new_center_freq = constrain_float(new_center_freq, _center_freq_hz * NOTCH_MAX_SLEW_LOWER,
+                                          _center_freq_hz * NOTCH_MAX_SLEW_UPPER);
+    }
+
+    if (is_positive(new_center_freq) && (new_center_freq < 0.5 * sample_freq_hz) && (Q > 0.0)) {
+        float omega = 2.0 * M_PI * new_center_freq / sample_freq_hz;
+        float alpha = sinf(omega) / (2 * Q);
+        b0 =  1.0 + alpha*sq(A);
+        b1 = -2.0 * cosf(omega);
+        b2 =  1.0 - alpha*sq(A);
+        a1 = b1;
+        a2 =  1.0 - alpha;
+
+        const float a0_inv =  1.0/(1.0 + alpha);
+
+        // Pre-multiply to save runtime calc
+        b0 *= a0_inv;
+        b1 *= a0_inv;
+        b2 *= a0_inv;
+        a1 *= a0_inv;
+        a2 *= a0_inv;
+
+        _center_freq_hz = new_center_freq;
+        _sample_freq_hz = sample_freq_hz;
+        _A = A;
+        initialised = true;
+    } else {
+        // leave center_freq_hz at last value
+        initialised = false;
+    }
+}
+
+/*
+  apply a new input sample, returning new output
+ */
+template <class T>
+T NotchFilter<T>::apply(const T &sample)
+{
+    if (!initialised || need_reset) {
+        // if we have not been initialised when return the input
+        // sample as output and update delayed samples
+        signal1 = sample;
+        signal2 = sample;
+        ntchsig1 = sample;
+        ntchsig2 = sample;
+        need_reset = false;
+        return sample;
+    }
+
+    T output = sample*b0 + ntchsig1*b1 + ntchsig2*b2 - signal1*a1 - signal2*a2;
+
+    ntchsig2 = ntchsig1;
+    ntchsig1 = sample;
+
+    signal2 = signal1;
+    signal1 = output;
+    return output;
+}
+
+template <class T>
+void NotchFilter<T>::reset()
+{
+    need_reset = true;
+}
+
+#if HAL_LOGGING_ENABLED
+// return the frequency to log for the notch
+template <class T>
+float NotchFilter<T>::logging_frequency() const
+{
+    return initialised ? _center_freq_hz : AP::logger().quiet_nanf();
+}
+#endif
+
+/*
+   instantiate template classes
+ */
+template class NotchFilter<float>;
+template class NotchFilter<Vector2f>;
+template class NotchFilter<Vector3f>;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+/*
+  notch filter with settable sample rate, center frequency, bandwidth and attenuation
+
+  Design by Leonard Hall
+ */
+
+#include <AP_Math/AP_Math.h>
+#include <cmath>
+#include <inttypes.h>
+#include <AP_Param/AP_Param.h>
+
+
+template <class T>
+class HarmonicNotchFilter;
+
+template <class T>
+class NotchFilter {
+public:
+    friend class HarmonicNotchFilter<T>;
+    // set parameters
+    void init(float sample_freq_hz, float center_freq_hz, float bandwidth_hz, float attenuation_dB);
+    void init_with_A_and_Q(float sample_freq_hz, float center_freq_hz, float A, float Q);
+    T apply(const T &sample);
+    void reset();
+    float center_freq_hz() const { return _center_freq_hz; }
+    float sample_freq_hz() const { return _sample_freq_hz; }
+
+    // calculate attenuation and quality from provided center frequency and bandwidth
+    static void calculate_A_and_Q(float center_freq_hz, float bandwidth_hz, float attenuation_dB, float& A, float& Q); 
+
+    void disable(void) {
+        initialised = false;
+    }
+
+    // return the frequency to log for the notch
+    float logging_frequency(void) const;
+
+protected:
+
+    bool initialised, need_reset;
+    float b0, b1, b2, a1, a2;
+    float _center_freq_hz, _sample_freq_hz, _A;
+    T ntchsig1, ntchsig2, signal2, signal1;
+};
+
+/*
+  notch filter enable and filter parameters
+ */
+class NotchFilterParams {
+public:
+    float center_freq_hz(void) const { return _center_freq_hz; }
+    float bandwidth_hz(void) const { return _bandwidth_hz; }
+    float attenuation_dB(void) const { return _attenuation_dB; }
+    uint8_t enabled(void) const { return _enable; }
+    void enable() { _enable.set(true); }
+    
+protected:
+    AP_Int8 _enable;
+    AP_Float _center_freq_hz;
+    AP_Float _bandwidth_hz;
+    AP_Float _attenuation_dB;
+};
+
+typedef NotchFilter<float> NotchFilterFloat;
+typedef NotchFilter<Vector2f> NotchFilterVector2f;
+typedef NotchFilter<Vector3f> NotchFilterVector3f;
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #pragma once
+
+/* slew rate limiting filter. This is used to prevent oscillation of a
+ * controller by modifying the controllers output based on a maximum
+ * slew rate
+*/
+
+#include <AP_Math/AP_Math.h>
+#include <stdint.h>
+#include "SlewLimiter.h"
+
+class SlewCalculator2D {
+public:
+    SlewCalculator2D();
+
+    CLASS_NO_COPY(SlewCalculator2D);
+
+    // apply filter to sample and calculate slewrate
+    void update(const Vector2f& sample, float dt);
+
+    // get last oscillation slew rate
+    float get_slew_rate() const;
+
+private:
+    SlewLimiter xlimiter;   // X-axis 1D slew rate limiter
+    SlewLimiter ylimiter;   // Y-axis 1D slew rate limiter
+
+    float slew_rate_max = 0;    // slew rate max (always zero)
+    float slew_rate_tau = 1.0;  // slew rate tau (always 1.0)
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+  The SlewLimiter filter provides an actuator slew rate limiter for
+  PID controllers. It is used to reduce the P and D gains when the
+  filter detects that the P+D components are pushing the actuator
+  beyond the configured actuator rate limit. This can prevent
+  oscillations that are caused by the output actuation rate going
+  beyond the actuator maximum physical rate, which causes the
+  actuation demand and achieved rate to get out of phase.
+
+  this filter was originally written by Paul Riseborough for fixed
+  wing use. It was adapted for wider use in AC_PID by Andrew Tridgell
+ */
+#include "SlewLimiter.h"
+
+#define WINDOW_MS 300                   // time in msec required for a half cycle of the slowest oscillation frequency expected
+#define MODIFIER_GAIN 1.5f              // ratio of modifier reduction to slew rate exceedance ratio
+#define DERIVATIVE_CUTOFF_FREQ 25.0f
+
+SlewLimiter::SlewLimiter(const float &_slew_rate_max, const float &_slew_rate_tau) :
+    slew_rate_max(_slew_rate_max),
+    slew_rate_tau(_slew_rate_tau)
+{
+    slew_filter.set_cutoff_frequency(DERIVATIVE_CUTOFF_FREQ);
+    slew_filter.reset(0.0);
+}
+
+/*
+  apply filter to sample, returning multiplier between 0 and 1 to keep
+  output within slew rate
+ */
+float SlewLimiter::modifier(float sample, float dt)
+{
+    if (!is_positive(dt)) {
+        return 1.0;
+    }
+
+    // Calculate a low pass filtered slew rate
+    const float slew_rate = slew_filter.apply((sample - last_sample) / dt, dt);
+    last_sample = sample;
+
+    uint32_t now_ms = AP_HAL::millis();
+
+    // Apply a filter to decay maximum seen slew rate once the value had left the window period
+    const float decay_alpha = fminf(dt, slew_rate_tau) / slew_rate_tau;
+
+    // Apply a filter to increases in slew rate only to reduce the effect of gusts and large controller setpoint changes
+    const float attack_alpha = fminf(2.0f * decay_alpha, 1.0f);
+
+    // Decay the peak positive and negative slew rate if they are outside the window
+    // Never drop PID gains below 10% of configured value
+    if (slew_rate > _max_pos_slew_rate) {
+        _max_pos_slew_rate = slew_rate;
+        _max_pos_slew_event_ms = now_ms;
+    } else if (now_ms - _max_pos_slew_event_ms > WINDOW_MS) {
+        _max_pos_slew_rate *= (1.0f - decay_alpha);
+    }
+
+    if (-slew_rate > _max_neg_slew_rate) {
+        _max_neg_slew_rate = -slew_rate;
+        _max_neg_slew_event_ms = now_ms;
+    } else if (now_ms - _max_neg_slew_event_ms > WINDOW_MS) {
+        _max_neg_slew_rate *= (1.0f - decay_alpha);
+    }
+
+    const float raw_slew_rate = 0.5f*(_max_pos_slew_rate + _max_neg_slew_rate);
+    _output_slew_rate = (1.0f - attack_alpha) * _output_slew_rate + attack_alpha * raw_slew_rate;
+    _output_slew_rate = fminf(_output_slew_rate, raw_slew_rate);
+
+    if (slew_rate_max <= 0) {
+        return 1.0;
+    }
+
+    // Constrain slew rate used for calculation
+    const float limited_raw_slew_rate = 0.5f*(fminf(_max_pos_slew_rate, 10.0f * slew_rate_max) + fminf(_max_neg_slew_rate, 10.0f * slew_rate_max));
+
+    // Store a series of positive slew rate exceedance events
+    if (!_pos_event_stored && slew_rate > slew_rate_max) {
+        if (_pos_event_index >= SLEWLIMITER_N_EVENTS) {
+            _pos_event_index = 0;
+        }
+        _pos_event_ms[_pos_event_index] = now_ms;
+        _pos_event_index++;
+        _pos_event_stored = true;
+        _neg_event_stored = false;
+    }
+
+    // Store a series of negative slew rate exceedance events
+    if (!_neg_event_stored && -slew_rate > slew_rate_max) {
+        if (_neg_event_index >= SLEWLIMITER_N_EVENTS) {
+            _neg_event_index = 0;
+        }
+        _neg_event_ms[_neg_event_index] = now_ms;
+        _neg_event_index++;
+        _neg_event_stored = true;
+        _pos_event_stored = false;
+    }
+
+    // Find the oldest event time
+    uint32_t oldest_ms = now_ms;
+    for (uint8_t index = 0; index < SLEWLIMITER_N_EVENTS; index++) {
+        oldest_ms = MIN(oldest_ms, _pos_event_ms[index]);
+        oldest_ms = MIN(oldest_ms, _neg_event_ms[index]);
+    }
+
+    // Apply a further reduction when the oldest exceedance event falls outside the window required for the
+    // specified number of exceedance events. This prevents spikes due to control mode changed, etc causing
+    // unwanted gain reduction and is only applied to the slew rate used for gain reduction
+    float modifier_input = limited_raw_slew_rate;
+    if (now_ms - oldest_ms > (SLEWLIMITER_N_EVENTS + 1) * WINDOW_MS) {
+        const float oldest_time_from_window = 0.001f*(float)(now_ms - oldest_ms - (SLEWLIMITER_N_EVENTS + 1) * WINDOW_MS);
+        modifier_input *= expf(-oldest_time_from_window / slew_rate_tau);
+    }
+
+    _modifier_slew_rate = (1.0f - attack_alpha) * _modifier_slew_rate + attack_alpha * modifier_input;
+    _modifier_slew_rate = fminf(_modifier_slew_rate, modifier_input);
+
+    // Calculate the gain adjustment
+    float mod = 1.0f;
+    if (_modifier_slew_rate > slew_rate_max) {
+        mod = slew_rate_max / (slew_rate_max + MODIFIER_GAIN * (_modifier_slew_rate - slew_rate_max));
+    }
+
+    return mod;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+ *       Example sketch to demonstrate use of DerivativeFilter library.
+ */
+
+#include <AP_HAL/AP_HAL.h>
+#include <Filter/Filter.h>
+#include <Filter/DerivativeFilter.h>
+
+void setup();
+void loop();
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+#define USE_NOISE 0
+
+DerivativeFilter<float, 11> derivative;
+
+// setup routine
+void setup() {}
+
+static float noise(void)
+{
+#if USE_NOISE
+    return ((random() % 100)-50) * 0.001f;
+#else
+    return 0;
+#endif
+}
+
+// Main loop where the action takes place
+void loop()
+{
+    hal.scheduler->delay(50);
+    float t = AP_HAL::millis() * 1.0e-3f;
+    float s = sinf(t);
+    s += noise();
+    uint32_t t1 = AP_HAL::micros();
+    derivative.update(s, t1);
+    float output = derivative.slope() * 1.0e6f;
+    hal.console->printf("%f %f %f %f\n", (double)t, (double)output, (double)s, (double)cosf(t));
+}
+
+AP_HAL_MAIN();
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_example(
+        use='ap',
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           close all
+clear
+clc
+
+% File generated by the TransferFunctionCheck example
+filename = "test.csv";
+
+% There are some annoying warnings for text parsing and matrix solve
+warning('off','MATLAB:rankDeficientMatrix');
+warning('off','MATLAB:table:ModifiedAndSavedVarnames');
+
+data = readtable(filename);
+
+lines = readlines(filename);
+data_start = find(startsWith(lines,"f(hz),"));
+if numel(data_start) ~= 1
+    error("Could not parse type")
+end
+lines = lines(1:data_start-1);
+fprintf("%s\n",lines)
+
+% Try and work out types
+filters = {};
+filter_index = find(startsWith(lines,"LowPassFilterConstDtFloat"));
+for i = 1:numel(filter_index)
+    filters{end+1} = parse_low_pass(lines, filter_index(i)); %#ok<SAGROW> 
+end
+filter_index = find(startsWith(lines,"LowPassFilterFloat"));
+for i = 1:numel(filter_index)
+    filters{end+1} = parse_low_pass(lines, filter_index(i)); %#ok<SAGROW> 
+end
+filter_index = find(startsWith(lines,"LowPassFilter2pFloat"));
+for i = 1:numel(filter_index)
+    filters{end+1} = parse_biquad(lines, filter_index(i)); %#ok<SAGROW> 
+end
+filter_index = find(startsWith(lines,"NotchFilterFloat"));
+for i = 1:numel(filter_index)
+    filters{end+1} = parse_notch(lines, filter_index(i)); %#ok<SAGROW> 
+end
+
+if numel(filters) == 0
+    error("Failed to parse filters")
+end
+
+% Make sure all have the same sample rate
+for i = 2:numel(filters)
+    if filters{i}.sample_rate ~= filters{1}.sample_rate
+        error("Sample rate mismatch")
+    end
+end
+sample_freq = filters{1}.sample_rate;
+
+% Parse time from headers
+for i = numel(data.Properties.VariableDescriptions):-1:2
+    time(i-1) = sscanf(data.Properties.VariableDescriptions{i},'t = %f');
+end
+if any(isnan(time))
+    error("Got NAN time")
+end
+
+% Parse input frequency and output amplitude
+freq = data{:,1};
+if any(isnan(freq))
+    error("Got NAN freq")
+end
+
+output = data{:,2:end};
+if any(isnan(output))
+    error("Got NAN time")
+end
+
+% Brute force the amplitude and phase from the sweep
+% This method is currently used in the js filter tool
+
+% Best fit to sin to get amplitude, phase and DC offset
+% https://math.stackexchange.com/questions/3926007/least-squares-regression-of-sine-wave
+% Expecting output to be of same frequency at input
+% Z = a*sin(t*kt + p) + O
+% A = a*cos(p)
+% B = a*sin(p)
+% S = sin(t*kt)
+% C = cos(t*kt)
+
+num_sweep = numel(freq);
+
+amplitude = zeros(num_sweep,1);
+phase = zeros(num_sweep,1);
+
+% Only fit to last 100 points, better aproximation for steady state
+num_best_fit_points = 100;
+best_fit_index = false(1,numel(time));
+best_fit_index(end-num_best_fit_points+1:end) = true;
+for i = 1:num_sweep
+ 
+    X = [sin(time(best_fit_index) * 2*pi*freq(i));
+         cos(time(best_fit_index) * 2*pi*freq(i)); 
+         zeros(1,num_best_fit_points)];
+    Y = output(i,best_fit_index);
+
+    % Z = a*sin(t*kt + p) + O
+    Z = Y / X;
+
+    amplitude(i) = sqrt(Z(1)^2 + Z(2)^2);
+    phase(i) = atan2d(Z(2), Z(1));
+    % DC_offset = Z(3);
+
+end
+
+% Calculate using transfer function
+Z = exp(1i*pi*(freq/(sample_freq*0.5)));
+
+for i = numel(filters):-1:1
+    % Transfer function of each filter
+    H(:,i) = filters{i}.transfer_function(Z);
+end
+
+% multiply all transfer functions together
+H_all = prod(H,2); 
+
+% Extract amplitude and phase from transfer function
+calc_amplitude = abs(H_all);
+calc_phase = atan2d(imag(H_all),real(H_all));
+
+% Caculate and print error size
+amp_error = abs(amplitude - calc_amplitude);
+fprintf('Amplitude error - max: %g mean: %g\n',max(amp_error), mean(amp_error))
+
+phgase_error = abs(phase - calc_phase);
+fprintf('Phase error - max: %g mean: %g\n',max(phgase_error), mean(phgase_error))
+
+% Bode plot
+figure
+tiledlayout(2,1)
+nexttile
+hold all
+plot(freq, amplitude)
+plot(freq, calc_amplitude)
+ylabel('magnitude')
+legend('Brute force','transfer function')
+
+nexttile
+hold all
+plot(freq, phase)
+plot(freq, calc_phase)
+xlabel('Frequency (Hz)')
+ylabel('phase')
+
+function ret = parse_low_pass(lines, start_index)
+    found = startsWith(lines(start_index),"LowPassFilterFloat") || startsWith(lines(start_index),"LowPassFilterConstDtFloat");
+    if ~found
+        error("Expecting LowPassFilterConstDtFloat or LowPassFilterFloat")
+    end
+    
+    % Next line gives sample rate and cutoff
+    temp =  sscanf(lines(start_index+1),'Sample rate: %f Hz, Cutoff: %f Hz');
+    ret.sample_rate = temp(1);
+    ret.target_freq = temp(2);
+
+    % Assume we know the form
+    alpha = sscanf(lines(start_index+3),'a: %f');
+
+    ret.transfer_function = @(z) alpha./(1-(1-alpha)*z.^-1);
+
+end
+
+function ret = parse_biquad(lines, start_index)
+    if ~startsWith(lines(start_index),"LowPassFilter2pFloat")
+        error("Expecting LowPassFilter2pFloat")
+    end
+    
+    % Next line gives sample rate and cutoff
+    temp =  sscanf(lines(start_index+1),'Sample rate: %f Hz, Cutoff: %f Hz');
+    ret.sample_rate = temp(1);
+    ret.target_freq = temp(2);
+
+    % Assume we know the form
+    coefficents = sscanf(lines(start_index+3),'a1: %f, a2: %f, b0: %f, b1: %f, b2: %f');
+ 
+    a1 = coefficents(1);
+    a2 = coefficents(2);
+    b0 = coefficents(3);
+    b1 = coefficents(4);
+    b2 = coefficents(5);
+
+    ret.transfer_function = @(z) (b0 + b1*z.^-1 + b2*z.^-2)./(1 + a1*z.^-1 + a2*z.^-2);
+
+end
+
+function ret = parse_notch(lines, start_index)
+    if ~startsWith(lines(start_index),"NotchFilterFloat")
+        error("Expecting NotchFilterFloat")
+    end
+    
+    % Next line gives sample rate and cutoff
+    temp =  sscanf(lines(start_index+1),'Sample rate: %f Hz, Center: %f Hz');
+    ret.sample_rate = temp(1);
+    ret.target_freq = temp(2);
+
+    % Assume we know the form
+    coefficents = sscanf(lines(start_index+3),'a0: %f, a1: %f, a2: %f, b0: %f, b1: %f, b2: %f');
+ 
+    a0 = coefficents(1);
+    a1 = coefficents(2);
+    a2 = coefficents(3);
+    b0 = coefficents(4);
+    b1 = coefficents(5);
+    b2 = coefficents(6);
+
+    ret.transfer_function = @(z) (b0 + b1*z.^-1 + b2*z.^-2)./(a0 + a1*z.^-1 + a2*z.^-2);
+
+end
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              // Example and MATLAB script for verifying transfer functions of filters as implemented
+
+/* on Linux run with
+    ./waf configure --board linux
+    ./waf --targets examples/TransferFunctionCheck
+    ./build/linux/examples/TransferFunctionCheck
+*/
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Math/AP_Math.h>
+#include <Filter/Filter.h>
+#include <Filter/LowPassFilter2p.h>
+#include <Filter/NotchFilter.h>
+
+const AP_HAL::HAL& hal = AP_HAL::get_HAL();
+
+// Some helper classes to allow accessing protected variables, also useful for adding type specific prints
+
+class LowPassConstDtHelper : public LowPassFilterConstDtFloat {
+public:
+    using LowPassFilterConstDtFloat::LowPassFilterConstDtFloat;
+
+    void set_cutoff_frequency_override(float sample_freq, float new_cutoff_freq) {
+        // Stash the sample rate so we can use it later
+        _sample_freq = sample_freq;
+        set_cutoff_frequency(sample_freq, new_cutoff_freq);
+    }
+
+    // Were really cheating here and using the same method as the filter to get the coefficient
+    // rather than pulling the coefficient directly
+    void print_transfer_function() {
+        hal.console->printf("LowPassFilterConstDtFloat\n");
+        hal.console->printf("Sample rate: %.9f Hz, Cutoff: %.9f Hz\n", _sample_freq, get_cutoff_freq());
+        hal.console->printf("Low pass filter in the form: H(z) = a/(1-(1-a)*z^-1)\n");
+        hal.console->printf("a: %.9f\n", calc_lowpass_alpha_dt(1.0/_sample_freq, get_cutoff_freq()));
+    }
+
+private:
+    float _sample_freq;
+};
+
+class LowPassHelper : public LowPassFilterFloat {
+public:
+    using LowPassFilterFloat::LowPassFilterFloat;
+
+    void set_cutoff_frequency_override(float sample_freq, float new_cutoff_freq) {
+        // Stash the DT so we can use it later
+        _DT = 1.0 / sample_freq;
+        set_cutoff_frequency(new_cutoff_freq);
+    }
+
+    // Were really cheating here and using the same method as the filter to get the coefficient
+    // rather than pulling the coefficient directly
+    void print_transfer_function() {
+        hal.console->printf("LowPassFilterFloat\n");
+        hal.console->printf("Sample rate: %.9f Hz, Cutoff: %.9f Hz\n", 1.0 / _DT, get_cutoff_freq());
+        hal.console->printf("Low pass filter in the form: H(z) = a/(1-(1-a)*z^-1)\n");
+        hal.console->printf("a: %.9f\n", calc_lowpass_alpha_dt(_DT, get_cutoff_freq()));
+    }
+
+    float apply_override(const float sample) {
+        return apply(sample, _DT);
+    }
+
+private:
+    float _DT;
+};
+
+class LowPass2pHelper : public LowPassFilter2pFloat {
+public:
+    using LowPassFilter2pFloat::LowPassFilter2pFloat;
+
+    // Print transfer function and variables to console
+    void print_transfer_function() {
+        hal.console->printf("LowPassFilter2pFloat\n");
+        hal.console->printf("Sample rate: %.9f Hz, Cutoff: %.9f Hz\n", get_sample_freq(), get_cutoff_freq());
+        hal.console->printf("Biquad filter in the form: H(z) = (b0 + b1*z^-1 + b2*z^-2)/(1 + a1*z^-1 + a2*z^-2)\n");
+        hal.console->printf("a1: %.9f, a2: %.9f, b0: %.9f, b1: %.9f, b2: %.9f\n", _params.a1, _params.a2, _params.b0, _params.b1, _params.b2);
+    }
+};
+
+class NotchHelper : public NotchFilterFloat {
+public:
+    using NotchFilterFloat::NotchFilterFloat;
+
+    // Print transfer function and variables to console
+    void print_transfer_function() {
+        hal.console->printf("NotchFilterFloat\n");
+        hal.console->printf("Sample rate: %.9f Hz, Center: %.9f Hz\n", _sample_freq_hz, _center_freq_hz);
+        hal.console->printf("Notch filter in the form: H(z) = (b0 + b1*z^-1 + b2*z^-2)/(a0 + a1*z^-1 + a2*z^-2)\n");
+        hal.console->printf("a0: %.9f, a1: %.9f, a2: %.9f, b0: %.9f, b1: %.9f, b2: %.9f\n", 1.0, a1, a2, b0, b1, b2);
+    }
+};
+
+
+// create an instance each filter to test
+LowPassConstDtHelper lowpassConstDt;
+LowPassHelper lowpass;
+LowPass2pHelper biquad;
+NotchHelper notch;
+NotchHelper notch2;
+
+enum class filter_type {
+    LowPassConstDT,
+    LowPass,
+    Biquad,
+    Notch,
+    Combination,
+} type;
+
+void setup();
+void loop();
+void reset_all();
+float apply_to_filter_under_test(float input);
+void sweep(uint16_t num_samples,  uint16_t max_freq, float sample_rate);
+
+void loop() {};
+
+// setup routine
+void setup()
+{
+    hal.console->printf("Frequency sweep transfer function test\n");
+    hal.console->printf("Sweeping a range of frequencies in the form sin(2*pi*t*f)\n");
+
+    // Set sample rate and target frequency
+    const float sample_rate = 1000;
+    const float target_freq = 50;
+
+    type = filter_type::LowPassConstDT;
+
+    // Run 1000 time steps at each frequency
+    const uint16_t num_samples = 1000;
+
+    // Run upto 150 hz
+    const uint16_t max_freq = 150;
+
+    // Print transfer function of filter under test
+    hal.console->printf("\n");
+    switch (type) {
+    case filter_type::LowPassConstDT:
+        lowpassConstDt.set_cutoff_frequency_override(sample_rate, target_freq);
+        lowpassConstDt.print_transfer_function();
+        break;
+
+    case filter_type::LowPass:
+        lowpass.set_cutoff_frequency_override(sample_rate, target_freq);
+        lowpass.print_transfer_function();
+        break;
+
+    case filter_type::Biquad:
+        biquad.set_cutoff_frequency(sample_rate, target_freq);
+        biquad.print_transfer_function();
+        break;
+
+    case filter_type::Notch:
+        notch.init(sample_rate, target_freq, target_freq*0.25, 40);
+        notch.print_transfer_function();
+        break;
+
+    case filter_type::Combination:
+        // A combination of two notches and a biquad lowpass, representative of a typical setup
+        notch.init(sample_rate, target_freq, target_freq*0.25, 40);
+        notch2.init(sample_rate, target_freq*2.00, target_freq*0.25, 40);
+        biquad.set_cutoff_frequency(sample_rate, target_freq*1.5);
+        notch.print_transfer_function();
+        hal.console->printf("\n");
+        notch2.print_transfer_function();
+        hal.console->printf("\n");
+        biquad.print_transfer_function();
+        break;
+    }
+    hal.console->printf("\n");
+
+    // Run sweep over given range
+    sweep(num_samples, max_freq, sample_rate);
+
+    // Wait a while for print buffer to empty and exit
+    hal.scheduler->delay(1000);
+    exit(0);
+}
+
+void reset_all()
+{
+    lowpassConstDt.reset(0.0);
+    lowpass.reset(0.0);
+    biquad.reset(0.0);
+    notch.reset();
+    notch2.reset();
+}
+
+float apply_to_filter_under_test(float input)
+{
+    switch (type) {
+        case filter_type::LowPassConstDT:
+            return lowpassConstDt.apply(input);
+
+        case filter_type::LowPass:
+            return lowpass.apply_override(input);
+
+        case filter_type::Biquad:
+            return biquad.apply(input);
+
+        case filter_type::Notch:
+            return notch.apply(input);
+
+        case filter_type::Combination: // Ordering does not matter
+            return biquad.apply(notch.apply(notch2.apply(input)));
+
+    }
+    return input;
+}
+
+void sweep(uint16_t num_samples,  uint16_t max_freq, float sample_rate)
+{
+    // print header
+    hal.console->printf("f(hz)");
+    for (uint16_t i = 0; i < num_samples; i++) {
+        hal.console->printf(", t = %.9f", i / sample_rate);
+    }
+    hal.console->printf("\n");
+
+
+    for (uint16_t f = 1; f <= max_freq; f++) {
+        // Print freq and reset filter
+        hal.console->printf("%i", f);
+        reset_all();
+
+        // Run over the given number of samples
+        for (uint16_t i = 0; i < num_samples; i++) {
+            const float t = i / sample_rate;
+            const float input = sinf(M_2PI*t*f);
+            const float output = apply_to_filter_under_test(input);
+            hal.console->printf(", %+.9f", output);
+        }
+        hal.console->printf("\n");
+
+        // Try not to overflow the print buffer
+        hal.scheduler->delay(100);
+    }
+}
+
+AP_HAL_MAIN();
+                                                                                                                                                                                                                                                                                                                                                                                                                           #!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_example(
+        use='ap',
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #!/usr/bin/gnuplot -persist
+set y2tics 0,10
+set ytics nomirror
+set style data linespoints
+set key autotitle
+set datafile separator ","
+set key autotitle columnhead
+set xlabel "Freq(Hz)"
+set ylabel "Attenuation"
+#set ylabel2 "PhaseLag(deg)"
+plot "harmonicnotch_test.csv" using 1:2 axis x1y1, "harmonicnotch_test.csv" using 1:3 axis x1y2
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #!/usr/bin/gnuplot -persist
+set y2tics 0,10
+set ytics nomirror
+set style data linespoints
+set key autotitle
+set datafile separator ","
+set key autotitle columnhead
+set xlabel "Freq(Hz)"
+set ylabel "Attenuation(dB)"
+#set ylabel2 "PhaseLag(deg)"
+plot "harmonicnotch_test2.csv" using 1:2 axis x1y1, "harmonicnotch_test2.csv" using 1:3 axis x1y2
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #!/usr/bin/gnuplot -persist
+set y2tics 0,10
+set ytics nomirror
+set style data linespoints
+set key autotitle
+set datafile separator ","
+set key autotitle columnhead
+set xlabel "Freq(Hz)"
+set ylabel "Attenuation(dB)"
+#set ylabel2 "PhaseLag(deg)"
+plot "harmonicnotch_test3.csv" using 1:2 axis x1y1, "harmonicnotch_test3.csv" using 1:3 axis x1y2, "harmonicnotch_test3.csv" using 1:4 axis x1y1, "harmonicnotch_test3.csv" using 1:5 axis x1y2
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #!/usr/bin/gnuplot -persist
+set y2tics 0,10
+set ytics nomirror
+set style data linespoints
+set key autotitle
+set datafile separator ","
+set key autotitle columnhead
+set xlabel "Freq(Hz)"
+set ylabel "Attenuation(dB)"
+set key left bottom
+plot "harmonicnotch_test4.csv" using 1:2, "harmonicnotch_test4.csv" using 1:3, "harmonicnotch_test4.csv" using 1:4, "harmonicnotch_test4.csv" using 1:5, "harmonicnotch_test4.csv" using 1:6, "harmonicnotch_test4.csv" using 1:7, "harmonicnotch_test4.csv" using 1:8
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             

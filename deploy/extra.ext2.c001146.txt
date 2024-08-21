@@ -1,0 +1,2300 @@
+!gps.is_healthy(instance)) {
+        msg.status.status = -1; // STATUS_NO_FIX
+        msg.status.service = 0; // No services supported
+        msg.position_covariance_type = 0; // COVARIANCE_TYPE_UNKNOWN
+        return false;
+    }
+
+    // No update is needed
+    const auto last_fix_time_ms = gps.last_fix_time_ms(instance);
+    if (last_nav_sat_fix_time_ms == last_fix_time_ms) {
+        return false;
+    } else {
+        last_nav_sat_fix_time_ms = last_fix_time_ms;
+    }
+
+
+    update_topic(msg.header.stamp);
+    strcpy(msg.header.frame_id, WGS_84_FRAME_ID);
+    msg.status.service = 0; // SERVICE_GPS
+    msg.status.status = -1; // STATUS_NO_FIX
+
+
+    //! @todo What about glonass, compass, galileo?
+    //! This will be properly designed and implemented to spec in #23277
+    msg.status.service = 1; // SERVICE_GPS
+
+    const auto status = gps.status(instance);
+    switch (status) {
+    case AP_GPS::NO_GPS:
+    case AP_GPS::NO_FIX:
+        msg.status.status = -1; // STATUS_NO_FIX
+        msg.position_covariance_type = 0; // COVARIANCE_TYPE_UNKNOWN
+        return true;
+    case AP_GPS::GPS_OK_FIX_2D:
+    case AP_GPS::GPS_OK_FIX_3D:
+        msg.status.status = 0; // STATUS_FIX
+        break;
+    case AP_GPS::GPS_OK_FIX_3D_DGPS:
+        msg.status.status = 1; // STATUS_SBAS_FIX
+        break;
+    case AP_GPS::GPS_OK_FIX_3D_RTK_FLOAT:
+    case AP_GPS::GPS_OK_FIX_3D_RTK_FIXED:
+        msg.status.status = 2; // STATUS_SBAS_FIX
+        break;
+    default:
+        //! @todo Can we not just use an enum class and not worry about this condition?
+        break;
+    }
+    const auto loc = gps.location(instance);
+    msg.latitude = loc.lat * 1E-7;
+    msg.longitude = loc.lng * 1E-7;
+
+    int32_t alt_cm;
+    if (!loc.get_alt_cm(Location::AltFrame::ABSOLUTE, alt_cm)) {
+        // With absolute frame, this condition is unlikely
+        msg.status.status = -1; // STATUS_NO_FIX
+        msg.position_covariance_type = 0; // COVARIANCE_TYPE_UNKNOWN
+        return true;
+    }
+    msg.altitude = alt_cm * 0.01;
+
+    // ROS allows double precision, ArduPilot exposes float precision today
+    Matrix3f cov;
+    msg.position_covariance_type = (uint8_t)gps.position_covariance(instance, cov);
+    msg.position_covariance[0] = cov[0][0];
+    msg.position_covariance[1] = cov[0][1];
+    msg.position_covariance[2] = cov[0][2];
+    msg.position_covariance[3] = cov[1][0];
+    msg.position_covariance[4] = cov[1][1];
+    msg.position_covariance[5] = cov[1][2];
+    msg.position_covariance[6] = cov[2][0];
+    msg.position_covariance[7] = cov[2][1];
+    msg.position_covariance[8] = cov[2][2];
+
+    return true;
+}
+
+void AP_DDS_Client::populate_static_transforms(tf2_msgs_msg_TFMessage& msg)
+{
+    msg.transforms_size = 0;
+
+    auto &gps = AP::gps();
+    for (uint8_t i = 0; i < GPS_MAX_RECEIVERS; i++) {
+        const auto gps_type = gps.get_type(i);
+        if (gps_type == AP_GPS::GPS_Type::GPS_TYPE_NONE) {
+            continue;
+        }
+        update_topic(msg.transforms[i].header.stamp);
+        char gps_frame_id[16];
+        //! @todo should GPS frame ID's be 0 or 1 indexed in ROS?
+        hal.util->snprintf(gps_frame_id, sizeof(gps_frame_id), "GPS_%u", i);
+        strcpy(msg.transforms[i].header.frame_id, BASE_LINK_FRAME_ID);
+        strcpy(msg.transforms[i].child_frame_id, gps_frame_id);
+        // The body-frame offsets
+        // X - Forward
+        // Y - Right
+        // Z - Down
+        // https://ardupilot.org/copter/docs/common-sensor-offset-compensation.html#sensor-position-offset-compensation
+
+        const auto offset = gps.get_antenna_offset(i);
+
+        // In ROS REP 103, it follows this convention
+        // X - Forward
+        // Y - Left
+        // Z - Up
+        // https://www.ros.org/reps/rep-0103.html#axis-orientation
+
+        msg.transforms[i].transform.translation.x = offset[0];
+        msg.transforms[i].transform.translation.y = -1 * offset[1];
+        msg.transforms[i].transform.translation.z = -1 * offset[2];
+
+        // Ensure rotation is initialized.
+        initialize(msg.transforms[i].transform.rotation);
+
+        msg.transforms_size++;
+    }
+
+}
+
+void AP_DDS_Client::update_topic(sensor_msgs_msg_BatteryState& msg, const uint8_t instance)
+{
+    if (instance >= AP_BATT_MONITOR_MAX_INSTANCES) {
+        return;
+    }
+
+    update_topic(msg.header.stamp);
+    auto &battery = AP::battery();
+
+    if (!battery.healthy(instance)) {
+        msg.power_supply_status = 3; //POWER_SUPPLY_HEALTH_DEAD
+        msg.present = false;
+        return;
+    }
+    msg.present = true;
+
+    msg.voltage = battery.voltage(instance);
+
+    float temperature;
+    msg.temperature = (battery.get_temperature(temperature, instance)) ? temperature : NAN;
+
+    float current;
+    msg.current = (battery.current_amps(current, instance)) ? -1 * current : NAN;
+
+    const float design_capacity = (float)battery.pack_capacity_mah(instance) * 0.001;
+    msg.design_capacity = design_capacity;
+
+    uint8_t percentage;
+    if (battery.capacity_remaining_pct(percentage, instance)) {
+        msg.percentage = percentage * 0.01;
+        msg.charge = (percentage * design_capacity) * 0.01;
+    } else {
+        msg.percentage = NAN;
+        msg.charge = NAN;
+    }
+
+    msg.capacity = NAN;
+
+    if (battery.current_amps(current, instance)) {
+        if (percentage == 100) {
+            msg.power_supply_status = 4;   //POWER_SUPPLY_STATUS_FULL
+        } else if (current < 0.0) {
+            msg.power_supply_status = 1;   //POWER_SUPPLY_STATUS_CHARGING
+        } else if (current > 0.0) {
+            msg.power_supply_status = 2;   //POWER_SUPPLY_STATUS_DISCHARGING
+        } else {
+            msg.power_supply_status = 3;   //POWER_SUPPLY_STATUS_NOT_CHARGING
+        }
+    } else {
+        msg.power_supply_status = 0; //POWER_SUPPLY_STATUS_UNKNOWN
+    }
+
+    msg.power_supply_health = (battery.overpower_detected(instance)) ? 4 : 1; //POWER_SUPPLY_HEALTH_OVERVOLTAGE or POWER_SUPPLY_HEALTH_GOOD
+
+    msg.power_supply_technology = 0; //POWER_SUPPLY_TECHNOLOGY_UNKNOWN
+
+    if (battery.has_cell_voltages(instance)) {
+        const auto &cells = battery.get_cell_voltages(instance);
+        const uint8_t ncells_max = MIN(ARRAY_SIZE(msg.cell_voltage), ARRAY_SIZE(cells.cells));
+        for (uint8_t i=0; i< ncells_max; i++) {
+            msg.cell_voltage[i] = cells.cells[i] * 0.001;
+        }
+    }
+}
+
+void AP_DDS_Client::update_topic(geometry_msgs_msg_PoseStamped& msg)
+{
+    update_topic(msg.header.stamp);
+    strcpy(msg.header.frame_id, BASE_LINK_FRAME_ID);
+
+    auto &ahrs = AP::ahrs();
+    WITH_SEMAPHORE(ahrs.get_semaphore());
+
+    // ROS REP 103 uses the ENU convention:
+    // X - East
+    // Y - North
+    // Z - Up
+    // https://www.ros.org/reps/rep-0103.html#axis-orientation
+    // AP_AHRS uses the NED convention
+    // X - North
+    // Y - East
+    // Z - Down
+    // As a consequence, to follow ROS REP 103, it is necessary to switch X and Y,
+    // as well as invert Z
+
+    Vector3f position;
+    if (ahrs.get_relative_position_NED_home(position)) {
+        msg.pose.position.x = position[1];
+        msg.pose.position.y = position[0];
+        msg.pose.position.z = -position[2];
+    }
+
+    // In ROS REP 103, axis orientation uses the following convention:
+    // X - Forward
+    // Y - Left
+    // Z - Up
+    // https://www.ros.org/reps/rep-0103.html#axis-orientation
+    // As a consequence, to follow ROS REP 103, it is necessary to switch X and Y,
+    // as well as invert Z (NED to ENU conversion) as well as a 90 degree rotation in the Z axis
+    // for x to point forward
+    Quaternion orientation;
+    if (ahrs.get_quaternion(orientation)) {
+        Quaternion aux(orientation[0], orientation[2], orientation[1], -orientation[3]); //NED to ENU transformation
+        Quaternion transformation (sqrtF(2) * 0.5,0,0,sqrtF(2) * 0.5); // Z axis 90 degree rotation
+        orientation = aux * transformation;
+        msg.pose.orientation.w = orientation[0];
+        msg.pose.orientation.x = orientation[1];
+        msg.pose.orientation.y = orientation[2];
+        msg.pose.orientation.z = orientation[3];
+    } else {
+        initialize(msg.pose.orientation);
+    }
+}
+
+void AP_DDS_Client::update_topic(geometry_msgs_msg_TwistStamped& msg)
+{
+    update_topic(msg.header.stamp);
+    strcpy(msg.header.frame_id, BASE_LINK_FRAME_ID);
+
+    auto &ahrs = AP::ahrs();
+    WITH_SEMAPHORE(ahrs.get_semaphore());
+
+    // ROS REP 103 uses the ENU convention:
+    // X - East
+    // Y - North
+    // Z - Up
+    // https://www.ros.org/reps/rep-0103.html#axis-orientation
+    // AP_AHRS uses the NED convention
+    // X - North
+    // Y - East
+    // Z - Down
+    // As a consequence, to follow ROS REP 103, it is necessary to switch X and Y,
+    // as well as invert Z
+    Vector3f velocity;
+    if (ahrs.get_velocity_NED(velocity)) {
+        msg.twist.linear.x = velocity[1];
+        msg.twist.linear.y = velocity[0];
+        msg.twist.linear.z = -velocity[2];
+    }
+
+    // In ROS REP 103, axis orientation uses the following convention:
+    // X - Forward
+    // Y - Left
+    // Z - Up
+    // https://www.ros.org/reps/rep-0103.html#axis-orientation
+    // The gyro data is received from AP_AHRS in body-frame
+    // X - Forward
+    // Y - Right
+    // Z - Down
+    // As a consequence, to follow ROS REP 103, it is necessary to invert Y and Z
+    Vector3f angular_velocity = ahrs.get_gyro();
+    msg.twist.angular.x = angular_velocity[0];
+    msg.twist.angular.y = -angular_velocity[1];
+    msg.twist.angular.z = -angular_velocity[2];
+}
+
+void AP_DDS_Client::update_topic(geographic_msgs_msg_GeoPoseStamped& msg)
+{
+    update_topic(msg.header.stamp);
+    strcpy(msg.header.frame_id, BASE_LINK_FRAME_ID);
+
+    auto &ahrs = AP::ahrs();
+    WITH_SEMAPHORE(ahrs.get_semaphore());
+
+    Location loc;
+    if (ahrs.get_location(loc)) {
+        msg.pose.position.latitude = loc.lat * 1E-7;
+        msg.pose.position.longitude = loc.lng * 1E-7;
+        // TODO this is assumed to be absolute frame in WGS-84 as per the GeoPose message definition in ROS.
+        // Use loc.get_alt_frame() to convert if necessary.
+        msg.pose.position.altitude = loc.alt * 0.01; // Transform from cm to m
+    }
+
+    // In ROS REP 103, axis orientation uses the following convention:
+    // X - Forward
+    // Y - Left
+    // Z - Up
+    // https://www.ros.org/reps/rep-0103.html#axis-orientation
+    // As a consequence, to follow ROS REP 103, it is necessary to switch X and Y,
+    // as well as invert Z (NED to ENU conversion) as well as a 90 degree rotation in the Z axis
+    // for x to point forward
+    Quaternion orientation;
+    if (ahrs.get_quaternion(orientation)) {
+        Quaternion aux(orientation[0], orientation[2], orientation[1], -orientation[3]); //NED to ENU transformation
+        Quaternion transformation(sqrtF(2) * 0.5, 0, 0, sqrtF(2) * 0.5); // Z axis 90 degree rotation
+        orientation = aux * transformation;
+        msg.pose.orientation.w = orientation[0];
+        msg.pose.orientation.x = orientation[1];
+        msg.pose.orientation.y = orientation[2];
+        msg.pose.orientation.z = orientation[3];
+    } else {
+        initialize(msg.pose.orientation);
+    }
+}
+
+void AP_DDS_Client::update_topic(sensor_msgs_msg_Imu& msg)
+{
+    update_topic(msg.header.stamp);
+    strcpy(msg.header.frame_id, BASE_LINK_NED_FRAME_ID);
+
+    auto &imu = AP::ins();
+    auto &ahrs = AP::ahrs();
+
+    WITH_SEMAPHORE(ahrs.get_semaphore());
+
+    Quaternion orientation;
+    if (ahrs.get_quaternion(orientation)) {
+        msg.orientation.x = orientation[0];
+        msg.orientation.y = orientation[1];
+        msg.orientation.z = orientation[2];
+        msg.orientation.w = orientation[3];
+    } else {
+        initialize(msg.orientation);
+    }
+    msg.orientation_covariance[0] = -1;
+
+    uint8_t accel_index = ahrs.get_primary_accel_index();
+    uint8_t gyro_index = ahrs.get_primary_gyro_index();
+    const Vector3f accel_data = imu.get_accel(accel_index);
+    const Vector3f gyro_data = imu.get_gyro(gyro_index);
+
+    // Populate the message fields
+    msg.linear_acceleration.x = accel_data.x;
+    msg.linear_acceleration.y = accel_data.y;
+    msg.linear_acceleration.z = accel_data.z;
+
+    msg.angular_velocity.x = gyro_data.x;
+    msg.angular_velocity.y = gyro_data.y;
+    msg.angular_velocity.z = gyro_data.z;
+    msg.angular_velocity_covariance[0] = -1;
+    msg.linear_acceleration_covariance[0] = -1;
+}
+
+void AP_DDS_Client::update_topic(rosgraph_msgs_msg_Clock& msg)
+{
+    update_topic(msg.clock);
+}
+
+void AP_DDS_Client::update_topic(geographic_msgs_msg_GeoPointStamped& msg)
+{
+    update_topic(msg.header.stamp);
+    strcpy(msg.header.frame_id, BASE_LINK_FRAME_ID);
+
+    auto &ahrs = AP::ahrs();
+    WITH_SEMAPHORE(ahrs.get_semaphore());
+
+    Location ekf_origin;
+    // LLA is WGS-84 geodetic coordinate.
+    // Altitude converted from cm to m.
+    if (ahrs.get_origin(ekf_origin)) {
+        msg.position.latitude = ekf_origin.lat * 1E-7;
+        msg.position.longitude = ekf_origin.lng * 1E-7;
+        msg.position.altitude = ekf_origin.alt * 0.01;
+    }
+}
+
+/*
+  start the DDS thread
+ */
+bool AP_DDS_Client::start(void)
+{
+    AP_Param::setup_object_defaults(this, var_info);
+    AP_Param::load_object_from_eeprom(this, var_info);
+
+    if (enabled == 0) {
+        return true;
+    }
+
+    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_DDS_Client::main_loop, void),
+                                      "DDS",
+                                      8192, AP_HAL::Scheduler::PRIORITY_IO, 1)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Thread create failed", msg_prefix);
+        return false;
+    }
+    return true;
+}
+
+// read function triggered at every subscription callback
+void AP_DDS_Client::on_topic_trampoline(uxrSession* uxr_session, uxrObjectId object_id, uint16_t request_id, uxrStreamId stream_id, struct ucdrBuffer* ub, uint16_t length,
+                                        void* args)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)args;
+    dds->on_topic(uxr_session, object_id, request_id, stream_id, ub, length);
+}
+
+void AP_DDS_Client::on_topic(uxrSession* uxr_session, uxrObjectId object_id, uint16_t request_id, uxrStreamId stream_id, struct ucdrBuffer* ub, uint16_t length)
+{
+    /*
+    TEMPLATE for reading to the subscribed topics
+    1) Store the read contents into the ucdr buffer
+    2) Deserialize the said contents into the topic instance
+    */
+    (void) uxr_session;
+    (void) request_id;
+    (void) stream_id;
+    (void) length;
+    switch (object_id.id) {
+    case topics[to_underlying(TopicIndex::JOY_SUB)].dr_id.id: {
+        const bool success = sensor_msgs_msg_Joy_deserialize_topic(ub, &rx_joy_topic);
+
+        if (success == false) {
+            break;
+        }
+
+        if (rx_joy_topic.axes_size >= 4) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Received sensor_msgs/Joy: %f, %f, %f, %f",
+                          msg_prefix, rx_joy_topic.axes[0], rx_joy_topic.axes[1], rx_joy_topic.axes[2], rx_joy_topic.axes[3]);
+            // TODO implement joystick RC control to AP
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Received sensor_msgs/Joy. Axes size must be >= 4", msg_prefix);
+        }
+        break;
+    }
+    case topics[to_underlying(TopicIndex::DYNAMIC_TRANSFORMS_SUB)].dr_id.id: {
+        const bool success = tf2_msgs_msg_TFMessage_deserialize_topic(ub, &rx_dynamic_transforms_topic);
+        if (success == false) {
+            break;
+        }
+
+        if (rx_dynamic_transforms_topic.transforms_size > 0) {
+#if AP_DDS_VISUALODOM_ENABLED
+            AP_DDS_External_Odom::handle_external_odom(rx_dynamic_transforms_topic);
+#endif // AP_DDS_VISUALODOM_ENABLED
+
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Received tf2_msgs/TFMessage: TF is empty", msg_prefix);
+        }
+        break;
+    }
+    case topics[to_underlying(TopicIndex::VELOCITY_CONTROL_SUB)].dr_id.id: {
+        const bool success = geometry_msgs_msg_TwistStamped_deserialize_topic(ub, &rx_velocity_control_topic);
+        if (success == false) {
+            break;
+        }
+
+#if AP_EXTERNAL_CONTROL_ENABLED
+        if (!AP_DDS_External_Control::handle_velocity_control(rx_velocity_control_topic)) {
+            // TODO #23430 handle velocity control failure through rosout, throttled.
+        }
+#endif // AP_EXTERNAL_CONTROL_ENABLED
+        break;
+    }
+    case topics[to_underlying(TopicIndex::GLOBAL_POSITION_SUB)].dr_id.id: {
+        const bool success = ardupilot_msgs_msg_GlobalPosition_deserialize_topic(ub, &rx_global_position_control_topic);
+        if (success == false) {
+            break;
+        }
+
+#if AP_EXTERNAL_CONTROL_ENABLED
+        if (!AP_DDS_External_Control::handle_global_position_control(rx_global_position_control_topic)) {
+            // TODO #23430 handle global position control failure through rosout, throttled.
+        }
+#endif // AP_EXTERNAL_CONTROL_ENABLED
+        break;
+    }
+    }
+
+}
+
+/*
+  callback on request completion
+ */
+void AP_DDS_Client::on_request_trampoline(uxrSession* uxr_session, uxrObjectId object_id, uint16_t request_id, SampleIdentity* sample_id, ucdrBuffer* ub, uint16_t length, void* args)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)args;
+    dds->on_request(uxr_session, object_id, request_id, sample_id, ub, length);
+}
+
+void AP_DDS_Client::on_request(uxrSession* uxr_session, uxrObjectId object_id, uint16_t request_id, SampleIdentity* sample_id, ucdrBuffer* ub, uint16_t length)
+{
+    (void) request_id;
+    (void) length;
+    switch (object_id.id) {
+    case services[to_underlying(ServiceIndex::ARMING_MOTORS)].rep_id: {
+        ardupilot_msgs_srv_ArmMotors_Request arm_motors_request;
+        ardupilot_msgs_srv_ArmMotors_Response arm_motors_response;
+        const bool deserialize_success = ardupilot_msgs_srv_ArmMotors_Request_deserialize_topic(ub, &arm_motors_request);
+        if (deserialize_success == false) {
+            break;
+        }
+
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Request for %sing received", msg_prefix, arm_motors_request.arm ? "arm" : "disarm");
+        arm_motors_response.result = arm_motors_request.arm ? AP::arming().arm(AP_Arming::Method::DDS) : AP::arming().disarm(AP_Arming::Method::DDS);
+
+        const uxrObjectId replier_id = {
+            .id = services[to_underlying(ServiceIndex::ARMING_MOTORS)].rep_id,
+            .type = UXR_REPLIER_ID
+        };
+
+        uint8_t reply_buffer[8] {};
+        ucdrBuffer reply_ub;
+
+        ucdr_init_buffer(&reply_ub, reply_buffer, sizeof(reply_buffer));
+        const bool serialize_success = ardupilot_msgs_srv_ArmMotors_Response_serialize_topic(&reply_ub, &arm_motors_response);
+        if (serialize_success == false) {
+            break;
+        }
+
+        uxr_buffer_reply(uxr_session, reliable_out, replier_id, sample_id, reply_buffer, ucdr_buffer_length(&reply_ub));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Request for Arming/Disarming : %s", msg_prefix, arm_motors_response.result ? "SUCCESS" : "FAIL");
+        break;
+    }
+    case services[to_underlying(ServiceIndex::MODE_SWITCH)].rep_id: {
+        ardupilot_msgs_srv_ModeSwitch_Request mode_switch_request;
+        ardupilot_msgs_srv_ModeSwitch_Response mode_switch_response;
+        const bool deserialize_success = ardupilot_msgs_srv_ModeSwitch_Request_deserialize_topic(ub, &mode_switch_request);
+        if (deserialize_success == false) {
+            break;
+        }
+        mode_switch_response.status = AP::vehicle()->set_mode(mode_switch_request.mode, ModeReason::DDS_COMMAND);
+        mode_switch_response.curr_mode = AP::vehicle()->get_mode();
+
+        const uxrObjectId replier_id = {
+            .id = services[to_underlying(ServiceIndex::MODE_SWITCH)].rep_id,
+            .type = UXR_REPLIER_ID
+        };
+
+        uint8_t reply_buffer[8] {};
+        ucdrBuffer reply_ub;
+
+        ucdr_init_buffer(&reply_ub, reply_buffer, sizeof(reply_buffer));
+        const bool serialize_success = ardupilot_msgs_srv_ModeSwitch_Response_serialize_topic(&reply_ub, &mode_switch_response);
+        if (serialize_success == false) {
+            break;
+        }
+
+        uxr_buffer_reply(uxr_session, reliable_out, replier_id, sample_id, reply_buffer, ucdr_buffer_length(&reply_ub));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Request for Mode Switch : %s", msg_prefix, mode_switch_response.status ? "SUCCESS" : "FAIL");
+        break;
+    }
+    }
+}
+
+/*
+  main loop for DDS thread
+ */
+void AP_DDS_Client::main_loop(void)
+{
+    if (!init_transport()) {
+        return;
+    }
+
+    //! @todo check for request to stop task
+    while (true) {
+        if (comm == nullptr) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s transport invalid, exiting", msg_prefix);
+            return;
+        }
+
+        // check ping
+        const uint64_t ping_timeout_ms{1000};
+        const uint8_t ping_max_attempts{10};
+        if (!uxr_ping_agent_attempts(comm, ping_timeout_ms, ping_max_attempts)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s No ping response, exiting", msg_prefix);
+            return;
+        }
+
+        // create session
+        if (!init_session() || !create()) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Creation Requests failed", msg_prefix);
+            return;
+        }
+        connected = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Initialization passed", msg_prefix);
+
+        populate_static_transforms(tx_static_transforms_topic);
+        write_static_transforms();
+
+        uint64_t last_ping_ms{0};
+        uint8_t num_pings_missed{0};
+        bool had_ping_reply{false};
+        while (connected) {
+            hal.scheduler->delay(1);
+
+            // publish topics
+            update();
+
+            // check ping response
+            if (session.on_pong_flag == PONG_IN_SESSION_STATUS) {
+                had_ping_reply = true;
+            }
+
+            const auto cur_time_ms = AP_HAL::millis64();
+            if (cur_time_ms - last_ping_ms > DELAY_PING_MS) {
+                last_ping_ms = cur_time_ms;
+
+                if (had_ping_reply) {
+                    num_pings_missed = 0;
+
+                } else {
+                    ++num_pings_missed;
+                }
+
+                const int ping_agent_timeout_ms{0};
+                const uint8_t ping_agent_attempts{1};
+                uxr_ping_agent_session(&session, ping_agent_timeout_ms, ping_agent_attempts);
+
+                had_ping_reply = false;
+            }
+
+            if (num_pings_missed > 2) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR,
+                              "%s No ping response, disconnecting", msg_prefix);
+                connected = false;
+            }
+        }
+
+        // delete session if connected
+        if (connected) {
+            uxr_delete_session(&session);
+        }
+    }
+}
+
+bool AP_DDS_Client::init_transport()
+{
+    // serial init will fail if the SERIALn_PROTOCOL is not setup
+    bool initTransportStatus = ddsSerialInit();
+    is_using_serial = initTransportStatus;
+
+#if AP_DDS_UDP_ENABLED
+    // fallback to UDP if available
+    if (!initTransportStatus) {
+        initTransportStatus = ddsUdpInit();
+    }
+#endif
+
+    if (!initTransportStatus) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Transport initialization failed", msg_prefix);
+        return false;
+    }
+
+    return true;
+}
+
+bool AP_DDS_Client::init_session()
+{
+    // init session
+    uxr_init_session(&session, comm, key);
+
+    // Register topic callbacks
+    uxr_set_topic_callback(&session, AP_DDS_Client::on_topic_trampoline, this);
+
+    // ROS-2 Service : Register service request callbacks
+    uxr_set_request_callback(&session, AP_DDS_Client::on_request_trampoline, this);
+
+    while (!uxr_create_session(&session)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Initialization waiting...", msg_prefix);
+        hal.scheduler->delay(1000);
+    }
+
+    // setup reliable stream buffers
+    input_reliable_stream = NEW_NOTHROW uint8_t[DDS_BUFFER_SIZE];
+    output_reliable_stream = NEW_NOTHROW uint8_t[DDS_BUFFER_SIZE];
+    if (input_reliable_stream == nullptr || output_reliable_stream == nullptr) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Allocation failed", msg_prefix);
+        return false;
+    }
+
+    reliable_in = uxr_create_input_reliable_stream(&session, input_reliable_stream, DDS_BUFFER_SIZE, DDS_STREAM_HISTORY);
+    reliable_out = uxr_create_output_reliable_stream(&session, output_reliable_stream, DDS_BUFFER_SIZE, DDS_STREAM_HISTORY);
+
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Init complete", msg_prefix);
+
+    return true;
+}
+
+bool AP_DDS_Client::create()
+{
+    WITH_SEMAPHORE(csem);
+
+    // Participant
+    const uxrObjectId participant_id = {
+        .id = 0x01,
+        .type = UXR_PARTICIPANT_ID
+    };
+    const char* participant_name = "ardupilot_dds";
+    const auto participant_req_id = uxr_buffer_create_participant_bin(&session, reliable_out, participant_id,
+                                    static_cast<uint16_t>(domain_id), participant_name, UXR_REPLACE);
+
+    //Participant requests
+    constexpr uint8_t nRequestsParticipant = 1;
+    const uint16_t requestsParticipant[nRequestsParticipant] = {participant_req_id};
+
+    constexpr uint16_t maxTimeMsPerRequestMs = 500;
+    constexpr uint16_t requestTimeoutParticipantMs = (uint16_t) nRequestsParticipant * maxTimeMsPerRequestMs;
+    uint8_t statusParticipant[nRequestsParticipant];
+    if (!uxr_run_session_until_all_status(&session, requestTimeoutParticipantMs, requestsParticipant, statusParticipant, nRequestsParticipant)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Participant session request failure", msg_prefix);
+        // TODO add a failure log message sharing the status results
+        return false;
+    }
+
+    for (uint16_t i = 0 ; i < ARRAY_SIZE(topics); i++) {
+        // Topic
+        const uxrObjectId topic_id = {
+            .id = topics[i].topic_id,
+            .type = UXR_TOPIC_ID
+        };
+        const auto topic_req_id = uxr_buffer_create_topic_bin(&session, reliable_out, topic_id,
+                                  participant_id, topics[i].topic_name, topics[i].type_name, UXR_REPLACE);
+
+        // Status requests
+        constexpr uint8_t nRequests = 3;
+        uint16_t requests[nRequests];
+        constexpr uint16_t requestTimeoutMs = nRequests * maxTimeMsPerRequestMs;
+        uint8_t status[nRequests];
+
+        if (topics[i].topic_rw == Topic_rw::DataWriter) {
+            // Publisher
+            const uxrObjectId pub_id = {
+                .id = topics[i].pub_id,
+                .type = UXR_PUBLISHER_ID
+            };
+            const auto pub_req_id = uxr_buffer_create_publisher_bin(&session, reliable_out, pub_id,
+                                    participant_id, UXR_REPLACE);
+
+            // Data Writer
+            const auto dwriter_req_id = uxr_buffer_create_datawriter_bin(&session, reliable_out, topics[i].dw_id,
+                                        pub_id, topic_id, topics[i].qos, UXR_REPLACE);
+
+            // save the request statuses
+            requests[0] = topic_req_id;
+            requests[1] = pub_req_id;
+            requests[2] = dwriter_req_id;
+
+            if (!uxr_run_session_until_all_status(&session, requestTimeoutMs, requests, status, nRequests)) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Topic/Pub/Writer session request failure for index '%u'", msg_prefix, i);
+                for (uint8_t s = 0 ; s < nRequests; s++) {
+                    GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Status '%d' result '%u'", msg_prefix, s, status[s]);
+                }
+                // TODO add a failure log message sharing the status results
+                return false;
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Topic/Pub/Writer session pass for index '%u'", msg_prefix, i);
+            }
+        } else if (topics[i].topic_rw == Topic_rw::DataReader) {
+            // Subscriber
+            const uxrObjectId sub_id = {
+                .id = topics[i].sub_id,
+                .type = UXR_SUBSCRIBER_ID
+            };
+            const auto sub_req_id = uxr_buffer_create_subscriber_bin(&session, reliable_out, sub_id,
+                                    participant_id, UXR_REPLACE);
+
+            // Data Reader
+            const auto dreader_req_id = uxr_buffer_create_datareader_bin(&session, reliable_out, topics[i].dr_id,
+                                        sub_id, topic_id, topics[i].qos, UXR_REPLACE);
+
+            // save the request statuses
+            requests[0] = topic_req_id;
+            requests[1] = sub_req_id;
+            requests[2] = dreader_req_id;
+
+            if (!uxr_run_session_until_all_status(&session, requestTimeoutMs, requests, status, nRequests)) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Topic/Sub/Reader session request failure for index '%u'", msg_prefix, i);
+                for (uint8_t s = 0 ; s < nRequests; s++) {
+                    GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Status '%d' result '%u'", msg_prefix, s, status[s]);
+                }
+                // TODO add a failure log message sharing the status results
+                return false;
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Topic/Sub/Reader session pass for index '%u'", msg_prefix, i);
+                uxr_buffer_request_data(&session, reliable_out, topics[i].dr_id, reliable_in, &delivery_control);
+            }
+        }
+    }
+
+    // ROS-2 Service : else case for service requests
+
+    for (uint16_t i = 0; i < ARRAY_SIZE(services); i++) {
+
+        constexpr uint16_t requestTimeoutMs = maxTimeMsPerRequestMs;
+
+        if (services[i].service_rr == Service_rr::Replier) {
+            const uxrObjectId rep_id = {
+                .id = services[i].rep_id,
+                .type = UXR_REPLIER_ID
+            };
+            const auto replier_req_id = uxr_buffer_create_replier_bin(&session, reliable_out, rep_id,
+                                        participant_id, services[i].service_name, services[i].request_type, services[i].reply_type,
+                                        services[i].request_topic_name, services[i].reply_topic_name, services[i].qos, UXR_REPLACE);
+
+            uint16_t request = replier_req_id;
+            uint8_t status;
+
+            if (!uxr_run_session_until_all_status(&session, requestTimeoutMs, &request, &status, 1)) {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Service/Replier session request failure for index '%u'", msg_prefix, i);
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "%s Status result '%u'", msg_prefix, status);
+                // TODO add a failure log message sharing the status results
+                return false;
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s Service/Replier session pass for index '%u'", msg_prefix, i);
+                uxr_buffer_request_data(&session, reliable_out, rep_id, reliable_in, &delivery_control);
+            }
+
+        } else if (services[i].service_rr == Service_rr::Requester) {
+            // TODO : Add Similar Code for Requester Profile
+        }
+    }
+
+    return true;
+}
+
+void AP_DDS_Client::write_time_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = builtin_interfaces_msg_Time_size_of_topic(&time_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::TIME_PUB)].dw_id, &ub, topic_size);
+        const bool success = builtin_interfaces_msg_Time_serialize_topic(&ub, &time_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: XRCE_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_nav_sat_fix_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = sensor_msgs_msg_NavSatFix_size_of_topic(&nav_sat_fix_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::NAV_SAT_FIX_PUB)].dw_id, &ub, topic_size);
+        const bool success = sensor_msgs_msg_NavSatFix_serialize_topic(&ub, &nav_sat_fix_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_static_transforms()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = tf2_msgs_msg_TFMessage_size_of_topic(&tx_static_transforms_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::STATIC_TRANSFORMS_PUB)].dw_id, &ub, topic_size);
+        const bool success = tf2_msgs_msg_TFMessage_serialize_topic(&ub, &tx_static_transforms_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_battery_state_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = sensor_msgs_msg_BatteryState_size_of_topic(&battery_state_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::BATTERY_STATE_PUB)].dw_id, &ub, topic_size);
+        const bool success = sensor_msgs_msg_BatteryState_serialize_topic(&ub, &battery_state_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_local_pose_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = geometry_msgs_msg_PoseStamped_size_of_topic(&local_pose_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::LOCAL_POSE_PUB)].dw_id, &ub, topic_size);
+        const bool success = geometry_msgs_msg_PoseStamped_serialize_topic(&ub, &local_pose_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_tx_local_velocity_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = geometry_msgs_msg_TwistStamped_size_of_topic(&tx_local_velocity_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::LOCAL_VELOCITY_PUB)].dw_id, &ub, topic_size);
+        const bool success = geometry_msgs_msg_TwistStamped_serialize_topic(&ub, &tx_local_velocity_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_imu_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = sensor_msgs_msg_Imu_size_of_topic(&imu_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::IMU_PUB)].dw_id, &ub, topic_size);
+        const bool success = sensor_msgs_msg_Imu_serialize_topic(&ub, &imu_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_geo_pose_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = geographic_msgs_msg_GeoPoseStamped_size_of_topic(&geo_pose_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::GEOPOSE_PUB)].dw_id, &ub, topic_size);
+        const bool success = geographic_msgs_msg_GeoPoseStamped_serialize_topic(&ub, &geo_pose_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_clock_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = rosgraph_msgs_msg_Clock_size_of_topic(&clock_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::CLOCK_PUB)].dw_id, &ub, topic_size);
+        const bool success = rosgraph_msgs_msg_Clock_serialize_topic(&ub, &clock_topic);
+        if (!success) {
+            // TODO sometimes serialization fails on bootup. Determine why.
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::write_gps_global_origin_topic()
+{
+    WITH_SEMAPHORE(csem);
+    if (connected) {
+        ucdrBuffer ub {};
+        const uint32_t topic_size = geographic_msgs_msg_GeoPointStamped_size_of_topic(&gps_global_origin_topic, 0);
+        uxr_prepare_output_stream(&session, reliable_out, topics[to_underlying(TopicIndex::GPS_GLOBAL_ORIGIN_PUB)].dw_id, &ub, topic_size);
+        const bool success = geographic_msgs_msg_GeoPointStamped_serialize_topic(&ub, &gps_global_origin_topic);
+        if (!success) {
+            // AP_HAL::panic("FATAL: DDS_Client failed to serialize\n");
+        }
+    }
+}
+
+void AP_DDS_Client::update()
+{
+    WITH_SEMAPHORE(csem);
+    const auto cur_time_ms = AP_HAL::millis64();
+
+    if (cur_time_ms - last_time_time_ms > DELAY_TIME_TOPIC_MS) {
+        update_topic(time_topic);
+        last_time_time_ms = cur_time_ms;
+        write_time_topic();
+    }
+
+    constexpr uint8_t gps_instance = 0;
+    if (update_topic(nav_sat_fix_topic, gps_instance)) {
+        write_nav_sat_fix_topic();
+    }
+
+    if (cur_time_ms - last_battery_state_time_ms > DELAY_BATTERY_STATE_TOPIC_MS) {
+        constexpr uint8_t battery_instance = 0;
+        update_topic(battery_state_topic, battery_instance);
+        last_battery_state_time_ms = cur_time_ms;
+        write_battery_state_topic();
+    }
+
+    if (cur_time_ms - last_local_pose_time_ms > DELAY_LOCAL_POSE_TOPIC_MS) {
+        update_topic(local_pose_topic);
+        last_local_pose_time_ms = cur_time_ms;
+        write_local_pose_topic();
+    }
+
+    if (cur_time_ms - last_local_velocity_time_ms > DELAY_LOCAL_VELOCITY_TOPIC_MS) {
+        update_topic(tx_local_velocity_topic);
+        last_local_velocity_time_ms = cur_time_ms;
+        write_tx_local_velocity_topic();
+    }
+
+    if (cur_time_ms - last_imu_time_ms > DELAY_IMU_TOPIC_MS) {
+        update_topic(imu_topic);
+        last_imu_time_ms = cur_time_ms;
+        write_imu_topic();
+    }
+
+    if (cur_time_ms - last_geo_pose_time_ms > DELAY_GEO_POSE_TOPIC_MS) {
+        update_topic(geo_pose_topic);
+        last_geo_pose_time_ms = cur_time_ms;
+        write_geo_pose_topic();
+    }
+
+    if (cur_time_ms - last_clock_time_ms > DELAY_CLOCK_TOPIC_MS) {
+        update_topic(clock_topic);
+        last_clock_time_ms = cur_time_ms;
+        write_clock_topic();
+    }
+
+    if (cur_time_ms - last_gps_global_origin_time_ms > DELAY_GPS_GLOBAL_ORIGIN_TOPIC_MS) {
+        update_topic(gps_global_origin_topic);
+        last_gps_global_origin_time_ms = cur_time_ms;
+        write_gps_global_origin_topic();
+    }
+
+    status_ok = uxr_run_session_time(&session, 1);
+}
+
+#if CONFIG_HAL_BOARD != HAL_BOARD_SITL
+extern "C" {
+    int clock_gettime(clockid_t clockid, struct timespec *ts);
+}
+
+int clock_gettime(clockid_t clockid, struct timespec *ts)
+{
+    //! @todo the value of clockid is ignored here.
+    //! A fallback mechanism is employed against the caller's choice of clock.
+    uint64_t utc_usec;
+    if (!AP::rtc().get_utc_usec(utc_usec)) {
+        utc_usec = AP_HAL::micros64();
+    }
+    ts->tv_sec = utc_usec / 1000000ULL;
+    ts->tv_nsec = (utc_usec % 1000000ULL) * 1000UL;
+    return 0;
+}
+#endif // CONFIG_HAL_BOARD != HAL_BOARD_SITL
+
+#endif // AP_DDS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #pragma once
+
+#include "AP_DDS_config.h"
+
+#if AP_DDS_ENABLED
+
+#include "uxr/client/client.h"
+#include "ucdr/microcdr.h"
+
+#include "ardupilot_msgs/msg/GlobalPosition.h"
+#include "builtin_interfaces/msg/Time.h"
+
+#include "sensor_msgs/msg/NavSatFix.h"
+#include "tf2_msgs/msg/TFMessage.h"
+#include "sensor_msgs/msg/BatteryState.h"
+#include "sensor_msgs/msg/Imu.h"
+#include "sensor_msgs/msg/Joy.h"
+#include "geometry_msgs/msg/PoseStamped.h"
+#include "geometry_msgs/msg/TwistStamped.h"
+#include "geographic_msgs/msg/GeoPointStamped.h"
+#include "geographic_msgs/msg/GeoPoseStamped.h"
+#include "rosgraph_msgs/msg/Clock.h"
+
+#include <AP_HAL/AP_HAL.h>
+#include <AP_HAL/Scheduler.h>
+#include <AP_HAL/Semaphores.h>
+#include <AP_AHRS/AP_AHRS.h>
+
+#include "fcntl.h"
+
+#include <AP_Param/AP_Param.h>
+
+#define DDS_MTU             512
+#define DDS_STREAM_HISTORY  8
+#define DDS_BUFFER_SIZE     DDS_MTU * DDS_STREAM_HISTORY
+
+#if AP_DDS_UDP_ENABLED
+#include <AP_HAL/utility/Socket.h>
+#include <AP_Networking/AP_Networking_address.h>
+#endif
+
+extern const AP_HAL::HAL& hal;
+
+class AP_DDS_Client
+{
+
+private:
+
+    AP_Int8 enabled;
+
+    // Serial Allocation
+    uxrSession session; //Session
+    bool is_using_serial; // true when using serial transport
+
+    // input and output stream
+    uint8_t *input_reliable_stream;
+    uint8_t *output_reliable_stream;
+    uxrStreamId reliable_in;
+    uxrStreamId reliable_out;
+
+    // Outgoing Sensor and AHRS data
+    builtin_interfaces_msg_Time time_topic;
+    geographic_msgs_msg_GeoPointStamped gps_global_origin_topic;
+    geographic_msgs_msg_GeoPoseStamped geo_pose_topic;
+    geometry_msgs_msg_PoseStamped local_pose_topic;
+    geometry_msgs_msg_TwistStamped tx_local_velocity_topic;
+    sensor_msgs_msg_BatteryState battery_state_topic;
+    sensor_msgs_msg_NavSatFix nav_sat_fix_topic;
+    sensor_msgs_msg_Imu imu_topic;
+    rosgraph_msgs_msg_Clock clock_topic;
+    // incoming joystick data
+    static sensor_msgs_msg_Joy rx_joy_topic;
+    // incoming REP147 velocity control
+    static geometry_msgs_msg_TwistStamped rx_velocity_control_topic;
+    // incoming REP147 goal interface global position
+    static ardupilot_msgs_msg_GlobalPosition rx_global_position_control_topic;
+    // outgoing transforms
+    tf2_msgs_msg_TFMessage tx_static_transforms_topic;
+    // incoming transforms
+    static tf2_msgs_msg_TFMessage rx_dynamic_transforms_topic;
+
+    HAL_Semaphore csem;
+
+    // connection parametrics
+    bool status_ok{false};
+    bool connected{false};
+
+    static void update_topic(builtin_interfaces_msg_Time& msg);
+    bool update_topic(sensor_msgs_msg_NavSatFix& msg, const uint8_t instance) WARN_IF_UNUSED;
+    static void populate_static_transforms(tf2_msgs_msg_TFMessage& msg);
+    static void update_topic(sensor_msgs_msg_BatteryState& msg, const uint8_t instance);
+    static void update_topic(geometry_msgs_msg_PoseStamped& msg);
+    static void update_topic(geometry_msgs_msg_TwistStamped& msg);
+    static void update_topic(geographic_msgs_msg_GeoPoseStamped& msg);
+    static void update_topic(sensor_msgs_msg_Imu& msg);
+    static void update_topic(rosgraph_msgs_msg_Clock& msg);
+    static void update_topic(geographic_msgs_msg_GeoPointStamped& msg);
+
+    // subscription callback function
+    static void on_topic_trampoline(uxrSession* session, uxrObjectId object_id, uint16_t request_id, uxrStreamId stream_id, struct ucdrBuffer* ub, uint16_t length, void* args);
+    void on_topic(uxrSession* session, uxrObjectId object_id, uint16_t request_id, uxrStreamId stream_id, struct ucdrBuffer* ub, uint16_t length);
+
+    // service replier callback function
+    static void on_request_trampoline(uxrSession* session, uxrObjectId object_id, uint16_t request_id, SampleIdentity* sample_id, ucdrBuffer* ub, uint16_t length, void* args);
+    void on_request(uxrSession* session, uxrObjectId object_id, uint16_t request_id, SampleIdentity* sample_id, ucdrBuffer* ub, uint16_t length);
+
+    // delivery control parameters
+    uxrDeliveryControl delivery_control {
+        .max_samples = UXR_MAX_SAMPLES_UNLIMITED,
+        .max_elapsed_time = 0,
+        .max_bytes_per_second = 0,
+        .min_pace_period = 0
+    };
+
+    // The last ms timestamp AP_DDS wrote a Time message
+    uint64_t last_time_time_ms;
+    // The last ms timestamp AP_DDS wrote a NavSatFix message
+    uint64_t last_nav_sat_fix_time_ms;
+    // The last ms timestamp AP_DDS wrote a BatteryState message
+    uint64_t last_battery_state_time_ms;
+    // The last ms timestamp AP_DDS wrote an IMU message
+    uint64_t last_imu_time_ms;
+    // The last ms timestamp AP_DDS wrote a Local Pose message
+    uint64_t last_local_pose_time_ms;
+    // The last ms timestamp AP_DDS wrote a Local Velocity message
+    uint64_t last_local_velocity_time_ms;
+    // The last ms timestamp AP_DDS wrote a GeoPose message
+    uint64_t last_geo_pose_time_ms;
+    // The last ms timestamp AP_DDS wrote a Clock message
+    uint64_t last_clock_time_ms;
+    // The last ms timestamp AP_DDS wrote a gps global origin message
+    uint64_t last_gps_global_origin_time_ms;
+
+    // functions for serial transport
+    bool ddsSerialInit();
+    static bool serial_transport_open(uxrCustomTransport* args);
+    static bool serial_transport_close(uxrCustomTransport* transport);
+    static size_t serial_transport_write(uxrCustomTransport* transport, const uint8_t* buf, size_t len, uint8_t* error);
+    static size_t serial_transport_read(uxrCustomTransport* transport, uint8_t* buf, size_t len, int timeout, uint8_t* error);
+    struct {
+        AP_HAL::UARTDriver *port;
+        uxrCustomTransport transport;
+    } serial;
+
+#if AP_DDS_UDP_ENABLED
+    // functions for udp transport
+    bool ddsUdpInit();
+    static bool udp_transport_open(uxrCustomTransport* args);
+    static bool udp_transport_close(uxrCustomTransport* transport);
+    static size_t udp_transport_write(uxrCustomTransport* transport, const uint8_t* buf, size_t len, uint8_t* error);
+    static size_t udp_transport_read(uxrCustomTransport* transport, uint8_t* buf, size_t len, int timeout, uint8_t* error);
+
+    struct {
+        AP_Int32 port;
+        // UDP endpoint
+        AP_Networking_IPV4 ip{AP_DDS_DEFAULT_UDP_IP_ADDR};
+        // UDP Allocation
+        uxrCustomTransport transport;
+        SocketAPM *socket;
+    } udp;
+#endif
+    // pointer to transport's communication structure
+    uxrCommunication *comm{nullptr};
+
+    // client key we present
+    static constexpr uint32_t key = 0xAAAABBBB;
+
+public:
+    ~AP_DDS_Client();
+
+    bool start(void);
+    void main_loop(void);
+
+    //! @brief Initialize the client's transport
+    //! @return True on successful initialization, false on failure
+    bool init_transport() WARN_IF_UNUSED;
+
+    //! @brief Initialize the client's uxr session and IO stream(s)
+    //! @return True on successful initialization, false on failure
+    bool init_session() WARN_IF_UNUSED;
+
+    //! @brief Set up the client's participants, data read/writes,
+    //         publishers, subscribers
+    //! @return True on successful creation, false on failure
+    bool create() WARN_IF_UNUSED;
+
+    //! @brief Serialize the current time state and publish to the IO stream(s)
+    void write_time_topic();
+    //! @brief Serialize the current nav_sat_fix state and publish to the IO stream(s)
+    void write_nav_sat_fix_topic();
+    //! @brief Serialize the static transforms and publish to the IO stream(s)
+    void write_static_transforms();
+    //! @brief Serialize the current nav_sat_fix state and publish it to the IO stream(s)
+    void write_battery_state_topic();
+    //! @brief Serialize the current local_pose and publish to the IO stream(s)
+    void write_local_pose_topic();
+    //! @brief Serialize the current local velocity and publish to the IO stream(s)
+    void write_tx_local_velocity_topic();
+    //! @brief Serialize the current geo_pose and publish to the IO stream(s)
+    void write_geo_pose_topic();
+    //! @brief Serialize the current IMU data and publish to the IO stream(s)
+    void write_imu_topic();
+    //! @brief Serialize the current clock and publish to the IO stream(s)
+    void write_clock_topic();
+    //! @brief Serialize the current gps global origin and publish to the IO stream(s)
+    void write_gps_global_origin_topic();
+    //! @brief Update the internally stored DDS messages with latest data
+    void update();
+
+    //! @brief GCS message prefix
+    static constexpr const char* msg_prefix = "DDS:";
+
+    //! @brief Parameter storage
+    static const struct AP_Param::GroupInfo var_info[];
+
+    //! @brief ROS_DOMAIN_ID
+    AP_Int32 domain_id;
+
+    //! @brief Enum used to mark a topic as a data reader or writer
+    enum class Topic_rw : uint8_t {
+        DataReader = 0,
+        DataWriter = 1,
+    };
+
+    //! @brief Convenience grouping for a single "channel" of data
+    struct Topic_table {
+        const uint8_t topic_id;
+        const uint8_t pub_id;
+        const uint8_t sub_id;    // added sub_id fields to avoid confusion
+        const uxrObjectId dw_id;
+        const uxrObjectId dr_id; // added dr_id fields to avoid confusion
+        const Topic_rw topic_rw;
+        const char* topic_name;
+        const char* type_name;
+        const uxrQoS_t qos;
+    };
+    static const struct Topic_table topics[];
+
+    //! @brief Enum used to mark a service as a requester or replier
+    enum class Service_rr : uint8_t {
+        Requester = 0,
+        Replier = 1,
+    };
+
+    //! @brief Convenience grouping for a single "channel" of services
+    struct Service_table {
+        //! @brief Request ID for the service
+        const uint8_t req_id;
+
+        //! @brief Reply ID for the service
+        const uint8_t rep_id;
+
+        //! @brief Service is requester or replier
+        const Service_rr service_rr;
+
+        //! @brief Service name as it appears in ROS
+        const char* service_name;
+
+        //! @brief Service requester message type
+        const char* request_type;
+
+        //! @brief Service replier message type
+        const char* reply_type;
+
+        //! @brief Service requester topic name
+        const char* request_topic_name;
+
+        //! @brief Service replier topic name
+        const char* reply_topic_name;
+
+        //! @brief QoS for the service
+        const uxrQoS_t qos;
+    };
+    static const struct Service_table services[];
+};
+
+#endif // AP_DDS_ENABLED
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #include "AP_DDS_config.h"
+
+#if AP_DDS_ENABLED
+
+#include "AP_DDS_ExternalControl.h"
+#include "AP_DDS_Frames.h"
+#include <AP_AHRS/AP_AHRS.h>
+
+#include <AP_ExternalControl/AP_ExternalControl.h>
+
+// These are the Goal Interface constants. Because microxrceddsgen does not expose
+// them in the generated code, they are manually maintained
+// Position ignore flags
+static constexpr uint16_t TYPE_MASK_IGNORE_LATITUDE = 1;
+static constexpr uint16_t TYPE_MASK_IGNORE_LONGITUDE = 2;
+static constexpr uint16_t TYPE_MASK_IGNORE_ALTITUDE = 4;
+
+bool AP_DDS_External_Control::handle_global_position_control(ardupilot_msgs_msg_GlobalPosition& cmd_pos)
+{
+    auto *external_control = AP::externalcontrol();
+    if (external_control == nullptr) {
+        return false;
+    }
+
+    if (strcmp(cmd_pos.header.frame_id, MAP_FRAME) == 0) {
+        // Narrow the altitude
+        const int32_t alt_cm  = static_cast<int32_t>(cmd_pos.altitude * 100);
+
+        Location::AltFrame alt_frame;
+        if (!convert_alt_frame(cmd_pos.coordinate_frame, alt_frame)) {
+            return false;
+        }
+
+        constexpr uint32_t MASK_POS_IGNORE =
+            TYPE_MASK_IGNORE_LATITUDE |
+            TYPE_MASK_IGNORE_LONGITUDE |
+            TYPE_MASK_IGNORE_ALTITUDE;
+
+        if (!(cmd_pos.type_mask & MASK_POS_IGNORE)) {
+            Location loc(cmd_pos.latitude * 1E7, cmd_pos.longitude * 1E7, alt_cm, alt_frame);
+            if (!external_control->set_global_position(loc)) {
+                return false; // Don't try sending other commands if this fails
+            }
+        }
+
+        // TODO add velocity and accel handling
+
+        return true;
+    }
+
+    return false;
+}
+
+bool AP_DDS_External_Control::handle_velocity_control(geometry_msgs_msg_TwistStamped& cmd_vel)
+{
+    auto *external_control = AP::externalcontrol();
+    if (external_control == nullptr) {
+        return false;
+    }
+
+    if (strcmp(cmd_vel.header.frame_id, BASE_LINK_FRAME_ID) == 0) {
+        // Convert commands from body frame (x-forward, y-left, z-up) to NED.
+        Vector3f linear_velocity;
+        Vector3f linear_velocity_base_link {
+            float(cmd_vel.twist.linear.x),
+            float(cmd_vel.twist.linear.y),
+            float(-cmd_vel.twist.linear.z) };
+        const float yaw_rate = -cmd_vel.twist.angular.z;
+
+        auto &ahrs = AP::ahrs();
+        linear_velocity = ahrs.body_to_earth(linear_velocity_base_link);
+        return external_control->set_linear_velocity_and_yaw_rate(linear_velocity, yaw_rate);
+    }
+
+    else if (strcmp(cmd_vel.header.frame_id, MAP_FRAME) == 0) {
+        // Convert commands from ENU to NED frame
+        Vector3f linear_velocity {
+            float(cmd_vel.twist.linear.y),
+            float(cmd_vel.twist.linear.x),
+            float(-cmd_vel.twist.linear.z) };
+        const float yaw_rate = -cmd_vel.twist.angular.z;
+        return external_control->set_linear_velocity_and_yaw_rate(linear_velocity, yaw_rate);
+    }
+
+    return false;
+}
+
+bool AP_DDS_External_Control::convert_alt_frame(const uint8_t frame_in,  Location::AltFrame& frame_out)
+{
+
+    // Specified in ROS REP-147; only some are supported.
+    switch (frame_in) {
+    case 5: // FRAME_GLOBAL_INT
+        frame_out = Location::AltFrame::ABSOLUTE;
+        break;
+    case 6: // FRAME_GLOBAL_REL_ALT
+        frame_out = Location::AltFrame::ABOVE_HOME;
+        break;
+    case 11: // FRAME_GLOBAL_TERRAIN_ALT
+        frame_out = Location::AltFrame::ABOVE_TERRAIN;
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
+
+#endif // AP_DDS_ENABLED                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #pragma once
+
+#if AP_DDS_ENABLED
+#include "ardupilot_msgs/msg/GlobalPosition.h"
+#include "geometry_msgs/msg/TwistStamped.h"
+
+#include <AP_Common/Location.h>
+
+class AP_DDS_External_Control
+{
+public:
+    // REP-147 Goal Interface Global Position Control
+    // https://ros.org/reps/rep-0147.html#goal-interface
+    static bool handle_global_position_control(ardupilot_msgs_msg_GlobalPosition& cmd_pos);
+    static bool handle_velocity_control(geometry_msgs_msg_TwistStamped& cmd_vel);
+private:
+    static bool convert_alt_frame(const uint8_t frame_in,  Location::AltFrame& frame_out);
+};
+#endif // AP_DDS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+
+#include "AP_DDS_External_Odom.h"
+#include "AP_DDS_Type_Conversions.h"
+
+#if AP_DDS_VISUALODOM_ENABLED
+
+#include <AP_VisualOdom/AP_VisualOdom.h>
+#include <GCS_MAVLink/GCS.h>
+
+void AP_DDS_External_Odom::handle_external_odom(const tf2_msgs_msg_TFMessage& msg)
+{
+    auto *visual_odom = AP::visualodom();
+    if (visual_odom == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0; i < msg.transforms_size; i++) {
+        const auto& ros_transform_stamped = msg.transforms[i];
+        if (!is_odometry_frame(ros_transform_stamped)) {
+            continue;
+        }
+        const uint64_t remote_time_us {AP_DDS_Type_Conversions::time_u64_micros(ros_transform_stamped.header.stamp)};
+
+        Vector3f ap_position;
+        Quaternion ap_rotation;
+
+        convert_transform(ros_transform_stamped.transform, ap_position, ap_rotation);
+        // Although ROS convention states quaternions in ROS messages should be normalized, it's not guaranteed.
+        // Before propagating a potentially inaccurate quaternion to the rest of AP, normalize it here.
+        // TODO what if the quaternion is NaN?
+        ap_rotation.normalize();
+
+        // No error is available in TF, trust the data as-is
+        const float posErr {0.0};
+        const float angErr {0.0};
+        // The odom to base_link transform used is locally consistent per ROS REP-105.
+        // https://www.ros.org/reps/rep-0105.html#id16
+        // Thus, there will not be any resets.
+        const uint8_t reset_counter {0};
+        // TODO implement jitter correction similar to GCS_MAVLINK::correct_offboard_timestamp_usec_to_ms(remote_time_us, sizeof(msg));
+        const uint32_t time_ms {static_cast<uint32_t>(remote_time_us * 1E-3)};
+        visual_odom->handle_pose_estimate(remote_time_us, time_ms, ap_position.x, ap_position.y, ap_position.z, ap_rotation, posErr, angErr, reset_counter, 0);
+
+    }
+}
+
+bool AP_DDS_External_Odom::is_odometry_frame(const geometry_msgs_msg_TransformStamped& msg)
+{
+    char odom_parent[] = "odom";
+    char odom_child[] = "base_link";
+    // Assume the frame ID's are null terminated.
+    return (strcmp(msg.header.frame_id, odom_parent) == 0) &&
+           (strcmp(msg.child_frame_id, odom_child) == 0);
+}
+
+void AP_DDS_External_Odom::convert_transform(const geometry_msgs_msg_Transform& ros_transform, Vector3f& translation, Quaternion& rotation)
+{
+    // convert from x-forward, y-left, z-up to NED
+    // https://github.com/mavlink/mavros/issues/49#issuecomment-51614130
+    translation = {
+        static_cast<float>(ros_transform.translation.x),
+        static_cast<float>(-ros_transform.translation.y),
+        static_cast<float>(-ros_transform.translation.z)
+    };
+
+    // In AP, q1 is the quaternion's scalar component.
+    // In ROS, w is the quaternion's scalar component.
+    // https://docs.ros.org/en/humble/Tutorials/Intermediate/Tf2/Quaternion-Fundamentals.html#components-of-a-quaternion
+    rotation.q1 = ros_transform.rotation.w;
+    rotation.q2 = ros_transform.rotation.x;
+    rotation.q3 = -ros_transform.rotation.y;
+    rotation.q4 = -ros_transform.rotation.z;
+}
+
+#endif // AP_DDS_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        // Class for handling external localization data.
+// For historical reasons, it's called odometry to match AP_VisualOdom.
+
+#pragma once
+
+#include "AP_DDS_config.h"
+#if AP_DDS_VISUALODOM_ENABLED
+
+#include "geometry_msgs/msg/TransformStamped.h"
+#include "tf2_msgs/msg/TFMessage.h"
+#include "AP_Math/vector3.h"
+#include "AP_Math/quaternion.h"
+
+class AP_DDS_External_Odom
+{
+public:
+
+    // Handler for external position localization
+    static void handle_external_odom(const tf2_msgs_msg_TFMessage& msg);
+
+    // Checks the child and parent frames match a set needed for external odom.
+    // Since multiple different transforms can be sent, this validates the specific transform is
+    // for odometry.
+    static bool is_odometry_frame(const geometry_msgs_msg_TransformStamped& msg);
+
+    // Helper to convert from ROS transform to AP datatypes
+    // ros_transform is in ENU
+    // translation is in NED
+    static void convert_transform(const geometry_msgs_msg_Transform& ros_transform, Vector3f& translation, Quaternion& rotation);
+
+};
+
+#endif // AP_DDS_VISUALODOM_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #pragma once
+
+static constexpr char WGS_84_FRAME_ID[] = "WGS-84";
+// https://www.ros.org/reps/rep-0105.html#base-link
+static constexpr char BASE_LINK_FRAME_ID[] = "base_link";
+static constexpr char BASE_LINK_NED_FRAME_ID[] = "base_link_ned";
+// https://www.ros.org/reps/rep-0105.html#map
+static constexpr char MAP_FRAME[] = "map";
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "AP_DDS_Client.h"
+
+#include <AP_SerialManager/AP_SerialManager.h>
+
+#include <errno.h>
+
+/*
+  open connection on a serial port
+ */
+bool AP_DDS_Client::serial_transport_open(uxrCustomTransport *t)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    AP_SerialManager *serial_manager = AP_SerialManager::get_singleton();
+    auto *dds_port = serial_manager->find_serial(AP_SerialManager::SerialProtocol_DDS_XRCE, 0);
+    if (dds_port == nullptr) {
+        return false;
+    }
+    // ensure we own the UART
+    dds_port->begin(0);
+    dds->serial.port = dds_port;
+    return true;
+}
+
+/*
+  close serial transport
+ */
+bool AP_DDS_Client::serial_transport_close(uxrCustomTransport *t)
+{
+    // we don't actually close the UART
+    return true;
+}
+
+/*
+  write on serial transport
+ */
+size_t AP_DDS_Client::serial_transport_write(uxrCustomTransport *t, const uint8_t* buf, size_t len, uint8_t* error)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    if (dds->serial.port == nullptr) {
+        *error = EINVAL;
+        return 0;
+    }
+    ssize_t bytes_written = dds->serial.port->write(buf, len);
+    if (bytes_written <= 0) {
+        *error = 1;
+        return 0;
+    }
+    //! @todo populate the error code correctly
+    *error = 0;
+    return bytes_written;
+}
+
+/*
+  read from a serial transport
+ */
+size_t AP_DDS_Client::serial_transport_read(uxrCustomTransport *t, uint8_t* buf, size_t len, int timeout_ms, uint8_t* error)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    if (dds->serial.port == nullptr) {
+        *error = EINVAL;
+        return 0;
+    }
+    const uint32_t tstart = AP_HAL::millis();
+    while (AP_HAL::millis() - tstart < uint32_t(timeout_ms) &&
+           dds->serial.port->available() < len) {
+        hal.scheduler->delay_microseconds(100); // TODO select or poll this is limiting speed (100us)
+    }
+    ssize_t bytes_read = dds->serial.port->read(buf, len);
+    if (bytes_read <= 0) {
+        *error = 1;
+        return 0;
+    }
+    //! @todo Add error reporting
+    *error = 0;
+    return bytes_read;
+}
+
+/*
+  initialise serial connection
+ */
+bool AP_DDS_Client::ddsSerialInit()
+{
+    // setup a framed transport for serial
+    uxr_set_custom_transport_callbacks(&serial.transport, true,
+                                       serial_transport_open,
+                                       serial_transport_close,
+                                       serial_transport_write,
+                                       serial_transport_read);
+
+    if (!uxr_init_custom_transport(&serial.transport, (void*)this)) {
+        return false;
+    }
+    comm = &serial.transport.comm;
+    return true;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #include "uxr/client/client.h"
+
+enum class ServiceIndex: uint8_t {
+    ARMING_MOTORS,
+    MODE_SWITCH
+};
+
+static inline constexpr uint8_t to_underlying(const ServiceIndex index)
+{
+    static_assert(sizeof(index) == sizeof(uint8_t));
+    return static_cast<uint8_t>(index);
+}
+
+constexpr struct AP_DDS_Client::Service_table AP_DDS_Client::services[] = {
+    {
+        .req_id = to_underlying(ServiceIndex::ARMING_MOTORS),
+        .rep_id = to_underlying(ServiceIndex::ARMING_MOTORS),
+        .service_rr = Service_rr::Replier,
+        .service_name = "rs/ap/arm_motorsService",
+        .request_type = "ardupilot_msgs::srv::dds_::ArmMotors_Request_",
+        .reply_type = "ardupilot_msgs::srv::dds_::ArmMotors_Response_",
+        .request_topic_name = "rq/ap/arm_motorsRequest",
+        .reply_topic_name = "rr/ap/arm_motorsReply",
+        .qos = {
+            .durability = UXR_DURABILITY_TRANSIENT_LOCAL,
+            .reliability = UXR_RELIABILITY_RELIABLE,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .req_id = to_underlying(ServiceIndex::MODE_SWITCH),
+        .rep_id = to_underlying(ServiceIndex::MODE_SWITCH),
+        .service_rr = Service_rr::Replier,
+        .service_name = "rs/ap/mode_switchService",
+        .request_type = "ardupilot_msgs::srv::dds_::ModeSwitch_Request_",
+        .reply_type = "ardupilot_msgs::srv::dds_::ModeSwitch_Response_",
+        .request_topic_name = "rq/ap/mode_switchRequest",
+        .reply_topic_name = "rr/ap/mode_switchReply",
+    },
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #include "builtin_interfaces/msg/Time.h"
+#include "sensor_msgs/msg/NavSatFix.h"
+#include "tf2_msgs/msg/TFMessage.h"
+#include "sensor_msgs/msg/BatteryState.h"
+#include "geographic_msgs/msg/GeoPoseStamped.h"
+#include "sensor_msgs/msg/Imu.h"
+
+#include "uxr/client/client.h"
+
+// Code generated table based on the enabled topics.
+// Mavgen is using python, loops are not readable.
+// Can use jinja to template (like Flask)
+
+enum class TopicIndex: uint8_t {
+    TIME_PUB,
+    NAV_SAT_FIX_PUB,
+    STATIC_TRANSFORMS_PUB,
+    BATTERY_STATE_PUB,
+    IMU_PUB,
+    LOCAL_POSE_PUB,
+    LOCAL_VELOCITY_PUB,
+    GEOPOSE_PUB,
+    CLOCK_PUB,
+    GPS_GLOBAL_ORIGIN_PUB,
+    JOY_SUB,
+    DYNAMIC_TRANSFORMS_SUB,
+    VELOCITY_CONTROL_SUB,
+    GLOBAL_POSITION_SUB,
+};
+
+static inline constexpr uint8_t to_underlying(const TopicIndex index)
+{
+    static_assert(sizeof(index) == sizeof(uint8_t));
+    return static_cast<uint8_t>(index);
+}
+
+
+constexpr struct AP_DDS_Client::Topic_table AP_DDS_Client::topics[] = {
+    {
+        .topic_id = to_underlying(TopicIndex::TIME_PUB),
+        .pub_id = to_underlying(TopicIndex::TIME_PUB),
+        .sub_id = to_underlying(TopicIndex::TIME_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::TIME_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::TIME_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/time",
+        .type_name = "builtin_interfaces::msg::dds_::Time_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_RELIABLE,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 20,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::NAV_SAT_FIX_PUB),
+        .pub_id = to_underlying(TopicIndex::NAV_SAT_FIX_PUB),
+        .sub_id = to_underlying(TopicIndex::NAV_SAT_FIX_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::NAV_SAT_FIX_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::NAV_SAT_FIX_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/navsat/navsat0",
+        .type_name = "sensor_msgs::msg::dds_::NavSatFix_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::STATIC_TRANSFORMS_PUB),
+        .pub_id = to_underlying(TopicIndex::STATIC_TRANSFORMS_PUB),
+        .sub_id = to_underlying(TopicIndex::STATIC_TRANSFORMS_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::STATIC_TRANSFORMS_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::STATIC_TRANSFORMS_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/tf_static",
+        .type_name = "tf2_msgs::msg::dds_::TFMessage_",
+        .qos = {
+            .durability = UXR_DURABILITY_TRANSIENT_LOCAL,
+            .reliability = UXR_RELIABILITY_RELIABLE,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 1,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::BATTERY_STATE_PUB),
+        .pub_id = to_underlying(TopicIndex::BATTERY_STATE_PUB),
+        .sub_id = to_underlying(TopicIndex::BATTERY_STATE_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::BATTERY_STATE_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::BATTERY_STATE_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/battery/battery0",
+        .type_name = "sensor_msgs::msg::dds_::BatteryState_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::IMU_PUB),
+        .pub_id = to_underlying(TopicIndex::IMU_PUB),
+        .sub_id = to_underlying(TopicIndex::IMU_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::IMU_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::IMU_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/imu/experimental/data",
+        .type_name = "sensor_msgs::msg::dds_::Imu_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::LOCAL_POSE_PUB),
+        .pub_id = to_underlying(TopicIndex::LOCAL_POSE_PUB),
+        .sub_id = to_underlying(TopicIndex::LOCAL_POSE_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::LOCAL_POSE_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::LOCAL_POSE_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/pose/filtered",
+        .type_name = "geometry_msgs::msg::dds_::PoseStamped_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::LOCAL_VELOCITY_PUB),
+        .pub_id = to_underlying(TopicIndex::LOCAL_VELOCITY_PUB),
+        .sub_id = to_underlying(TopicIndex::LOCAL_VELOCITY_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::LOCAL_VELOCITY_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::LOCAL_VELOCITY_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/twist/filtered",
+        .type_name = "geometry_msgs::msg::dds_::TwistStamped_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::GEOPOSE_PUB),
+        .pub_id = to_underlying(TopicIndex::GEOPOSE_PUB),
+        .sub_id = to_underlying(TopicIndex::GEOPOSE_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::GEOPOSE_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::GEOPOSE_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/geopose/filtered",
+        .type_name = "geographic_msgs::msg::dds_::GeoPoseStamped_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::CLOCK_PUB),
+        .pub_id = to_underlying(TopicIndex::CLOCK_PUB),
+        .sub_id = to_underlying(TopicIndex::CLOCK_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::CLOCK_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::CLOCK_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/clock",
+        .type_name = "rosgraph_msgs::msg::dds_::Clock_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_RELIABLE,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 20,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::GPS_GLOBAL_ORIGIN_PUB),
+        .pub_id = to_underlying(TopicIndex::GPS_GLOBAL_ORIGIN_PUB),
+        .sub_id = to_underlying(TopicIndex::GPS_GLOBAL_ORIGIN_PUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::GPS_GLOBAL_ORIGIN_PUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::GPS_GLOBAL_ORIGIN_PUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataWriter,
+        .topic_name = "rt/ap/gps_global_origin/filtered",
+        .type_name = "geographic_msgs::msg::dds_::GeoPointStamped_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::JOY_SUB),
+        .pub_id = to_underlying(TopicIndex::JOY_SUB),
+        .sub_id = to_underlying(TopicIndex::JOY_SUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::JOY_SUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::JOY_SUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataReader,
+        .topic_name = "rt/ap/joy",
+        .type_name = "sensor_msgs::msg::dds_::Joy_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::DYNAMIC_TRANSFORMS_SUB),
+        .pub_id = to_underlying(TopicIndex::DYNAMIC_TRANSFORMS_SUB),
+        .sub_id = to_underlying(TopicIndex::DYNAMIC_TRANSFORMS_SUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::DYNAMIC_TRANSFORMS_SUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::DYNAMIC_TRANSFORMS_SUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataReader,
+        .topic_name = "rt/ap/tf",
+        .type_name = "tf2_msgs::msg::dds_::TFMessage_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::VELOCITY_CONTROL_SUB),
+        .pub_id = to_underlying(TopicIndex::VELOCITY_CONTROL_SUB),
+        .sub_id = to_underlying(TopicIndex::VELOCITY_CONTROL_SUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::VELOCITY_CONTROL_SUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::VELOCITY_CONTROL_SUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataReader,
+        .topic_name = "rt/ap/cmd_vel",
+        .type_name = "geometry_msgs::msg::dds_::TwistStamped_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+    {
+        .topic_id = to_underlying(TopicIndex::GLOBAL_POSITION_SUB),
+        .pub_id = to_underlying(TopicIndex::GLOBAL_POSITION_SUB),
+        .sub_id = to_underlying(TopicIndex::GLOBAL_POSITION_SUB),
+        .dw_id = uxrObjectId{.id=to_underlying(TopicIndex::GLOBAL_POSITION_SUB), .type=UXR_DATAWRITER_ID},
+        .dr_id = uxrObjectId{.id=to_underlying(TopicIndex::GLOBAL_POSITION_SUB), .type=UXR_DATAREADER_ID},
+        .topic_rw = Topic_rw::DataReader,
+        .topic_name = "rt/ap/cmd_gps_pose",
+        .type_name = "ardupilot_msgs::msg::dds_::GlobalPosition_",
+        .qos = {
+            .durability = UXR_DURABILITY_VOLATILE,
+            .reliability = UXR_RELIABILITY_BEST_EFFORT,
+            .history = UXR_HISTORY_KEEP_LAST,
+            .depth = 5,
+        },
+    },
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #include "AP_DDS_Type_Conversions.h"
+#if AP_DDS_ENABLED
+
+#include "builtin_interfaces/msg/Time.h"
+
+
+uint64_t AP_DDS_Type_Conversions::time_u64_micros(const builtin_interfaces_msg_Time& ros_time)
+{
+    return (uint64_t(ros_time.sec) * 1000000ULL) + (ros_time.nanosec / 1000ULL);
+}
+
+
+#endif // AP_DDS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             // Class for handling type conversions for DDS.
+
+#pragma once
+
+#include "AP_DDS_config.h"
+
+#if AP_DDS_ENABLED
+
+#include "builtin_interfaces/msg/Time.h"
+
+class AP_DDS_Type_Conversions
+{
+public:
+
+    // Convert ROS time to a uint64_t [μS]
+    static uint64_t time_u64_micros(const builtin_interfaces_msg_Time& ros_time);
+};
+
+#endif // AP_DDS_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #include "AP_DDS_Client.h"
+
+#if AP_DDS_UDP_ENABLED
+
+#include <errno.h>
+
+/*
+  open connection on UDP
+ */
+bool AP_DDS_Client::udp_transport_open(uxrCustomTransport *t)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    auto *sock = NEW_NOTHROW SocketAPM(true);
+    if (sock == nullptr) {
+        return false;
+    }
+    if (!sock->connect(dds->udp.ip.get_str(), dds->udp.port.get())) {
+        return false;
+    }
+    dds->udp.socket = sock;
+    return true;
+}
+
+/*
+  close UDP connection
+ */
+bool AP_DDS_Client::udp_transport_close(uxrCustomTransport *t)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    delete dds->udp.socket;
+    dds->udp.socket = nullptr;
+    return true;
+}
+
+/*
+  write on UDP
+ */
+size_t AP_DDS_Client::udp_transport_write(uxrCustomTransport *t, const uint8_t* buf, size_t len, uint8_t* error)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    if (dds->udp.socket == nullptr) {
+        *error = EINVAL;
+        return 0;
+    }
+    const ssize_t ret = dds->udp.socket->send(buf, len);
+    if (ret <= 0) {
+        *error = errno;
+        return 0;
+    }
+    return ret;
+}
+
+/*
+  read from UDP
+ */
+size_t AP_DDS_Client::udp_transport_read(uxrCustomTransport *t, uint8_t* buf, size_t len, int timeout_ms, uint8_t* error)
+{
+    AP_DDS_Client *dds = (AP_DDS_Client *)t->args;
+    if (dds->udp.socket == nullptr) {
+        *error = EINVAL;
+        return 0;
+    }
+    const ssize_t ret = dds->udp.socket->recv(buf, len, timeout_ms);
+    if (ret <= 0) {
+        *error = errno;
+        return 0;
+    }
+    return ret;
+}
+
+/*
+  initialise UDP connection
+ */
+bool AP_DDS_Client::ddsUdpInit()
+{
+    // setup a non-framed transport for UDP
+    uxr_set_custom_transport_callbacks(&udp.transport, false,
+                                       udp_transport_open,
+                                       udp_transport_close,
+                                       udp_transport_write,
+                                       udp_transport_read);
+
+    if (!uxr_init_custom_transport(&udp.transport, (void*)this)) {
+        return false;
+    }
+    comm = &udp.transport.comm;
+    return true;
+}
+#endif // AP_DDS_UDP_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #pragma once
+
+#include <AP_HAL/AP_HAL_Boards.h>
+#include <AP_Networking/AP_Networking_Config.h>
+
+#ifndef AP_DDS_ENABLED
+#define AP_DDS_ENABLED 1
+#endif
+
+// UDP only on SITL for now
+#ifndef AP_DDS_UDP_ENABLED
+#define AP_DDS_UDP_ENABLED AP_DDS_ENABLED && AP_NETWORKING_ENABLED
+#endif
+
+#include <AP_VisualOdom/AP_VisualOdom_config.h>
+#ifndef AP_DDS_VISUALODOM_ENABLED
+#define AP_DDS_VISUALODOM_ENABLED HAL_VISUALODOM_ENABLED && AP_DDS_ENABLED
+#endif
+
+#ifndef AP_DDS_DEFAULT_UDP_IP_ADDR
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+#define AP_DDS_DEFAULT_UDP_IP_ADDR "192.168.13.2"
+#else
+#define AP_DDS_DEFAULT_UDP_IP_ADDR "127.0.0.1"
+#endif
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              // generated from rosidl_adapter/resource/msg.idl.em
+// with input from ardupilot_msgs/msg/GlobalPosition.msg
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Twist.idl"
+#include "std_msgs/msg/Header.idl"
+
+module ardupilot_msgs {
+  module msg {
+    module GlobalPosition_Constants {
+      const uint8 FRAME_GLOBAL_INT = 5;
+      const uint8 FRAME_GLOBAL_REL_ALT = 6;
+      const uint8 FRAME_GLOBAL_TERRAIN_ALT = 11;
+      @verbatim (language="comment", text=
+        "Position ignore flags")
+      const uint16 IGNORE_LATITUDE = 1;
+      const uint16 IGNORE_LONGITUDE = 2;
+      const uint16 IGNORE_ALTITUDE = 4;
+      @verbatim (language="comment", text=
+        "Velocity vector ignore flags")
+      const uint16 IGNORE_VX = 8;
+      const uint16 IGNORE_VY = 16;
+      const uint16 IGNORE_VZ = 32;
+      @verbatim (language="comment", text=
+        "Acceleration/Force vector ignore flags")
+      const uint16 IGNORE_AFX = 64;
+      const uint16 IGNORE_AFY = 128;
+      const uint16 IGNORE_AFZ = 256;
+      @verbatim (language="comment", text=
+        "Force in af vector flag")
+      const uint16 FORCE = 512;
+      const uint16 IGNORE_YAW = 1024;
+      const uint16 IGNORE_YAW_RATE = 2048;
+    };
+    @verbatim (language="comment", text=
+      "Experimental REP-147 Goal Interface" "\n"
+      "https://ros.org/reps/rep-0147.html#goal-interface")
+    struct GlobalPosition {
+      std_msgs::msg::Header header;
+
+      uint8 coordinate_frame;
+
+      uint16 type_mask;
+
+      double latitude;
+
+      double longitude;
+
+      @verbatim (language="comment", text=
+        "in meters, AMSL or above terrain")
+      float altitude;
+
+      geometry_msgs::msg::Twist velocity;
+
+      geometry_msgs::msg::Twist acceleration_or_force;
+
+      float yaw;
+    };
+  };
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             // generated from rosidl_adapter/resource/srv.idl.em
+// with input from ardupilot_msgs/srv/ArmMotors.srv
+// generated code does not contain a copyright notice
+
+
+module ardupilot_msgs {
+  module srv {
+    struct ArmMotors_Request {
+      @verbatim (language="comment", text=
+        "This service requests the vehicle to arm or disarm its motors." "\n"
+        "Set true to arm motors, false to disarm motors.")
+      boolean arm;
+    };
+    @verbatim (language="comment", text=
+      "True if arming/disarming request for motors was successful , false otherwise. ")
+    struct ArmMotors_Response {
+      boolean result;
+    };
+  };
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     # Declination Table Generator
+
+To run the generator you need the igrf module. Install like this:
+
+  python3 -m pip install --user igrf
+
+Note that python3 must be used.
+
+Then cd to libraries/AP_Declination directory, and run:
+
+ python3 generate/generate.py
+
+it will updates the tables.cpp code
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #pragma once
+
+#include <AP_SerialManager/AP_SerialManager.h>
+
+#ifndef AP_DRONECAN_SERIAL_NUM_PORTS
+#define AP_DRONECAN_SERIAL_NUM_PORTS 3
+#endif
+
+class AP_DroneCAN;
+
+class AP_DroneCAN_Serial
+{
+public:
+    /* Do not allow copies */
+    CLASS_NO_COPY(AP_DroneCAN_Serial);
+
+    AP_DroneCAN_Serial() {}
+
+    AP_Int8 enable;
+
+    void init(AP_DroneCAN *dronecan);
+    void update(void);
+
+public:
+    class Port : public AP_SerialManager::RegisteredPort {
+    public:
+        friend class AP_DroneCAN_Serial;
+        void init(void);
+
+        AP_Int8 node;
+        AP_Int8 idx;
+
+    private:
+        bool is_initialized() override {
+            return true;
+        }
+        bool tx_pending() override {
+            return false;
+        }
+
+        bool init_buffers(const uint32_t size_rx, const uint32_t size_tx);
+
+        uint32_t txspace() override;
+        void _begin(uint32_t b, uint16_t rxS, uint16_t txS) override;
+        size_t _write(const uint8_t *buffer, size_t size) override;
+        ssize_t _read(uint8_t *buffer, uint16_t count) override;
+        uint32_t _available() override;
+        void _end() override {}
+        void _flush() override {}
+        bool _discard_input() override;
+        uint64_t receive_time_constraint_us(uint16_t nbytes) override;
+
+        ByteBuffer *readbuffer;
+        ByteBuffer *writebuffer;
+        uint32_t baudrate;
+        uint32_t last_send_ms;
+        uint32_t last_size_tx;
+        uint32_t last_size_rx;
+        uint64_t last_recv_us;
+
+        HAL_Semaphore sem;
+    };
+
+    Port ports[AP_DRONECAN_SERIAL_NUM_PORTS];
+
+private:
+    AP_DroneCAN *dronecan;
+
+    Canard::Publisher<uavcan_tunnel_Targetted> *targetted;
+    static void handle_tunnel_targetted(AP_DroneCAN *dronecan,
+                                        const CanardRxTransfer& transfer,
+                                        const uavcan_tunnel_Targetted &msg);
+
+    static AP_DroneCAN_Serial *serial[HAL_MAX_CAN_PROTOCOL_DRIVERS];
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #include <AP_HAL/AP_HAL.h> // to include SEMAPHORE
+
+namespace Canard {
+typedef ::HAL_Semaphore Semaphore;
+}
+
+#define CANARD_MALLOC malloc
+#define CANARD_FREE free
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             

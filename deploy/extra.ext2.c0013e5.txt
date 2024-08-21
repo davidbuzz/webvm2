@@ -1,0 +1,3008 @@
+:func:`waflib.Tools.ccroot.use_rec`.
+	"""
+
+	use_not = self.tmp_use_not = set()
+	self.tmp_use_seen = [] # we would like an ordered set
+	use_prec = self.tmp_use_prec = {}
+	self.uselib = self.to_list(getattr(self, 'uselib', []))
+	self.includes = self.to_list(getattr(self, 'includes', []))
+	names = self.to_list(getattr(self, 'use', []))
+
+	for x in names:
+		self.use_rec(x)
+
+	for x in use_not:
+		if x in use_prec:
+			del use_prec[x]
+
+	# topological sort
+	out = self.tmp_use_sorted = []
+	tmp = []
+	for x in self.tmp_use_seen:
+		for k in use_prec.values():
+			if x in k:
+				break
+		else:
+			tmp.append(x)
+
+	while tmp:
+		e = tmp.pop()
+		out.append(e)
+		try:
+			nlst = use_prec[e]
+		except KeyError:
+			pass
+		else:
+			del use_prec[e]
+			for x in nlst:
+				for y in use_prec:
+					if x in use_prec[y]:
+						break
+				else:
+					tmp.append(x)
+	if use_prec:
+		raise Errors.WafError('Cycle detected in the use processing %r' % use_prec)
+	out.reverse()
+
+	link_task = getattr(self, 'link_task', None)
+	for x in out:
+		y = self.bld.get_tgen_by_name(x)
+		var = y.tmp_use_var
+		if var and link_task:
+			if self.env.SKIP_STLIB_LINK_DEPS and isinstance(link_task, stlink_task):
+				# If the skip_stlib_link_deps feature is enabled then we should
+				# avoid adding lib deps to the stlink_task instance.
+				pass
+			elif var == 'LIB' or y.tmp_use_stlib or x in names:
+				self.env.append_value(var, [y.target[y.target.rfind(os.sep) + 1:]])
+				self.link_task.dep_nodes.extend(y.link_task.outputs)
+				tmp_path = y.link_task.outputs[0].parent.path_from(self.get_cwd())
+				self.env.append_unique(var + 'PATH', [tmp_path])
+		else:
+			if y.tmp_use_objects:
+				self.add_objects_from_tgen(y)
+
+		if getattr(y, 'export_includes', None):
+			# self.includes may come from a global variable #2035
+			self.includes = self.includes + y.to_incnodes(y.export_includes)
+
+		if getattr(y, 'export_defines', None):
+			self.env.append_value('DEFINES', self.to_list(y.export_defines))
+
+
+	# and finally, add the use variables (no recursion needed)
+	for x in names:
+		try:
+			y = self.bld.get_tgen_by_name(x)
+		except Errors.WafError:
+			if not self.env['STLIB_' + x] and not x in self.uselib:
+				self.uselib.append(x)
+		else:
+			for k in self.to_list(getattr(y, 'use', [])):
+				if not self.env['STLIB_' + k] and not k in self.uselib:
+					self.uselib.append(k)
+
+@taskgen_method
+def accept_node_to_link(self, node):
+	"""
+	PRIVATE INTERNAL USE ONLY
+	"""
+	return not node.name.endswith('.pdb')
+
+@taskgen_method
+def add_objects_from_tgen(self, tg):
+	"""
+	Add the objects from the depending compiled tasks as link task inputs.
+
+	Some objects are filtered: for instance, .pdb files are added
+	to the compiled tasks but not to the link tasks (to avoid errors)
+	PRIVATE INTERNAL USE ONLY
+	"""
+	try:
+		link_task = self.link_task
+	except AttributeError:
+		pass
+	else:
+		for tsk in getattr(tg, 'compiled_tasks', []):
+			for x in tsk.outputs:
+				if self.accept_node_to_link(x):
+					link_task.inputs.append(x)
+
+@taskgen_method
+def get_uselib_vars(self):
+	"""
+	:return: the *uselib* variables associated to the *features* attribute (see :py:attr:`waflib.Tools.ccroot.USELIB_VARS`)
+	:rtype: list of string
+	"""
+	_vars = set()
+	for x in self.features:
+		if x in USELIB_VARS:
+			_vars |= USELIB_VARS[x]
+	return _vars
+
+@feature('c', 'cxx', 'd', 'fc', 'javac', 'cs', 'uselib', 'asm')
+@after_method('process_use')
+def propagate_uselib_vars(self):
+	"""
+	Process uselib variables for adding flags. For example, the following target::
+
+		def build(bld):
+			bld.env.AFLAGS_aaa = ['bar']
+			from waflib.Tools.ccroot import USELIB_VARS
+			USELIB_VARS['aaa'] = ['AFLAGS']
+
+			tg = bld(features='aaa', aflags='test')
+
+	The *aflags* attribute will be processed and this method will set::
+
+			tg.env.AFLAGS = ['bar', 'test']
+	"""
+	_vars = self.get_uselib_vars()
+	env = self.env
+	app = env.append_value
+	feature_uselib = self.features + self.to_list(getattr(self, 'uselib', []))
+	for var in _vars:
+		y = var.lower()
+		val = getattr(self, y, [])
+		if val:
+			app(var, self.to_list(val))
+
+		for x in feature_uselib:
+			val = env['%s_%s' % (var, x)]
+			if val:
+				app(var, val)
+
+# ============ the code above must not know anything about import libs ==========
+
+@feature('cshlib', 'cxxshlib', 'fcshlib')
+@after_method('apply_link')
+def apply_implib(self):
+	"""
+	Handle dlls and their import libs on Windows-like systems.
+
+	A ``.dll.a`` file called *import library* is generated.
+	It must be installed as it is required for linking the library.
+	"""
+	if not self.env.DEST_BINFMT == 'pe':
+		return
+
+	dll = self.link_task.outputs[0]
+	if isinstance(self.target, Node.Node):
+		name = self.target.name
+	else:
+		name = os.path.split(self.target)[1]
+	implib = self.env.implib_PATTERN % name
+	implib = dll.parent.find_or_declare(implib)
+	self.env.append_value('LINKFLAGS', self.env.IMPLIB_ST % implib.bldpath())
+	self.link_task.outputs.append(implib)
+
+	if getattr(self, 'defs', None) and self.env.DEST_BINFMT == 'pe':
+		node = self.path.find_resource(self.defs)
+		if not node:
+			raise Errors.WafError('invalid def file %r' % self.defs)
+		if self.env.def_PATTERN:
+			self.env.append_value('LINKFLAGS', self.env.def_PATTERN % node.path_from(self.get_cwd()))
+			self.link_task.dep_nodes.append(node)
+		else:
+			# gcc for windows takes *.def file as input without any special flag
+			self.link_task.inputs.append(node)
+
+	# where to put the import library
+	if getattr(self, 'install_task', None):
+		try:
+			# user has given a specific installation path for the import library
+			inst_to = self.install_path_implib
+		except AttributeError:
+			try:
+				# user has given an installation path for the main library, put the import library in it
+				inst_to = self.install_path
+			except AttributeError:
+				# else, put the library in BINDIR and the import library in LIBDIR
+				inst_to = '${IMPLIBDIR}'
+				self.install_task.install_to = '${BINDIR}'
+				if not self.env.IMPLIBDIR:
+					self.env.IMPLIBDIR = self.env.LIBDIR
+		self.implib_install_task = self.add_install_files(install_to=inst_to, install_from=implib,
+			chmod=self.link_task.chmod, task=self.link_task)
+
+# ============ the code above must not know anything about vnum processing on unix platforms =========
+
+re_vnum = re.compile('^([1-9]\\d*|0)([.]([1-9]\\d*|0)){0,2}?$')
+@feature('cshlib', 'cxxshlib', 'dshlib', 'fcshlib', 'vnum')
+@after_method('apply_link', 'propagate_uselib_vars')
+def apply_vnum(self):
+	"""
+	Enforce version numbering on shared libraries. The valid version numbers must have either zero or two dots::
+
+		def build(bld):
+			bld.shlib(source='a.c', target='foo', vnum='14.15.16')
+
+	In this example on Linux platform, ``libfoo.so`` is installed as ``libfoo.so.14.15.16``, and the following symbolic links are created:
+
+	* ``libfoo.so    → libfoo.so.14.15.16``
+	* ``libfoo.so.14 → libfoo.so.14.15.16``
+
+	By default, the library will be assigned SONAME ``libfoo.so.14``, effectively declaring ABI compatibility between all minor and patch releases for the major version of the library.  When necessary, the compatibility can be explicitly defined using `cnum` parameter:
+
+		def build(bld):
+			bld.shlib(source='a.c', target='foo', vnum='14.15.16', cnum='14.15')
+
+	In this case, the assigned SONAME will be ``libfoo.so.14.15`` with ABI compatibility only between path releases for a specific major and minor version of the library.
+
+	On OS X platform, install-name parameter will follow the above logic for SONAME with exception that it also specifies an absolute path (based on install_path) of the library.
+	"""
+	if not getattr(self, 'vnum', '') or os.name != 'posix' or self.env.DEST_BINFMT not in ('elf', 'mac-o'):
+		return
+
+	link = self.link_task
+	if not re_vnum.match(self.vnum):
+		raise Errors.WafError('Invalid vnum %r for target %r' % (self.vnum, getattr(self, 'name', self)))
+	nums = self.vnum.split('.')
+	node = link.outputs[0]
+
+	cnum = getattr(self, 'cnum', str(nums[0]))
+	cnums = cnum.split('.')
+	if len(cnums)>len(nums) or nums[0:len(cnums)] != cnums:
+		raise Errors.WafError('invalid compatibility version %s' % cnum)
+
+	libname = node.name
+	if libname.endswith('.dylib'):
+		name3 = libname.replace('.dylib', '.%s.dylib' % self.vnum)
+		name2 = libname.replace('.dylib', '.%s.dylib' % cnum)
+	else:
+		name3 = libname + '.' + self.vnum
+		name2 = libname + '.' + cnum
+
+	# add the so name for the ld linker - to disable, just unset env.SONAME_ST
+	if self.env.SONAME_ST:
+		v = self.env.SONAME_ST % name2
+		self.env.append_value('LINKFLAGS', v.split())
+
+	# the following task is just to enable execution from the build dir :-/
+	if self.env.DEST_OS != 'openbsd':
+		outs = [node.parent.make_node(name3)]
+		if name2 != name3:
+			outs.append(node.parent.make_node(name2))
+		self.create_task('vnum', node, outs)
+
+	if getattr(self, 'install_task', None):
+		self.install_task.hasrun = Task.SKIPPED
+		self.install_task.no_errcheck_out = True
+		path = self.install_task.install_to
+		if self.env.DEST_OS == 'openbsd':
+			libname = self.link_task.outputs[0].name
+			t1 = self.add_install_as(install_to='%s/%s' % (path, libname), install_from=node, chmod=self.link_task.chmod)
+			self.vnum_install_task = (t1,)
+		else:
+			t1 = self.add_install_as(install_to=path + os.sep + name3, install_from=node, chmod=self.link_task.chmod)
+			t3 = self.add_symlink_as(install_to=path + os.sep + libname, install_from=name3)
+			if name2 != name3:
+				t2 = self.add_symlink_as(install_to=path + os.sep + name2, install_from=name3)
+				self.vnum_install_task = (t1, t2, t3)
+			else:
+				self.vnum_install_task = (t1, t3)
+
+	if '-dynamiclib' in self.env.LINKFLAGS:
+		# this requires after(propagate_uselib_vars)
+		try:
+			inst_to = self.install_path
+		except AttributeError:
+			inst_to = self.link_task.inst_to
+		if inst_to:
+			p = Utils.subst_vars(inst_to, self.env)
+			path = os.path.join(p, name2)
+			self.env.append_value('LINKFLAGS', ['-install_name', path])
+			self.env.append_value('LINKFLAGS', '-Wl,-compatibility_version,%s' % cnum)
+			self.env.append_value('LINKFLAGS', '-Wl,-current_version,%s' % self.vnum)
+
+class vnum(Task.Task):
+	"""
+	Create the symbolic links for a versioned shared library. Instances are created by :py:func:`waflib.Tools.ccroot.apply_vnum`
+	"""
+	color = 'CYAN'
+	ext_in = ['.bin']
+	def keyword(self):
+		return 'Symlinking'
+	def run(self):
+		for x in self.outputs:
+			path = x.abspath()
+			try:
+				os.remove(path)
+			except OSError:
+				pass
+
+			try:
+				os.symlink(self.inputs[0].name, path)
+			except OSError:
+				return 1
+
+class fake_shlib(link_task):
+	"""
+	Task used for reading a system library and adding the dependency on it
+	"""
+	def runnable_status(self):
+		for t in self.run_after:
+			if not t.hasrun:
+				return Task.ASK_LATER
+		return Task.SKIP_ME
+
+class fake_stlib(stlink_task):
+	"""
+	Task used for reading a system library and adding the dependency on it
+	"""
+	def runnable_status(self):
+		for t in self.run_after:
+			if not t.hasrun:
+				return Task.ASK_LATER
+		return Task.SKIP_ME
+
+@conf
+def read_shlib(self, name, paths=[], export_includes=[], export_defines=[]):
+	"""
+	Read a system shared library, enabling its use as a local library. Will trigger a rebuild if the file changes::
+
+		def build(bld):
+			bld.read_shlib('m')
+			bld.program(source='main.c', use='m')
+	"""
+	return self(name=name, features='fake_lib', lib_paths=paths, lib_type='shlib', export_includes=export_includes, export_defines=export_defines)
+
+@conf
+def read_stlib(self, name, paths=[], export_includes=[], export_defines=[]):
+	"""
+	Read a system static library, enabling a use as a local library. Will trigger a rebuild if the file changes.
+	"""
+	return self(name=name, features='fake_lib', lib_paths=paths, lib_type='stlib', export_includes=export_includes, export_defines=export_defines)
+
+lib_patterns = {
+	'shlib' : ['lib%s.so', '%s.so', 'lib%s.dylib', 'lib%s.dll', '%s.dll'],
+	'stlib' : ['lib%s.a', '%s.a', 'lib%s.dll', '%s.dll', 'lib%s.lib', '%s.lib'],
+}
+
+@feature('fake_lib')
+def process_lib(self):
+	"""
+	Find the location of a foreign library. Used by :py:class:`waflib.Tools.ccroot.read_shlib` and :py:class:`waflib.Tools.ccroot.read_stlib`.
+	"""
+	node = None
+
+	names = [x % self.name for x in lib_patterns[self.lib_type]]
+	for x in self.lib_paths + [self.path] + SYSTEM_LIB_PATHS:
+		if not isinstance(x, Node.Node):
+			x = self.bld.root.find_node(x) or self.path.find_node(x)
+			if not x:
+				continue
+
+		for y in names:
+			node = x.find_node(y)
+			if node:
+				try:
+					Utils.h_file(node.abspath())
+				except EnvironmentError:
+					raise ValueError('Could not read %r' % y)
+				break
+		else:
+			continue
+		break
+	else:
+		raise Errors.WafError('could not find library %r' % self.name)
+	self.link_task = self.create_task('fake_%s' % self.lib_type, [], [node])
+	self.target = self.name
+
+
+class fake_o(Task.Task):
+	def runnable_status(self):
+		return Task.SKIP_ME
+
+@extension('.o', '.obj')
+def add_those_o_files(self, node):
+	tsk = self.create_task('fake_o', [], node)
+	try:
+		self.compiled_tasks.append(tsk)
+	except AttributeError:
+		self.compiled_tasks = [tsk]
+
+@feature('fake_obj')
+@before_method('process_source')
+def process_objs(self):
+	"""
+	Puts object files in the task generator outputs
+	"""
+	for node in self.to_nodes(self.source):
+		self.add_those_o_files(node)
+	self.source = []
+
+@conf
+def read_object(self, obj):
+	"""
+	Read an object file, enabling injection in libs/programs. Will trigger a rebuild if the file changes.
+
+	:param obj: object file path, as string or Node
+	"""
+	if not isinstance(obj, self.path.__class__):
+		obj = self.path.find_resource(obj)
+	return self(features='fake_obj', source=obj, name=obj.name)
+
+@feature('cxxprogram', 'cprogram')
+@after_method('apply_link', 'process_use')
+def set_full_paths_hpux(self):
+	"""
+	On hp-ux, extend the libpaths and static library paths to absolute paths
+	"""
+	if self.env.DEST_OS != 'hp-ux':
+		return
+	base = self.bld.bldnode.abspath()
+	for var in ['LIBPATH', 'STLIBPATH']:
+		lst = []
+		for x in self.env[var]:
+			if x.startswith('/'):
+				lst.append(x)
+			else:
+				lst.append(os.path.normpath(os.path.join(base, x)))
+		self.env[var] = lst
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #!/usr/bin/env python
+# encoding: utf-8
+# Krzysztof Kosiński 2014
+
+"""
+Detect the Clang C compiler
+"""
+
+from waflib.Tools import ccroot, ar, gcc
+from waflib.Configure import conf
+
+@conf
+def find_clang(conf):
+	"""
+	Finds the program clang and executes it to ensure it really is clang
+	"""
+	cc = conf.find_program('clang', var='CC')
+	conf.get_cc_version(cc, clang=True)
+	conf.env.CC_NAME = 'clang'
+
+def configure(conf):
+	conf.find_clang()
+	conf.find_program(['llvm-ar', 'ar'], var='AR')
+	conf.find_ar()
+	conf.gcc_common_flags()
+	conf.gcc_modifier_platform()
+	conf.cc_load_tools()
+	conf.cc_add_flags()
+	conf.link_add_flags()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy 2009-2018 (ita)
+
+"""
+Detect the Clang++ C++ compiler
+"""
+
+from waflib.Tools import ccroot, ar, gxx
+from waflib.Configure import conf
+
+@conf
+def find_clangxx(conf):
+	"""
+	Finds the program clang++, and executes it to ensure it really is clang++
+	"""
+	cxx = conf.find_program('clang++', var='CXX')
+	conf.get_cc_version(cxx, clang=True)
+	conf.env.CXX_NAME = 'clang'
+
+def configure(conf):
+	conf.find_clangxx()
+	conf.find_program(['llvm-ar', 'ar'], var='AR')
+	conf.find_ar()
+	conf.gxx_common_flags()
+	conf.gxx_modifier_platform()
+	conf.cxx_load_tools()
+	conf.cxx_add_flags()
+	conf.link_add_flags()
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #!/usr/bin/env python
+# encoding: utf-8
+# Matthias Jahn jahn dôt matthias ât freenet dôt de, 2007 (pmarat)
+
+"""
+Try to detect a C compiler from the list of supported compilers (gcc, msvc, etc)::
+
+	def options(opt):
+		opt.load('compiler_c')
+	def configure(cnf):
+		cnf.load('compiler_c')
+	def build(bld):
+		bld.program(source='main.c', target='app')
+
+The compilers are associated to platforms in :py:attr:`waflib.Tools.compiler_c.c_compiler`. To register
+a new C compiler named *cfoo* (assuming the tool ``waflib/extras/cfoo.py`` exists), use::
+
+	from waflib.Tools.compiler_c import c_compiler
+	c_compiler['win32'] = ['cfoo', 'msvc', 'gcc']
+
+	def options(opt):
+		opt.load('compiler_c')
+	def configure(cnf):
+		cnf.load('compiler_c')
+	def build(bld):
+		bld.program(source='main.c', target='app')
+
+Not all compilers need to have a specific tool. For example, the clang compilers can be detected by the gcc tools when using::
+
+	$ CC=clang waf configure
+"""
+
+import re
+from waflib.Tools import ccroot
+from waflib import Utils
+from waflib.Logs import debug
+
+c_compiler = {
+'win32':       ['msvc', 'gcc', 'clang'],
+'cygwin':      ['gcc', 'clang'],
+'darwin':      ['clang', 'gcc'],
+'aix':         ['xlc', 'gcc', 'clang'],
+'linux':       ['gcc', 'clang', 'icc'],
+'sunos':       ['suncc', 'gcc'],
+'irix':        ['gcc', 'irixcc'],
+'hpux':        ['gcc'],
+'osf1V':       ['gcc'],
+'gnu':         ['gcc', 'clang'],
+'java':        ['gcc', 'msvc', 'clang', 'icc'],
+'gnukfreebsd': ['gcc', 'clang'],
+'default':     ['clang', 'gcc'],
+}
+"""
+Dict mapping platform names to Waf tools finding specific C compilers::
+
+	from waflib.Tools.compiler_c import c_compiler
+	c_compiler['linux'] = ['gcc', 'icc', 'suncc']
+"""
+
+def default_compilers():
+	build_platform = Utils.unversioned_sys_platform()
+	possible_compiler_list = c_compiler.get(build_platform, c_compiler['default'])
+	return ' '.join(possible_compiler_list)
+
+def configure(conf):
+	"""
+	Detects a suitable C compiler
+
+	:raises: :py:class:`waflib.Errors.ConfigurationError` when no suitable compiler is found
+	"""
+	try:
+		test_for_compiler = conf.options.check_c_compiler or default_compilers()
+	except AttributeError:
+		conf.fatal("Add options(opt): opt.load('compiler_c')")
+
+	for compiler in re.split('[ ,]+', test_for_compiler):
+		conf.env.stash()
+		conf.start_msg('Checking for %r (C compiler)' % compiler)
+		try:
+			conf.load(compiler)
+		except conf.errors.ConfigurationError as e:
+			conf.env.revert()
+			conf.end_msg(False)
+			debug('compiler_c: %r', e)
+		else:
+			if conf.env.CC:
+				conf.end_msg(conf.env.get_flat('CC'))
+				conf.env.COMPILER_CC = compiler
+				conf.env.commit()
+				break
+			conf.env.revert()
+			conf.end_msg(False)
+	else:
+		conf.fatal('could not configure a C compiler!')
+
+def options(opt):
+	"""
+	This is how to provide compiler preferences on the command-line::
+
+		$ waf configure --check-c-compiler=gcc
+	"""
+	test_for_compiler = default_compilers()
+	opt.load_special_tools('c_*.py', ban=['c_dumbpreproc.py'])
+	cc_compiler_opts = opt.add_option_group('Configuration options')
+	cc_compiler_opts.add_option('--check-c-compiler', default=None,
+		help='list of C compilers to try [%s]' % test_for_compiler,
+		dest="check_c_compiler")
+
+	for x in test_for_compiler.split():
+		opt.load('%s' % x)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             #!/usr/bin/env python
+# encoding: utf-8
+# Matthias Jahn jahn dôt matthias ât freenet dôt de 2007 (pmarat)
+
+"""
+Try to detect a C++ compiler from the list of supported compilers (g++, msvc, etc)::
+
+	def options(opt):
+		opt.load('compiler_cxx')
+	def configure(cnf):
+		cnf.load('compiler_cxx')
+	def build(bld):
+		bld.program(source='main.cpp', target='app')
+
+The compilers are associated to platforms in :py:attr:`waflib.Tools.compiler_cxx.cxx_compiler`. To register
+a new C++ compiler named *cfoo* (assuming the tool ``waflib/extras/cfoo.py`` exists), use::
+
+	from waflib.Tools.compiler_cxx import cxx_compiler
+	cxx_compiler['win32'] = ['cfoo', 'msvc', 'gcc']
+
+	def options(opt):
+		opt.load('compiler_cxx')
+	def configure(cnf):
+		cnf.load('compiler_cxx')
+	def build(bld):
+		bld.program(source='main.c', target='app')
+
+Not all compilers need to have a specific tool. For example, the clang compilers can be detected by the gcc tools when using::
+
+	$ CXX=clang waf configure
+"""
+
+
+import re
+from waflib.Tools import ccroot
+from waflib import Utils
+from waflib.Logs import debug
+
+cxx_compiler = {
+'win32':       ['msvc', 'g++', 'clang++'],
+'cygwin':      ['g++', 'clang++'],
+'darwin':      ['clang++', 'g++'],
+'aix':         ['xlc++', 'g++', 'clang++'],
+'linux':       ['g++', 'clang++', 'icpc'],
+'sunos':       ['sunc++', 'g++'],
+'irix':        ['g++'],
+'hpux':        ['g++'],
+'osf1V':       ['g++'],
+'gnu':         ['g++', 'clang++'],
+'java':        ['g++', 'msvc', 'clang++', 'icpc'],
+'gnukfreebsd': ['g++', 'clang++'],
+'default':     ['clang++', 'g++']
+}
+"""
+Dict mapping the platform names to Waf tools finding specific C++ compilers::
+
+	from waflib.Tools.compiler_cxx import cxx_compiler
+	cxx_compiler['linux'] = ['gxx', 'icpc', 'suncxx']
+"""
+
+def default_compilers():
+	build_platform = Utils.unversioned_sys_platform()
+	possible_compiler_list = cxx_compiler.get(build_platform, cxx_compiler['default'])
+	return ' '.join(possible_compiler_list)
+
+def configure(conf):
+	"""
+	Detects a suitable C++ compiler
+
+	:raises: :py:class:`waflib.Errors.ConfigurationError` when no suitable compiler is found
+	"""
+	try:
+		test_for_compiler = conf.options.check_cxx_compiler or default_compilers()
+	except AttributeError:
+		conf.fatal("Add options(opt): opt.load('compiler_cxx')")
+
+	for compiler in re.split('[ ,]+', test_for_compiler):
+		conf.env.stash()
+		conf.start_msg('Checking for %r (C++ compiler)' % compiler)
+		try:
+			conf.load(compiler)
+		except conf.errors.ConfigurationError as e:
+			conf.env.revert()
+			conf.end_msg(False)
+			debug('compiler_cxx: %r', e)
+		else:
+			if conf.env.CXX:
+				conf.end_msg(conf.env.get_flat('CXX'))
+				conf.env.COMPILER_CXX = compiler
+				conf.env.commit()
+				break
+			conf.env.revert()
+			conf.end_msg(False)
+	else:
+		conf.fatal('could not configure a C++ compiler!')
+
+def options(opt):
+	"""
+	This is how to provide compiler preferences on the command-line::
+
+		$ waf configure --check-cxx-compiler=gxx
+	"""
+	test_for_compiler = default_compilers()
+	opt.load_special_tools('cxx_*.py')
+	cxx_compiler_opts = opt.add_option_group('Configuration options')
+	cxx_compiler_opts.add_option('--check-cxx-compiler', default=None,
+		help='list of C++ compilers to try [%s]' % test_for_compiler,
+		dest="check_cxx_compiler")
+
+	for x in test_for_compiler.split():
+		opt.load('%s' % x)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #!/usr/bin/env python
+# encoding: utf-8
+# Carlos Rafael Giani, 2007 (dv)
+# Thomas Nagy, 2016-2018 (ita)
+
+"""
+Try to detect a D compiler from the list of supported compilers::
+
+	def options(opt):
+		opt.load('compiler_d')
+	def configure(cnf):
+		cnf.load('compiler_d')
+	def build(bld):
+		bld.program(source='main.d', target='app')
+
+Only three D compilers are really present at the moment:
+
+* gdc
+* dmd, the ldc compiler having a very similar command-line interface
+* ldc2
+"""
+
+import re
+from waflib import Utils, Logs
+
+d_compiler = {
+'default' : ['gdc', 'dmd', 'ldc2']
+}
+"""
+Dict mapping the platform names to lists of names of D compilers to try, in order of preference::
+
+	from waflib.Tools.compiler_d import d_compiler
+	d_compiler['default'] = ['gdc', 'dmd', 'ldc2']
+"""
+
+def default_compilers():
+	build_platform = Utils.unversioned_sys_platform()
+	possible_compiler_list = d_compiler.get(build_platform, d_compiler['default'])
+	return ' '.join(possible_compiler_list)
+
+def configure(conf):
+	"""
+	Detects a suitable D compiler
+
+	:raises: :py:class:`waflib.Errors.ConfigurationError` when no suitable compiler is found
+	"""
+	try:
+		test_for_compiler = conf.options.check_d_compiler or default_compilers()
+	except AttributeError:
+		conf.fatal("Add options(opt): opt.load('compiler_d')")
+
+	for compiler in re.split('[ ,]+', test_for_compiler):
+		conf.env.stash()
+		conf.start_msg('Checking for %r (D compiler)' % compiler)
+		try:
+			conf.load(compiler)
+		except conf.errors.ConfigurationError as e:
+			conf.env.revert()
+			conf.end_msg(False)
+			Logs.debug('compiler_d: %r', e)
+		else:
+			if conf.env.D:
+				conf.end_msg(conf.env.get_flat('D'))
+				conf.env.COMPILER_D = compiler
+				conf.env.commit()
+				break
+			conf.env.revert()
+			conf.end_msg(False)
+	else:
+		conf.fatal('could not configure a D compiler!')
+
+def options(opt):
+	"""
+	This is how to provide compiler preferences on the command-line::
+
+		$ waf configure --check-d-compiler=dmd
+	"""
+	test_for_compiler = default_compilers()
+	d_compiler_opts = opt.add_option_group('Configuration options')
+	d_compiler_opts.add_option('--check-d-compiler', default=None,
+		help='list of D compilers to try [%s]' % test_for_compiler, dest='check_d_compiler')
+
+	for x in test_for_compiler.split():
+		opt.load('%s' % x)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #!/usr/bin/env python
+# encoding: utf-8
+
+import re
+from waflib import Utils, Logs
+from waflib.Tools import fc
+
+fc_compiler = {
+	'win32'  : ['gfortran','ifort'],
+	'darwin' : ['gfortran', 'g95', 'ifort'],
+	'linux'  : ['gfortran', 'g95', 'ifort'],
+	'java'   : ['gfortran', 'g95', 'ifort'],
+	'default': ['gfortran'],
+	'aix'    : ['gfortran']
+}
+"""
+Dict mapping the platform names to lists of names of Fortran compilers to try, in order of preference::
+
+	from waflib.Tools.compiler_c import c_compiler
+	c_compiler['linux'] = ['gfortran', 'g95', 'ifort']
+"""
+
+def default_compilers():
+	build_platform = Utils.unversioned_sys_platform()
+	possible_compiler_list = fc_compiler.get(build_platform, fc_compiler['default'])
+	return ' '.join(possible_compiler_list)
+
+def configure(conf):
+	"""
+	Detects a suitable Fortran compiler
+
+	:raises: :py:class:`waflib.Errors.ConfigurationError` when no suitable compiler is found
+	"""
+	try:
+		test_for_compiler = conf.options.check_fortran_compiler or default_compilers()
+	except AttributeError:
+		conf.fatal("Add options(opt): opt.load('compiler_fc')")
+	for compiler in re.split('[ ,]+', test_for_compiler):
+		conf.env.stash()
+		conf.start_msg('Checking for %r (Fortran compiler)' % compiler)
+		try:
+			conf.load(compiler)
+		except conf.errors.ConfigurationError as e:
+			conf.env.revert()
+			conf.end_msg(False)
+			Logs.debug('compiler_fortran: %r', e)
+		else:
+			if conf.env.FC:
+				conf.end_msg(conf.env.get_flat('FC'))
+				conf.env.COMPILER_FORTRAN = compiler
+				conf.env.commit()
+				break
+			conf.env.revert()
+			conf.end_msg(False)
+	else:
+		conf.fatal('could not configure a Fortran compiler!')
+
+def options(opt):
+	"""
+	This is how to provide compiler preferences on the command-line::
+
+		$ waf configure --check-fortran-compiler=ifort
+	"""
+	test_for_compiler = default_compilers()
+	opt.load_special_tools('fc_*.py')
+	fortran_compiler_opts = opt.add_option_group('Configuration options')
+	fortran_compiler_opts.add_option('--check-fortran-compiler', default=None,
+			help='list of Fortran compiler to try [%s]' % test_for_compiler,
+		dest="check_fortran_compiler")
+
+	for x in test_for_compiler.split():
+		opt.load('%s' % x)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2006-2018 (ita)
+
+"""
+C# support. A simple example::
+
+	def configure(conf):
+		conf.load('cs')
+	def build(bld):
+		bld(features='cs', source='main.cs', gen='foo')
+
+Note that the configuration may compile C# snippets::
+
+	FRAG = '''
+	namespace Moo {
+		public class Test { public static int Main(string[] args) { return 0; } }
+	}'''
+	def configure(conf):
+		conf.check(features='cs', fragment=FRAG, compile_filename='test.cs', gen='test.exe',
+			bintype='exe', csflags=['-pkg:gtk-sharp-2.0'], msg='Checking for Gtksharp support')
+"""
+
+from waflib import Utils, Task, Options, Errors
+from waflib.TaskGen import before_method, after_method, feature
+from waflib.Tools import ccroot
+from waflib.Configure import conf
+
+ccroot.USELIB_VARS['cs'] = set(['CSFLAGS', 'ASSEMBLIES', 'RESOURCES'])
+ccroot.lib_patterns['csshlib'] = ['%s']
+
+@feature('cs')
+@before_method('process_source')
+def apply_cs(self):
+	"""
+	Create a C# task bound to the attribute *cs_task*. There can be only one C# task by task generator.
+	"""
+	cs_nodes = []
+	no_nodes = []
+	for x in self.to_nodes(self.source):
+		if x.name.endswith('.cs'):
+			cs_nodes.append(x)
+		else:
+			no_nodes.append(x)
+	self.source = no_nodes
+
+	bintype = getattr(self, 'bintype', self.gen.endswith('.dll') and 'library' or 'exe')
+	self.cs_task = tsk = self.create_task('mcs', cs_nodes, self.path.find_or_declare(self.gen))
+	tsk.env.CSTYPE = '/target:%s' % bintype
+	tsk.env.OUT = '/out:%s' % tsk.outputs[0].abspath()
+	self.env.append_value('CSFLAGS', '/platform:%s' % getattr(self, 'platform', 'anycpu'))
+
+	inst_to = getattr(self, 'install_path', bintype=='exe' and '${BINDIR}' or '${LIBDIR}')
+	if inst_to:
+		# note: we are making a copy, so the files added to cs_task.outputs won't be installed automatically
+		mod = getattr(self, 'chmod', bintype=='exe' and Utils.O755 or Utils.O644)
+		self.install_task = self.add_install_files(install_to=inst_to, install_from=self.cs_task.outputs[:], chmod=mod)
+
+@feature('cs')
+@after_method('apply_cs')
+def use_cs(self):
+	"""
+	C# applications honor the **use** keyword::
+
+		def build(bld):
+			bld(features='cs', source='My.cs', bintype='library', gen='my.dll', name='mylib')
+			bld(features='cs', source='Hi.cs', includes='.', bintype='exe', gen='hi.exe', use='mylib', name='hi')
+	"""
+	names = self.to_list(getattr(self, 'use', []))
+	get = self.bld.get_tgen_by_name
+	for x in names:
+		try:
+			y = get(x)
+		except Errors.WafError:
+			self.env.append_value('CSFLAGS', '/reference:%s' % x)
+			continue
+		y.post()
+
+		tsk = getattr(y, 'cs_task', None) or getattr(y, 'link_task', None)
+		if not tsk:
+			self.bld.fatal('cs task has no link task for use %r' % self)
+		self.cs_task.dep_nodes.extend(tsk.outputs) # dependency
+		self.cs_task.set_run_after(tsk) # order (redundant, the order is inferred from the nodes inputs/outputs)
+		self.env.append_value('CSFLAGS', '/reference:%s' % tsk.outputs[0].abspath())
+
+@feature('cs')
+@after_method('apply_cs', 'use_cs')
+def debug_cs(self):
+	"""
+	The C# targets may create .mdb or .pdb files::
+
+		def build(bld):
+			bld(features='cs', source='My.cs', bintype='library', gen='my.dll', csdebug='full')
+			# csdebug is a value in (True, 'full', 'pdbonly')
+	"""
+	csdebug = getattr(self, 'csdebug', self.env.CSDEBUG)
+	if not csdebug:
+		return
+
+	node = self.cs_task.outputs[0]
+	if self.env.CS_NAME == 'mono':
+		out = node.parent.find_or_declare(node.name + '.mdb')
+	else:
+		out = node.change_ext('.pdb')
+	self.cs_task.outputs.append(out)
+
+	if getattr(self, 'install_task', None):
+		self.pdb_install_task = self.add_install_files(
+			install_to=self.install_task.install_to, install_from=out)
+
+	if csdebug == 'pdbonly':
+		val = ['/debug+', '/debug:pdbonly']
+	elif csdebug == 'full':
+		val = ['/debug+', '/debug:full']
+	else:
+		val = ['/debug-']
+	self.env.append_value('CSFLAGS', val)
+
+@feature('cs')
+@after_method('debug_cs')
+def doc_cs(self):
+	"""
+	The C# targets may create .xml documentation files::
+
+		def build(bld):
+			bld(features='cs', source='My.cs', bintype='library', gen='my.dll', csdoc=True)
+			# csdoc is a boolean value
+	"""
+	csdoc = getattr(self, 'csdoc', self.env.CSDOC)
+	if not csdoc:
+		return
+
+	node = self.cs_task.outputs[0]
+	out = node.change_ext('.xml')
+	self.cs_task.outputs.append(out)
+
+	if getattr(self, 'install_task', None):
+		self.doc_install_task = self.add_install_files(
+			install_to=self.install_task.install_to, install_from=out)
+
+	self.env.append_value('CSFLAGS', '/doc:%s' % out.abspath())
+
+class mcs(Task.Task):
+	"""
+	Compile C# files
+	"""
+	color   = 'YELLOW'
+	run_str = '${MCS} ${CSTYPE} ${CSFLAGS} ${ASS_ST:ASSEMBLIES} ${RES_ST:RESOURCES} ${OUT} ${SRC}'
+
+	def split_argfile(self, cmd):
+		inline = [cmd[0]]
+		infile = []
+		for x in cmd[1:]:
+			# csc doesn't want /noconfig in @file
+			if x.lower() == '/noconfig':
+				inline.append(x)
+			else:
+				infile.append(self.quote_flag(x))
+		return (inline, infile)
+
+def configure(conf):
+	"""
+	Find a C# compiler, set the variable MCS for the compiler and CS_NAME (mono or csc)
+	"""
+	csc = getattr(Options.options, 'cscbinary', None)
+	if csc:
+		conf.env.MCS = csc
+	conf.find_program(['csc', 'mcs', 'gmcs'], var='MCS')
+	conf.env.ASS_ST = '/r:%s'
+	conf.env.RES_ST = '/resource:%s'
+
+	conf.env.CS_NAME = 'csc'
+	if str(conf.env.MCS).lower().find('mcs') > -1:
+		conf.env.CS_NAME = 'mono'
+
+def options(opt):
+	"""
+	Add a command-line option for the configuration::
+
+		$ waf configure --with-csc-binary=/foo/bar/mcs
+	"""
+	opt.add_option('--with-csc-binary', type='string', dest='cscbinary')
+
+class fake_csshlib(Task.Task):
+	"""
+	Task used for reading a foreign .net assembly and adding the dependency on it
+	"""
+	color   = 'YELLOW'
+	inst_to = None
+
+	def runnable_status(self):
+		return Task.SKIP_ME
+
+@conf
+def read_csshlib(self, name, paths=[]):
+	"""
+	Read a foreign .net assembly for the *use* system::
+
+		def build(bld):
+			bld.read_csshlib('ManagedLibrary.dll', paths=[bld.env.mylibrarypath])
+			bld(features='cs', source='Hi.cs', bintype='exe', gen='hi.exe', use='ManagedLibrary.dll')
+
+	:param name: Name of the library
+	:type name: string
+	:param paths: Folders in which the library may be found
+	:type paths: list of string
+	:return: A task generator having the feature *fake_lib* which will call :py:func:`waflib.Tools.ccroot.process_lib`
+	:rtype: :py:class:`waflib.TaskGen.task_gen`
+	"""
+	return self(name=name, features='fake_lib', lib_paths=paths, lib_type='csshlib')
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2005-2018 (ita)
+
+"Base for c++ programs and libraries"
+
+from waflib import TaskGen, Task
+from waflib.Tools import c_preproc
+from waflib.Tools.ccroot import link_task, stlink_task
+
+@TaskGen.extension('.cpp','.cc','.cxx','.C','.c++')
+def cxx_hook(self, node):
+	"Binds c++ file extensions to create :py:class:`waflib.Tools.cxx.cxx` instances"
+	return self.create_compiled_task('cxx', node)
+
+if not '.c' in TaskGen.task_gen.mappings:
+	TaskGen.task_gen.mappings['.c'] = TaskGen.task_gen.mappings['.cpp']
+
+class cxx(Task.Task):
+	"Compiles C++ files into object files"
+	run_str = '${CXX} ${ARCH_ST:ARCH} ${CXXFLAGS} ${FRAMEWORKPATH_ST:FRAMEWORKPATH} ${CPPPATH_ST:INCPATHS} ${DEFINES_ST:DEFINES} ${CXX_SRC_F}${SRC} ${CXX_TGT_F}${TGT[0].relpath()} ${CPPFLAGS}'
+	vars    = ['CXXDEPS'] # unused variable to depend on, just in case
+	ext_in  = ['.h'] # set the build order easily by using ext_out=['.h']
+	scan    = c_preproc.scan
+
+class cxxprogram(link_task):
+	"Links object files into c++ programs"
+	run_str = '${LINK_CXX} ${LINKFLAGS} ${CXXLNK_SRC_F}${SRC} ${CXXLNK_TGT_F}${TGT[0].relpath()} ${RPATH_ST:RPATH} ${FRAMEWORKPATH_ST:FRAMEWORKPATH} ${FRAMEWORK_ST:FRAMEWORK} ${ARCH_ST:ARCH} ${STLIB_MARKER} ${STLIBPATH_ST:STLIBPATH} ${STLIB_ST:STLIB} ${SHLIB_MARKER} ${LIBPATH_ST:LIBPATH} ${LIB_ST:LIB} ${LDFLAGS}'
+	vars    = ['LINKDEPS']
+	ext_out = ['.bin']
+	inst_to = '${BINDIR}'
+
+class cxxshlib(cxxprogram):
+	"Links object files into c++ shared libraries"
+	inst_to = '${LIBDIR}'
+
+class cxxstlib(stlink_task):
+	"Links object files into c++ static libraries"
+	pass # do not remove
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #!/usr/bin/env python
+# encoding: utf-8
+# Carlos Rafael Giani, 2007 (dv)
+# Thomas Nagy, 2007-2018 (ita)
+
+from waflib import Utils, Task, Errors
+from waflib.TaskGen import taskgen_method, feature, extension
+from waflib.Tools import d_scan, d_config
+from waflib.Tools.ccroot import link_task, stlink_task
+
+class d(Task.Task):
+	"Compile a d file into an object file"
+	color   = 'GREEN'
+	run_str = '${D} ${DFLAGS} ${DINC_ST:INCPATHS} ${D_SRC_F:SRC} ${D_TGT_F:TGT}'
+	scan    = d_scan.scan
+
+class d_with_header(d):
+	"Compile a d file and generate a header"
+	run_str = '${D} ${DFLAGS} ${DINC_ST:INCPATHS} ${D_HDR_F:tgt.outputs[1].bldpath()} ${D_SRC_F:SRC} ${D_TGT_F:tgt.outputs[0].bldpath()}'
+
+class d_header(Task.Task):
+	"Compile d headers"
+	color   = 'BLUE'
+	run_str = '${D} ${D_HEADER} ${SRC}'
+
+class dprogram(link_task):
+	"Link object files into a d program"
+	run_str = '${D_LINKER} ${LINKFLAGS} ${DLNK_SRC_F}${SRC} ${DLNK_TGT_F:TGT} ${RPATH_ST:RPATH} ${DSTLIB_MARKER} ${DSTLIBPATH_ST:STLIBPATH} ${DSTLIB_ST:STLIB} ${DSHLIB_MARKER} ${DLIBPATH_ST:LIBPATH} ${DSHLIB_ST:LIB}'
+	inst_to = '${BINDIR}'
+
+class dshlib(dprogram):
+	"Link object files into a d shared library"
+	inst_to = '${LIBDIR}'
+
+class dstlib(stlink_task):
+	"Link object files into a d static library"
+	pass # do not remove
+
+@extension('.d', '.di', '.D')
+def d_hook(self, node):
+	"""
+	Compile *D* files. To get .di files as well as .o files, set the following::
+
+		def build(bld):
+			bld.program(source='foo.d', target='app', generate_headers=True)
+
+	"""
+	ext = Utils.destos_to_binfmt(self.env.DEST_OS) == 'pe' and 'obj' or 'o'
+	out = '%s.%d.%s' % (node.name, self.idx, ext)
+	def create_compiled_task(self, name, node):
+		task = self.create_task(name, node, node.parent.find_or_declare(out))
+		try:
+			self.compiled_tasks.append(task)
+		except AttributeError:
+			self.compiled_tasks = [task]
+		return task
+
+	if getattr(self, 'generate_headers', None):
+		tsk = create_compiled_task(self, 'd_with_header', node)
+		tsk.outputs.append(node.change_ext(self.env.DHEADER_ext))
+	else:
+		tsk = create_compiled_task(self, 'd', node)
+	return tsk
+
+@taskgen_method
+def generate_header(self, filename):
+	"""
+	See feature request #104::
+
+		def build(bld):
+			tg = bld.program(source='foo.d', target='app')
+			tg.generate_header('blah.d')
+			# is equivalent to:
+			#tg = bld.program(source='foo.d', target='app', header_lst='blah.d')
+
+	:param filename: header to create
+	:type filename: string
+	"""
+	try:
+		self.header_lst.append([filename, self.install_path])
+	except AttributeError:
+		self.header_lst = [[filename, self.install_path]]
+
+@feature('d')
+def process_header(self):
+	"""
+	Process the attribute 'header_lst' to create the d header compilation tasks::
+
+		def build(bld):
+			bld.program(source='foo.d', target='app', header_lst='blah.d')
+	"""
+	for i in getattr(self, 'header_lst', []):
+		node = self.path.find_resource(i[0])
+		if not node:
+			raise Errors.WafError('file %r not found on d obj' % i[0])
+		self.create_task('d_header', node, node.change_ext('.di'))
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2016-2018 (ita)
+
+from waflib import Utils
+from waflib.Configure import conf
+
+@conf
+def d_platform_flags(self):
+	"""
+	Sets the extensions dll/so for d programs and libraries
+	"""
+	v = self.env
+	if not v.DEST_OS:
+		v.DEST_OS = Utils.unversioned_sys_platform()
+	binfmt = Utils.destos_to_binfmt(self.env.DEST_OS)
+	if binfmt == 'pe':
+		v.dprogram_PATTERN = '%s.exe'
+		v.dshlib_PATTERN   = 'lib%s.dll'
+		v.dstlib_PATTERN   = 'lib%s.a'
+	elif binfmt == 'mac-o':
+		v.dprogram_PATTERN = '%s'
+		v.dshlib_PATTERN   = 'lib%s.dylib'
+		v.dstlib_PATTERN   = 'lib%s.a'
+	else:
+		v.dprogram_PATTERN = '%s'
+		v.dshlib_PATTERN   = 'lib%s.so'
+		v.dstlib_PATTERN   = 'lib%s.a'
+
+DLIB = '''
+version(D_Version2) {
+	import std.stdio;
+	int main() {
+		writefln("phobos2");
+		return 0;
+	}
+} else {
+	version(Tango) {
+		import tango.stdc.stdio;
+		int main() {
+			printf("tango");
+			return 0;
+		}
+	} else {
+		import std.stdio;
+		int main() {
+			writefln("phobos1");
+			return 0;
+		}
+	}
+}
+'''
+"""Detection string for the D standard library"""
+
+@conf
+def check_dlibrary(self, execute=True):
+	"""
+	Detects the kind of standard library that comes with the compiler,
+	and sets conf.env.DLIBRARY to tango, phobos1 or phobos2
+	"""
+	ret = self.check_cc(features='d dprogram', fragment=DLIB, compile_filename='test.d', execute=execute, define_ret=True)
+	if execute:
+		self.env.DLIBRARY = ret.strip()
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2016-2018 (ita)
+
+"""
+Provide a scanner for finding dependencies on d files
+"""
+
+import re
+from waflib import Utils
+
+def filter_comments(filename):
+	"""
+	:param filename: d file name
+	:type filename: string
+	:rtype: list
+	:return: a list of characters
+	"""
+	txt = Utils.readf(filename)
+	i = 0
+	buf = []
+	max = len(txt)
+	begin = 0
+	while i < max:
+		c = txt[i]
+		if c == '"' or c == "'":  # skip a string or character literal
+			buf.append(txt[begin:i])
+			delim = c
+			i += 1
+			while i < max:
+				c = txt[i]
+				if c == delim:
+					break
+				elif c == '\\':  # skip the character following backslash
+					i += 1
+				i += 1
+			i += 1
+			begin = i
+		elif c == '/':  # try to replace a comment with whitespace
+			buf.append(txt[begin:i])
+			i += 1
+			if i == max:
+				break
+			c = txt[i]
+			if c == '+':  # eat nesting /+ +/ comment
+				i += 1
+				nesting = 1
+				c = None
+				while i < max:
+					prev = c
+					c = txt[i]
+					if prev == '/' and c == '+':
+						nesting += 1
+						c = None
+					elif prev == '+' and c == '/':
+						nesting -= 1
+						if nesting == 0:
+							break
+						c = None
+					i += 1
+			elif c == '*':  # eat /* */ comment
+				i += 1
+				c = None
+				while i < max:
+					prev = c
+					c = txt[i]
+					if prev == '*' and c == '/':
+						break
+					i += 1
+			elif c == '/':  # eat // comment
+				i += 1
+				while i < max and txt[i] != '\n':
+					i += 1
+			else:  # no comment
+				begin = i - 1
+				continue
+			i += 1
+			begin = i
+			buf.append(' ')
+		else:
+			i += 1
+	buf.append(txt[begin:])
+	return buf
+
+class d_parser(object):
+	"""
+	Parser for d files
+	"""
+	def __init__(self, env, incpaths):
+		#self.code = ''
+		#self.module = ''
+		#self.imports = []
+
+		self.allnames = []
+
+		self.re_module = re.compile(r"module\s+([^;]+)")
+		self.re_import = re.compile(r"import\s+([^;]+)")
+		self.re_import_bindings = re.compile("([^:]+):(.*)")
+		self.re_import_alias = re.compile("[^=]+=(.+)")
+
+		self.env = env
+
+		self.nodes = []
+		self.names = []
+
+		self.incpaths = incpaths
+
+	def tryfind(self, filename):
+		"""
+		Search file a file matching an module/import directive
+
+		:param filename: file to read
+		:type filename: string
+		"""
+		found = 0
+		for n in self.incpaths:
+			found = n.find_resource(filename.replace('.', '/') + '.d')
+			if found:
+				self.nodes.append(found)
+				self.waiting.append(found)
+				break
+		if not found:
+			if not filename in self.names:
+				self.names.append(filename)
+
+	def get_strings(self, code):
+		"""
+		:param code: d code to parse
+		:type code: string
+		:return: the modules that the code uses
+		:rtype: a list of match objects
+		"""
+		#self.imports = []
+		self.module = ''
+		lst = []
+
+		# get the module name (if present)
+
+		mod_name = self.re_module.search(code)
+		if mod_name:
+			self.module = re.sub(r'\s+', '', mod_name.group(1)) # strip all whitespaces
+
+		# go through the code, have a look at all import occurrences
+
+		# first, lets look at anything beginning with "import" and ending with ";"
+		import_iterator = self.re_import.finditer(code)
+		if import_iterator:
+			for import_match in import_iterator:
+				import_match_str = re.sub(r'\s+', '', import_match.group(1)) # strip all whitespaces
+
+				# does this end with an import bindings declaration?
+				# (import bindings always terminate the list of imports)
+				bindings_match = self.re_import_bindings.match(import_match_str)
+				if bindings_match:
+					import_match_str = bindings_match.group(1)
+					# if so, extract the part before the ":" (since the module declaration(s) is/are located there)
+
+				# split the matching string into a bunch of strings, separated by a comma
+				matches = import_match_str.split(',')
+
+				for match in matches:
+					alias_match = self.re_import_alias.match(match)
+					if alias_match:
+						# is this an alias declaration? (alias = module name) if so, extract the module name
+						match = alias_match.group(1)
+
+					lst.append(match)
+		return lst
+
+	def start(self, node):
+		"""
+		The parsing starts here
+
+		:param node: input file
+		:type node: :py:class:`waflib.Node.Node`
+		"""
+		self.waiting = [node]
+		# while the stack is not empty, add the dependencies
+		while self.waiting:
+			nd = self.waiting.pop(0)
+			self.iter(nd)
+
+	def iter(self, node):
+		"""
+		Find all the modules that a file depends on, uses :py:meth:`waflib.Tools.d_scan.d_parser.tryfind` to process dependent files
+
+		:param node: input file
+		:type node: :py:class:`waflib.Node.Node`
+		"""
+		path = node.abspath() # obtain the absolute path
+		code = "".join(filter_comments(path)) # read the file and filter the comments
+		names = self.get_strings(code) # obtain the import strings
+		for x in names:
+			# optimization
+			if x in self.allnames:
+				continue
+			self.allnames.append(x)
+
+			# for each name, see if it is like a node or not
+			self.tryfind(x)
+
+def scan(self):
+	"look for .d/.di used by a d file"
+	env = self.env
+	gruik = d_parser(env, self.generator.includes_nodes)
+	node = self.inputs[0]
+	gruik.start(node)
+	nodes = gruik.nodes
+	names = gruik.names
+	return (nodes, names)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #!/usr/bin/env python
+# encoding: utf-8
+# Ali Sabil, 2007
+
+"""
+Compiles dbus files with **dbus-binding-tool**
+
+Typical usage::
+
+	def options(opt):
+		opt.load('compiler_c dbus')
+	def configure(conf):
+		conf.load('compiler_c dbus')
+	def build(bld):
+		tg = bld.program(
+			includes = '.',
+			source = bld.path.ant_glob('*.c'),
+			target = 'gnome-hello')
+		tg.add_dbus_file('test.xml', 'test_prefix', 'glib-server')
+"""
+
+from waflib import Task, Errors
+from waflib.TaskGen import taskgen_method, before_method
+
+@taskgen_method
+def add_dbus_file(self, filename, prefix, mode):
+	"""
+	Adds a dbus file to the list of dbus files to process. Store them in the attribute *dbus_lst*.
+
+	:param filename: xml file to compile
+	:type filename: string
+	:param prefix: dbus binding tool prefix (--prefix=prefix)
+	:type prefix: string
+	:param mode: dbus binding tool mode (--mode=mode)
+	:type mode: string
+	"""
+	if not hasattr(self, 'dbus_lst'):
+		self.dbus_lst = []
+	if not 'process_dbus' in self.meths:
+		self.meths.append('process_dbus')
+	self.dbus_lst.append([filename, prefix, mode])
+
+@before_method('process_source')
+def process_dbus(self):
+	"""
+	Processes the dbus files stored in the attribute *dbus_lst* to create :py:class:`waflib.Tools.dbus.dbus_binding_tool` instances.
+	"""
+	for filename, prefix, mode in getattr(self, 'dbus_lst', []):
+		node = self.path.find_resource(filename)
+		if not node:
+			raise Errors.WafError('file not found ' + filename)
+		tsk = self.create_task('dbus_binding_tool', node, node.change_ext('.h'))
+		tsk.env.DBUS_BINDING_TOOL_PREFIX = prefix
+		tsk.env.DBUS_BINDING_TOOL_MODE   = mode
+
+class dbus_binding_tool(Task.Task):
+	"""
+	Compiles a dbus file
+	"""
+	color   = 'BLUE'
+	ext_out = ['.h']
+	run_str = '${DBUS_BINDING_TOOL} --prefix=${DBUS_BINDING_TOOL_PREFIX} --mode=${DBUS_BINDING_TOOL_MODE} --output=${TGT} ${SRC}'
+	shell   = True # temporary workaround for #795
+
+def configure(conf):
+	"""
+	Detects the program dbus-binding-tool and sets ``conf.env.DBUS_BINDING_TOOL``
+	"""
+	conf.find_program('dbus-binding-tool', var='DBUS_BINDING_TOOL')
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #!/usr/bin/env python
+# encoding: utf-8
+# Carlos Rafael Giani, 2007 (dv)
+# Thomas Nagy, 2008-2018 (ita)
+
+import sys
+from waflib.Tools import ar, d
+from waflib.Configure import conf
+
+@conf
+def find_dmd(conf):
+	"""
+	Finds the program *dmd*, *dmd2*, or *ldc* and set the variable *D*
+	"""
+	conf.find_program(['dmd', 'dmd2', 'ldc'], var='D')
+
+	# make sure that we're dealing with dmd1, dmd2, or ldc(1)
+	out = conf.cmd_and_log(conf.env.D + ['--help'])
+	if out.find("D Compiler v") == -1:
+		out = conf.cmd_and_log(conf.env.D + ['-version'])
+		if out.find("based on DMD v1.") == -1:
+			conf.fatal("detected compiler is not dmd/ldc")
+
+@conf
+def common_flags_ldc(conf):
+	"""
+	Sets the D flags required by *ldc*
+	"""
+	v = conf.env
+	v.DFLAGS        = ['-d-version=Posix']
+	v.LINKFLAGS     = []
+	v.DFLAGS_dshlib = ['-relocation-model=pic']
+
+@conf
+def common_flags_dmd(conf):
+	"""
+	Set the flags required by *dmd* or *dmd2*
+	"""
+	v = conf.env
+
+	v.D_SRC_F           = ['-c']
+	v.D_TGT_F           = '-of%s'
+
+	v.D_LINKER          = v.D
+	v.DLNK_SRC_F        = ''
+	v.DLNK_TGT_F        = '-of%s'
+	v.DINC_ST           = '-I%s'
+
+	v.DSHLIB_MARKER = v.DSTLIB_MARKER = ''
+	v.DSTLIB_ST = v.DSHLIB_ST         = '-L-l%s'
+	v.DSTLIBPATH_ST = v.DLIBPATH_ST   = '-L-L%s'
+
+	v.LINKFLAGS_dprogram= ['-quiet']
+
+	v.DFLAGS_dshlib     = ['-fPIC']
+	v.LINKFLAGS_dshlib  = ['-L-shared']
+
+	v.DHEADER_ext       = '.di'
+	v.DFLAGS_d_with_header = ['-H', '-Hf']
+	v.D_HDR_F           = '%s'
+
+def configure(conf):
+	"""
+	Configuration for *dmd*, *dmd2*, and *ldc*
+	"""
+	conf.find_dmd()
+
+	if sys.platform == 'win32':
+		out = conf.cmd_and_log(conf.env.D + ['--help'])
+		if out.find('D Compiler v2.') > -1:
+			conf.fatal('dmd2 on Windows is not supported, use gdc or ldc2 instead')
+
+	conf.load('ar')
+	conf.load('d')
+	conf.common_flags_dmd()
+	conf.d_platform_flags()
+
+	if str(conf.env.D).find('ldc') > -1:
+		conf.common_flags_ldc()
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #! /usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2011 (ita)
+
+"""
+Common mistakes highlighting.
+
+There is a performance impact, so this tool is only loaded when running ``waf -v``
+"""
+
+typos = {
+'feature':'features',
+'sources':'source',
+'targets':'target',
+'include':'includes',
+'export_include':'export_includes',
+'define':'defines',
+'importpath':'includes',
+'installpath':'install_path',
+'iscopy':'is_copy',
+'uses':'use',
+}
+
+meths_typos = ['__call__', 'program', 'shlib', 'stlib', 'objects']
+
+import sys
+from waflib import Logs, Build, Node, Task, TaskGen, ConfigSet, Errors, Utils
+from waflib.Tools import ccroot
+
+def check_same_targets(self):
+	mp = Utils.defaultdict(list)
+	uids = {}
+
+	def check_task(tsk):
+		if not isinstance(tsk, Task.Task):
+			return
+		if hasattr(tsk, 'no_errcheck_out'):
+			return
+
+		for node in tsk.outputs:
+			mp[node].append(tsk)
+		try:
+			uids[tsk.uid()].append(tsk)
+		except KeyError:
+			uids[tsk.uid()] = [tsk]
+
+	for g in self.groups:
+		for tg in g:
+			try:
+				for tsk in tg.tasks:
+					check_task(tsk)
+			except AttributeError:
+				# raised if not a task generator, which should be uncommon
+				check_task(tg)
+
+	dupe = False
+	for (k, v) in mp.items():
+		if len(v) > 1:
+			dupe = True
+			msg = '* Node %r is created more than once%s. The task generators are:' % (k, Logs.verbose == 1 and " (full message on 'waf -v -v')" or "")
+			Logs.error(msg)
+			for x in v:
+				if Logs.verbose > 1:
+					Logs.error('  %d. %r', 1 + v.index(x), x.generator)
+				else:
+					Logs.error('  %d. %r in %r', 1 + v.index(x), x.generator.name, getattr(x.generator, 'path', None))
+			Logs.error('If you think that this is an error, set no_errcheck_out on the task instance')
+
+	if not dupe:
+		for (k, v) in uids.items():
+			if len(v) > 1:
+				Logs.error('* Several tasks use the same identifier. Please check the information on\n   https://waf.io/apidocs/Task.html?highlight=uid#waflib.Task.Task.uid')
+				tg_details = tsk.generator.name
+				if Logs.verbose > 2:
+					tg_details = tsk.generator
+				for tsk in v:
+					Logs.error('  - object %r (%r) defined in %r', tsk.__class__.__name__, tsk, tg_details)
+
+def check_invalid_constraints(self):
+	feat = set()
+	for x in list(TaskGen.feats.values()):
+		feat.union(set(x))
+	for (x, y) in TaskGen.task_gen.prec.items():
+		feat.add(x)
+		feat.union(set(y))
+	ext = set()
+	for x in TaskGen.task_gen.mappings.values():
+		ext.add(x.__name__)
+	invalid = ext & feat
+	if invalid:
+		Logs.error('The methods %r have invalid annotations:  @extension <-> @feature/@before_method/@after_method', list(invalid))
+
+	# the build scripts have been read, so we can check for invalid after/before attributes on task classes
+	for cls in list(Task.classes.values()):
+		if sys.hexversion > 0x3000000 and issubclass(cls, Task.Task) and isinstance(cls.hcode, str):
+			raise Errors.WafError('Class %r has hcode value %r of type <str>, expecting <bytes> (use Utils.h_cmd() ?)' % (cls, cls.hcode))
+
+		for x in ('before', 'after'):
+			for y in Utils.to_list(getattr(cls, x, [])):
+				if not Task.classes.get(y):
+					Logs.error('Erroneous order constraint %r=%r on task class %r', x, y, cls.__name__)
+		if getattr(cls, 'rule', None):
+			Logs.error('Erroneous attribute "rule" on task class %r (rename to "run_str")', cls.__name__)
+
+def replace(m):
+	"""
+	Replaces existing BuildContext methods to verify parameter names,
+	for example ``bld(source=)`` has no ending *s*
+	"""
+	oldcall = getattr(Build.BuildContext, m)
+	def call(self, *k, **kw):
+		ret = oldcall(self, *k, **kw)
+		for x in typos:
+			if x in kw:
+				if x == 'iscopy' and 'subst' in getattr(self, 'features', ''):
+					continue
+				Logs.error('Fix the typo %r -> %r on %r', x, typos[x], ret)
+		return ret
+	setattr(Build.BuildContext, m, call)
+
+def enhance_lib():
+	"""
+	Modifies existing classes and methods to enable error verification
+	"""
+	for m in meths_typos:
+		replace(m)
+
+	# catch '..' in ant_glob patterns
+	def ant_glob(self, *k, **kw):
+		if k:
+			lst = Utils.to_list(k[0])
+			for pat in lst:
+				sp = pat.split('/')
+				if '..' in sp:
+					Logs.error("In ant_glob pattern %r: '..' means 'two dots', not 'parent directory'", k[0])
+				if '.' in sp:
+					Logs.error("In ant_glob pattern %r: '.' means 'one dot', not 'current directory'", k[0])
+		return self.old_ant_glob(*k, **kw)
+	Node.Node.old_ant_glob = Node.Node.ant_glob
+	Node.Node.ant_glob = ant_glob
+
+	# catch ant_glob on build folders
+	def ant_iter(self, accept=None, maxdepth=25, pats=[], dir=False, src=True, remove=True, quiet=False):
+		if remove:
+			try:
+				if self.is_child_of(self.ctx.bldnode) and not quiet:
+					quiet = True
+					Logs.error('Calling ant_glob on build folders (%r) is dangerous: add quiet=True / remove=False', self)
+			except AttributeError:
+				pass
+		return self.old_ant_iter(accept, maxdepth, pats, dir, src, remove, quiet)
+	Node.Node.old_ant_iter = Node.Node.ant_iter
+	Node.Node.ant_iter = ant_iter
+
+	# catch conflicting ext_in/ext_out/before/after declarations
+	old = Task.is_before
+	def is_before(t1, t2):
+		ret = old(t1, t2)
+		if ret and old(t2, t1):
+			Logs.error('Contradictory order constraints in classes %r %r', t1, t2)
+		return ret
+	Task.is_before = is_before
+
+	# check for bld(feature='cshlib') where no 'c' is given - this can be either a mistake or on purpose
+	# so we only issue a warning
+	def check_err_features(self):
+		lst = self.to_list(self.features)
+		if 'shlib' in lst:
+			Logs.error('feature shlib -> cshlib, dshlib or cxxshlib')
+		for x in ('c', 'cxx', 'd', 'fc'):
+			if not x in lst and lst and lst[0] in [x+y for y in ('program', 'shlib', 'stlib')]:
+				Logs.error('%r features is probably missing %r', self, x)
+	TaskGen.feature('*')(check_err_features)
+
+	# check for erroneous order constraints
+	def check_err_order(self):
+		if not hasattr(self, 'rule') and not 'subst' in Utils.to_list(self.features):
+			for x in ('before', 'after', 'ext_in', 'ext_out'):
+				if hasattr(self, x):
+					Logs.warn('Erroneous order constraint %r on non-rule based task generator %r', x, self)
+		else:
+			for x in ('before', 'after'):
+				for y in self.to_list(getattr(self, x, [])):
+					if not Task.classes.get(y):
+						Logs.error('Erroneous order constraint %s=%r on %r (no such class)', x, y, self)
+	TaskGen.feature('*')(check_err_order)
+
+	# check for @extension used with @feature/@before_method/@after_method
+	def check_compile(self):
+		check_invalid_constraints(self)
+		try:
+			ret = self.orig_compile()
+		finally:
+			check_same_targets(self)
+		return ret
+	Build.BuildContext.orig_compile = Build.BuildContext.compile
+	Build.BuildContext.compile = check_compile
+
+	# check for invalid build groups #914
+	def use_rec(self, name, **kw):
+		try:
+			y = self.bld.get_tgen_by_name(name)
+		except Errors.WafError:
+			pass
+		else:
+			idx = self.bld.get_group_idx(self)
+			odx = self.bld.get_group_idx(y)
+			if odx > idx:
+				msg = "Invalid 'use' across build groups:"
+				if Logs.verbose > 1:
+					msg += '\n  target %r\n  uses:\n  %r' % (self, y)
+				else:
+					msg += " %r uses %r (try 'waf -v -v' for the full error)" % (self.name, name)
+				raise Errors.WafError(msg)
+		self.orig_use_rec(name, **kw)
+	TaskGen.task_gen.orig_use_rec = TaskGen.task_gen.use_rec
+	TaskGen.task_gen.use_rec = use_rec
+
+	# check for env.append
+	def _getattr(self, name, default=None):
+		if name == 'append' or name == 'add':
+			raise Errors.WafError('env.append and env.add do not exist: use env.append_value/env.append_unique')
+		elif name == 'prepend':
+			raise Errors.WafError('env.prepend does not exist: use env.prepend_value')
+		if name in self.__slots__:
+			return super(ConfigSet.ConfigSet, self).__getattr__(name, default)
+		else:
+			return self[name]
+	ConfigSet.ConfigSet.__getattr__ = _getattr
+
+
+def options(opt):
+	"""
+	Error verification can be enabled by default (not just on ``waf -v``) by adding to the user script options
+	"""
+	enhance_lib()
+
+                                                                                                                                                                                                                                                                                                                                                                              #! /usr/bin/env python
+# encoding: utf-8
+# DC 2008
+# Thomas Nagy 2016-2018 (ita)
+
+"""
+Fortran support
+"""
+
+from waflib import Utils, Task, Errors
+from waflib.Tools import ccroot, fc_config, fc_scan
+from waflib.TaskGen import extension
+from waflib.Configure import conf
+
+ccroot.USELIB_VARS['fc'] = set(['FCFLAGS', 'DEFINES', 'INCLUDES', 'FCPPFLAGS'])
+ccroot.USELIB_VARS['fcprogram_test'] = ccroot.USELIB_VARS['fcprogram'] = set(['LIB', 'STLIB', 'LIBPATH', 'STLIBPATH', 'LINKFLAGS', 'RPATH', 'LINKDEPS', 'LDFLAGS'])
+ccroot.USELIB_VARS['fcshlib'] = set(['LIB', 'STLIB', 'LIBPATH', 'STLIBPATH', 'LINKFLAGS', 'RPATH', 'LINKDEPS', 'LDFLAGS'])
+ccroot.USELIB_VARS['fcstlib'] = set(['ARFLAGS', 'LINKDEPS'])
+
+@extension('.f','.F','.f90','.F90','.for','.FOR','.f95','.F95','.f03','.F03','.f08','.F08')
+def fc_hook(self, node):
+	"Binds the Fortran file extensions create :py:class:`waflib.Tools.fc.fc` instances"
+	return self.create_compiled_task('fc', node)
+
+@conf
+def modfile(conf, name):
+	"""
+	Turns a module name into the right module file name.
+	Defaults to all lower case.
+	"""
+	if name.find(':') >= 0:
+		# Depending on a submodule!
+		separator = conf.env.FC_SUBMOD_SEPARATOR or '@'
+		# Ancestors of the submodule will be prefixed to the
+		# submodule name, separated by a colon.
+		modpath = name.split(':')
+		# Only the ancestor (actual) module and the submodule name
+		# will be used for the filename.
+		modname = modpath[0] + separator + modpath[-1]
+		suffix = conf.env.FC_SUBMOD_SUFFIX or '.smod'
+	else:
+		modname = name
+		suffix = '.mod'
+
+	return {'lower'     :modname.lower() + suffix.lower(),
+		'lower.MOD' :modname.lower() + suffix.upper(),
+		'UPPER.mod' :modname.upper() + suffix.lower(),
+		'UPPER'     :modname.upper() + suffix.upper()}[conf.env.FC_MOD_CAPITALIZATION or 'lower']
+
+def get_fortran_tasks(tsk):
+	"""
+	Obtains all fortran tasks from the same build group. Those tasks must not have
+	the attribute 'nomod' or 'mod_fortran_done'
+
+	:return: a list of :py:class:`waflib.Tools.fc.fc` instances
+	"""
+	bld = tsk.generator.bld
+	tasks = bld.get_tasks_group(bld.get_group_idx(tsk.generator))
+	return [x for x in tasks if isinstance(x, fc) and not getattr(x, 'nomod', None) and not getattr(x, 'mod_fortran_done', None)]
+
+class fc(Task.Task):
+	"""
+	Fortran tasks can only run when all fortran tasks in a current task group are ready to be executed
+	This may cause a deadlock if some fortran task is waiting for something that cannot happen (circular dependency)
+	Should this ever happen, set the 'nomod=True' on those tasks instances to break the loop
+	"""
+	color = 'GREEN'
+	run_str = '${FC} ${FCFLAGS} ${FCINCPATH_ST:INCPATHS} ${FCDEFINES_ST:DEFINES} ${_FCMODOUTFLAGS} ${FC_TGT_F}${TGT[0].abspath()} ${FC_SRC_F}${SRC[0].abspath()} ${FCPPFLAGS}'
+	vars = ["FORTRANMODPATHFLAG"]
+
+	def scan(self):
+		"""Fortran dependency scanner"""
+		tmp = fc_scan.fortran_parser(self.generator.includes_nodes)
+		tmp.task = self
+		tmp.start(self.inputs[0])
+		return (tmp.nodes, tmp.names)
+
+	def runnable_status(self):
+		"""
+		Sets the mod file outputs and the dependencies on the mod files over all Fortran tasks
+		executed by the main thread so there are no concurrency issues
+		"""
+		if getattr(self, 'mod_fortran_done', None):
+			return super(fc, self).runnable_status()
+
+		# now, if we reach this part it is because this fortran task is the first in the list
+		bld = self.generator.bld
+
+		# obtain the fortran tasks
+		lst = get_fortran_tasks(self)
+
+		# disable this method for other tasks
+		for tsk in lst:
+			tsk.mod_fortran_done = True
+
+		# wait for all the .f tasks to be ready for execution
+		# and ensure that the scanners are called at least once
+		for tsk in lst:
+			ret = tsk.runnable_status()
+			if ret == Task.ASK_LATER:
+				# we have to wait for one of the other fortran tasks to be ready
+				# this may deadlock if there are dependencies between fortran tasks
+				# but this should not happen (we are setting them here!)
+				for x in lst:
+					x.mod_fortran_done = None
+
+				return Task.ASK_LATER
+
+		ins = Utils.defaultdict(set)
+		outs = Utils.defaultdict(set)
+
+		# the .mod files to create
+		for tsk in lst:
+			key = tsk.uid()
+			for x in bld.raw_deps[key]:
+				if x.startswith('MOD@'):
+					name = bld.modfile(x.replace('MOD@', ''))
+					node = bld.srcnode.find_or_declare(name)
+					tsk.set_outputs(node)
+					outs[node].add(tsk)
+
+		# the .mod files to use
+		for tsk in lst:
+			key = tsk.uid()
+			for x in bld.raw_deps[key]:
+				if x.startswith('USE@'):
+					name = bld.modfile(x.replace('USE@', ''))
+					node = bld.srcnode.find_resource(name)
+					if node and node not in tsk.outputs:
+						if not node in bld.node_deps[key]:
+							bld.node_deps[key].append(node)
+						ins[node].add(tsk)
+
+		# if the intersection matches, set the order
+		for k in ins.keys():
+			for a in ins[k]:
+				a.run_after.update(outs[k])
+				for x in outs[k]:
+					self.generator.bld.producer.revdeps[x].add(a)
+
+				# the scanner cannot output nodes, so we have to set them
+				# ourselves as task.dep_nodes (additional input nodes)
+				tmp = []
+				for t in outs[k]:
+					tmp.extend(t.outputs)
+				a.dep_nodes.extend(tmp)
+				a.dep_nodes.sort(key=lambda x: x.abspath())
+
+		# the task objects have changed: clear the signature cache
+		for tsk in lst:
+			try:
+				delattr(tsk, 'cache_sig')
+			except AttributeError:
+				pass
+
+		return super(fc, self).runnable_status()
+
+class fcprogram(ccroot.link_task):
+	"""Links Fortran programs"""
+	color = 'YELLOW'
+	run_str = '${FC} ${LINKFLAGS} ${FCLNK_SRC_F}${SRC} ${FCLNK_TGT_F}${TGT[0].abspath()} ${RPATH_ST:RPATH} ${FCSTLIB_MARKER} ${FCSTLIBPATH_ST:STLIBPATH} ${FCSTLIB_ST:STLIB} ${FCSHLIB_MARKER} ${FCLIBPATH_ST:LIBPATH} ${FCLIB_ST:LIB} ${LDFLAGS}'
+	inst_to = '${BINDIR}'
+
+class fcshlib(fcprogram):
+	"""Links Fortran libraries"""
+	inst_to = '${LIBDIR}'
+
+class fcstlib(ccroot.stlink_task):
+	"""Links Fortran static libraries (uses ar by default)"""
+	pass # do not remove the pass statement
+
+class fcprogram_test(fcprogram):
+	"""Custom link task to obtain compiler outputs for Fortran configuration tests"""
+
+	def runnable_status(self):
+		"""This task is always executed"""
+		ret = super(fcprogram_test, self).runnable_status()
+		if ret == Task.SKIP_ME:
+			ret = Task.RUN_ME
+		return ret
+
+	def exec_command(self, cmd, **kw):
+		"""Stores the compiler std our/err onto the build context, to bld.out + bld.err"""
+		bld = self.generator.bld
+
+		kw['shell'] = isinstance(cmd, str)
+		kw['stdout'] = kw['stderr'] = Utils.subprocess.PIPE
+		kw['cwd'] = self.get_cwd()
+		bld.out = bld.err = ''
+
+		bld.to_log('command: %s\n' % cmd)
+
+		kw['output'] = 0
+		try:
+			(bld.out, bld.err) = bld.cmd_and_log(cmd, **kw)
+		except Errors.WafError:
+			return -1
+
+		if bld.out:
+			bld.to_log('out: %s\n' % bld.out)
+		if bld.err:
+			bld.to_log('err: %s\n' % bld.err)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #! /usr/bin/env python
+# encoding: utf-8
+# DC 2008
+# Thomas Nagy 2016-2018 (ita)
+
+"""
+Fortran configuration helpers
+"""
+
+import re, os, sys, shlex
+from waflib.Configure import conf
+from waflib.TaskGen import feature, before_method
+
+FC_FRAGMENT = '        program main\n        end     program main\n'
+FC_FRAGMENT2 = '        PROGRAM MAIN\n        END\n' # what's the actual difference between these?
+
+@conf
+def fc_flags(conf):
+	"""
+	Defines common fortran configuration flags and file extensions
+	"""
+	v = conf.env
+
+	v.FC_SRC_F    = []
+	v.FC_TGT_F    = ['-c', '-o']
+	v.FCINCPATH_ST  = '-I%s'
+	v.FCDEFINES_ST  = '-D%s'
+
+	if not v.LINK_FC:
+		v.LINK_FC = v.FC
+
+	v.FCLNK_SRC_F = []
+	v.FCLNK_TGT_F = ['-o']
+
+	v.FCFLAGS_fcshlib   = ['-fpic']
+	v.LINKFLAGS_fcshlib = ['-shared']
+	v.fcshlib_PATTERN   = 'lib%s.so'
+
+	v.fcstlib_PATTERN   = 'lib%s.a'
+
+	v.FCLIB_ST       = '-l%s'
+	v.FCLIBPATH_ST   = '-L%s'
+	v.FCSTLIB_ST     = '-l%s'
+	v.FCSTLIBPATH_ST = '-L%s'
+	v.FCSTLIB_MARKER = '-Wl,-Bstatic'
+	v.FCSHLIB_MARKER = '-Wl,-Bdynamic'
+
+	v.SONAME_ST      = '-Wl,-h,%s'
+
+@conf
+def fc_add_flags(conf):
+	"""
+	Adds FCFLAGS / LDFLAGS / LINKFLAGS from os.environ to conf.env
+	"""
+	conf.add_os_flags('FCPPFLAGS', dup=False)
+	conf.add_os_flags('FCFLAGS', dup=False)
+	conf.add_os_flags('LINKFLAGS', dup=False)
+	conf.add_os_flags('LDFLAGS', dup=False)
+
+@conf
+def check_fortran(self, *k, **kw):
+	"""
+	Compiles a Fortran program to ensure that the settings are correct
+	"""
+	self.check_cc(
+		fragment         = FC_FRAGMENT,
+		compile_filename = 'test.f',
+		features         = 'fc fcprogram',
+		msg              = 'Compiling a simple fortran app')
+
+@conf
+def check_fc(self, *k, **kw):
+	"""
+	Same as :py:func:`waflib.Tools.c_config.check` but defaults to the *Fortran* programming language
+	(this overrides the C defaults in :py:func:`waflib.Tools.c_config.validate_c`)
+	"""
+	kw['compiler'] = 'fc'
+	if not 'compile_mode' in kw:
+		kw['compile_mode'] = 'fc'
+	if not 'type' in kw:
+		kw['type'] = 'fcprogram'
+	if not 'compile_filename' in kw:
+		kw['compile_filename'] = 'test.f90'
+	if not 'code' in kw:
+		kw['code'] = FC_FRAGMENT
+	return self.check(*k, **kw)
+
+# ------------------------------------------------------------------------
+# --- These are the default platform modifiers, refactored here for
+#     convenience.  gfortran and g95 have much overlap.
+# ------------------------------------------------------------------------
+
+@conf
+def fortran_modifier_darwin(conf):
+	"""
+	Defines Fortran flags and extensions for OSX systems
+	"""
+	v = conf.env
+	v.FCFLAGS_fcshlib   = ['-fPIC']
+	v.LINKFLAGS_fcshlib = ['-dynamiclib']
+	v.fcshlib_PATTERN   = 'lib%s.dylib'
+	v.FRAMEWORKPATH_ST  = '-F%s'
+	v.FRAMEWORK_ST      = ['-framework']
+
+	v.LINKFLAGS_fcstlib = []
+
+	v.FCSHLIB_MARKER    = ''
+	v.FCSTLIB_MARKER    = ''
+	v.SONAME_ST         = ''
+
+@conf
+def fortran_modifier_win32(conf):
+	"""
+	Defines Fortran flags for Windows platforms
+	"""
+	v = conf.env
+	v.fcprogram_PATTERN = v.fcprogram_test_PATTERN  = '%s.exe'
+
+	v.fcshlib_PATTERN   = '%s.dll'
+	v.implib_PATTERN    = '%s.dll.a'
+	v.IMPLIB_ST         = '-Wl,--out-implib,%s'
+
+	v.FCFLAGS_fcshlib   = []
+
+	# Auto-import is enabled by default even without this option,
+	# but enabling it explicitly has the nice effect of suppressing the rather boring, debug-level messages
+	# that the linker emits otherwise.
+	v.append_value('LINKFLAGS', ['-Wl,--enable-auto-import'])
+
+@conf
+def fortran_modifier_cygwin(conf):
+	"""
+	Defines Fortran flags for use on cygwin
+	"""
+	fortran_modifier_win32(conf)
+	v = conf.env
+	v.fcshlib_PATTERN = 'cyg%s.dll'
+	v.append_value('LINKFLAGS_fcshlib', ['-Wl,--enable-auto-image-base'])
+	v.FCFLAGS_fcshlib = []
+
+# ------------------------------------------------------------------------
+
+@conf
+def check_fortran_dummy_main(self, *k, **kw):
+	"""
+	Determines if a main function is needed by compiling a code snippet with
+	the C compiler and linking it with the Fortran compiler (useful on unix-like systems)
+	"""
+	if not self.env.CC:
+		self.fatal('A c compiler is required for check_fortran_dummy_main')
+
+	lst = ['MAIN__', '__MAIN', '_MAIN', 'MAIN_', 'MAIN']
+	lst.extend([m.lower() for m in lst])
+	lst.append('')
+
+	self.start_msg('Detecting whether we need a dummy main')
+	for main in lst:
+		kw['fortran_main'] = main
+		try:
+			self.check_cc(
+				fragment = 'int %s() { return 0; }\n' % (main or 'test'),
+				features = 'c fcprogram',
+				mandatory = True
+			)
+			if not main:
+				self.env.FC_MAIN = -1
+				self.end_msg('no')
+			else:
+				self.env.FC_MAIN = main
+				self.end_msg('yes %s' % main)
+			break
+		except self.errors.ConfigurationError:
+			pass
+	else:
+		self.end_msg('not found')
+		self.fatal('could not detect whether fortran requires a dummy main, see the config.log')
+
+# ------------------------------------------------------------------------
+
+GCC_DRIVER_LINE = re.compile('^Driving:')
+POSIX_STATIC_EXT = re.compile(r'\S+\.a')
+POSIX_LIB_FLAGS = re.compile(r'-l\S+')
+
+@conf
+def is_link_verbose(self, txt):
+	"""Returns True if 'useful' link options can be found in txt"""
+	assert isinstance(txt, str)
+	for line in txt.splitlines():
+		if not GCC_DRIVER_LINE.search(line):
+			if POSIX_STATIC_EXT.search(line) or POSIX_LIB_FLAGS.search(line):
+				return True
+	return False
+
+@conf
+def check_fortran_verbose_flag(self, *k, **kw):
+	"""
+	Checks what kind of verbose (-v) flag works, then sets it to env.FC_VERBOSE_FLAG
+	"""
+	self.start_msg('fortran link verbose flag')
+	for x in ('-v', '--verbose', '-verbose', '-V'):
+		try:
+			self.check_cc(
+				features = 'fc fcprogram_test',
+				fragment = FC_FRAGMENT2,
+				compile_filename = 'test.f',
+				linkflags = [x],
+				mandatory=True)
+		except self.errors.ConfigurationError:
+			pass
+		else:
+			# output is on stderr or stdout (for xlf)
+			if self.is_link_verbose(self.test_bld.err) or self.is_link_verbose(self.test_bld.out):
+				self.end_msg(x)
+				break
+	else:
+		self.end_msg('failure')
+		self.fatal('Could not obtain the fortran link verbose flag (see config.log)')
+
+	self.env.FC_VERBOSE_FLAG = x
+	return x
+
+# ------------------------------------------------------------------------
+
+# linkflags which match those are ignored
+LINKFLAGS_IGNORED = [r'-lang*', r'-lcrt[a-zA-Z0-9\.]*\.o', r'-lc$', r'-lSystem', r'-libmil', r'-LIST:*', r'-LNO:*']
+if os.name == 'nt':
+	LINKFLAGS_IGNORED.extend([r'-lfrt*', r'-luser32', r'-lkernel32', r'-ladvapi32', r'-lmsvcrt', r'-lshell32', r'-lmingw', r'-lmoldname'])
+else:
+	LINKFLAGS_IGNORED.append(r'-lgcc*')
+RLINKFLAGS_IGNORED = [re.compile(f) for f in LINKFLAGS_IGNORED]
+
+def _match_ignore(line):
+	"""Returns True if the line should be ignored (Fortran verbose flag test)"""
+	for i in RLINKFLAGS_IGNORED:
+		if i.match(line):
+			return True
+	return False
+
+def parse_fortran_link(lines):
+	"""Given the output of verbose link of Fortran compiler, this returns a
+	list of flags necessary for linking using the standard linker."""
+	final_flags = []
+	for line in lines:
+		if not GCC_DRIVER_LINE.match(line):
+			_parse_flink_line(line, final_flags)
+	return final_flags
+
+SPACE_OPTS = re.compile('^-[LRuYz]$')
+NOSPACE_OPTS = re.compile('^-[RL]')
+
+def _parse_flink_token(lexer, token, tmp_flags):
+	# Here we go (convention for wildcard is shell, not regex !)
+	#   1 TODO: we first get some root .a libraries
+	#   2 TODO: take everything starting by -bI:*
+	#   3 Ignore the following flags: -lang* | -lcrt*.o | -lc |
+	#   -lgcc* | -lSystem | -libmil | -LANG:=* | -LIST:* | -LNO:*)
+	#   4 take into account -lkernel32
+	#   5 For options of the kind -[[LRuYz]], as they take one argument
+	#   after, the actual option is the next token
+	#   6 For -YP,*: take and replace by -Larg where arg is the old
+	#   argument
+	#   7 For -[lLR]*: take
+
+	# step 3
+	if _match_ignore(token):
+		pass
+	# step 4
+	elif token.startswith('-lkernel32') and sys.platform == 'cygwin':
+		tmp_flags.append(token)
+	# step 5
+	elif SPACE_OPTS.match(token):
+		t = lexer.get_token()
+		if t.startswith('P,'):
+			t = t[2:]
+		for opt in t.split(os.pathsep):
+			tmp_flags.append('-L%s' % opt)
+	# step 6
+	elif NOSPACE_OPTS.match(token):
+		tmp_flags.append(token)
+	# step 7
+	elif POSIX_LIB_FLAGS.match(token):
+		tmp_flags.append(token)
+	else:
+		# ignore anything not explicitly taken into account
+		pass
+
+	t = lexer.get_token()
+	return t
+
+def _parse_flink_line(line, final_flags):
+	"""private"""
+	lexer = shlex.shlex(line, posix = True)
+	lexer.whitespace_split = True
+
+	t = lexer.get_token()
+	tmp_flags = []
+	while t:
+		t = _parse_flink_token(lexer, t, tmp_flags)
+
+	final_flags.extend(tmp_flags)
+	return final_flags
+
+@conf
+def check_fortran_clib(self, autoadd=True, *k, **kw):
+	"""
+	Obtains the flags for linking with the C library
+	if this check works, add uselib='CLIB' to your task generators
+	"""
+	if not self.env.FC_VERBOSE_FLAG:
+		self.fatal('env.FC_VERBOSE_FLAG is not set: execute check_fortran_verbose_flag?')
+
+	self.start_msg('Getting fortran runtime link flags')
+	try:
+		self.check_cc(
+			fragment = FC_FRAGMENT2,
+			compile_filename = 'test.f',
+			features = 'fc fcprogram_test',
+			linkflags = [self.env.FC_VERBOSE_FLAG]
+		)
+	except Exception:
+		self.end_msg(False)
+		if kw.get('mandatory', True):
+			conf.fatal('Could not find the c library flags')
+	else:
+		out = self.test_bld.err
+		flags = parse_fortran_link(out.splitlines())
+		self.end_msg('ok (%s)' % ' '.join(flags))
+		self.env.LINKFLAGS_CLIB = flags
+		return flags
+	return []
+
+def getoutput(conf, cmd, stdin=False):
+	"""
+	Obtains Fortran command outputs
+	"""
+	from waflib import Errors
+	if conf.env.env:
+		env = conf.env.env
+	else:
+		env = dict(os.environ)
+		env['LANG'] = 'C'
+	input = stdin and '\n'.encode() or None
+	try:
+		out, err = conf.cmd_and_log(cmd, env=env, output=0, input=input)
+	except Errors.WafError as e:
+		# An WafError might indicate an error code during the command
+		# execution, in this case we still obtain the stderr and stdout,
+		# which we can use to find the version string.
+		if not (hasattr(e, 'stderr') and hasattr(e, 'stdout')):
+			raise e
+		else:
+			# Ignore the return code and return the original
+			# stdout and stderr.
+			out = e.stdout
+			err = e.stderr
+	except Exception:
+		conf.fatal('could not determine the compiler version %r' % cmd)
+	return (out, err)
+
+# ------------------------------------------------------------------------
+
+ROUTINES_CODE = """\
+      subroutine foobar()
+      return
+      end
+      subroutine foo_bar()
+      return
+      end
+"""
+
+MAIN_CODE = """
+void %(dummy_func_nounder)s(void);
+void %(dummy_func_under)s(void);
+int %(main_func_name)s() {
+  %(dummy_func_nounder)s();
+  %(dummy_func_under)s();
+  return 0;
+}
+"""
+
+@feature('link_main_routines_func')
+@before_method('process_source')
+def link_main_routines_tg_method(self):
+	"""
+	The configuration test declares a unique task generator,
+	so we create other task generators from there for fortran link tests
+	"""
+	def write_test_file(task):
+		task.outputs[0].write(task.generator.code)
+	bld = self.bld
+	bld(rule=write_test_file, target='main.c', code=MAIN_CODE % self.__dict__)
+	bld(rule=write_test_file, target='test.f', code=ROUTINES_CODE)
+	bld(features='fc fcstlib', source='test.f', target='test')
+	bld(features='c fcprogram', source='main.c', target='app', use='test')
+
+def mangling_schemes():
+	"""
+	Generate triplets for use with mangle_name
+	(used in check_fortran_mangling)
+	the order is tuned for gfortan
+	"""
+	for u in ('_', ''):
+		for du in ('', '_'):
+			for c in ("lower", "upper"):
+				yield (u, du, c)
+
+def mangle_name(u, du, c, name):
+	"""Mangle a name from a triplet (used in check_fortran_mangling)"""
+	return getattr(name, c)() + u + (name.find('_') != -1 and du or '')
+
+@conf
+def check_fortran_mangling(self, *k, **kw):
+	"""
+	Detect the mangling scheme, sets FORTRAN_MANGLING to the triplet found
+
+	This test will compile a fortran static library, then link a c app against it
+	"""
+	if not self.env.CC:
+		self.fatal('A c compiler is required for link_main_routines')
+	if not self.env.FC:
+		self.fatal('A fortran compiler is required for link_main_routines')
+	if not self.env.FC_MAIN:
+		self.fatal('Checking for mangling requires self.env.FC_MAIN (execute "check_fortran_dummy_main" first?)')
+
+	self.start_msg('Getting fortran mangling scheme')
+	for (u, du, c) in mangling_schemes():
+		try:
+			self.check_cc(
+				compile_filename   = [],
+				features           = 'link_main_routines_func',
+				msg                = 'nomsg',
+				errmsg             = 'nomsg',
+				dummy_func_nounder = mangle_name(u, du, c, 'foobar'),
+				dummy_func_under   = mangle_name(u, du, c, 'foo_bar'),
+				main_func_name     = self.env.FC_MAIN
+			)
+		except self.errors.ConfigurationError:
+			pass
+		else:
+			self.end_msg("ok ('%s', '%s', '%s-case')" % (u, du, c))
+			self.env.FORTRAN_MANGLING = (u, du, c)
+			break
+	else:
+		self.end_msg(False)
+		self.fatal('mangler not found')
+	return (u, du, c)
+
+@feature('pyext')
+@before_method('propagate_uselib_vars', 'apply_link')
+def set_lib_pat(self):
+	"""Sets the Fortran flags for linking with Python"""
+	self.env.fcshlib_PATTERN = self.env.pyext_PATTERN
+
+@conf
+def detect_openmp(self):
+	"""
+	Detects openmp flags and sets the OPENMP ``FCFLAGS``/``LINKFLAGS``
+	"""
+	for x in ('-fopenmp','-openmp','-mp','-xopenmp','-omp','-qsmp=omp'):
+		try:
+			self.check_fc(
+				msg          = 'Checking for OpenMP flag %s' % x,
+				fragment     = 'program main\n  call omp_get_num_threads()\nend program main',
+				fcflags      = x,
+				linkflags    = x,
+				uselib_store = 'OPENMP'
+			)
+		except self.errors.ConfigurationError:
+			pass
+		else:
+			break
+	else:
+		self.fatal('Could not find OpenMP')
+
+@conf
+def check_gfortran_o_space(self):
+	if self.env.FC_NAME != 'GFORTRAN' or int(self.env.FC_VERSION[0]) > 4:
+		# This is for old compilers and only for gfortran.
+		# No idea how other implementations handle this. Be safe and bail out.
+		return
+	self.env.stash()
+	self.env.FCLNK_TGT_F = ['-o', '']
+	try:
+		self.check_fc(msg='Checking if the -o link must be split from arguments', fragment=FC_FRAGMENT, features='fc fcshlib')
+	except self.errors.ConfigurationError:
+		self.env.revert()
+	else:
+		self.env.commit()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #! /usr/bin/env python
+# encoding: utf-8
+# DC 2008
+# Thomas Nagy 2016-2018 (ita)
+
+import re
+
+INC_REGEX = r"""(?:^|['">]\s*;)\s*(?:|#\s*)INCLUDE\s+(?:\w+_)?[<"'](.+?)(?=["'>])"""
+USE_REGEX = r"""(?:^|;)\s*USE(?:\s+|(?:(?:\s*,\s*(?:NON_)?INTRINSIC)?\s*::))\s*(\w+)"""
+MOD_REGEX = r"""(?:^|;)\s*MODULE(?!\s+(?:PROCEDURE|SUBROUTINE|FUNCTION))\s+(\w+)"""
+SMD_REGEX = r"""(?:^|;)\s*SUBMODULE\s*\(([\w:]+)\)\s*(\w+)"""
+
+re_inc = re.compile(INC_REGEX, re.I)
+re_use = re.compile(USE_REGEX, re.I)
+re_mod = re.compile(MOD_REGEX, re.I)
+re_smd = re.compile(SMD_REGEX, re.I)
+
+class fortran_parser(object):
+	"""
+	This parser returns:
+
+	* the nodes corresponding to the module names to produce
+	* the nodes corresponding to the include files used
+	* the module names used by the fortran files
+	"""
+	def __init__(self, incpaths):
+		self.seen = []
+		"""Files already parsed"""
+
+		self.nodes = []
+		"""List of :py:class:`waflib.Node.Node` representing the dependencies to return"""
+
+		self.names = []
+		"""List of module names to return"""
+
+		self.incpaths = incpaths
+		"""List of :py:class:`waflib.Node.Node` representing the include paths"""
+
+	def find_deps(self, node):
+		"""
+		Parses a Fortran file to obtain the dependencies used/provided
+
+		:param node: fortran file to read
+		:type node: :py:class:`waflib.Node.Node`
+		:return: lists representing the includes, the modules used, and the modules created by a fortran file
+		:rtype: tuple of list of strings
+		"""
+		txt = node.read()
+		incs = []
+		uses = []
+		mods = []
+		for line in txt.splitlines():
+			# line by line regexp search? optimize?
+			m = re_inc.search(line)
+			if m:
+				incs.append(m.group(1))
+			m = re_use.search(line)
+			if m:
+				uses.append(m.group(1))
+			m = re_mod.search(line)
+			if m:
+				mods.append(m.group(1))
+			m = re_smd.search(line)
+			if m:
+				uses.append(m.group(1))
+				mods.append('{0}:{1}'.format(m.group(1),m.group(2)))
+		return (incs, uses, mods)
+
+	def start(self, node):
+		"""
+		Start parsing. Use the stack ``self.waiting`` to hold nodes to iterate on
+
+		:param node: fortran file
+		:type node: :py:class:`waflib.Node.Node`
+		"""
+		self.waiting = [node]
+		while self.waiting:
+			nd = self.waiting.pop(0)
+			self.iter(nd)
+
+	def iter(self, node):
+		"""
+		Processes a single file during dependency parsing. Extracts files used
+		modules used and modules provided.
+		"""
+		incs, uses, mods = self.find_deps(node)
+		for x in incs:
+			if x in self.seen:
+				continue
+			self.seen.append(x)
+			self.tryfind_header(x)
+
+		for x in uses:
+			name = "USE@%s" % x
+			if not name in self.names:
+				self.names.append(name)
+
+		for x in mods:
+			name = "MOD@%s" % x
+			if not name in self.names:
+				self.names.append(name)
+
+	def tryfind_header(self, filename):
+		"""
+		Adds an include file to the list of nodes to process
+
+		:param filename: file name
+		:type filename: string
+		"""
+		found = None
+		for n in self.incpaths:
+			found = n.find_resource(filename)
+			if found:
+				self.nodes.append(found)
+				self.waiting.append(found)
+				break
+		if not found:
+			if not filename in self.names:
+				self.names.append(filename)
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #!/usr/bin/env python
+# encoding: utf-8
+# John O'Meara, 2006
+# Thomas Nagy, 2006-2018 (ita)
+
+"""
+The **flex** program is a code generator which creates C or C++ files.
+The generated files are compiled into object files.
+"""
+
+import os, re
+from waflib import Task, TaskGen
+from waflib.Tools import ccroot
+
+def decide_ext(self, node):
+	if 'cxx' in self.features:
+		return ['.lex.cc']
+	return ['.lex.c']
+
+def flexfun(tsk):
+	env = tsk.env
+	bld = tsk.generator.bld
+	wd = bld.variant_dir
+	def to_list(xx):
+		if isinstance(xx, str):
+			return [xx]
+		return xx
+	tsk.last_cmd = lst = []
+	lst.extend(to_list(env.FLEX))
+	lst.extend(to_list(env.FLEXFLAGS))
+	inputs = [a.path_from(tsk.get_cwd()) for a in tsk.inputs]
+	if env.FLEX_MSYS:
+		inputs = [x.replace(os.sep, '/') for x in inputs]
+	lst.extend(inputs)
+	lst = [x for x in lst if x]
+	txt = bld.cmd_and_log(lst, cwd=wd, env=env.env or None, quiet=0)
+	tsk.outputs[0].write(txt.replace('\r\n', '\n').replace('\r', '\n')) # issue #1207
+
+TaskGen.declare_chain(
+	name = 'flex',
+	rule = flexfun, # issue #854
+	ext_in = '.l',
+	decider = decide_ext,
+)
+
+# To support the following:
+# bld(features='c', flexflags='-P/foo')
+Task.classes['flex'].vars = ['FLEXFLAGS', 'FLEX']
+ccroot.USELIB_VARS['c'].add('FLEXFLAGS')
+ccroot.USELIB_VARS['cxx'].add('FLEXFLAGS')
+
+def configure(conf):
+	"""
+	Detect the *flex* program
+	"""
+	conf.find_program('flex', var='FLEX')
+	conf.env.FLEXFLAGS = ['-t']
+
+	if re.search (r"\\msys\\[0-9.]+\\bin\\flex.exe$", conf.env.FLEX[0]):
+		# this is the flex shipped with MSYS
+		conf.env.FLEX_MSYS = True
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               #! /usr/bin/env python
+# encoding: utf-8
+# KWS 2010
+# Thomas Nagy 2016-2018 (ita)
+
+import re
+from waflib import Utils
+from waflib.Tools import fc, fc_config, fc_scan, ar
+from waflib.Configure import conf
+
+@conf
+def find_g95(conf):
+	fc = conf.find_program('g95', var='FC')
+	conf.get_g95_version(fc)
+	conf.env.FC_NAME = 'G95'
+
+@conf
+def g95_flags(conf):
+	v = conf.env
+	v.FCFLAGS_fcshlib   = ['-fPIC']
+	v.FORTRANMODFLAG  = ['-fmod=', ''] # template for module path
+	v.FCFLAGS_DEBUG = ['-Werror'] # why not
+
+@conf
+def g95_modifier_win32(conf):
+	fc_config.fortran_modifier_win32(conf)
+
+@conf
+def g95_modifier_cygwin(conf):
+	fc_config.fortran_modifier_cygwin(conf)
+
+@conf
+def g95_modifier_darwin(conf):
+	fc_config.fortran_modifier_darwin(conf)
+
+@conf
+def g95_modifier_platform(conf):
+	dest_os = conf.env.DEST_OS or Utils.unversioned_sys_platform()
+	g95_modifier_func = getattr(conf, 'g95_modifier_' + dest_os, None)
+	if g95_modifier_func:
+		g95_modifier_func()
+
+@conf
+def get_g95_version(conf, fc):
+	"""get the compiler version"""
+
+	version_re = re.compile(r"g95\s*(?P<major>\d*)\.(?P<minor>\d*)").search
+	cmd = fc + ['--version']
+	out, err = fc_config.getoutput(conf, cmd, stdin=False)
+	if out:
+		match = version_re(out)
+	else:
+		match = version_re(err)
+	if not match:
+		conf.fatal('cannot determine g95 version')
+	k = match.groupdict()
+	conf.env.FC_VERSION = (k['major'], k['minor'])
+
+def configure(conf):
+	conf.find_g95()
+	conf.find_ar()
+	conf.fc_flags()
+	conf.fc_add_flags()
+	conf.g95_flags()
+	conf.g95_modifier_platform()
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2008-2018 (ita)
+
+"Detect as/gas/gcc for compiling assembly files"
+
+import waflib.Tools.asm # - leave this
+from waflib.Tools import ar
+
+def configure(conf):
+	"""
+	Find the programs gas/as/gcc and set the variable *AS*
+	"""
+	conf.find_program(['gas', 'gcc'], var='AS')
+	conf.env.AS_TGT_F = ['-c', '-o']
+	conf.env.ASLNK_TGT_F = ['-o']
+	conf.find_ar()
+	conf.load('asm')
+	conf.env.ASM_NAME = 'gas'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                #!/usr/bin/env python
+# encoding: utf-8
+# Thomas Nagy, 2006-2018 (ita)
+# Ralf Habacker, 2006 (rh)
+# Yinon Ehrlich, 2009
+
+"""
+gcc/llvm detection.
+"""
+
+from waflib.Tools import ccroot, ar
+from waflib.Configure import conf
+
+@conf
+def find_gcc(conf):
+	"""
+	Find the program gcc, and if present, try to detect its version number
+	"""
+	cc = conf.find_program(['gcc', 'cc'], var='CC')
+	conf.get_cc_version(cc, gcc=True)
+	conf.env.CC_NAME = 'gcc'
+
+@conf
+def gcc_common_flags(conf):
+	"""
+	Common flags for gcc on nearly all platforms
+	"""
+	v = conf.env
+
+	v.CC_SRC_F            = []
+	v.CC_TGT_F            = ['-c', '-o']
+
+	if not v.LINK_CC:
+		v.LINK_CC = v.CC
+
+	v.CCLNK_SRC_F         = []
+	v.CCLNK_TGT_F         = ['-o']
+	v.CPPPATH_ST          = '-I%s'
+	v.DEFINES_ST          = '-D%s'
+
+	v.LIB_ST              = '-l%s' # template for adding libs
+	v.LIBPATH_ST          = '-L%s' # template for adding libpaths
+	v.STLIB_ST            = '-l%s'
+	v.STLIBPATH_ST        = '-L%s'
+	v.RPATH_ST            = '-Wl,-rpath,%s'
+
+	v.SONAME_ST           = '-Wl,-h,%s'
+	v.SHLIB_MARKER        = '-Wl,-Bdynamic'
+	v.STLIB_MARKER        = '-Wl,-Bstatic'
+
+	v.cprogram_PATTERN    = '%s'
+
+	v.CFLAGS_cshlib       = ['-fPIC']
+	v.LINKFLAGS_cshlib    = ['-shared']
+	v.cshlib_PATTERN      = 'lib%s.so'
+
+	v.LINKFLAGS_cstlib    = ['-Wl,-Bstatic']
+	v.cstlib_PATTERN      = 'lib%s.a'
+
+	v.LINKFLAGS_MACBUNDLE = ['-bundle', '-undefined', 'dynamic_lookup']
+	v.CFLAGS_MACBUNDLE    = ['-fPIC']
+	v.macbundle_PATTERN   = '%s.bundle'
+
+@conf
+def gcc_modifier_win32(conf):
+	"""Configuration flags for executing gcc on Windows"""
+	v = conf.env
+	v.cprogram_PATTERN    = '%s.exe'
+
+	v.cshlib_PATTERN      = '%s.dll'
+	v.implib_PATTERN      = '%s.dll.a'
+	v.IMPLIB_ST           = '-Wl,--out-implib,%s'
+
+	v.CFLAGS_cshlib       = []
+
+	# Auto-import is enabled by default even without this option,
+	# but enabling it explicitly has the nice effect of suppressing the rather boring, debug-level messages
+	# that the linker emits otherwise.
+	import sys
+	if sys.platform != "cygwin":
+		# disabled on cygwin as it breaks build with arm cross compiler
+		v.append_value('LINKFLAGS', ['-Wl,--enable-auto-import'])
+
+@conf
+def gcc_modifier_cygwin(conf):
+	"""Configuration flags for executing gcc on Cygwin"""
+	gcc_modifier_win32(conf)
+	v = conf.env
+	v.cshlib_PATTERN = 'cyg%s.dll'
+	v.append_value('LINKFLAGS_cshlib', ['-Wl,--enable-auto-image-base'])
+	v.CFLAGS_cshlib = []
+
+@conf
+def gcc_modifier_darwin(conf):
+	"""Configuration flags for executing gcc on MacOS"""
+	v = conf.env
+	v.CFLAGS_cshlib       = ['-fPIC']
+	v.LINKFLAGS_cshlib    = ['-dynamiclib']
+	v.cshlib_PATTERN      = 'lib%s.dylib'
+	v.FRAMEWORKPATH_ST    = '-F%s'
+	v.FRAMEWORK_ST        = ['-framework']
+	v.ARCH_ST             = ['-arch']
+
+	v.LINKFLAGS_cstlib    = []
+
+	v.SHLIB_MARKER        = []
+	v.STLIB_MARKER        = []
+	v.SONAME_ST           = []
+
+@conf
+def gcc_modifier_aix(conf):
+	"""Configuration flags for executing gcc on AIX"""
+	v = conf.env
+	v.LINKFLAGS_cprogram  = ['-Wl,-brtl']
+	v.LINKFLAGS_cshlib    = ['-shared','-Wl,-brtl,-bexpfull']
+	v.SHLIB_MARKER        = []
+
+@conf
+def gcc_modifier_hpux(conf):
+	v = conf.env
+	v.SHLIB_MARKER        = []
+	v.STLIB_MARKER        = []
+	v.CFLAGS_cshlib       = ['-fPIC','-DPIC']
+	v.cshlib_PATTERN      = 'lib%s.sl'
+
+@conf
+def gcc_modifier_openbsd(conf):
+	conf.env.SONAME_ST = []
+
+@conf
+def gcc_modifier_osf1V(conf):
+	v = conf.env
+	v.SHLIB_MARKER        = []
+	v.STLIB_MARKER        = []
+	v.SONAME_ST           = []
+
+@conf
+def gcc_modifier_platform(conf):
+	"""Execute platform-specific functions based on *gcc_modifier_+NAME*"""
+	# * set configurations specific for a platform.
+	# * the destination platform is detected automatically by looking at the macros the compiler predefines,
+	#   and if it's not recognised, it fallbacks to sys.platform.
+	gcc_modifier_func = getattr(conf, 'gcc_modifier_' + conf.env.DEST_OS, None)
+	if gcc_modifier_func:
+		gcc_modifier_func()
+
+def configure(conf):
+	"""
+	Configuration for gcc
+	"""
+	conf.find_gcc()
+	conf.find_ar()
+	conf.gcc_common_flags()
+	conf.gcc_modifier_platform()
+	conf.cc_load_tools()
+	conf.cc_add_flags()
+	con

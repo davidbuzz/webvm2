@@ -1,0 +1,3035 @@
+rride for next iteration
+                roll_mode = RPMode::PILOT_OVERRIDE;
+            }
+
+            // calculate controller_to_pilot mix ratio
+            controller_to_pilot_roll_mix = (float)controller_to_pilot_timer_roll / (float)POSHOLD_CONTROLLER_TO_PILOT_MIX_TIMER;
+
+            // mix final loiter lean angle and pilot desired lean angles
+            roll = mix_controls(controller_to_pilot_roll_mix, controller_final_roll, pilot_roll + wind_comp_roll);
+            break;
+    }
+
+    // Pitch state machine
+    //  Each state (aka mode) is responsible for:
+    //      1. dealing with pilot input
+    //      2. calculating the final pitch output to the attitude contpitcher
+    //      3. checking if the state (aka mode) should be changed and if 'yes' perform any required initialisation for the new state
+    switch (pitch_mode) {
+
+        case RPMode::PILOT_OVERRIDE:
+            // update pilot desired pitch angle using latest radio input
+            //  this filters the input so that it returns to zero no faster than the brake-rate
+            update_pilot_lean_angle(pilot_pitch, target_pitch);
+
+            // switch to BRAKE mode for next iteration if no pilot input
+            if (is_zero(target_pitch) && (fabsf(pilot_pitch) < 2 * g.poshold_brake_rate)) {
+                // initialise BRAKE mode
+                pitch_mode = RPMode::BRAKE;       // set brake pitch mode
+                brake.pitch = 0.0f;                 // initialise braking angle to zero
+                brake.angle_max_pitch = 0.0f;       // reset brake_angle_max so we can detect when vehicle begins to flatten out during braking
+                brake.timeout_pitch = POSHOLD_BRAKE_TIME_ESTIMATE_MAX; // number of cycles the brake will be applied, updated during braking mode.
+                brake.time_updated_pitch = false;   // flag the braking time can be re-estimated
+            }
+
+            // final lean angle should be pilot input plus wind compensation
+            pitch = pilot_pitch + wind_comp_pitch;
+            break;
+
+        case RPMode::BRAKE:
+        case RPMode::BRAKE_READY_TO_LOITER:
+            // calculate brake_pitch angle to counter-act velocity
+            update_brake_angle_from_velocity(brake.pitch, -vel_fw);
+
+            // update braking time estimate
+            if (!brake.time_updated_pitch) {
+                // check if brake angle is increasing
+                if (fabsf(brake.pitch) >= brake.angle_max_pitch) {
+                    brake.angle_max_pitch = fabsf(brake.pitch);
+                } else {
+                    // braking angle has started decreasing so re-estimate braking time
+                    brake.timeout_pitch = 1+(uint16_t)(LOOP_RATE_FACTOR*15L*(int32_t)(fabsf(brake.pitch))/(10L*(int32_t)g.poshold_brake_rate));  // the 1.2 (12/10) factor has to be tuned in flight, here it means 120% of the "normal" time.
+                    brake.time_updated_pitch = true;
+                }
+            }
+
+            // if velocity is very low reduce braking time to 0.5seconds
+            if ((fabsf(vel_fw) <= POSHOLD_SPEED_0) && (brake.timeout_pitch > 50*LOOP_RATE_FACTOR)) {
+                brake.timeout_pitch = 50*LOOP_RATE_FACTOR;
+            }
+
+            // reduce braking timer
+            if (brake.timeout_pitch > 0) {
+                brake.timeout_pitch--;
+            } else {
+                // indicate that we are ready to move to Loiter.
+                // Loiter will only actually be engaged once both pitch_mode and pitch_mode are changed to RPMode::BRAKE_READY_TO_LOITER
+                //  logic for engaging loiter is handled below the pitch and pitch mode switch statements
+                pitch_mode = RPMode::BRAKE_READY_TO_LOITER;
+            }
+
+            // final lean angle is braking angle + wind compensation angle
+            pitch = brake.pitch + wind_comp_pitch;
+
+            // check for pilot input
+            if (!is_zero(target_pitch)) {
+                // init transition to pilot override
+                pitch_controller_to_pilot_override();
+            }
+            break;
+
+        case RPMode::BR#include "Copter.h"
+
+/*
+  mavlink motor test - implements the MAV_CMD_DO_MOTOR_TEST mavlink command so that the GCS/pilot can test an individual motor or flaps
+                       to ensure proper wiring, rotation.
+ */
+
+// motor test definitions
+#define MOTOR_TEST_TIMEOUT_SEC          600     // max timeout is 10 minutes (600 seconds)
+
+static uint32_t motor_test_start_ms;        // system time the motor test began
+static uint32_t motor_test_timeout_ms;      // test will timeout this many milliseconds after the motor_test_start_ms
+static uint8_t motor_test_seq;              // motor sequence number of motor being tested
+static uint8_t motor_test_count;            // number of motors to test
+static uint8_t motor_test_throttle_type;    // motor throttle type (0=throttle percentage, 1=PWM, 2=pilot throttle channel pass-through)
+static float motor_test_throttle_value;  // throttle to be sent to motor, value depends upon it's type
+
+// motor_test_output - checks for timeout and sends updates to motors objects
+void Copter::motor_test_output()
+{
+    // exit immediately if the motor test is not running
+    if (!ap.motor_test) {
+        return;
+    }
+
+    EXPECT_DELAY_MS(2000);
+
+    // check for test timeout
+    uint32_t now = AP_HAL::millis();
+    if ((now - motor_test_start_ms) >= motor_test_timeout_ms) {
+        if (motor_test_count > 1) {
+            if (now - motor_test_start_ms < motor_test_timeout_ms*1.5) {
+                // output zero for 50% of the test time
+                motors->output_min();
+            } else {
+                // move onto next motor
+                motor_test_seq++;
+                motor_test_count--;
+                motor_test_start_ms = now;
+                if (!motors->armed()) {
+                    motors->armed(true);
+                    hal.util->set_soft_armed(true);
+                }
+            }
+            return;
+        }
+        // stop motor test
+        motor_test_stop();
+    } else {
+        int16_t pwm = 0;   // pwm that will be output to the motors
+
+        // calculate pwm based on throttle type
+        switch (motor_test_throttle_type) {
+
+            case MOTOR_TEST_COMPASS_CAL:
+                compass.set_voltage(battery.voltage());
+                compass.per_motor_calibration_update();
+                FALLTHROUGH;
+
+            case MOTOR_TEST_THROTTLE_PERCENT:
+                // sanity check motor_test_throttle value
+#if FRAME_CONFIG != HELI_FRAME
+                if (motor_test_throttle_value <= 100) {
+                    int16_t pwm_min = motors->get_pwm_output_min();
+                    int16_t pwm_max = motors->get_pwm_output_max();
+                    pwm = (int16_t) (pwm_min + (pwm_max - pwm_min) * motor_test_throttle_value * 1e-2f);
+                }
+#endif
+                break;
+
+            case MOTOR_TEST_THROTTLE_PWM:
+                pwm = (int16_t)motor_test_throttle_value;
+                break;
+
+            case MOTOR_TEST_THROTTLE_PILOT:
+                pwm = channel_throttle->get_radio_in();
+                break;
+
+            default:
+                motor_test_stop();
+                return;
+        }
+
+        // sanity check throttle values
+        if (pwm >= RC_Channel::RC_MIN_LIMIT_PWM && pwm <= RC_Channel::RC_MAX_LIMIT_PWM) {
+            // turn on motor to specified pwm value
+            motors->output_test_seq(motor_test_seq, pwm);
+        } else {
+            motor_test_stop();
+        }
+    }
+}
+
+// mavlink_motor_test_check - perform checks before motor tests can begin
+//  return true if tests can continue, false if not
+bool Copter::mavlink_motor_control_check(const GCS_MAVLINK &gcs_chan, bool check_rc, const char* mode)
+{
+    // check board has initialised
+    if (!ap.initialised) {
+        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: Board initialising", mode);
+        return false;
+    }
+
+    // Check Motor test is allowed
+    char failure_msg[50] {};
+    if (!motors->motor_test_checks(ARRAY_SIZE(failure_msg), failure_msg)) {
+        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: %s", mode, failure_msg);
+        return false;
+    }
+
+    // check rc has been calibrated
+    if (check_rc && !arming.rc_calibration_checks(true)) {
+        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: RC not calibrated", mode);
+        return false;
+    }
+
+    // ensure we are landed
+    if (!ap.land_complete) {
+        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: vehicle not landed", mode);
+        return false;
+    }
+
+    // check if safety switch has been pushed
+    if (hal.util->safety_switch_state() == AP_HAL::Util::SAFETY_DISARMED) {
+        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: Safety switch", mode);
+        return false;
+    }
+
+    // check E-Stop is not active
+    if (SRV_Channels::get_emergency_stop()) {
+        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: Motor Emergency Stopped", mode);
+        return false;
+    }
+
+    // if we got this far the check was successful and the motor test can continue
+    return true;
+}
+
+// mavlink_motor_test_start - start motor test - spin a single motor at a specified pwm
+//  returns MAV_RESULT_ACCEPTED on success, MAV_RESULT_FAILED on failure
+MAV_RESULT Copter::mavlink_motor_test_start(const GCS_MAVLINK &gcs_chan, uint8_t motor_seq, uint8_t throttle_type, float throttle_value,
+                                         float timeout_sec, uint8_t motor_count)
+{
+    if (motor_count == 0) {
+        motor_count = 1;
+    }
+    // if test has not started try to start it
+    if (!ap.motor_test) {
+        /* perform checks that it is ok to start test
+           The RC calibrated check can be skipped if direct pwm is
+           supplied
+        */
+        if (!mavlink_motor_control_check(gcs_chan, throttle_type != 1, "Motor Test")) {
+            return MAV_RESULT_FAILED;
+        } else {
+            // start test
+            gcs().send_text(MAV_SEVERITY_INFO, "starting motor test");
+            ap.motor_test = true;
+
+            EXPECT_DELAY_MS(3000);
+            // enable and arm motors
+            if (!motors->armed()) {
+                motors->output_min();  // output lowest possible value to motors
+                motors->armed(true);
+                hal.util->set_soft_armed(true);
+            }
+
+            // disable throttle and gps failsafe
+            g.failsafe_throttle.set(FS_THR_DISABLED);
+            g.failsafe_gcs.set(FS_GCS_DISABLED);
+            g.fs_ekf_action.set(0);
+
+            // turn on notify leds
+            AP_Notify::flags.esc_calibration = true;
+        }
+    }
+
+    // set timeout
+    motor_test_start_ms = AP_HAL::millis();
+    motor_test_timeout_ms = MIN(timeout_sec, MOTOR_TEST_TIMEOUT_SEC) * 1000;
+
+    // store required output
+    motor_test_seq = motor_seq;
+    motor_test_count = motor_count;
+    motor_test_throttle_type = throttle_type;
+    motor_test_throttle_value = throttle_value;
+
+    if (motor_test_throttle_type == MOTOR_TEST_COMPASS_CAL) {
+        compass.per_motor_calibration_start();
+    }            
+
+    // return success
+    return MAV_RESULT_ACCEPTED;
+}
+
+// motor_test_stop - stops the motor test
+void Copter::motor_test_stop()
+{
+    // exit immediately if the test is not running
+    if (!ap.motor_test) {
+        return;
+    }
+
+    gcs().send_text(MAV_SEVERITY_INFO, "finished motor test");    
+
+    // flag test is complete
+    ap.motor_test = false;
+
+    // disarm motors
+    motors->armed(false);
+    hal.util->set_soft_armed(false);
+
+    // reset timeout
+    motor_test_start_ms = 0;
+    motor_test_timeout_ms = 0;
+
+    // re-enable failsafes
+    g.failsafe_throttle.load();
+    g.failsafe_gcs.load();
+    g.fs_ekf_action.load();
+
+    if (motor_test_throttle_type == MOTOR_TEST_COMPASS_CAL) {
+        compass.per_motor_calibration_end();
+    }
+
+    // turn off notify leds
+    AP_Notify::flags.esc_calibration = false;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                           #include "Copter.h"
+
+#define ARM_DELAY               20  // called at 10hz so 2 seconds
+#define DISARM_DELAY            20  // called at 10hz so 2 seconds
+#define AUTO_TRIM_DELAY         100 // called at 10hz so 10 seconds
+#define LOST_VEHICLE_DELAY      10  // called at 10hz so 1 second
+
+static uint32_t auto_disarm_begin;
+
+// arm_motors_check - checks for pilot input to arm or disarm the copter
+// called at 10hz
+void Copter::arm_motors_check()
+{
+    static int16_t arming_counter;
+
+    // check if arming/disarm using rudder is allowed
+    AP_Arming::RudderArming arming_rudder = arming.get_rudder_arming_type();
+    if (arming_rudder == AP_Arming::RudderArming::IS_DISABLED) {
+        arming_counter = 0;
+        return;
+    }
+
+#if TOY_MODE_ENABLED == ENABLED
+    if (g2.toy_mode.enabled()) {
+        // not armed with sticks in toy mode
+        return;
+    }
+#endif
+
+    // ensure throttle is down
+    if (channel_throttle->get_control_in() > 0) {
+        arming_counter = 0;
+        return;
+    }
+
+    int16_t yaw_in = channel_yaw->get_control_in();
+
+    // full right
+    if (yaw_in > 4000) {
+
+        // increase the arming counter to a maximum of 1 beyond the auto trim counter
+        if (arming_counter <= AUTO_TRIM_DELAY) {
+            arming_counter++;
+        }
+
+        // arm the motors and configure for flight
+        if (arming_counter == ARM_DELAY && !motors->armed()) {
+            // reset arming counter if arming fail
+            if (!arming.arm(AP_Arming::Method::RUDDER)) {
+                arming_counter = 0;
+            }
+        }
+
+        // arm the motors and configure for flight
+        if (arming_counter == AUTO_TRIM_DELAY && motors->armed() && flightmode->mode_number() == Mode::Number::STABILIZE) {
+            gcs().send_text(MAV_SEVERITY_INFO, "AutoTrim start");
+            auto_trim_counter = 250;
+            auto_trim_started = false;
+            // ensure auto-disarm doesn't trigger immediately
+            auto_disarm_begin = millis();
+        }
+
+    // full left and rudder disarming is enabled
+    } else if ((yaw_in < -4000) && (arming_rudder == AP_Arming::RudderArming::ARMDISARM)) {
+        if (!flightmode->has_manual_throttle() && !ap.land_complete) {
+            arming_counter = 0;
+            return;
+        }
+
+        // increase the counter to a maximum of 1 beyond the disarm delay
+        if (arming_counter <= DISARM_DELAY) {
+            arming_counter++;
+        }
+
+        // disarm the motors
+        if (arming_counter == DISARM_DELAY && motors->armed()) {
+            arming.disarm(AP_Arming::Method::RUDDER);
+        }
+
+    // Yaw is centered so reset arming counter
+    } else {
+        arming_counter = 0;
+    }
+}
+
+// auto_disarm_check - disarms the copter if it has been sitting on the ground in manual mode with throttle low for at least 15 seconds
+void Copter::auto_disarm_check()
+{
+    uint32_t tnow_ms = millis();
+    uint32_t disarm_delay_ms = 1000*constrain_int16(g.disarm_delay, 0, 127);
+
+    // exit immediately if we are already disarmed, or if auto
+    // disarming is disabled
+    if (!motors->armed() || disarm_delay_ms == 0 || flightmode->mode_number() == Mode::Number::THROW) {
+        auto_disarm_begin = tnow_ms;
+        return;
+    }
+
+    // if the rotor is still spinning, don't initiate auto disarm
+    if (motors->get_spool_state() > AP_Motors::SpoolState::GROUND_IDLE) {
+        auto_disarm_begin = tnow_ms;
+        return;
+    }
+
+    // always allow auto disarm if using interlock switch or motors are Emergency Stopped
+    if ((ap.using_interlock && !motors->get_interlock()) || SRV_Channels::get_emergency_stop()) {
+#if FRAME_CONFIG != HELI_FRAME
+        // use a shorter delay if using throttle interlock switch or Emergency Stop, because it is less
+        // obvious the copter is armed as the motors will not be spinning
+        disarm_delay_ms /= 2;
+#endif
+    } else {
+        bool sprung_throttle_stick = (g.throttle_behavior & THR_BEHAVE_FEEDBACK_FROM_MID_STICK) != 0;
+        bool thr_low;
+        if (flightmode->has_manual_throttle() || !sprung_throttle_stick) {
+            thr_low = ap.throttle_zero;
+        } else {
+            float deadband_top = get_throttle_mid() + g.throttle_deadzone;
+            thr_low = channel_throttle->get_control_in() <= deadband_top;
+        }
+
+        if (!thr_low || !ap.land_complete) {
+            // reset timer
+            auto_disarm_begin = tnow_ms;
+        }
+    }
+
+    // disarm once timer expires
+    if ((tnow_ms-auto_disarm_begin) >= disarm_delay_ms) {
+        arming.disarm(AP_Arming::Method::DISARMDELAY);
+        auto_disarm_begin = tnow_ms;
+    }
+}
+
+// motors_output - send output to motors library which will adjust and send to ESCs and servos
+void Copter::motors_output()
+{
+#if ADVANCED_FAILSAFE == ENABLED
+    // this is to allow the failsafe module to deliberately crash
+    // the vehicle. Only used in extreme circumstances to meet the
+    // OBC rules
+    if (g2.afs.should_crash_vehicle()) {
+        g2.afs.terminate_vehicle();
+        if (!g2.afs.terminating_vehicle_via_landing()) {
+            return;
+        }
+        // landing must continue to run the motors output
+    }
+#endif
+
+    // Update arming delay state
+    if (ap.in_arming_delay && (!motors->armed() || millis()-arm_time_ms > ARMING_DELAY_SEC*1.0e3f || flightmode->mode_number() == Mode::Number::THROW)) {
+        ap.in_arming_delay = false;
+    }
+
+    // output any servo channels
+    SRV_Channels::calc_pwm();
+
+    // cork now, so that all channel outputs happen at once
+    SRV_Channels::cork();
+
+    // update output on any aux channels, for manual passthru
+    SRV_Channels::output_ch_all();
+
+    // update motors interlock state
+    bool interlock = motors->armed() && !ap.in_arming_delay && (!ap.using_interlock || ap.motor_interlock_switch) && !SRV_Channels::get_emergency_stop();
+    if (!motors->get_interlock() && interlock) {
+        motors->set_interlock(true);
+        LOGGER_WRITE_EVENT(LogEvent::MOTORS_INTERLOCK_ENABLED);
+    } else if (motors->get_interlock() && !interlock) {
+        motors->set_interlock(false);
+        LOGGER_WRITE_EVENT(LogEvent::MOTORS_INTERLOCK_DISABLED);
+    }
+
+    if (ap.motor_test) {
+        // check if we are performing the motor test
+        motor_test_output();
+    } else {
+        // send output signals to motors
+        flightmode->output_to_motors();
+    }
+
+    // push all channels
+    SRV_Channels::push();
+}
+
+// check for pilot stick input to trigger lost vehicle alarm
+void Copter::lost_vehicle_check()
+{
+    static uint8_t soundalarm_counter;
+
+    // disable if aux switch is setup to vehicle alarm as the two could interfere
+    if (rc().find_channel_for_option(RC_Channel::AUX_FUNC::LOST_VEHICLE_SOUND)) {
+        return;
+    }
+
+    // ensure throttle is down, motors not armed, pitch and roll rc at max. Note: rc1=roll rc2=pitch
+    if (ap.throttle_zero && !motors->armed() && (channel_roll->get_control_in() > 4000) && (channel_pitch->get_control_in() > 4000)) {
+        if (soundalarm_counter >= LOST_VEHICLE_DELAY) {
+            if (AP_Notify::flags.vehicle_lost == false) {
+                AP_Notify::flags.vehicle_lost = true;
+                gcs().send_text(MAV_SEVERITY_NOTICE,"Locate Copter alarm");
+            }
+        } else {
+            soundalarm_counter++;
+        }
+    } else {
+        soundalarm_counter = 0;
+        if (AP_Notify::flags.vehicle_lost == true) {
+            AP_Notify::flags.vehicle_lost = false;
+        }
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #include "Copter.h"
+
+// run_nav_updates - top level call for the autopilot
+// ensures calculations such as "distance to waypoint" are calculated before autopilot makes decisions
+// To-Do - rename and move this function to make it's purpose more clear
+void Copter::run_nav_updates(void)
+{
+    update_super_simple_bearing(false);
+}
+
+// distance between vehicle and home in cm
+uint32_t Copter::home_distance()
+{
+    if (position_ok()) {
+        _home_distance = current_loc.get_distance(ahrs.get_home()) * 100;
+    }
+    return _home_distance;
+}
+
+// The location of home in relation to the vehicle in centi-degrees
+int32_t Copter::home_bearing()
+{
+    if (position_ok()) {
+        _home_bearing = current_loc.get_bearing_to(ahrs.get_home());
+    }
+    return _home_bearing;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           //
+// functions to support precision landing
+//
+
+#include "Copter.h"
+
+#if AC_PRECLAND_ENABLED
+
+void Copter::init_precland()
+{
+    copter.precland.init(400);
+}
+
+void Copter::update_precland()
+{
+    // alt will be unused if we pass false through as the second parameter:
+    return precland.update(rangefinder_state.alt_cm_glitch_protected,
+                           rangefinder_alt_ok());
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  #include "Copter.h"
+
+
+// Function that will read the radio data, limit servos and trigger a failsafe
+// ----------------------------------------------------------------------------
+
+void Copter::default_dead_zones()
+{
+    channel_roll->set_default_dead_zone(20);
+    channel_pitch->set_default_dead_zone(20);
+#if FRAME_CONFIG == HELI_FRAME
+    channel_throttle->set_default_dead_zone(10);
+    channel_yaw->set_default_dead_zone(15);
+#else
+    channel_throttle->set_default_dead_zone(30);
+    channel_yaw->set_default_dead_zone(20);
+#endif
+    rc().channel(CH_6)->set_default_dead_zone(0);
+}
+
+void Copter::init_rc_in()
+{
+    channel_roll     = rc().channel(rcmap.roll()-1);
+    channel_pitch    = rc().channel(rcmap.pitch()-1);
+    channel_throttle = rc().channel(rcmap.throttle()-1);
+    channel_yaw      = rc().channel(rcmap.yaw()-1);
+
+    // set rc channel ranges
+    channel_roll->set_angle(ROLL_PITCH_YAW_INPUT_MAX);
+    channel_pitch->set_angle(ROLL_PITCH_YAW_INPUT_MAX);
+    channel_yaw->set_angle(ROLL_PITCH_YAW_INPUT_MAX);
+    channel_throttle->set_range(1000);
+
+    // set default dead zones
+    default_dead_zones();
+
+    // initialise throttle_zero flag
+    ap.throttle_zero = true;
+}
+
+ // init_rc_out -- initialise motors
+void Copter::init_rc_out()
+{
+    motors->init((AP_Motors::motor_frame_class)g2.frame_class.get(), (AP_Motors::motor_frame_type)g.frame_type.get());
+
+    // enable aux servos to cope with multiple output channels per motor
+    SRV_Channels::enable_aux_servos();
+
+    // update rate must be set after motors->init() to allow for motor mapping
+    motors->set_update_rate(g.rc_speed);
+
+#if FRAME_CONFIG != HELI_FRAME
+    if (channel_throttle->configured()) {
+        // throttle inputs setup, use those to set motor PWM min and max if not already configured
+        motors->convert_pwm_min_max_param(channel_throttle->get_radio_min(), channel_throttle->get_radio_max());
+    } else {
+        // throttle inputs default, force set motor PWM min and max to defaults so they will not be over-written by a future change in RC min / max
+        motors->convert_pwm_min_max_param(1000, 2000);
+    }
+    motors->update_throttle_range();
+#else
+    // setup correct scaling for ESCs like the UAVCAN ESCs which
+    // take a proportion of speed.
+    hal.rcout->set_esc_scaling(channel_throttle->get_radio_min(), channel_throttle->get_radio_max());
+#endif
+
+    // refresh auxiliary channel to function map
+    SRV_Channels::update_aux_servo_function();
+
+#if FRAME_CONFIG != HELI_FRAME
+    /*
+      setup a default safety ignore mask, so that servo gimbals can be active while safety is on
+     */
+    uint16_t safety_ignore_mask = (~copter.motors->get_motor_mask()) & 0x3FFF;
+    BoardConfig.set_default_safety_ignore_mask(safety_ignore_mask);
+#endif
+}
+
+
+void Copter::read_radio()
+{
+    const uint32_t tnow_ms = millis();
+
+    if (rc().read_input()) {
+        ap.new_radio_frame = true;
+
+        set_throttle_and_failsafe(channel_throttle->get_radio_in());
+        set_throttle_zero_flag(channel_throttle->get_control_in());
+
+        // pass pilot input through to motors (used to allow wiggling servos while disarmed on heli, single, coax copters)
+        radio_passthrough_to_motors();
+
+        const float dt = (tnow_ms - last_radio_update_ms)*1.0e-3f;
+        rc_throttle_control_in_filter.apply(channel_throttle->get_control_in(), dt);
+        last_radio_update_ms = tnow_ms;
+        return;
+    }
+
+    // No radio input this time
+    if (failsafe.radio) {
+        // already in failsafe!
+        return;
+    }
+
+    // trigger failsafe if no update from the RC Radio for RC_FS_TIMEOUT seconds
+    const uint32_t elapsed_ms = tnow_ms - last_radio_update_ms;
+    if (elapsed_ms < rc().get_fs_timeout_ms()) {
+        // not timed out yet
+        return;
+    }
+    if (!g.failsafe_throttle) {
+        // throttle failsafe not enabled
+        return;
+    }
+    if (!rc().has_ever_seen_rc_input() && !motors->armed()) {
+        // we only failsafe if we are armed OR we have ever seen an RC receiver
+        return;
+    }
+
+    // Log an error and enter failsafe.
+    LOGGER_WRITE_ERROR(LogErrorSubsystem::RADIO, LogErrorCode::RADIO_LATE_FRAME);
+    set_failsafe_radio(true);
+}
+
+#define FS_COUNTER 3        // radio failsafe kicks in after 3 consecutive throttle values below failsafe_throttle_value
+void Copter::set_throttle_and_failsafe(uint16_t throttle_pwm)
+{
+    // if failsafe not enabled pass through throttle and exit
+    if(g.failsafe_throttle == FS_THR_DISABLED) {
+        return;
+    }
+
+    //check for low throttle value
+    if (throttle_pwm < (uint16_t)g.failsafe_throttle_value) {
+
+        // if we are already in failsafe or motors not armed pass through throttle and exit
+        if (failsafe.radio || !(rc().has_ever_seen_rc_input() || motors->armed())) {
+            return;
+        }
+
+        // check for 3 low throttle values
+        // Note: we do not pass through the low throttle until 3 low throttle values are received
+        failsafe.radio_counter++;
+        if( failsafe.radio_counter >= FS_COUNTER ) {
+            failsafe.radio_counter = FS_COUNTER;  // check to ensure we don't overflow the counter
+            set_failsafe_radio(true);
+        }
+    }else{
+        // we have a good throttle so reduce failsafe counter
+        failsafe.radio_counter--;
+        if( failsafe.radio_counter <= 0 ) {
+            failsafe.radio_counter = 0;   // check to ensure we don't underflow the counter
+
+            // disengage failsafe after three (nearly) consecutive valid throttle values
+            if (failsafe.radio) {
+                set_failsafe_radio(false);
+            }
+        }
+        // pass through throttle
+    }
+}
+
+#define THROTTLE_ZERO_DEBOUNCE_TIME_MS 400
+// set_throttle_zero_flag - set throttle_zero flag from debounced throttle control
+// throttle_zero is used to determine if the pilot intends to shut down the motors
+// Basically, this signals when we are not flying.  We are either on the ground
+// or the pilot has shut down the copter in the air and it is free-falling
+void Copter::set_throttle_zero_flag(int16_t throttle_control)
+{
+    static uint32_t last_nonzero_throttle_ms = 0;
+    uint32_t tnow_ms = millis();
+
+    // if not using throttle interlock and non-zero throttle and not E-stopped,
+    // or using motor interlock and it's enabled, then motors are running, 
+    // and we are flying. Immediately set as non-zero
+    if ((!ap.using_interlock && (throttle_control > 0) && !SRV_Channels::get_emergency_stop()) ||
+        (ap.using_interlock && motors->get_interlock()) ||
+        ap.armed_with_airmode_switch || air_mode == AirMode::AIRMODE_ENABLED) {
+        last_nonzero_throttle_ms = tnow_ms;
+        ap.throttle_zero = false;
+    } else if (tnow_ms - last_nonzero_throttle_ms > THROTTLE_ZERO_DEBOUNCE_TIME_MS) {
+        ap.throttle_zero = true;
+    }
+}
+
+// pass pilot's inputs to motors library (used to allow wiggling servos while disarmed on heli, single, coax copters)
+void Copter::radio_passthrough_to_motors()
+{
+    motors->set_radio_passthrough(channel_roll->norm_input(),
+                                  channel_pitch->norm_input(),
+                                  channel_throttle->get_control_in_zero_dz()*0.001f,
+                                  channel_yaw->norm_input());
+}
+
+/*
+  return the throttle input for mid-stick as a control-in value
+ */
+int16_t Copter::get_throttle_mid(void)
+{
+#if TOY_MODE_ENABLED == ENABLED
+    if (g2.toy_mode.enabled()) {
+        return g2.toy_mode.get_throttle_mid();
+    }
+#endif
+    return channel_throttle->get_control_mid();
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     #include "Copter.h"
+
+// return barometric altitude in centimeters
+void Copter::read_barometer(void)
+{
+    barometer.update();
+
+    baro_alt = barometer.get_altitude() * 100.0f;
+}
+
+#if AP_RANGEFINDER_ENABLED
+void Copter::init_rangefinder(void)
+{
+   rangefinder.set_log_rfnd_bit(MASK_LOG_CTUN);
+   rangefinder.init(ROTATION_PITCH_270);
+   rangefinder_state.alt_cm_filt.set_cutoff_frequency(g2.rangefinder_filt);
+   rangefinder_state.enabled = rangefinder.has_orientation(ROTATION_PITCH_270);
+
+   // upward facing range finder
+   rangefinder_up_state.alt_cm_filt.set_cutoff_frequency(g2.rangefinder_filt);
+   rangefinder_up_state.enabled = rangefinder.has_orientation(ROTATION_PITCH_90);
+}
+
+// return rangefinder altitude in centimeters
+void Copter::read_rangefinder(void)
+{
+    rangefinder.update();
+
+    rangefinder_state.update();
+    rangefinder_up_state.update();
+
+#if HAL_PROXIMITY_ENABLED
+    if (rangefinder_state.enabled_and_healthy() || rangefinder_state.data_stale()) {
+        g2.proximity.set_rangefinder_alt(rangefinder_state.enabled, rangefinder_state.alt_healthy, rangefinder_state.alt_cm_filt.get());
+    }
+#endif
+}
+#endif  // AP_RANGEFINDER_ENABLED
+
+// return true if rangefinder_alt can be used
+bool Copter::rangefinder_alt_ok() const
+{
+    return rangefinder_state.enabled_and_healthy();
+}
+
+// return true if rangefinder_alt can be used
+bool Copter::rangefinder_up_ok() const
+{
+    return rangefinder_up_state.enabled_and_healthy();
+}
+
+// update rangefinder based terrain offset
+// terrain offset is the terrain's height above the EKF origin
+void Copter::update_rangefinder_terrain_offset()
+{
+    float terrain_offset_cm = rangefinder_state.inertial_alt_cm - rangefinder_state.alt_cm_glitch_protected;
+    rangefinder_state.terrain_offset_cm += (terrain_offset_cm - rangefinder_state.terrain_offset_cm) * (copter.G_Dt / MAX(copter.g2.surftrak_tc, copter.G_Dt));
+
+    terrain_offset_cm = rangefinder_up_state.inertial_alt_cm + rangefinder_up_state.alt_cm_glitch_protected;
+    rangefinder_up_state.terrain_offset_cm += (terrain_offset_cm - rangefinder_up_state.terrain_offset_cm) * (copter.G_Dt / MAX(copter.g2.surftrak_tc, copter.G_Dt));
+
+    if (rangefinder_state.alt_healthy || rangefinder_state.data_stale()) {
+        wp_nav->set_rangefinder_terrain_offset(rangefinder_state.enabled, rangefinder_state.alt_healthy, rangefinder_state.terrain_offset_cm);
+#if MODE_CIRCLE_ENABLED
+        circle_nav->set_rangefinder_terrain_offset(rangefinder_state.enabled && wp_nav->rangefinder_used(), rangefinder_state.alt_healthy, rangefinder_state.terrain_offset_cm);
+#endif
+    }
+}
+
+// helper function to get inertially interpolated rangefinder height.
+bool Copter::get_rangefinder_height_interpolated_cm(int32_t& ret) const
+{
+#if AP_RANGEFINDER_ENABLED
+    return rangefinder_state.get_rangefinder_height_interpolated_cm(ret);
+#else
+    return false;
+#endif
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #include "Copter.h"
+
+// Run standby functions at approximately 100 Hz to limit maximum variable build up
+//
+// When standby is active:
+//      all I terms are continually reset
+//      heading error is reset to zero
+//      position errors are reset to zero
+//      crash_check is disabled
+//      thrust_loss_check is disabled
+//      parachute_check is disabled
+//      hover throttle learn is disabled
+//      and landing detection is disabled.
+void Copter::standby_update()
+{
+    if (!standby_active) {
+        return;
+    }
+
+    attitude_control->reset_rate_controller_I_terms();
+    attitude_control->reset_yaw_target_and_rate();
+    pos_control->standby_xyz_reset();
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            #include "Copter.h"
+
+#if AP_RANGEFINDER_ENABLED
+
+// update_surface_offset - manages the vertical offset of the position controller to follow the measured ground or ceiling
+//   level measured using the range finder.
+void Copter::SurfaceTracking::update_surface_offset()
+{
+    // check for timeout
+    const uint32_t now_ms = millis();
+    const bool timeout = (now_ms - last_update_ms) > SURFACE_TRACKING_TIMEOUT_MS;
+
+    // check tracking state and that range finders are healthy
+    if (((surface == Surface::GROUND) && copter.rangefinder_alt_ok() && (copter.rangefinder_state.glitch_count == 0)) ||
+        ((surface == Surface::CEILING) && copter.rangefinder_up_ok() && (copter.rangefinder_up_state.glitch_count == 0))) {
+
+        // Get the appropriate surface distance state, the terrain offset is calculated in the surface distance lib. 
+        AP_SurfaceDistance &rf_state = (surface == Surface::GROUND) ? copter.rangefinder_state : copter.rangefinder_up_state;
+
+        // update position controller target offset to the surface's alt above the EKF origin
+        copter.pos_control->set_pos_offset_target_z_cm(rf_state.terrain_offset_cm);
+        last_update_ms = now_ms;
+        valid_for_logging = true;
+
+        // reset target altitude if this controller has just been engaged
+        // target has been changed between upwards vs downwards
+        // or glitch has cleared
+        if (timeout ||
+            reset_target ||
+            (last_glitch_cleared_ms != rf_state.glitch_cleared_ms)) {
+            copter.pos_control->set_pos_offset_z_cm(rf_state.terrain_offset_cm);
+            reset_target = false;
+            last_glitch_cleared_ms = rf_state.glitch_cleared_ms;
+        }
+
+    } else {
+        // reset position controller offsets if surface tracking is inactive
+        // flag target should be reset when/if it next becomes active
+        if (timeout) {
+            copter.pos_control->set_pos_offset_z_cm(0);
+            copter.pos_control->set_pos_offset_target_z_cm(0);
+            reset_target = true;
+        }
+    }
+}
+
+
+// get target altitude (in cm) above ground
+// returns true if there is a valid target
+bool Copter::SurfaceTracking::get_target_alt_cm(float &target_alt_cm) const
+{
+    // fail if we are not tracking downwards
+    if (surface != Surface::GROUND) {
+        return false;
+    }
+    // check target has been updated recently
+    if (AP_HAL::millis() - last_update_ms > SURFACE_TRACKING_TIMEOUT_MS) {
+        return false;
+    }
+    target_alt_cm = (copter.pos_control->get_pos_target_z_cm() - copter.pos_control->get_pos_offset_z_cm());
+    return true;
+}
+
+// set target altitude (in cm) above ground
+void Copter::SurfaceTracking::set_target_alt_cm(float _target_alt_cm)
+{
+    // fail if we are not tracking downwards
+    if (surface != Surface::GROUND) {
+        return;
+    }
+    copter.pos_control->set_pos_offset_z_cm(copter.inertial_nav.get_position_z_up_cm() - _target_alt_cm);
+    last_update_ms = AP_HAL::millis();
+}
+
+bool Copter::SurfaceTracking::get_target_dist_for_logging(float &target_dist) const
+{
+    if (!valid_for_logging || (surface == Surface::NONE)) {
+        return false;
+    }
+
+    const float dir = (surface == Surface::GROUND) ? 1.0f : -1.0f;
+    target_dist = dir * (copter.pos_control->get_pos_target_z_cm() - copter.pos_control->get_pos_offset_z_cm()) * 0.01f;
+    return true;
+}
+
+float Copter::SurfaceTracking::get_dist_for_logging() const
+{
+    return ((surface == Surface::CEILING) ? copter.rangefinder_up_state.alt_cm : copter.rangefinder_state.alt_cm) * 0.01f;
+}
+
+// set direction
+void Copter::SurfaceTracking::set_surface(Surface new_surface)
+{
+    if (surface == new_surface) {
+        return;
+    }
+    // check we have a range finder in the correct direction
+    if ((new_surface == Surface::GROUND) && !copter.rangefinder.has_orientation(ROTATION_PITCH_270)) {
+        copter.gcs().send_text(MAV_SEVERITY_WARNING, "SurfaceTracking: no downward rangefinder");
+        AP_Notify::events.user_mode_change_failed = 1;
+        return;
+    }
+    if ((new_surface == Surface::CEILING) && !copter.rangefinder.has_orientation(ROTATION_PITCH_90)) {
+        copter.gcs().send_text(MAV_SEVERITY_WARNING, "SurfaceTracking: no upward rangefinder");
+        AP_Notify::events.user_mode_change_failed = 1;
+        return;
+    }
+    surface = new_surface;
+    reset_target = true;
+}
+
+#endif  // AP_RANGEFINDER_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #include "Copter.h"
+#include <AP_ESC_Telem/AP_ESC_Telem.h>
+
+/*****************************************************************************
+*   The init_ardupilot function processes everything we need for an in - air restart
+*        We will determine later if we are actually on the ground and process a
+*        ground start in that case.
+*
+*****************************************************************************/
+
+static void failsafe_check_static()
+{
+    copter.failsafe_check();
+}
+
+void Copter::init_ardupilot()
+{
+    // init winch
+#if AP_WINCH_ENABLED
+    g2.winch.init();
+#endif
+
+    // initialise notify system
+    notify.init();
+    notify_flight_mode();
+
+    // initialise battery monitor
+    battery.init();
+
+#if AP_RSSI_ENABLED
+    // Init RSSI
+    rssi.init();
+#endif
+
+    barometer.init();
+
+    // setup telem slots with serial ports
+    gcs().setup_uarts();
+
+#if OSD_ENABLED == ENABLED
+    osd.init();
+#endif
+
+    // update motor interlock state
+    update_using_interlock();
+
+#if FRAME_CONFIG == HELI_FRAME
+    // trad heli specific initialisation
+    heli_init();
+#endif
+#if FRAME_CONFIG == HELI_FRAME
+    input_manager.set_loop_rate(scheduler.get_loop_rate_hz());
+#endif
+
+    init_rc_in();               // sets up rc channels from radio
+
+#if AP_RANGEFINDER_ENABLED
+    // initialise surface to be tracked in SurfaceTracking
+    // must be before rc init to not override initial switch position
+    surface_tracking.init((SurfaceTracking::Surface)copter.g2.surftrak_mode.get());
+#endif
+
+    // allocate the motors class
+    allocate_motors();
+
+    // initialise rc channels including setting mode
+    rc().convert_options(RC_Channel::AUX_FUNC::ARMDISARM_UNUSED, RC_Channel::AUX_FUNC::ARMDISARM_AIRMODE);
+    rc().init();
+
+    // sets up motors and output to escs
+    init_rc_out();
+
+    // check if we should enter esc calibration mode
+    esc_calibration_startup_check();
+
+    // motors initialised so parameters can be sent
+    ap.initialised_params = true;
+
+#if AP_RELAY_ENABLED
+    relay.init();
+#endif
+
+    /*
+     *  setup the 'main loop is dead' check. Note that this relies on
+     *  the RC library being initialised.
+     */
+    hal.scheduler->register_timer_failsafe(failsafe_check_static, 1000);
+
+    // Do GPS init
+    gps.set_log_gps_bit(MASK_LOG_GPS);
+    gps.init();
+
+    AP::compass().set_log_bit(MASK_LOG_COMPASS);
+    AP::compass().init();
+
+#if AP_AIRSPEED_ENABLED
+    airspeed.set_log_bit(MASK_LOG_IMU);
+#endif
+
+#if AP_OAPATHPLANNER_ENABLED
+    g2.oa.init();
+#endif
+
+    attitude_control->parameter_sanity_check();
+
+#if AP_OPTICALFLOW_ENABLED
+    // initialise optical flow sensor
+    optflow.init(MASK_LOG_OPTFLOW);
+#endif      // AP_OPTICALFLOW_ENABLED
+
+#if HAL_MOUNT_ENABLED
+    // initialise camera mount
+    camera_mount.init();
+#endif
+
+#if AP_CAMERA_ENABLED
+    // initialise camera
+    camera.init();
+#endif
+
+#if AC_PRECLAND_ENABLED
+    // initialise precision landing
+    init_precland();
+#endif
+
+#if AP_LANDINGGEAR_ENABLED
+    // initialise landing gear position
+    landinggear.init();
+#endif
+
+#ifdef USERHOOK_INIT
+    USERHOOK_INIT
+#endif
+
+    // read Baro pressure at ground
+    //-----------------------------
+    barometer.set_log_baro_bit(MASK_LOG_IMU);
+    barometer.calibrate();
+
+#if AP_RANGEFINDER_ENABLED
+    // initialise rangefinder
+    init_rangefinder();
+#endif
+
+#if HAL_PROXIMITY_ENABLED
+    // init proximity sensor
+    g2.proximity.init();
+#endif
+
+#if AP_BEACON_ENABLED
+    // init beacons used for non-gps position estimation
+    g2.beacon.init();
+#endif
+
+#if AP_RPM_ENABLED
+    // initialise AP_RPM library
+    rpm_sensor.init();
+#endif
+
+#if MODE_AUTO_ENABLED == ENABLED
+    // initialise mission library
+    mode_auto.mission.init();
+#endif
+
+#if MODE_SMARTRTL_ENABLED == ENABLED
+    // initialize SmartRTL
+    g2.smart_rtl.init();
+#endif
+
+#if HAL_LOGGING_ENABLED
+    // initialise AP_Logger library
+    logger.setVehicle_Startup_Writer(FUNCTOR_BIND(&copter, &Copter::Log_Write_Vehicle_Startup_Messages, void));
+#endif
+
+    startup_INS_ground();
+
+#if AC_CUSTOMCONTROL_MULTI_ENABLED == ENABLED
+    custom_control.init();
+#endif
+
+    // set landed flags
+    set_land_complete(true);
+    set_land_complete_maybe(true);
+
+    // enable CPU failsafe
+    failsafe_enable();
+
+    ins.set_log_raw_bit(MASK_LOG_IMU_RAW);
+
+    motors->output_min();  // output lowest possible value to motors
+
+    // attempt to set the initial_mode, else set to STABILIZE
+    if (!set_mode((enum Mode::Number)g.initial_mode.get(), ModeReason::INITIALISED)) {
+        // set mode to STABILIZE will trigger mode change notification to pilot
+        set_mode(Mode::Number::STABILIZE, ModeReason::UNAVAILABLE);
+    }
+
+    pos_variance_filt.set_cutoff_frequency(g2.fs_ekf_filt_hz);
+    vel_variance_filt.set_cutoff_frequency(g2.fs_ekf_filt_hz);
+    hgt_variance_filt.set_cutoff_frequency(g2.fs_ekf_filt_hz);
+
+    // flag that initialisation has completed
+    ap.initialised = true;
+}
+
+
+//******************************************************************************
+//This function does all the calibrations, etc. that we need during a ground start
+//******************************************************************************
+void Copter::startup_INS_ground()
+{
+    // initialise ahrs (may push imu calibration into the mpu6000 if using that device).
+    ahrs.init();
+    ahrs.set_vehicle_class(AP_AHRS::VehicleClass::COPTER);
+
+    // Warm up and calibrate gyro offsets
+    ins.init(scheduler.get_loop_rate_hz());
+
+    // reset ahrs including gyro bias
+    ahrs.reset();
+}
+
+// position_ok - returns true if the horizontal absolute position is ok and home position is set
+bool Copter::position_ok() const
+{
+    // return false if ekf failsafe has triggered
+    if (failsafe.ekf) {
+        return false;
+    }
+
+    // check ekf position estimate
+    return (ekf_has_absolute_position() || ekf_has_relative_position());
+}
+
+// ekf_has_absolute_position - returns true if the EKF can provide an absolute WGS-84 position estimate
+bool Copter::ekf_has_absolute_position() const
+{
+    if (!ahrs.have_inertial_nav()) {
+        // do not allow navigation with dcm position
+        return false;
+    }
+
+    // with EKF use filter status and ekf check
+    nav_filter_status filt_status = inertial_nav.get_filter_status();
+
+    // if disarmed we accept a predicted horizontal position
+    if (!motors->armed()) {
+        return ((filt_status.flags.horiz_pos_abs || filt_status.flags.pred_horiz_pos_abs));
+    } else {
+        // once armed we require a good absolute position and EKF must not be in const_pos_mode
+        return (filt_status.flags.horiz_pos_abs && !filt_status.flags.const_pos_mode);
+    }
+}
+
+// ekf_has_relative_position - returns true if the EKF can provide a position estimate relative to it's starting position
+bool Copter::ekf_has_relative_position() const
+{
+    // return immediately if EKF not used
+    if (!ahrs.have_inertial_nav()) {
+        return false;
+    }
+
+    // return immediately if neither optflow nor visual odometry is enabled and dead reckoning is inactive
+    bool enabled = false;
+#if AP_OPTICALFLOW_ENABLED
+    if (optflow.enabled()) {
+        enabled = true;
+    }
+#endif
+#if HAL_VISUALODOM_ENABLED
+    if (visual_odom.enabled()) {
+        enabled = true;
+    }
+#endif
+    if (dead_reckoning.active && !dead_reckoning.timeout) {
+        enabled = true;
+    }
+    if (!enabled) {
+        return false;
+    }
+
+    // get filter status from EKF
+    nav_filter_status filt_status = inertial_nav.get_filter_status();
+
+    // if disarmed we accept a predicted horizontal relative position
+    if (!motors->armed()) {
+        return (filt_status.flags.pred_horiz_pos_rel);
+    } else {
+        return (filt_status.flags.horiz_pos_rel && !filt_status.flags.const_pos_mode);
+    }
+}
+
+// returns true if the ekf has a good altitude estimate (required for modes which do AltHold)
+bool Copter::ekf_alt_ok() const
+{
+    if (!ahrs.have_inertial_nav()) {
+        // do not allow alt control with only dcm
+        return false;
+    }
+
+    // with EKF use filter status and ekf check
+    nav_filter_status filt_status = inertial_nav.get_filter_status();
+
+    // require both vertical velocity and position
+    return (filt_status.flags.vert_vel && filt_status.flags.vert_pos);
+}
+
+// update_auto_armed - update status of auto_armed flag
+void Copter::update_auto_armed()
+{
+    // disarm checks
+    if(ap.auto_armed){
+        // if motors are disarmed, auto_armed should also be false
+        if(!motors->armed()) {
+            set_auto_armed(false);
+            return;
+        }
+        // if in stabilize or acro flight mode and throttle is zero, auto-armed should become false
+        if(flightmode->has_manual_throttle() && ap.throttle_zero && !failsafe.radio) {
+            set_auto_armed(false);
+        }
+
+    }else{
+        // arm checks
+        
+        // for tradheli if motors are armed and throttle is above zero and the motor is started, auto_armed should be true
+        if(motors->armed() && ap.using_interlock) {
+            if(!ap.throttle_zero && motors->get_spool_state() == AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
+                set_auto_armed(true);
+            }
+        // if motors are armed and throttle is above zero auto_armed should be true
+        // if motors are armed and we are in throw mode, then auto_armed should be true
+        } else if (motors->armed() && !ap.using_interlock) {
+            if(!ap.throttle_zero || flightmode->mode_number() == Mode::Number::THROW) {
+                set_auto_armed(true);
+            }
+        }
+    }
+}
+
+#if HAL_LOGGING_ENABLED
+/*
+  should we log a message type now?
+ */
+bool Copter::should_log(uint32_t mask)
+{
+    ap.logging_started = logger.logging_started();
+    return logger.should_log(mask);
+}
+#endif
+
+/*
+  allocate the motors class
+ */
+void Copter::allocate_motors(void)
+{
+    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
+#if FRAME_CONFIG != HELI_FRAME
+        case AP_Motors::MOTOR_FRAME_QUAD:
+        case AP_Motors::MOTOR_FRAME_HEXA:
+        case AP_Motors::MOTOR_FRAME_Y6:
+        case AP_Motors::MOTOR_FRAME_OCTA:
+        case AP_Motors::MOTOR_FRAME_OCTAQUAD:
+        case AP_Motors::MOTOR_FRAME_DODECAHEXA:
+        case AP_Motors::MOTOR_FRAME_DECA:
+        case AP_Motors::MOTOR_FRAME_SCRIPTING_MATRIX:
+        default:
+            motors = NEW_NOTHROW AP_MotorsMatrix(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsMatrix::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_TRI:
+            motors = NEW_NOTHROW AP_MotorsTri(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsTri::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_TRICOPTER);
+            break;
+        case AP_Motors::MOTOR_FRAME_SINGLE:
+            motors = NEW_NOTHROW AP_MotorsSingle(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsSingle::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_COAX:
+            motors = NEW_NOTHROW AP_MotorsCoax(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsCoax::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_TAILSITTER:
+            motors = NEW_NOTHROW AP_MotorsTailsitter(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsTailsitter::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING:
+#if AP_SCRIPTING_ENABLED
+            motors = NEW_NOTHROW AP_MotorsMatrix_6DoF_Scripting(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsMatrix_6DoF_Scripting::var_info;
+#endif // AP_SCRIPTING_ENABLED
+            break;
+        case AP_Motors::MOTOR_FRAME_DYNAMIC_SCRIPTING_MATRIX:
+#if AP_SCRIPTING_ENABLED
+            motors = NEW_NOTHROW AP_MotorsMatrix_Scripting_Dynamic(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsMatrix_Scripting_Dynamic::var_info;
+#endif // AP_SCRIPTING_ENABLED
+            break;
+#else // FRAME_CONFIG == HELI_FRAME
+        case AP_Motors::MOTOR_FRAME_HELI_DUAL:
+            motors = NEW_NOTHROW AP_MotorsHeli_Dual(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsHeli_Dual::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
+            break;
+
+        case AP_Motors::MOTOR_FRAME_HELI_QUAD:
+            motors = NEW_NOTHROW AP_MotorsHeli_Quad(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsHeli_Quad::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
+            break;
+            
+        case AP_Motors::MOTOR_FRAME_HELI:
+        default:
+            motors = NEW_NOTHROW AP_MotorsHeli_Single(copter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsHeli_Single::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
+            break;
+#endif
+    }
+    if (motors == nullptr) {
+        AP_BoardConfig::allocation_error("FRAME_CLASS=%u", (unsigned)g2.frame_class.get());
+    }
+    AP_Param::load_object_from_eeprom(motors, motors_var_info);
+
+    ahrs_view = ahrs.create_view(ROTATION_NONE);
+    if (ahrs_view == nullptr) {
+        AP_BoardConfig::allocation_error("AP_AHRS_View");
+    }
+
+#if FRAME_CONFIG != HELI_FRAME
+    if ((AP_Motors::motor_frame_class)g2.frame_class.get() == AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING) {
+#if AP_SCRIPTING_ENABLED
+        attitude_control = NEW_NOTHROW AC_AttitudeControl_Multi_6DoF(*ahrs_view, aparm, *motors);
+        attitude_control_var_info = AC_AttitudeControl_Multi_6DoF::var_info;
+#endif // AP_SCRIPTING_ENABLED
+    } else {
+        attitude_control = NEW_NOTHROW AC_AttitudeControl_Multi(*ahrs_view, aparm, *motors);
+        attitude_control_var_info = AC_AttitudeControl_Multi::var_info;
+    }
+#else
+    attitude_control = NEW_NOTHROW AC_AttitudeControl_Heli(*ahrs_view, aparm, *motors);
+    attitude_control_var_info = AC_AttitudeControl_Heli::var_info;
+#endif
+    if (attitude_control == nullptr) {
+        AP_BoardConfig::allocation_error("AttitudeControl");
+    }
+    AP_Param::load_object_from_eeprom(attitude_control, attitude_control_var_info);
+        
+    pos_control = NEW_NOTHROW AC_PosControl(*ahrs_view, inertial_nav, *motors, *attitude_control);
+    if (pos_control == nullptr) {
+        AP_BoardConfig::allocation_error("PosControl");
+    }
+    AP_Param::load_object_from_eeprom(pos_control, pos_control->var_info);
+
+#if AP_OAPATHPLANNER_ENABLED
+    wp_nav = NEW_NOTHROW AC_WPNav_OA(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
+#else
+    wp_nav = NEW_NOTHROW AC_WPNav(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
+#endif
+    if (wp_nav == nullptr) {
+        AP_BoardConfig::allocation_error("WPNav");
+    }
+    AP_Param::load_object_from_eeprom(wp_nav, wp_nav->var_info);
+
+    loiter_nav = NEW_NOTHROW AC_Loiter(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
+    if (loiter_nav == nullptr) {
+        AP_BoardConfig::allocation_error("LoiterNav");
+    }
+    AP_Param::load_object_from_eeprom(loiter_nav, loiter_nav->var_info);
+
+#if MODE_CIRCLE_ENABLED == ENABLED
+    circle_nav = NEW_NOTHROW AC_Circle(inertial_nav, *ahrs_view, *pos_control);
+    if (circle_nav == nullptr) {
+        AP_BoardConfig::allocation_error("CircleNav");
+    }
+    AP_Param::load_object_from_eeprom(circle_nav, circle_nav->var_info);
+#endif
+
+    // reload lines from the defaults file that may now be accessible
+    AP_Param::reload_defaults_file(true);
+    
+    // now setup some frame-class specific defaults
+    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
+    case AP_Motors::MOTOR_FRAME_Y6:
+        attitude_control->get_rate_roll_pid().kP().set_default(0.1);
+        attitude_control->get_rate_roll_pid().kD().set_default(0.006);
+        attitude_control->get_rate_pitch_pid().kP().set_default(0.1);
+        attitude_control->get_rate_pitch_pid().kD().set_default(0.006);
+        attitude_control->get_rate_yaw_pid().kP().set_default(0.15);
+        attitude_control->get_rate_yaw_pid().kI().set_default(0.015);
+        break;
+    case AP_Motors::MOTOR_FRAME_TRI:
+        attitude_control->get_rate_yaw_pid().filt_D_hz().set_default(100);
+        break;
+    default:
+        break;
+    }
+
+    // brushed 16kHz defaults to 16kHz pulses
+    if (motors->is_brushed_pwm_type()) {
+        g.rc_speed.set_default(16000);
+    }
+    
+    // upgrade parameters. This must be done after allocating the objects
+    convert_pid_parameters();
+#if FRAME_CONFIG == HELI_FRAME
+    convert_tradheli_parameters();
+    motors->heli_motors_param_conversions();
+#endif
+
+#if HAL_PROXIMITY_ENABLED
+    // convert PRX to PRX1_ parameters
+    convert_prx_parameters();
+#endif
+
+    // param count could have changed
+    AP_Param::invalidate_count();
+}
+
+bool Copter::is_tradheli() const
+{
+#if FRAME_CONFIG == HELI_FRAME
+    return true;
+#else
+    return false;
+#endif
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       ontrol < limit) {
+            // limit descent rate close to the ground
+            throttle_control = limit;
+        }
+    }
+}
+
+
+/*
+  update blinking. Blinking is done with a 16 bit pattern for each
+  LED. A count can be set for a pattern, which makes the pattern
+  persist until the count is zero. When it is zero the normal pattern
+  settings based on system status are used
+ */
+void ToyMode::blink_update(void)
+{
+    if (red_blink_pattern & (1U<<red_blink_index)) {
+        copter.relay.on(1);
+    } else {
+        copter.relay.off(1);
+    }
+    if (green_blink_pattern & (1U<<green_blink_index)) {
+        copter.relay.on(0);
+    } else {
+        copter.relay.off(0);
+    }
+    green_blink_index = (green_blink_index+1) % 16;
+    red_blink_index = (red_blink_index+1) % 16;
+    if (green_blink_index == 0 && green_blink_count > 0) {
+        green_blink_count--;
+    }
+    if (red_blink_index == 0 && red_blink_count > 0) {
+        red_blink_count--;
+    }
+
+    // let the TX know we are recording video
+    uint32_t now = AP_HAL::millis();
+    if (now - last_video_ms < 1000) {
+        AP_Notify::flags.video_recording = true;
+    } else {
+        AP_Notify::flags.video_recording = false;
+    }
+    
+    if (red_blink_count > 0 && green_blink_count > 0) {
+        return;
+    }
+    
+    // setup normal patterns based on flight mode and arming
+    uint16_t pattern = 0;
+
+    // full on when we can see the TX, except for battery failsafe,
+    // when we blink rapidly
+    if (copter.motors->armed() && AP_Notify::flags.failsafe_battery) {
+        pattern = BLINK_8;
+    } else if (!copter.motors->armed() && (blink_disarm > 0)) {
+        pattern = BLINK_8;
+        blink_disarm--;
+    } else {
+        pattern = BLINK_FULL;
+    }
+    
+    if (copter.motors->armed()) {
+        blink_disarm = 4;
+    }
+    
+    if (red_blink_count == 0) {
+        red_blink_pattern = pattern;
+    }
+    if (green_blink_count == 0) {
+        green_blink_pattern = pattern;
+    }
+    if (red_blink_count == 0 && green_blink_count == 0) {
+        // get LEDs in sync
+        red_blink_index = green_blink_index;
+    }
+}
+
+// handle a mavlink message
+void ToyMode::handle_message(const mavlink_message_t &msg)
+{
+    if (msg.msgid != MAVLINK_MSG_ID_NAMED_VALUE_INT) {
+        return;
+    }
+    mavlink_named_value_int_t m;
+    mavlink_msg_named_value_int_decode(&msg, &m);
+    if (strncmp(m.name, "BLINKR", 10) == 0) {
+        red_blink_pattern = (uint16_t)m.value;
+        red_blink_count = m.value >> 16;
+        red_blink_index = 0;
+    } else if (strncmp(m.name, "BLINKG", 10) == 0) {
+        green_blink_pattern = (uint16_t)m.value;
+        green_blink_count = m.value >> 16;
+        green_blink_index = 0;
+    } else if (strncmp(m.name, "VNOTIFY", 10) == 0) {
+        // taking photos or video
+        if (green_blink_pattern != BLINK_2) {
+            green_blink_index = 0;
+        }
+        green_blink_pattern = BLINK_2;
+        green_blink_count = 1;
+        last_video_ms = AP_HAL::millis();
+        // immediately update AP_Notify recording flag
+        AP_Notify::flags.video_recording = true;
+    } else if (strncmp(m.name, "WIFICHAN", 10) == 0) {
+#if AP_RADIO_ENABLED
+        AP_Radio *radio = AP_Radio::get_singleton();
+        if (radio) {
+            radio->set_wifi_channel(m.value);
+        }
+#endif
+    } else if (strncmp(m.name, "LOGDISARM", 10) == 0) {
+        enum ap_var_type vtype;
+        AP_Int8 *log_disarmed = (AP_Int8 *)AP_Param::find("LOG_DISARMED", &vtype);
+        if (log_disarmed) {
+            log_disarmed->set(int8_t(m.value));
+        }
+    }
+}
+
+/*
+  send a named int to primary telem channel
+ */
+void ToyMode::send_named_int(const char *name, int32_t value)
+{
+    mavlink_msg_named_value_int_send(MAVLINK_COMM_1, AP_HAL::millis(), name, value);
+}
+
+/*
+  limit maximum thrust based on voltage
+ */
+void ToyMode::thrust_limiting(float *thrust, uint8_t num_motors)
+{
+    float thrust_mul = linear_interpolate(filter.thrust_max, filter.thrust_min, filtered_voltage, filter.volt_min, filter.volt_max);
+    for (uint8_t i=0; i<num_motors; i++) {
+        thrust[i] *= thrust_mul;
+    }
+    uint16_t pwm[4];
+    hal.rcout->read(pwm, 4);
+
+#if HAL_LOGGING_ENABLED
+// @LoggerMessage: THST
+// @Description: Maximum thrust limitation based on battery voltage in Toy Mode
+// @Field: TimeUS: Time since system startup
+// @Field: Vol: Filtered battery voltage
+// @Field: Mul: Thrust multiplier between 0 and 1 to limit the output thrust based on battery voltage
+// @Field: M1: Motor 1 pwm output
+// @Field: M2: Motor 2 pwm output
+// @Field: M3: Motor 3 pwm output
+// @Field: M4: Motor 4 pwm output
+
+    if (motor_log_counter++ % 10 == 0) {
+        AP::logger().WriteStreaming("THST", "TimeUS,Vol,Mul,M1,M2,M3,M4", "QffHHHH",
+                                               AP_HAL::micros64(),
+                                               (double)filtered_voltage,
+                                               (double)thrust_mul,
+                                               pwm[0], pwm[1], pwm[2], pwm[3]);
+    }
+#endif
+}
+
+#if ENABLE_LOAD_TEST
+/*
+  run a motor load test - used for endurance checking in factory tests
+ */
+void ToyMode::load_test_run(void)
+{
+    uint16_t pwm[4] {};
+    switch ((enum load_type)load_test.load_type.get()) {
+    case LOAD_TYPE_LOG1:
+        for (uint8_t i=0; i<4; i++) {
+            pwm[i] = load_data1[load_test.row].m[i];
+        }
+        load_test.filter_counter++;
+        if (load_test.filter_counter >= load_test.load_filter.get()) {
+            load_test.filter_counter = 0;
+            load_test.row = (load_test.row + 1) % ARRAY_SIZE(load_data1);
+        }
+        break;
+        
+    case LOAD_TYPE_LOG2:
+        // like log1, but all the same
+        for (uint8_t i=0; i<4; i++) {
+            pwm[i] = load_data1[load_test.row].m[0];
+        }
+        load_test.filter_counter++;
+        if (load_test.filter_counter >= load_test.load_filter.get()) {
+            load_test.filter_counter = 0;
+            load_test.row = (load_test.row + 1) % ARRAY_SIZE(load_data1);
+        }
+        break;
+
+    case LOAD_TYPE_CONSTANT:
+        for (uint8_t i=0; i<4; i++) {
+            pwm[i] = 500;
+        }
+        break;
+    default:
+        return;
+    }
+    for (uint8_t i=0; i<4; i++) {
+        pwm[i] *= load_test.load_mul;
+        // write, with conversion to 1000 to 2000 range
+        hal.rcout->write(i, 1000 + pwm[i]*2);
+    }
+
+    if (copter.failsafe.battery) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Tmode: load_test off (battery)");
+        copter.init_disarm_motors();
+        load_test.running = false;
+    }    
+}
+#endif // ENABLE_LOAD_TEST
+
+/*
+  if we try to arm and the compass is out of range then we enable
+  inflight compass learning
+ */
+void ToyMode::arm_check_compass(void)
+{
+    // check for unreasonable compass offsets
+    Vector3f offsets = copter.compass.get_offsets();
+    float field = copter.compass.get_field().length();
+    
+    char unused_compass_configured_error_message[20];
+    if (offsets.length() > copter.compass.get_offsets_max() ||
+        field < 200 || field > 800 ||
+        !copter.compass.configured(unused_compass_configured_error_message, ARRAY_SIZE(unused_compass_configured_error_message))) {
+        if (copter.compass.get_learn_type() != Compass::LEARN_INFLIGHT) {
+            gcs().send_text(MAV_SEVERITY_INFO, "Tmode: enable compass learning");
+            copter.compass.set_learn_type(Compass::LEARN_INFLIGHT, false);
+        }
+    }
+}
+
+#endif // TOY_MODE_ENABLED
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   #pragma once
+
+#include <stdint.h>
+#include <AP_Param/AP_Param.h>
+#include "mode.h"
+
+/*
+  class to support "toy" mode for simplified user interaction for
+  large volume consumer vehicles
+ */
+
+class ToyMode
+{
+public:
+    friend class Copter;
+
+    ToyMode();
+    bool enabled(void) const {
+        return enable.get() != 0;
+    }
+    
+    void update(void);
+
+    // get throttle mid-point
+    int16_t get_throttle_mid(void) {
+        return throttle_mid;
+    }
+
+    // adjust throttle for throttle takeoff
+    void throttle_adjust(float &throttle_control);
+
+    // handle mavlink message
+    void handle_message(const mavlink_message_t &msg);
+
+    void load_test_run(void);
+    
+    static const struct AP_Param::GroupInfo var_info[];
+    
+private:
+
+    void trim_update(void);
+    void action_arm(void);
+    void blink_update(void);
+    void send_named_int(const char *name, int32_t value);
+    bool set_and_remember_mode(Mode::Number mode, ModeReason reason);
+
+    void thrust_limiting(float *thrust, uint8_t num_motors);
+    void arm_check_compass(void);
+
+    // work out type of button setup
+    bool is_v2450_buttons(void) const {
+        return enable == 1;
+    }
+    bool is_f412_buttons(void) const {
+        return enable == 2;
+    }
+    
+    enum toy_action {
+        ACTION_NONE         = 0,
+        ACTION_TAKE_PHOTO   = 1,
+        ACTION_TOGGLE_VIDEO = 2,
+        ACTION_MODE_ACRO    = 3,
+        ACTION_MODE_ALTHOLD = 4,
+        ACTION_MODE_AUTO    = 5,
+        ACTION_MODE_LOITER  = 6,
+        ACTION_MODE_RTL     = 7,
+        ACTION_MODE_CIRCLE  = 8,
+        ACTION_MODE_LAND    = 9,
+        ACTION_MODE_DRIFT   = 10,
+        ACTION_MODE_SPORT   = 11,
+        ACTION_MODE_AUTOTUNE= 12,
+        ACTION_MODE_POSHOLD = 13,
+        ACTION_MODE_BRAKE   = 14,
+        ACTION_MODE_THROW   = 15,
+        ACTION_MODE_FLIP    = 16,
+        ACTION_MODE_STAB    = 17,
+        ACTION_DISARM       = 18,
+        ACTION_TOGGLE_MODE  = 19,
+        ACTION_ARM_LAND_RTL = 20,
+        ACTION_TOGGLE_SIMPLE = 21,
+        ACTION_TOGGLE_SSIMPLE = 22,
+        ACTION_LOAD_TEST = 23,
+        ACTION_MODE_FLOW = 24,
+    };
+
+    enum toy_action last_action;
+
+    // these are bitmask indexes for TMODE_FLAGS
+    enum toy_flags {
+        FLAG_THR_DISARM     = 1<<0,  // disarm on low throttle
+        FLAG_THR_ARM        = 1<<1,  // arm on high throttle
+        FLAG_UPGRADE_LOITER = 1<<2,  // auto upgrade from ALT_HOLD to LOITER
+        FLAG_RTL_CANCEL     = 1<<3,  // cancel RTL on large stick input
+    };
+
+    enum blink_patterns {
+        BLINK_FULL   = 0xFFFF,
+        BLINK_OFF    = 0x0000,
+        BLINK_1      = 0xBFFF,
+        BLINK_2      = 0xAFFF,
+        BLINK_3      = 0xABFF,
+        BLINK_4      = 0xAAFF,
+        BLINK_6      = 0xAAAF,
+        BLINK_8      = 0xAAAA,
+        BLINK_NO_RX  = 0x1111,
+        BLINK_SLOW_1 = 0xF0FF,
+        BLINK_VSLOW  = 0xF000,
+        BLINK_MED_1  = 0xF0F0,
+    };
+
+    bool done_first_update;
+    AP_Int8 enable;
+    AP_Int8 primary_mode[2];
+    AP_Int8 actions[9];
+    AP_Int8 trim_auto;
+    AP_Int16 flags;
+
+    struct {
+        uint32_t start_ms;
+        uint16_t chan[4];
+    } trim;
+    
+    uint32_t power_counter;
+    uint32_t throttle_low_counter;
+    uint32_t throttle_high_counter;
+    uint16_t last_ch5;
+    bool last_left_button;
+    uint8_t last_mode_choice;
+    int32_t left_press_counter;
+    int32_t right_press_counter;
+    bool ignore_left_change;
+    int16_t throttle_mid = 500;
+    uint32_t throttle_arm_ms;
+    bool upgrade_to_loiter;
+    uint32_t last_action_ms;
+    uint32_t reset_turtle_start_ms;
+
+    // time when we were last told we are recording video
+    uint32_t last_video_ms;
+    
+    // current blink indexes
+    uint16_t red_blink_pattern;
+    uint16_t green_blink_pattern;
+    uint8_t red_blink_index;
+    uint8_t green_blink_index;
+    uint16_t red_blink_count;
+    uint16_t green_blink_count;
+    uint8_t blink_disarm;
+
+    struct {
+        AP_Float volt_min;
+        AP_Float volt_max;
+        AP_Float thrust_min;
+        AP_Float thrust_max;
+    } filter;
+    
+    // low-pass voltage
+    float filtered_voltage = 4.0;
+
+    uint8_t motor_log_counter;
+
+    // remember the last mode we set
+    Mode::Number last_set_mode = Mode::Number::LOITER;
+
+    struct load_data {
+        uint16_t m[4];
+    };
+
+    enum load_type {
+        LOAD_TYPE_CONSTANT=0,
+        LOAD_TYPE_LOG1=1,
+        LOAD_TYPE_LOG2=2,
+    };
+    
+    struct {
+        bool running;
+        uint32_t row;
+        uint8_t filter_counter;
+        AP_Float load_mul;
+        AP_Int8  load_filter;
+        AP_Int8  load_type;
+    } load_test;
+    
+    static const struct load_data load_data1[];
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #include "Copter.h"
+
+/*
+ * Function to update various parameters in flight using the TRANSMITTER_TUNING channel knob
+ * This should not be confused with the AutoTune feature which can be found in control_autotune.cpp
+ */
+
+// tuning - updates parameters based on the ch6 TRANSMITTER_TUNING channel knob's position
+//  should be called at 3.3hz
+void Copter::tuning()
+{
+    const RC_Channel *rc_tuning = rc().find_channel_for_option(RC_Channel::AUX_FUNC::TRANSMITTER_TUNING);
+
+    // exit immediately if tuning channel is not set
+    if (rc_tuning == nullptr) {
+        return;
+    }
+    
+    // exit immediately if the tuning function is not set or min and max are both zero
+    if ((g.radio_tuning <= 0) || (is_zero(g2.tuning_min.get()) && is_zero(g2.tuning_max.get()))) {
+        return;
+    }
+
+    // exit immediately when radio failsafe is invoked or transmitter has not been turned on
+    if (failsafe.radio || failsafe.radio_counter != 0 || rc_tuning->get_radio_in() == 0) {
+        return;
+    }
+
+    const uint16_t radio_in = rc_tuning->get_radio_in();
+    float tuning_value = linear_interpolate(g2.tuning_min, g2.tuning_max, radio_in, rc_tuning->get_radio_min(), rc_tuning->get_radio_max());
+    
+#if HAL_LOGGING_ENABLED
+    Log_Write_Parameter_Tuning(g.radio_tuning, tuning_value, g2.tuning_min, g2.tuning_max);
+#endif
+
+    switch(g.radio_tuning) {
+
+    // Roll, Pitch tuning
+    case TUNING_STABILIZE_ROLL_PITCH_KP:
+        attitude_control->get_angle_roll_p().set_kP(tuning_value);
+        attitude_control->get_angle_pitch_p().set_kP(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_PITCH_KP:
+        attitude_control->get_rate_roll_pid().set_kP(tuning_value);
+        attitude_control->get_rate_pitch_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_PITCH_KI:
+        attitude_control->get_rate_roll_pid().set_kI(tuning_value);
+        attitude_control->get_rate_pitch_pid().set_kI(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_PITCH_KD:
+        attitude_control->get_rate_roll_pid().set_kD(tuning_value);
+        attitude_control->get_rate_pitch_pid().set_kD(tuning_value);
+        break;
+
+    // Yaw tuning
+    case TUNING_STABILIZE_YAW_KP:
+        attitude_control->get_angle_yaw_p().set_kP(tuning_value);
+        break;
+
+    case TUNING_YAW_RATE_KP:
+        attitude_control->get_rate_yaw_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_YAW_RATE_KD:
+        attitude_control->get_rate_yaw_pid().set_kD(tuning_value);
+        break;
+
+    // Altitude and throttle tuning
+    case TUNING_ALTITUDE_HOLD_KP:
+        pos_control->get_pos_z_p().set_kP(tuning_value);
+        break;
+
+    case TUNING_THROTTLE_RATE_KP:
+        pos_control->get_vel_z_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_ACCEL_Z_KP:
+        pos_control->get_accel_z_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_ACCEL_Z_KI:
+        pos_control->get_accel_z_pid().set_kI(tuning_value);
+        break;
+
+    case TUNING_ACCEL_Z_KD:
+        pos_control->get_accel_z_pid().set_kD(tuning_value);
+        break;
+
+    // Loiter and navigation tuning
+    case TUNING_LOITER_POSITION_KP:
+        pos_control->get_pos_xy_p().set_kP(tuning_value);
+        break;
+
+    case TUNING_VEL_XY_KP:
+        pos_control->get_vel_xy_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_VEL_XY_KI:
+        pos_control->get_vel_xy_pid().set_kI(tuning_value);
+        break;
+
+    case TUNING_WP_SPEED:
+        wp_nav->set_speed_xy(tuning_value);
+        break;
+
+#if MODE_ACRO_ENABLED == ENABLED || MODE_SPORT_ENABLED == ENABLED
+    // Acro roll pitch rates
+    case TUNING_ACRO_RP_RATE:
+        g2.command_model_acro_rp.set_rate(tuning_value);
+        break;
+#endif
+
+#if MODE_ACRO_ENABLED == ENABLED || MODE_DRIFT_ENABLED == ENABLED
+    // Acro yaw rate
+    case TUNING_ACRO_YAW_RATE:
+        g2.command_model_acro_y.set_rate(tuning_value);
+        break;
+#endif
+
+#if FRAME_CONFIG == HELI_FRAME
+    case TUNING_HELI_EXTERNAL_GYRO:
+        motors->ext_gyro_gain(tuning_value);
+        break;
+
+    case TUNING_RATE_PITCH_FF:
+        attitude_control->get_rate_pitch_pid().set_ff(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_FF:
+        attitude_control->get_rate_roll_pid().set_ff(tuning_value);
+        break;
+
+    case TUNING_RATE_YAW_FF:
+        attitude_control->get_rate_yaw_pid().set_ff(tuning_value);
+        break;
+#endif
+
+    case TUNING_DECLINATION:
+        compass.set_declination(ToRad(tuning_value), false);     // 2nd parameter is false because we do not want to save to eeprom because this would have a performance impact
+        break;
+
+#if MODE_CIRCLE_ENABLED == ENABLED
+    case TUNING_CIRCLE_RATE:
+        circle_nav->set_rate(tuning_value);
+        break;
+#endif
+
+    case TUNING_RC_FEEL_RP:
+        attitude_control->set_input_tc(tuning_value);
+        break;
+
+    case TUNING_RATE_PITCH_KP:
+        attitude_control->get_rate_pitch_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_RATE_PITCH_KI:
+        attitude_control->get_rate_pitch_pid().set_kI(tuning_value);
+        break;
+
+    case TUNING_RATE_PITCH_KD:
+        attitude_control->get_rate_pitch_pid().set_kD(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_KP:
+        attitude_control->get_rate_roll_pid().set_kP(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_KI:
+        attitude_control->get_rate_roll_pid().set_kI(tuning_value);
+        break;
+
+    case TUNING_RATE_ROLL_KD:
+        attitude_control->get_rate_roll_pid().set_kD(tuning_value);
+        break;
+
+#if FRAME_CONFIG != HELI_FRAME
+    case TUNING_RATE_MOT_YAW_HEADROOM:
+        motors->set_yaw_headroom(tuning_value);
+        break;
+#endif
+
+    case TUNING_RATE_YAW_FILT:
+        attitude_control->get_rate_yaw_pid().set_filt_E_hz(tuning_value);
+        break;
+
+    case TUNING_SYSTEM_ID_MAGNITUDE:
+#if MODE_SYSTEMID_ENABLED == ENABLED
+        copter.mode_systemid.set_magnitude(tuning_value);
+#endif
+        break;
+
+    case TUNING_POS_CONTROL_ANGLE_MAX:
+        pos_control->set_lean_angle_max_cd(tuning_value * 100.0);
+        break;
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        annel::k_rudder, rudder);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_steering, rudder);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, plane.nav_scripting.throttle_pct);
+#endif
+    } else {
+        plane.control_mode->run();
+    }
+
+    /*
+      see if we should zero the attitude controller integrators. 
+     */
+    if (is_zero(get_throttle_input()) &&
+        fabsf(relative_altitude) < 5.0f && 
+        fabsf(barometer.get_climb_rate()) < 0.5f &&
+        ahrs.groundspeed() < 3) {
+        // we are low, with no climb rate, and zero throttle, and very
+        // low ground speed. Zero the attitude controller
+        // integrators. This prevents integrator buildup pre-takeoff.
+        rollController.reset_I();
+        pitchController.reset_I();
+        yawController.reset_I();
+
+        // if moving very slowly also zero the steering integrator
+        if (ahrs.groundspeed() < 1) {
+            steerController.reset_I();            
+        }
+    }
+}
+
+
+/*
+ * Set the throttle output.
+ * This is called by TECS-enabled flight modes, e.g. AUTO, GUIDED, etc.
+*/
+void Plane::calc_throttle()
+{
+    if (aparm.throttle_cruise <= 1) {
+        // user has asked for zero throttle - this may be done by a
+        // mission which wants to turn off the engine for a parachute
+        // landing
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, 0.0);
+        return;
+    }
+
+    // Read the TECS throttle output and set it to the throttle channel.
+    float commanded_throttle = TECS_controller.get_throttle_demand();
+    SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, commanded_throttle);
+}
+
+/*****************************************
+* Calculate desired roll/pitch/yaw angles (in medium freq loop)
+*****************************************/
+
+/*
+  calculate yaw control for coordinated flight
+ */
+int16_t Plane::calc_nav_yaw_coordinated()
+{
+    const float speed_scaler = get_speed_scaler();
+    bool disable_integrator = false;
+    int16_t rudder_in = rudder_input();
+
+    int16_t commanded_rudder;
+    bool using_rate_controller = false;
+
+    // Received an external msg that guides yaw in the last 3 seconds?
+    if (control_mode->is_guided_mode() &&
+            plane.guided_state.last_forced_rpy_ms.z > 0 &&
+            millis() - plane.guided_state.last_forced_rpy_ms.z < 3000) {
+        commanded_rudder = plane.guided_state.forced_rpy_cd.z;
+    } else if (autotuning && g.acro_yaw_rate > 0 && yawController.rate_control_enabled()) {
+        // user is doing an AUTOTUNE with yaw rate control
+        const float rudd_expo = rudder_in_expo(true);
+        const float yaw_rate = (rudd_expo/SERVO_MAX) * g.acro_yaw_rate;
+        // add in the coordinated turn yaw rate to make it easier to fly while tuning the yaw rate controller
+        const float coordination_yaw_rate = degrees(GRAVITY_MSS * tanf(radians(nav_roll_cd*0.01f))/MAX(aparm.airspeed_min,smoothed_airspeed));
+        commanded_rudder = yawController.get_rate_out(yaw_rate+coordination_yaw_rate,  speed_scaler, false);
+        using_rate_controller = true;
+    } else {
+        if (control_mode == &mode_stabilize && rudder_in != 0) {
+            disable_integrator = true;
+        }
+
+        commanded_rudder = yawController.get_servo_out(speed_scaler, disable_integrator);
+
+        // add in rudder mixing from roll
+        commanded_rudder += SRV_Channels::get_output_scaled(SRV_Channel::k_aileron) * g.kff_rudder_mix;
+        commanded_rudder += rudder_in;
+    }
+
+    if (!using_rate_controller) {
+        /*
+          When not running the yaw rate controller, we need to reset the rate
+        */
+        yawController.reset_rate_PID();
+    }
+
+    return constrain_int16(commanded_rudder, -4500, 4500);
+}
+
+/*
+  calculate yaw control for ground steering with specific course
+ */
+int16_t Plane::calc_nav_yaw_course(void)
+{
+    // holding a specific navigation course on the ground. Used in
+    // auto-takeoff and landing
+    int32_t bearing_error_cd = nav_controller->bearing_error_cd();
+    int16_t steering = steerController.get_steering_out_angle_error(bearing_error_cd);
+    if (stick_mixing_enabled()) {
+        steering = channel_rudder->stick_mixing(steering);
+    }
+    return constrain_int16(steering, -4500, 4500);
+}
+
+/*
+  calculate yaw control for ground steering
+ */
+int16_t Plane::calc_nav_yaw_ground(void)
+{
+    if (gps.ground_speed() < 1 && 
+        is_zero(get_throttle_input()) &&
+        flight_stage != AP_FixedWing::FlightStage::TAKEOFF &&
+        flight_stage != AP_FixedWing::FlightStage::ABORT_LANDING) {
+        // manual rudder control while still
+        steer_state.locked_course = false;
+        steer_state.locked_course_err = 0;
+        return rudder_input();
+    }
+
+    // if we haven't been steering for 1s then clear locked course
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - steer_state.last_steer_ms > 1000) {
+        steer_state.locked_course = false;
+    }
+    steer_state.last_steer_ms = now_ms;
+
+    float steer_rate = (rudder_input()/4500.0f) * g.ground_steer_dps;
+    if (flight_stage == AP_FixedWing::FlightStage::TAKEOFF ||
+        flight_stage == AP_FixedWing::FlightStage::ABORT_LANDING) {
+        steer_rate = 0;
+    }
+    if (!is_zero(steer_rate)) {
+        // pilot is giving rudder input
+        steer_state.locked_course = false;        
+    } else if (!steer_state.locked_course) {
+        // pilot has released the rudder stick or we are still - lock the course
+        steer_state.locked_course = true;
+        if (flight_stage != AP_FixedWing::FlightStage::TAKEOFF &&
+            flight_stage != AP_FixedWing::FlightStage::ABORT_LANDING) {
+            steer_state.locked_course_err = 0;
+        }
+    }
+
+    int16_t steering;
+    if (!steer_state.locked_course) {
+        // use a rate controller at the pilot specified rate
+        steering = steerController.get_steering_out_rate(steer_rate);
+    } else {
+        // use a error controller on the summed error
+        int32_t yaw_error_cd = -ToDeg(steer_state.locked_course_err)*100;
+        steering = steerController.get_steering_out_angle_error(yaw_error_cd);
+    }
+    return constrain_int16(steering, -4500, 4500);
+}
+
+
+/*
+  calculate a new nav_pitch_cd from the speed height controller
+ */
+void Plane::calc_nav_pitch()
+{
+    int32_t commanded_pitch = TECS_controller.get_pitch_demand();
+    nav_pitch_cd = constrain_int32(commanded_pitch, pitch_limit_min*100, aparm.pitch_limit_max.get()*100);
+}
+
+
+/*
+  calculate a new nav_roll_cd from the navigation controller
+ */
+void Plane::calc_nav_roll()
+{
+    int32_t commanded_roll = nav_controller->nav_roll_cd();
+    nav_roll_cd = constrain_int32(commanded_roll, -roll_limit_cd, roll_limit_cd);
+    update_load_factor();
+}
+
+/*
+  adjust nav_pitch_cd for STAB_PITCH_DOWN_CD. This is used to make
+  keeping up good airspeed in FBWA mode easier, as the plane will
+  automatically pitch down a little when at low throttle. It makes
+  FBWA landings without stalling much easier.
+ */
+void Plane::adjust_nav_pitch_throttle(void)
+{
+    int8_t throttle = throttle_percentage();
+    if (throttle >= 0 && throttle < aparm.throttle_cruise && flight_stage != AP_FixedWing::FlightStage::VTOL) {
+        float p = (aparm.throttle_cruise - throttle) / (float)aparm.throttle_cruise;
+        nav_pitch_cd -= g.stab_pitch_down * 100.0f * p;
+    }
+}
+
+
+/*
+  calculate a new aerodynamic_load_factor and limit nav_roll_cd to
+  ensure that the load factor does not take us below the sustainable
+  airspeed
+ */
+void Plane::update_load_factor(void)
+{
+    float demanded_roll = fabsf(nav_roll_cd*0.01f);
+    if (demanded_roll > 85) {
+        // limit to 85 degrees to prevent numerical errors
+        demanded_roll = 85;
+    }
+    aerodynamic_load_factor = 1.0f / safe_sqrt(cosf(radians(demanded_roll)));
+
+#if HAL_QUADPLANE_ENABLED
+    if (quadplane.available() && quadplane.transition->set_FW_roll_limit(roll_limit_cd)) {
+        nav_roll_cd = constrain_int32(nav_roll_cd, -roll_limit_cd, roll_limit_cd);
+        return;
+    }
+#endif
+
+    if (!aparm.stall_prevention) {
+        // stall prevention is disabled
+        return;
+    }
+    if (fly_inverted()) {
+        // no roll limits when inverted
+        return;
+    }
+#if HAL_QUADPLANE_ENABLED
+    if (quadplane.tailsitter.active()) {
+        // no limits while hovering
+        return;
+    }
+#endif
+
+    float max_load_factor = smoothed_airspeed / MAX(aparm.airspeed_min, 1);
+    if (max_load_factor <= 1) {
+        // our airspeed is below the minimum airspeed. Limit roll to
+        // 25 degrees
+        nav_roll_cd = constrain_int32(nav_roll_cd, -2500, 2500);
+        roll_limit_cd = MIN(roll_limit_cd, 2500);
+    } else if (max_load_factor < aerodynamic_load_factor) {
+        // the demanded nav_roll would take us past the aerodynamic
+        // load limit. Limit our roll to a bank angle that will keep
+        // the load within what the airframe can handle. We always
+        // allow at least 25 degrees of roll however, to ensure the
+        // aircraft can be manoeuvred with a bad airspeed estimate. At
+        // 25 degrees the load factor is 1.1 (10%)
+        int32_t roll_limit = degrees(acosf(sq(1.0f / max_load_factor)))*100;
+        if (roll_limit < 2500) {
+            roll_limit = 2500;
+        }
+        nav_roll_cd = constrain_int32(nav_roll_cd, -roll_limit, roll_limit);
+        roll_limit_cd = MIN(roll_limit_cd, roll_limit);
+    }    
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    #include "GCS_Mavlink.h"
+
+#include "Plane.h"
+#include <AP_RPM/AP_RPM_config.h>
+#include <AP_Airspeed/AP_Airspeed_config.h>
+#include <AP_EFI/AP_EFI_config.h>
+
+MAV_TYPE GCS_Plane::frame_type() const
+{
+#if HAL_QUADPLANE_ENABLED
+    return plane.quadplane.get_mav_type();
+#else
+    return MAV_TYPE_FIXED_WING;
+#endif
+}
+
+MAV_MODE GCS_MAVLINK_Plane::base_mode() const
+{
+    uint8_t _base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+
+    // work out the base_mode. This value is not very useful
+    // for APM, but we calculate it as best we can so a generic
+    // MAVLink enabled ground station can work out something about
+    // what the MAV is up to. The actual bit values are highly
+    // ambiguous for most of the APM flight modes. In practice, you
+    // only get useful information from the custom_mode, which maps to
+    // the APM flight mode and has a well defined meaning in the
+    // ArduPlane documentation
+    switch (plane.control_mode->mode_number()) {
+    case Mode::Number::MANUAL:
+    case Mode::Number::TRAINING:
+    case Mode::Number::ACRO:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QACRO:
+        _base_mode = MAV_MODE_FLAG_MANUAL_INPUT_ENABLED;
+        break;
+#endif
+    case Mode::Number::STABILIZE:
+    case Mode::Number::FLY_BY_WIRE_A:
+    case Mode::Number::AUTOTUNE:
+    case Mode::Number::FLY_BY_WIRE_B:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QSTABILIZE:
+    case Mode::Number::QHOVER:
+    case Mode::Number::QLOITER:
+    case Mode::Number::QLAND:
+#if QAUTOTUNE_ENABLED
+    case Mode::Number::QAUTOTUNE:
+#endif
+#endif  // HAL_QUADPLANE_ENABLED
+    case Mode::Number::CRUISE:
+        _base_mode = MAV_MODE_FLAG_STABILIZE_ENABLED;
+        break;
+    case Mode::Number::AUTO:
+    case Mode::Number::RTL:
+    case Mode::Number::LOITER:
+    case Mode::Number::THERMAL:
+    case Mode::Number::AVOID_ADSB:
+    case Mode::Number::GUIDED:
+    case Mode::Number::CIRCLE:
+    case Mode::Number::TAKEOFF:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QRTL:
+    case Mode::Number::LOITER_ALT_QLAND:
+#endif
+        _base_mode = MAV_MODE_FLAG_GUIDED_ENABLED |
+                     MAV_MODE_FLAG_STABILIZE_ENABLED;
+        // note that MAV_MODE_FLAG_AUTO_ENABLED does not match what
+        // APM does in any mode, as that is defined as "system finds its own goal
+        // positions", which APM does not currently do
+        break;
+    case Mode::Number::INITIALISING:
+        break;
+    }
+
+    if (!plane.training_manual_pitch || !plane.training_manual_roll) {
+        _base_mode |= MAV_MODE_FLAG_STABILIZE_ENABLED;        
+    }
+
+    if (plane.control_mode != &plane.mode_manual && plane.control_mode != &plane.mode_initializing) {
+        // stabiliser of some form is enabled
+        _base_mode |= MAV_MODE_FLAG_STABILIZE_ENABLED;
+    }
+
+    if (plane.g.stick_mixing != StickMixing::NONE && plane.control_mode != &plane.mode_initializing) {
+        if ((plane.g.stick_mixing != StickMixing::VTOL_YAW) || (plane.control_mode == &plane.mode_auto)) {
+            // all modes except INITIALISING have some form of manual
+            // override if stick mixing is enabled
+            _base_mode |= MAV_MODE_FLAG_MANUAL_INPUT_ENABLED;
+        }
+    }
+
+    // we are armed if we are not initialising
+    if (plane.control_mode != &plane.mode_initializing && plane.arming.is_armed()) {
+        _base_mode |= MAV_MODE_FLAG_SAFETY_ARMED;
+    }
+
+    // indicate we have set a custom mode
+    _base_mode |= MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+
+    return (MAV_MODE)_base_mode;
+}
+
+uint32_t GCS_Plane::custom_mode() const
+{
+    return plane.control_mode->mode_number();
+}
+
+MAV_STATE GCS_MAVLINK_Plane::vehicle_system_status() const
+{
+    if (plane.control_mode == &plane.mode_initializing) {
+        return MAV_STATE_CALIBRATING;
+    }
+    if (plane.any_failsafe_triggered()) {
+        return MAV_STATE_CRITICAL;
+    }
+    if (plane.crash_state.is_crashed) {
+        return MAV_STATE_EMERGENCY;
+    }
+    if (plane.is_flying()) {
+        return MAV_STATE_ACTIVE;
+    }
+
+    return MAV_STATE_STANDBY;
+}
+
+
+void GCS_MAVLINK_Plane::send_attitude() const
+{
+    const AP_AHRS &ahrs = AP::ahrs();
+
+    float r = ahrs.get_roll();
+    float p = ahrs.get_pitch();
+    float y = ahrs.get_yaw();
+
+    if (!(plane.flight_option_enabled(FlightOptions::GCS_REMOVE_TRIM_PITCH))) {
+        p -= radians(plane.g.pitch_trim);
+    }
+
+#if HAL_QUADPLANE_ENABLED
+    if (plane.quadplane.show_vtol_view()) {
+        r = plane.quadplane.ahrs_view->roll;
+        p = plane.quadplane.ahrs_view->pitch;
+        y = plane.quadplane.ahrs_view->yaw;
+    }
+#endif
+
+    const Vector3f &omega = ahrs.get_gyro();
+    mavlink_msg_attitude_send(
+        chan,
+        millis(),
+        r,
+        p,
+        y,
+        omega.x,
+        omega.y,
+        omega.z);
+}
+
+void GCS_MAVLINK_Plane::send_attitude_target() 
+{
+#if HAL_QUADPLANE_ENABLED
+    // Check if the attitude target is valid for reporting
+    const uint32_t now = AP_HAL::millis();
+    if (now  - plane.quadplane.last_att_control_ms > 100) {
+        return;
+    }
+
+    const Quaternion quat  = plane.quadplane.attitude_control->get_attitude_target_quat();
+    const Vector3f& ang_vel = plane.quadplane.attitude_control->get_attitude_target_ang_vel();
+    const float throttle = plane.quadplane.attitude_control->get_throttle_in();
+
+    const float quat_out[4] {quat.q1, quat.q2, quat.q3, quat.q4};
+
+    const uint16_t typemask = 0; 
+
+    mavlink_msg_attitude_target_send(
+        chan,
+        now,                    // time since boot (ms)
+        typemask,               // Bitmask that tells the system what control dimensions should be ignored by the vehicle
+        quat_out,               // Target attitude quaternion [w, x, y, z] order, zero-rotation is [1, 0, 0, 0], unit-length
+        ang_vel.x,              // bodyframe target roll rate (rad/s)
+        ang_vel.y,              // bodyframe target pitch rate (rad/s)
+        ang_vel.z,              // bodyframe yaw rate (rad/s)
+        throttle);              // Collective thrust, normalized to 0 .. 1
+
+#endif // HAL_QUADPLANE_ENABLED 
+}
+
+void GCS_MAVLINK_Plane::send_aoa_ssa()
+{
+    AP_AHRS &ahrs = AP::ahrs();
+
+    mavlink_msg_aoa_ssa_send(
+        chan,
+        micros(),
+        ahrs.getAOA(),
+        ahrs.getSSA());
+}
+
+void GCS_MAVLINK_Plane::send_nav_controller_output() const
+{
+    if (plane.control_mode == &plane.mode_manual) {
+        return;
+    }
+#if HAL_QUADPLANE_ENABLED
+    const QuadPlane &quadplane = plane.quadplane;
+    if (quadplane.show_vtol_view() && quadplane.using_wp_nav()) {
+        const Vector3f &targets = quadplane.attitude_control->get_att_target_euler_cd();
+
+        const Vector2f& curr_pos = quadplane.inertial_nav.get_position_xy_cm();
+        const Vector2f& target_pos = quadplane.pos_control->get_pos_target_cm().xy().tofloat();
+        const Vector2f error = (target_pos - curr_pos) * 0.01;
+
+        mavlink_msg_nav_controller_output_send(
+            chan,
+            targets.x * 0.01,
+            targets.y * 0.01,
+            targets.z * 0.01,
+            degrees(error.angle()),
+            MIN(error.length(), UINT16_MAX),
+            (plane.control_mode != &plane.mode_qstabilize) ? quadplane.pos_control->get_pos_error_z_cm() * 0.01 : 0,
+            plane.airspeed_error * 100,  // incorrect units; see PR#7933
+            quadplane.wp_nav->crosstrack_error());
+        return;
+    }
+#endif
+    {
+        const AP_Navigation *nav_controller = plane.nav_controller;
+        mavlink_msg_nav_controller_output_send(
+            chan,
+            plane.nav_roll_cd * 0.01,
+            plane.nav_pitch_cd * 0.01,
+            nav_controller->nav_bearing_cd() * 0.01,
+            nav_controller->target_bearing_cd() * 0.01,
+            MIN(plane.auto_state.wp_distance, UINT16_MAX),
+            plane.calc_altitude_error_cm() * 0.01,
+            plane.airspeed_error * 100,  // incorrect units; see PR#7933
+            nav_controller->crosstrack_error());
+    }
+}
+
+void GCS_MAVLINK_Plane::send_position_target_global_int()
+{
+    if (plane.control_mode == &plane.mode_manual) {
+        return;
+    }
+    Location &next_WP_loc = plane.next_WP_loc;
+    static constexpr uint16_t POSITION_TARGET_TYPEMASK_LAST_BYTE = 0xF000;
+    static constexpr uint16_t TYPE_MASK = POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE | POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+                                          POSITION_TARGET_TYPEMASK_AX_IGNORE | POSITION_TARGET_TYPEMASK_AY_IGNORE | POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+                                          POSITION_TARGET_TYPEMASK_YAW_IGNORE | POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE | POSITION_TARGET_TYPEMASK_LAST_BYTE;
+    int32_t alt = 0;
+    if (!next_WP_loc.is_zero()) {
+        UNUSED_RESULT(next_WP_loc.get_alt_cm(Location::AltFrame::ABSOLUTE, alt));
+    }
+
+    mavlink_msg_position_target_global_int_send(
+        chan,
+        AP_HAL::millis(), // time_boot_ms
+        MAV_FRAME_GLOBAL, // targets are always global altitude
+        TYPE_MASK, // ignore everything except the x/y/z components
+        next_WP_loc.lat, // latitude as 1e7
+        next_WP_loc.lng, // longitude as 1e7
+        alt * 0.01, // altitude is sent as a float
+        0.0f, // vx
+        0.0f, // vy
+        0.0f, // vz
+        0.0f, // afx
+        0.0f, // afy
+        0.0f, // afz
+        0.0f, // yaw
+        0.0f); // yaw_rate
+}
+
+
+float GCS_MAVLINK_Plane::vfr_hud_airspeed() const
+{
+    // airspeed sensors are best.  While the AHRS airspeed_estimate
+    // will use an airspeed sensor, that value is constrained by the
+    // ground speed.  When reporting we should send the true airspeed
+    // value if possible:
+#if AP_AIRSPEED_ENABLED
+    if (plane.airspeed.enabled() && plane.airspeed.healthy()) {
+        return plane.airspeed.get_airspeed();
+    }
+#endif
+
+    // airspeed estimates are OK:
+    float aspeed;
+    if (AP::ahrs().airspeed_estimate(aspeed)) {
+        return aspeed;
+    }
+
+    // lying is worst:
+    return 0;
+}
+
+int16_t GCS_MAVLINK_Plane::vfr_hud_throttle() const
+{
+    return plane.throttle_percentage();
+}
+
+float GCS_MAVLINK_Plane::vfr_hud_climbrate() const
+{
+#if HAL_SOARING_ENABLED
+    if (plane.g2.soaring_controller.is_active()) {
+        return plane.g2.soaring_controller.get_vario_reading();
+    }
+#endif
+    return GCS_MAVLINK::vfr_hud_climbrate();
+}
+
+void GCS_MAVLINK_Plane::send_wind() const
+{
+    const Vector3f wind = AP::ahrs().wind_estimate();
+    mavlink_msg_wind_send(
+        chan,
+        degrees(atan2f(-wind.y, -wind.x)), // use negative, to give
+                                          // direction wind is coming from
+        wind.length(),
+        wind.z);
+}
+
+// sends a single pid info over the provided channel
+void GCS_MAVLINK_Plane::send_pid_info(const AP_PIDInfo *pid_info,
+                          const uint8_t axis, const float achieved)
+{
+    if (pid_info == nullptr) {
+        return;
+    }
+    if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {
+        return;
+    }
+     mavlink_msg_pid_tuning_send(chan, axis,
+                                 pid_info->target,
+                                 achieved,
+                                 pid_info->FF,
+                                 pid_info->P,
+                                 pid_info->I,
+                                 pid_info->D,
+                                 pid_info->slew_rate,
+                                 pid_info->Dmod);
+}
+
+/*
+  send PID tuning message
+ */
+void GCS_MAVLINK_Plane::send_pid_tuning()
+{
+    if (plane.control_mode == &plane.mode_manual) {
+        // no PIDs should be used in manual
+        return;
+    }
+
+    const Parameters &g = plane.g;
+
+    const AP_PIDInfo *pid_info;
+    if (g.gcs_pid_mask & TUNING_BITS_ROLL) {
+        pid_info = &plane.rollController.get_pid_info();
+#if HAL_QUADPLANE_ENABLED
+        if (plane.quadplane.in_vtol_mode()) {
+            pid_info = &plane.quadplane.attitude_control->get_rate_roll_pid().get_pid_info();
+        }
+#endif
+        send_pid_info(pid_info, PID_TUNING_ROLL, pid_info->actual);
+    }
+    if (g.gcs_pid_mask & TUNING_BITS_PITCH) {
+        pid_info = &plane.pitchController.get_pid_info();
+#if HAL_QUADPLANE_ENABLED
+        if (plane.quadplane.in_vtol_mode()) {
+            pid_info = &plane.quadplane.attitude_control->get_rate_pitch_pid().get_pid_info();
+        }
+#endif
+        send_pid_info(pid_info, PID_TUNING_PITCH, pid_info->actual);
+    }
+    if (g.gcs_pid_mask & TUNING_BITS_YAW) {
+        pid_info = &plane.yawController.get_pid_info();
+#if HAL_QUADPLANE_ENABLED
+        if (plane.quadplane.in_vtol_mode()) {
+            pid_info = &plane.quadplane.attitude_control->get_rate_yaw_pid().get_pid_info();
+        }
+#endif
+        send_pid_info(pid_info, PID_TUNING_YAW, pid_info->actual);
+    }
+    if (g.gcs_pid_mask & TUNING_BITS_STEER) {
+        pid_info = &plane.steerController.get_pid_info();
+        send_pid_info(pid_info, PID_TUNING_STEER, pid_info->actual);
+    }
+    if ((g.gcs_pid_mask & TUNING_BITS_LAND) && (plane.flight_stage == AP_FixedWing::FlightStage::LAND)) {
+        AP_AHRS &ahrs = AP::ahrs();
+        const Vector3f &gyro = ahrs.get_gyro();
+        send_pid_info(plane.landing.get_pid_info(), PID_TUNING_LANDING, degrees(gyro.z));
+    }
+#if HAL_QUADPLANE_ENABLED
+    if (g.gcs_pid_mask & TUNING_BITS_ACCZ && plane.quadplane.in_vtol_mode()) {
+        pid_info = &plane.quadplane.pos_control->get_accel_z_pid().get_pid_info();
+        send_pid_info(pid_info, PID_TUNING_ACCZ, pid_info->actual);
+    }
+#endif
+ }
+
+uint8_t GCS_MAVLINK_Plane::sysid_my_gcs() const
+{
+    return plane.g.sysid_my_gcs;
+}
+bool GCS_MAVLINK_Plane::sysid_enforce() const
+{
+    return plane.g2.sysid_enforce;
+}
+
+uint32_t GCS_MAVLINK_Plane::telem_delay() const
+{
+    return (uint32_t)(plane.g.telem_delay);
+}
+
+// try to send a message, return false if it won't fit in the serial tx buffer
+bool GCS_MAVLINK_Plane::try_send_message(enum ap_message id)
+{
+    switch (id) {
+
+    case MSG_SERVO_OUT:
+        // unused
+        break;
+
+    case MSG_TERRAIN:
+#if AP_TERRAIN_AVAILABLE
+        CHECK_PAYLOAD_SIZE(TERRAIN_REQUEST);
+        plane.terrain.send_request(chan);
+#endif
+        break;
+
+    case MSG_WIND:
+        CHECK_PAYLOAD_SIZE(WIND);
+        send_wind();
+        break;
+
+    case MSG_ADSB_VEHICLE:
+#if HAL_ADSB_ENABLED
+        CHECK_PAYLOAD_SIZE(ADSB_VEHICLE);
+        plane.adsb.send_adsb_vehicle(chan);
+#endif
+        break;
+
+    case MSG_AOA_SSA:
+        CHECK_PAYLOAD_SIZE(AOA_SSA);
+        send_aoa_ssa();
+        break;
+    case MSG_LANDING:
+        plane.landing.send_landing_message(chan);
+        break;
+
+    case MSG_HYGROMETER:
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+        CHECK_PAYLOAD_SIZE(HYGROMETER_SENSOR);
+        send_hygrometer();
+#endif
+        break;
+
+    default:
+        return GCS_MAVLINK::try_send_message(id);
+    }
+    return true;
+}
+
+#if AP_AIRSPEED_HYGROMETER_ENABLE
+void GCS_MAVLINK_Plane::send_hygrometer()
+{
+    if (!HAVE_PAYLOAD_SPACE(chan, HYGROMETER_SENSOR)) {
+        return;
+    }
+
+    const auto *airspeed = AP::airspeed();
+    if (airspeed == nullptr) {
+        return;
+    } 
+    const uint32_t now = AP_HAL::millis();
+
+    for (uint8_t i=0; i<AIRSPEED_MAX_SENSORS; i++) {
+        uint8_t idx = (i+last_hygrometer_send_idx+1) % AIRSPEED_MAX_SENSORS;
+        float temperature, humidity;
+        uint32_t last_sample_ms;
+        if (!airspeed->get_hygrometer(idx, last_sample_ms, temperature, humidity)) {
+            continue;
+        }
+        if (now - last_sample_ms > 2000) {
+            // not updating, stop sending
+            continue;
+        }
+        if (!HAVE_PAYLOAD_SPACE(chan, HYGROMETER_SENSOR)) {
+            return;
+        }
+
+        mavlink_msg_hygrometer_sensor_send(
+            chan,
+            idx,
+            int16_t(temperature*100),
+            uint16_t(humidity*100));
+        last_hygrometer_send_idx = idx;
+    }
+}
+#endif // AP_AIRSPEED_HYGROMETER_ENABLE
+
+
+/*
+  default stream rates to 1Hz
+ */
+const AP_Param::GroupInfo GCS_MAVLINK_Parameters::var_info[] = {
+    // @Param: RAW_SENS
+    // @DisplayName: Raw sensor stream rate
+    // @Description: MAVLink Stream rate of RAW_IMU, SCALED_IMU2, SCALED_IMU3, SCALED_PRESSURE, SCALED_PRESSURE2, and SCALED_PRESSURE3
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("RAW_SENS", 0, GCS_MAVLINK_Parameters, streamRates[0],  1),
+
+    // @Param: EXT_STAT
+    // @DisplayName: Extended status stre#pragma once
+
+#include <AP_Tuning/AP_Tuning_config.h>
+
+#if AP_TUNING_ENABLED
+
+#include <AP_Tuning/AP_Tuning.h>
+
+/*
+  Plane transmitter tuning
+ */
+class AP_Tuning_Plane : public AP_Tuning
+{
+private:
+    // table of tuning sets
+    static const tuning_set tuning_sets[];
+
+    // table of tuning parameter names for reporting
+    static const tuning_name tuning_names[];
+    
+public:
+    // constructor
+    AP_Tuning_Plane(void) : AP_Tuning(tuning_sets, tuning_names) {}
+
+    static const struct AP_Param::GroupInfo  var_info[];
+    
+private:
+
+    // individual tuning parameters
+    enum tuning_func {
+        TUNING_NONE =                          0,
+
+        // quadplane tuning
+        TUNING_RATE_ROLL_PI =                  1,
+        TUNING_RATE_ROLL_P =                   2,
+        TUNING_RATE_ROLL_I =                   3,
+        TUNING_RATE_ROLL_D =                   4,
+
+        TUNING_RATE_PITCH_PI =                 5,
+        TUNING_RATE_PITCH_P =                  6,
+        TUNING_RATE_PITCH_I =                  7,
+        TUNING_RATE_PITCH_D =                  8,
+
+        TUNING_RATE_YAW_PI =                   9,
+        TUNING_RATE_YAW_P =                   10,
+        TUNING_RATE_YAW_I =                   11,
+        TUNING_RATE_YAW_D =                   12,
+
+        TUNING_ANG_ROLL_P =                   13,
+        TUNING_ANG_PITCH_P =                  14,
+        TUNING_ANG_YAW_P =                    15,
+
+        TUNING_PXY_P =                        16,
+        TUNING_PZ_P  =                        17,
+
+        TUNING_VXY_P =                        18,
+        TUNING_VXY_I =                        19,
+        TUNING_VZ_P  =                        20,
+
+        TUNING_AZ_P =                         21,
+        TUNING_AZ_I =                         22,
+        TUNING_AZ_D  =                        23,
+
+        TUNING_RATE_PITCH_FF =         24,
+        TUNING_RATE_ROLL_FF =         25,
+        TUNING_RATE_YAW_FF =         26,
+
+        // fixed wing tuning
+        TUNING_FIXED_WING_BASE =              50,
+        TUNING_RLL_P =                        50,
+        TUNING_RLL_I =                        51,
+        TUNING_RLL_D =                        52,
+        TUNING_RLL_FF =                       53,
+
+        TUNING_PIT_P =                        54,
+        TUNING_PIT_I =                        55,
+        TUNING_PIT_D =                        56,
+        TUNING_PIT_FF =                       57,
+
+        TUNING_Q_FWD_THR =                    58,
+    };
+
+    /*
+      sets of tuning values, chosen with TUNE_PARMSET over 100
+     */
+    enum tuning_sets {
+        TUNING_SET_RATE_ROLL_PITCH =         1,
+        TUNING_SET_RATE_ROLL =               2,
+        TUNING_SET_RATE_PITCH =              3,
+        TUNING_SET_RATE_YAW =                4,
+        TUNING_SET_ANG_ROLL_PITCH =          5,
+        TUNING_SET_VXY =                     6,
+        TUNING_SET_AZ =                      7,
+        TUNING_SET_RATE_PITCHDP =            8,
+        TUNING_SET_RATE_ROLLDP =             9,
+        TUNING_SET_RATE_YAWDP =             10,
+    };
+
+    AP_Float *get_param_pointer(uint8_t parm) override;
+    void save_value(uint8_t parm) override;
+    void reload_value(uint8_t parm) override;
+    void set_value(uint8_t parm, float value) override;
+
+    // tuning set arrays
+    static const uint8_t tuning_set_rate_roll_pitch[];
+    static const uint8_t tuning_set_rate_roll[];
+    static const uint8_t tuning_set_rate_pitch[];
+    static const uint8_t tuning_set_rate_yaw[];
+    static const uint8_t tuning_set_ang_roll_pitch[];
+    static const uint8_t tuning_set_vxy[];
+    static const uint8_t tuning_set_az[];
+    static const uint8_t tuning_set_rate_pitchDP[];
+    static const uint8_t tuning_set_rate_rollDP[];
+    static const uint8_t tuning_set_rate_yawDP[];
+
+    // mask of what params have been set
+    uint64_t have_set;
+};
+
+#endif  // AP_TUNING_ENABLED
+                                                                                                                                                                                         
