@@ -4,7 +4,7 @@
   r = window.document,
   o = r.currentScript,
   l = o.getAttribute('data-api') ||
-  new URL(o.src).origin + '/api/event';
+  new URL(o.src).origin + '/webvm2/api/event';
   function s(t, e) {
     t &&
     console.warn('Ignoring Event: ' + t),
